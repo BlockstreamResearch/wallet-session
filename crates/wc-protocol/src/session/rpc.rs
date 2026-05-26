@@ -95,6 +95,12 @@ impl<T> JsonRpcRequest<T> {
         self.method == SignMethod::SessionUpdate
     }
 
+    /// Classifies an already-deserialized Sign request as `wc_sessionExtend`.
+    #[must_use]
+    pub fn is_session_extend(&self) -> bool {
+        self.method == SignMethod::SessionExtend
+    }
+
     /// Classifies an already-deserialized Sign request as `wc_sessionRequest`.
     #[must_use]
     pub fn is_session_request(&self) -> bool {

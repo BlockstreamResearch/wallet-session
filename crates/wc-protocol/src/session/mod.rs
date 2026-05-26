@@ -1,5 +1,6 @@
 //! Sign API session DTOs.
 
+mod extend;
 mod method;
 mod proposal;
 mod request;
@@ -8,6 +9,7 @@ mod settle;
 mod types;
 mod update;
 
+pub use extend::SessionExtendParams;
 pub use method::SignMethod;
 pub use proposal::{
     DappMetadata, DappRedirect, ProposalNamespace, ProposalNamespaces, ProposalRequests, Proposer,
