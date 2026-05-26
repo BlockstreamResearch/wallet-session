@@ -1,6 +1,7 @@
 //! Integration tests for Sign API session DTOs.
 
 mod session {
+    mod delete;
     mod event;
     mod extend;
     mod proposal;
