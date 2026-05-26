@@ -1,0 +1,31 @@
+[package]
+name = "wc-protocol"
+version = "0.1.0"
+description = "WalletConnect protocol DTOs, parsers, and validation primitives."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["walletconnect", "client"]
+categories = ["cryptography::cryptocurrencies", "network-programming"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Relay Auth JWT uses unpadded base64url for the header, claims, and signature.
+base64 = "0.22"
+
+# Relay Auth JWT issuer uses did:key Ed25519 public keys encoded as base58btc.
+bs58 = "0.5"
+
+# Relay Auth JWT uses EdDSA/Ed25519 signatures.
+ed25519-dalek = "2"
+
+thiserror = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
