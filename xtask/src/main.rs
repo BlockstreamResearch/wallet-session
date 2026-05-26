@@ -20,12 +20,15 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, Utf8Bytes},
 };
-use wc_protocol::relay::{
-    DEFAULT_RELAY_URL, IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchPublish,
-    IrnBatchSubscribe, IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse, IrnPublish,
-    IrnSubscribe, IrnSubscription, IrnUnsubscribe, RelayAuthToken, RelayConnectionUrl,
-    RelayJsonRpcRequest, RelayJsonRpcResponse, RelayJsonRpcSuccess, RelayRequest, RelayRpcId,
-    RelayTopic, relay_auth_audience,
+use wc_protocol::{
+    pairing::PairingUri,
+    relay::{
+        DEFAULT_RELAY_URL, IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchPublish,
+        IrnBatchSubscribe, IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse,
+        IrnPublish, IrnSubscribe, IrnSubscription, IrnUnsubscribe, RelayAuthToken,
+        RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse, RelayJsonRpcSuccess,
+        RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
+    },
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,15 +41,17 @@ fn main() -> Result<()> {
     } else {
         eprintln!("usage: cargo run -p xtask -- relay-probe");
         eprintln!("       cargo run -p xtask -- relay-probe --matrix");
+        eprintln!("       cargo run -p xtask -- relay-probe --pairing-uri '<wc uri>'");
         eprintln!("env: REOWN_PROJECT_ID=<project id>");
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeMode {
     Basic,
     Matrix,
+    PairingUri(String),
 }
 
 fn parse_probe_mode() -> Result<ProbeMode> {
@@ -56,9 +61,20 @@ fn parse_probe_mode() -> Result<ProbeMode> {
         match argument.as_str() {
             "--matrix" => "matrix".clone_into(&mut mode),
             "--basic" => "basic".clone_into(&mut mode),
+            "--pairing-uri" => {
+                let uri = env::args()
+                    .skip_while(|argument| argument != "--pairing-uri")
+                    .nth(1)
+                    .or_else(|| env::var("WC_PAIRING_URI").ok())
+                    .context("pass a URI after --pairing-uri or set WC_PAIRING_URI")?;
+                return Ok(ProbeMode::PairingUri(uri));
+            }
             "--help" | "-h" => {
-                eprintln!("usage: cargo run -p xtask -- relay-probe [--basic|--matrix]");
+                eprintln!(
+                    "usage: cargo run -p xtask -- relay-probe [--basic|--matrix|--pairing-uri '<wc uri>']"
+                );
                 eprintln!("env: WC_RELAY_PROBE_MODE=basic|matrix");
+                eprintln!("env: WC_PAIRING_URI=<wc uri>");
                 return Ok(ProbeMode::Basic);
             }
             other => bail!("unknown relay-probe argument: {other}"),
@@ -88,6 +104,7 @@ async fn relay_probe(mode: ProbeMode) -> Result<()> {
     match mode {
         ProbeMode::Basic => run_basic_probe(&config).await,
         ProbeMode::Matrix => run_probe_matrix(&config).await,
+        ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
 }
 
@@ -163,6 +180,87 @@ async fn run_basic_probe(config: &RelayProbeConfig) -> Result<()> {
     );
 
     run_push_delivery(config, "basic", topic, vec![message]).await?;
+
+    Ok(())
+}
+
+async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
+    let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
+    let now = unix_timestamp();
+    let methods = pairing
+        .methods()
+        .map_or_else(|| "<none>".to_owned(), |methods| methods.join(","));
+
+    println!(
+        "pairing-uri project_id={} relay_url={} topic={} version={} relay_protocol={} sym_key={} methods={} expiry={:?} expired_now={}",
+        redact(&config.project_id),
+        config.relay_url,
+        pairing.topic(),
+        pairing.version(),
+        pairing.relay().protocol(),
+        redact(pairing.sym_key().as_str()),
+        methods,
+        pairing.expiry_timestamp(),
+        pairing.is_expired_at(now)
+    );
+
+    let mut subscriber = config.connect("subscriber").await?;
+
+    let fetch_id = subscriber
+        .call(IrnFetchMessages::new(pairing.topic().clone()))
+        .await?;
+    let fetch_response: IrnFetchMessagesResponse = subscriber.read_response(fetch_id).await?;
+    println!(
+        "pairing-uri fetch_messages count={} has_more={}",
+        fetch_response.messages.len(),
+        fetch_response.has_more
+    );
+    for (index, message) in fetch_response.messages.iter().enumerate() {
+        println!(
+            "pairing-uri fetched index={index} topic={} message_len={} tag_present={} tag={} published_at={}",
+            message.topic,
+            message.message.len(),
+            message.tag.is_some(),
+            message.tag.unwrap_or_default(),
+            message.published_at
+        );
+    }
+
+    let subscribe_id = subscriber
+        .call(IrnSubscribe::new(pairing.topic().clone()))
+        .await?;
+    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    println!("pairing-uri subscription_id={subscription_id}");
+
+    let wait = pairing_uri_wait_timeout();
+    match subscriber
+        .read_any_subscription_for_topic(pairing.topic(), wait)
+        .await?
+    {
+        Some(subscription) => {
+            println!(
+                "pairing-uri live_message=true topic={} message_len={} tag_present={} tag={} published_at={}",
+                subscription.data.topic,
+                subscription.data.message.len(),
+                subscription.data.tag.is_some(),
+                subscription.data.tag.unwrap_or_default(),
+                subscription.data.published_at
+            );
+        }
+        None => println!(
+            "pairing-uri live_message=false wait_secs={}",
+            wait.as_secs()
+        ),
+    }
+
+    let unsubscribe_id = subscriber
+        .call(IrnUnsubscribe::new(
+            pairing.topic().clone(),
+            subscription_id,
+        ))
+        .await?;
+    let unsubscribe_result: bool = subscriber.read_response(unsubscribe_id).await?;
+    println!("pairing-uri unsubscribe_ack={unsubscribe_result}");
 
     Ok(())
 }
@@ -785,6 +883,13 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn pairing_uri_wait_timeout() -> Duration {
+    env::var("WC_PAIRING_URI_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(Duration::from_secs(5), Duration::from_secs)
 }
 
 fn redact(value: &str) -> String {
