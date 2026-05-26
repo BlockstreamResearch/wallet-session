@@ -1,5 +1,6 @@
 //! Sign API session DTOs.
 
+mod event;
 mod extend;
 mod method;
 mod proposal;
@@ -9,6 +10,7 @@ mod settle;
 mod types;
 mod update;
 
+pub use event::{SessionEvent, SessionEventParams};
 pub use extend::SessionExtendParams;
 pub use method::SignMethod;
 pub use proposal::{
