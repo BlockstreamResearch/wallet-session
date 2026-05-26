@@ -77,9 +77,15 @@ impl<T> JsonRpcRequest<T> {
         }
     }
 
-    /// Returns true for `wc_sessionPropose`.
+    /// Classifies an already-deserialized Sign request as `wc_sessionPropose`.
     #[must_use]
     pub fn is_session_propose(&self) -> bool {
         self.method == SignMethod::SessionPropose
+    }
+
+    /// Classifies an already-deserialized Sign request as `wc_sessionRequest`.
+    #[must_use]
+    pub fn is_session_request(&self) -> bool {
+        self.method == SignMethod::SessionRequest
     }
 }
