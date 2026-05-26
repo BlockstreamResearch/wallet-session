@@ -1,0 +1,398 @@
+//! Encrypted message envelope decoding.
+
+use std::{str, str::Utf8Error};
+
+use base64::{
+    DecodeError, Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use chacha20poly1305::{
+    ChaCha20Poly1305, Error as AeadError, Key, Nonce,
+    aead::{Aead, KeyInit},
+};
+
+use crate::pairing::PairingSymKey;
+
+/// `WalletConnect` envelope type byte.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L17-L19>
+///
+/// > export const TYPE_0 = 0;
+/// > export const TYPE_1 = 1;
+/// > export const TYPE_2 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeType {
+    /// Symmetric encrypted envelope: `type || iv || sealed`.
+    Type0,
+    /// Symmetric encrypted envelope with sender public key: `type || senderPublicKey || iv || sealed`.
+    Type1,
+    /// Plaintext link-mode envelope: `type || message`.
+    Type2,
+}
+
+/// Encoded envelope alphabet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeEncoding {
+    /// Padded base64 used by relay messages.
+    Base64,
+    /// Unpadded base64url used by link mode.
+    Base64Url,
+}
+
+/// Deserialized `WalletConnect` envelope.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L134-L148>
+///
+/// > concat([params.type, params.iv, params.sealed])
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::{
+///     envelope::{Envelope, EnvelopeEncoding},
+///     pairing::PairingSymKey,
+/// };
+///
+/// let key = PairingSymKey::from_hex(
+///     "0653ca620c7b4990392e1c53c4a51c14a2840cd20f0f1524cf435b17b6fe988c",
+/// )?;
+/// let envelope = Envelope::decode(
+///     "AHF3ZWNmYWFzZGFkc3paHoQ96/mLAdanVxi17icRXq+jyrqXA8ocVgGmryQZBFMg+uwgc8yLa43EOeY+IWEv84g8hn4L3Ncsgz6397sgNKnsNcL7A9k3Mg==",
+///     EnvelopeEncoding::Base64,
+/// )?;
+///
+/// let message = envelope.decrypt(&key)?;
+/// assert!(message.contains("\"method\":\"test_method\""));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    kind: EnvelopeType,
+    iv: Option<[u8; ENVELOPE_IV_BYTES]>,
+    sealed: Vec<u8>,
+    sender_public_key: Option<[u8; ENVELOPE_PUBLIC_KEY_BYTES]>,
+}
+
+impl Envelope {
+    /// Decodes base64/base64url and splits envelope fields.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L151-L175>
+    ///
+    /// > const type = bytes.slice(ZERO_INDEX, TYPE_LENGTH);
+    /// > const iv = bytes.slice(slice1, slice2);
+    pub fn decode(encoded: &str, encoding: EnvelopeEncoding) -> Result<Self, EnvelopeError> {
+        let bytes = decode_bytes(encoded, encoding)?;
+        let (&type_byte, body) = bytes.split_first().ok_or(EnvelopeError::Empty)?;
+
+        match type_byte {
+            TYPE_0 => decode_type_0(body),
+            TYPE_1 => decode_type_1(body),
+            TYPE_2 => Ok(Self {
+                kind: EnvelopeType::Type2,
+                iv: None,
+                sealed: body.to_vec(),
+                sender_public_key: None,
+            }),
+            other => Err(EnvelopeError::UnsupportedType(other)),
+        }
+    }
+
+    /// Envelope type byte.
+    #[must_use]
+    pub const fn envelope_type(&self) -> EnvelopeType {
+        self.kind
+    }
+
+    /// Nonce/IV used by encrypted envelopes.
+    #[must_use]
+    pub const fn iv(&self) -> Option<&[u8; ENVELOPE_IV_BYTES]> {
+        self.iv.as_ref()
+    }
+
+    /// Ciphertext plus authentication tag for encrypted envelopes.
+    #[must_use]
+    pub fn sealed(&self) -> &[u8] {
+        &self.sealed
+    }
+
+    /// Type 1 sender public key, when present.
+    #[must_use]
+    pub const fn sender_public_key(&self) -> Option<&[u8; ENVELOPE_PUBLIC_KEY_BYTES]> {
+        self.sender_public_key.as_ref()
+    }
+
+    /// Decrypts a type 0 or type 1 envelope with the pairing symmetric key.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L105-L111>
+    ///
+    /// > const box = chacha20poly1305(key, iv);
+    /// > const message = box.decrypt(sealed);
+    pub fn decrypt(&self, sym_key: &PairingSymKey) -> Result<String, EnvelopeError> {
+        let iv = self.iv.ok_or(EnvelopeError::NotEncrypted {
+            envelope_type: self.kind,
+        })?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&sym_key.to_bytes()));
+        let message = cipher
+            .decrypt(Nonce::from_slice(&iv), self.sealed.as_slice())
+            .map_err(|source| EnvelopeError::Decrypt { source })?;
+
+        String::from_utf8(message).map_err(|source| EnvelopeError::Utf8 { source })
+    }
+
+    /// Decodes a type 2 plaintext envelope.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L126-L131>
+    ///
+    /// > const { sealed } = deserialize({ encoded, encoding });
+    /// > return toString(sealed, UTF8);
+    pub fn plaintext(&self) -> Result<&str, EnvelopeError> {
+        if self.kind != EnvelopeType::Type2 {
+            return Err(EnvelopeError::Encrypted {
+                envelope_type: self.kind,
+            });
+        }
+
+        str::from_utf8(&self.sealed).map_err(|source| EnvelopeError::PlaintextUtf8 { source })
+    }
+}
+
+/// Envelope decoding/decryption error.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    /// Encoded envelope did not decode as base64/base64url.
+    #[error("invalid envelope encoding")]
+    Base64 {
+        /// Base64 decoder failure.
+        #[source]
+        source: DecodeError,
+    },
+
+    /// Envelope has no type byte.
+    #[error("empty envelope")]
+    Empty,
+
+    /// Envelope type is not currently supported.
+    #[error("unsupported envelope type: {0}")]
+    UnsupportedType(u8),
+
+    /// Type 0 envelope is too short to contain a 12-byte IV and auth tag.
+    #[error("type 0 envelope is too short: {actual} bytes")]
+    Type0TooShort {
+        /// Body length after the type byte.
+        actual: usize,
+    },
+
+    /// Type 1 envelope is too short to contain sender key, IV, and auth tag.
+    #[error("type 1 envelope is too short: {actual} bytes")]
+    Type1TooShort {
+        /// Body length after the type byte.
+        actual: usize,
+    },
+
+    /// Decryption was requested for a plaintext envelope.
+    #[error("envelope type {envelope_type:?} is not encrypted")]
+    NotEncrypted {
+        /// Envelope type.
+        envelope_type: EnvelopeType,
+    },
+
+    /// Plaintext extraction was requested for an encrypted envelope.
+    #[error("envelope type {envelope_type:?} is encrypted")]
+    Encrypted {
+        /// Envelope type.
+        envelope_type: EnvelopeType,
+    },
+
+    /// ChaCha20-Poly1305 authentication or decryption failed.
+    #[error("failed to decrypt envelope")]
+    Decrypt {
+        /// AEAD authentication/decryption failure.
+        #[source]
+        source: AeadError,
+    },
+
+    /// Decrypted bytes are not UTF-8 JSON text.
+    #[error("decrypted envelope is not UTF-8")]
+    Utf8 {
+        /// UTF-8 conversion failure.
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+
+    /// Type 2 bytes are not UTF-8 text.
+    #[error("plaintext envelope is not UTF-8")]
+    PlaintextUtf8 {
+        /// UTF-8 validation failure.
+        #[source]
+        source: Utf8Error,
+    },
+}
+
+const TYPE_0: u8 = 0;
+const TYPE_1: u8 = 1;
+const TYPE_2: u8 = 2;
+const ENVELOPE_IV_BYTES: usize = 12;
+const ENVELOPE_PUBLIC_KEY_BYTES: usize = 32;
+const CHACHA20POLY1305_TAG_BYTES: usize = 16;
+
+/// Decodes the outer envelope representation.
+///
+/// Relay messages use padded base64. Link-mode payloads use unpadded base64url,
+/// matching the JavaScript `toBase64URL` helper.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L76-L83>
+///
+/// > return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+fn decode_bytes(encoded: &str, encoding: EnvelopeEncoding) -> Result<Vec<u8>, EnvelopeError> {
+    match encoding {
+        EnvelopeEncoding::Base64 => STANDARD.decode(encoded),
+        EnvelopeEncoding::Base64Url => URL_SAFE_NO_PAD.decode(encoded),
+    }
+    .map_err(|source| EnvelopeError::Base64 { source })
+}
+
+/// Splits a type 0 encrypted envelope into IV and sealed bytes.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L171-L175>
+///
+/// > const iv = bytes.slice(slice1, slice2);
+/// > const sealed = bytes.slice(slice2);
+fn decode_type_0(body: &[u8]) -> Result<Envelope, EnvelopeError> {
+    if body.len() < ENVELOPE_IV_BYTES + CHACHA20POLY1305_TAG_BYTES {
+        return Err(EnvelopeError::Type0TooShort { actual: body.len() });
+    }
+
+    let (iv, sealed) = body.split_at(ENVELOPE_IV_BYTES);
+
+    Ok(Envelope {
+        kind: EnvelopeType::Type0,
+        iv: Some(iv.try_into().expect("split_at returns 12 IV bytes")),
+        sealed: sealed.to_vec(),
+        sender_public_key: None,
+    })
+}
+
+/// Splits a type 1 encrypted envelope into sender public key, IV, and sealed bytes.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L157-L163>
+///
+/// > const senderPublicKey = bytes.slice(slice1, slice2);
+/// > const iv = bytes.slice(slice2, slice3);
+fn decode_type_1(body: &[u8]) -> Result<Envelope, EnvelopeError> {
+    let minimum = ENVELOPE_PUBLIC_KEY_BYTES + ENVELOPE_IV_BYTES + CHACHA20POLY1305_TAG_BYTES;
+    if body.len() < minimum {
+        return Err(EnvelopeError::Type1TooShort { actual: body.len() });
+    }
+
+    let (sender_public_key, rest) = body.split_at(ENVELOPE_PUBLIC_KEY_BYTES);
+    let (iv, sealed) = rest.split_at(ENVELOPE_IV_BYTES);
+
+    Ok(Envelope {
+        kind: EnvelopeType::Type1,
+        iv: Some(iv.try_into().expect("split_at returns 12 IV bytes")),
+        sealed: sealed.to_vec(),
+        sender_public_key: Some(
+            sender_public_key
+                .try_into()
+                .expect("split_at returns 32 sender public key bytes"),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_MESSAGE: &str = r#"{"id":1,"jsonrpc":"2.0","method":"test_method","params":{}}"#;
+    const TEST_SYM_KEY: &str = "0653ca620c7b4990392e1c53c4a51c14a2840cd20f0f1524cf435b17b6fe988c";
+    const TEST_SENDER_PUBLIC_KEY: [u8; 32] = [
+        255, 122, 125, 87, 103, 195, 98, 176, 161, 122, 217, 34, 153, 235, 219, 120, 49, 220, 189,
+        154, 86, 149, 156, 1, 54, 140, 116, 4, 84, 59, 51, 66,
+    ];
+    const TEST_ENCODED_TYPE_0: &str = "AHF3ZWNmYWFzZGFkc3paHoQ96/mLAdanVxi17icRXq+jyrqXA8ocVgGmryQZBFMg+uwgc8yLa43EOeY+IWEv84g8hn4L3Ncsgz6397sgNKnsNcL7A9k3Mg==";
+    const TEST_ENCODED_TYPE_0_BASE64URL: &str = "AHF3ZWNmYWFzZGFkc3paHoQ96_mLAdanVxi17icRXq-jyrqXA8ocVgGmryQZBFMg-uwgc8yLa43EOeY-IWEv84g8hn4L3Ncsgz6397sgNKnsNcL7A9k3Mg";
+    const TEST_ENCODED_TYPE_1: &str = "Af96fVdnw2KwoXrZIpnr23gx3L2aVpWcATaMdARUOzNCcXdlY2ZhYXNkYWRzeloehD3r+YsB1qdXGLXuJxFer6PKupcDyhxWAaavJBkEUyD67CBzzItrjcQ55j4hYS/ziDyGfgvc1yyDPrf3uyA0qew1wvsD2Tcy";
+    const TEST_ENCODED_TYPE_2: &str =
+        "AnsiaWQiOjEsImpzb25ycGMiOiIyLjAiLCJtZXRob2QiOiJ0ZXN0X21ldGhvZCIsInBhcmFtcyI6e319";
+
+    fn test_key() -> PairingSymKey {
+        PairingSymKey::from_hex(TEST_SYM_KEY).expect("test symKey is valid")
+    }
+
+    #[test]
+    fn decrypts_upstream_type_0_vector() {
+        let envelope =
+            Envelope::decode(TEST_ENCODED_TYPE_0, EnvelopeEncoding::Base64).expect("decodes");
+
+        assert_eq!(envelope.envelope_type(), EnvelopeType::Type0);
+        assert_eq!(
+            envelope.decrypt(&test_key()).expect("decrypts"),
+            TEST_MESSAGE
+        );
+    }
+
+    #[test]
+    fn decrypts_upstream_type_0_base64url_vector() {
+        let envelope = Envelope::decode(TEST_ENCODED_TYPE_0_BASE64URL, EnvelopeEncoding::Base64Url)
+            .expect("decodes");
+
+        assert_eq!(envelope.envelope_type(), EnvelopeType::Type0);
+        assert_eq!(
+            envelope.decrypt(&test_key()).expect("decrypts"),
+            TEST_MESSAGE
+        );
+    }
+
+    #[test]
+    fn decrypts_upstream_type_1_vector_and_keeps_sender_key() {
+        let envelope =
+            Envelope::decode(TEST_ENCODED_TYPE_1, EnvelopeEncoding::Base64).expect("decodes");
+
+        assert_eq!(envelope.envelope_type(), EnvelopeType::Type1);
+        assert_eq!(envelope.sender_public_key(), Some(&TEST_SENDER_PUBLIC_KEY));
+        assert_eq!(
+            envelope.decrypt(&test_key()).expect("decrypts"),
+            TEST_MESSAGE
+        );
+    }
+
+    #[test]
+    fn decodes_upstream_type_2_vector() {
+        let envelope =
+            Envelope::decode(TEST_ENCODED_TYPE_2, EnvelopeEncoding::Base64Url).expect("decodes");
+
+        assert_eq!(envelope.envelope_type(), EnvelopeType::Type2);
+        assert_eq!(envelope.plaintext().expect("plaintext"), TEST_MESSAGE);
+    }
+
+    #[test]
+    fn rejects_decrypt_for_type_2() {
+        let envelope =
+            Envelope::decode(TEST_ENCODED_TYPE_2, EnvelopeEncoding::Base64Url).expect("decodes");
+
+        assert!(matches!(
+            envelope
+                .decrypt(&test_key())
+                .expect_err("type 2 is plaintext"),
+            EnvelopeError::NotEncrypted {
+                envelope_type: EnvelopeType::Type2
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_short_type_0() {
+        assert!(matches!(
+            Envelope::decode("AA==", EnvelopeEncoding::Base64).expect_err("too short"),
+            EnvelopeError::Type0TooShort { actual: 0 }
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_type() {
+        assert!(matches!(
+            Envelope::decode("CQ==", EnvelopeEncoding::Base64).expect_err("unknown type"),
+            EnvelopeError::UnsupportedType(9)
+        ));
+    }
+}

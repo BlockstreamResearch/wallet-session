@@ -190,6 +190,21 @@ impl PairingSymKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Decodes the 32-byte key used for symmetric envelope decryption.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L96-L100>
+    ///
+    /// > const key = fromString(params.symKey, BASE16);
+    /// > const box = chacha20poly1305(key, iv);
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; PAIRING_SYM_KEY_BYTES] {
+        let mut bytes = [0_u8; PAIRING_SYM_KEY_BYTES];
+        for (index, chunk) in self.0.as_bytes().chunks_exact(2).enumerate() {
+            bytes[index] = hex_pair(chunk[0], chunk[1]);
+        }
+        bytes
+    }
 }
 
 /// Relay transport options carried as `relay-*` query parameters.
@@ -544,6 +559,24 @@ fn set_once<T>(slot: &mut Option<T>, value: T, key: &'static str) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Decodes a validated lowercase hex byte pair.
+///
+/// `PairingSymKey::from_hex` already checks width and ASCII hex characters, so
+/// this helper can stay infallible and avoid reparsing errors at every caller.
+fn hex_pair(high: u8, low: u8) -> u8 {
+    (hex_nibble(high) << 4) | hex_nibble(low)
+}
+
+/// Maps one validated ASCII hex character to its numeric nibble.
+fn hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        b'A'..=b'F' => value - b'A' + 10,
+        _ => unreachable!("PairingSymKey::from_hex validates ASCII hex input"),
+    }
 }
 
 #[cfg(test)]
