@@ -6,6 +6,7 @@ mod request;
 mod rpc;
 mod settle;
 mod types;
+mod update;
 
 pub use method::SignMethod;
 pub use proposal::{
@@ -19,3 +20,4 @@ pub use types::{
     ScopedProperties, SessionConfig, SessionNamespace, SessionNamespaces, SessionParticipant,
     SessionProperties,
 };
+pub use update::SessionUpdateParams;

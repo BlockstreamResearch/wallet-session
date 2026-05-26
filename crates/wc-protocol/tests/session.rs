@@ -4,4 +4,5 @@ mod session {
     mod proposal;
     mod request;
     mod settle;
+    mod update;
 }

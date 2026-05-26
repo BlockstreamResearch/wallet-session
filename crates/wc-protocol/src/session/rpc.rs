@@ -89,6 +89,12 @@ impl<T> JsonRpcRequest<T> {
         self.method == SignMethod::SessionSettle
     }
 
+    /// Classifies an already-deserialized Sign request as `wc_sessionUpdate`.
+    #[must_use]
+    pub fn is_session_update(&self) -> bool {
+        self.method == SignMethod::SessionUpdate
+    }
+
     /// Classifies an already-deserialized Sign request as `wc_sessionRequest`.
     #[must_use]
     pub fn is_session_request(&self) -> bool {
