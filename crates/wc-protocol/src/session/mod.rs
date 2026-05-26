@@ -4,6 +4,8 @@ mod method;
 mod proposal;
 mod request;
 mod rpc;
+mod settle;
+mod types;
 
 pub use method::SignMethod;
 pub use proposal::{
@@ -12,3 +14,8 @@ pub use proposal::{
 };
 pub use request::{SessionRequest, SessionRequestParams};
 pub use rpc::JsonRpcRequest;
+pub use settle::{SessionSettleParams, SpecialNamespace, SpecialNamespaces};
+pub use types::{
+    ScopedProperties, SessionConfig, SessionNamespace, SessionNamespaces, SessionParticipant,
+    SessionProperties,
+};
