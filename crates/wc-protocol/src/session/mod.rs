@@ -4,6 +4,7 @@ mod delete;
 mod event;
 mod extend;
 mod method;
+mod ping;
 mod proposal;
 mod request;
 mod rpc;
@@ -15,6 +16,7 @@ pub use delete::SessionDeleteParams;
 pub use event::{SessionEvent, SessionEventParams};
 pub use extend::SessionExtendParams;
 pub use method::SignMethod;
+pub use ping::SessionPingParams;
 pub use proposal::{
     DappMetadata, DappRedirect, ProposalNamespace, ProposalNamespaces, ProposalRequests, Proposer,
     RelayProtocolOptions, SessionProposeParams,
