@@ -30,7 +30,7 @@ use wc_protocol::{
         RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse,
         RelayJsonRpcSuccess, RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
     },
-    session::{JsonRpcRequest, SessionProposeParams, WC_SESSION_PROPOSE_METHOD},
+    session::{JsonRpcRequest, SessionProposeParams, SignMethod},
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
@@ -311,7 +311,12 @@ fn print_pairing_payload_metadata(
         params_keys(&json)
     );
 
-    if json.get("method").and_then(Value::as_str) == Some(WC_SESSION_PROPOSE_METHOD) {
+    if json
+        .get("method")
+        .and_then(Value::as_str)
+        .and_then(SignMethod::from_wire)
+        == Some(SignMethod::SessionPropose)
+    {
         print_session_proposal_summary(label, json.clone())?;
     }
 
