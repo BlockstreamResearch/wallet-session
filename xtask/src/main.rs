@@ -21,13 +21,14 @@ use tokio_tungstenite::{
     tungstenite::{Message, Utf8Bytes},
 };
 use wc_protocol::{
-    pairing::PairingUri,
+    envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
+    pairing::{PairingSymKey, PairingUri},
     relay::{
         DEFAULT_RELAY_URL, IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchPublish,
         IrnBatchSubscribe, IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse,
-        IrnPublish, IrnSubscribe, IrnSubscription, IrnUnsubscribe, RelayAuthToken,
-        RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse, RelayJsonRpcSuccess,
-        RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
+        IrnPublish, IrnSubscribe, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
+        RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse,
+        RelayJsonRpcSuccess, RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
     },
 };
 
@@ -224,6 +225,11 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
             message.tag.unwrap_or_default(),
             message.published_at
         );
+        print_pairing_payload_metadata(
+            &format!("pairing-uri fetched index={index}"),
+            message,
+            pairing.sym_key(),
+        )?;
     }
 
     let subscribe_id = subscriber
@@ -246,6 +252,11 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
                 subscription.data.tag.unwrap_or_default(),
                 subscription.data.published_at
             );
+            print_pairing_payload_metadata(
+                "pairing-uri live_message",
+                &subscription.data,
+                pairing.sym_key(),
+            )?;
         }
         None => println!(
             "pairing-uri live_message=false wait_secs={}",
@@ -263,6 +274,56 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
     println!("pairing-uri unsubscribe_ack={unsubscribe_result}");
 
     Ok(())
+}
+
+fn print_pairing_payload_metadata(
+    label: &str,
+    data: &IrnSubscriptionData,
+    sym_key: &PairingSymKey,
+) -> Result<()> {
+    let envelope = Envelope::decode(&data.message, EnvelopeEncoding::Base64)
+        .with_context(|| format!("{label} failed to decode envelope"))?;
+    let plaintext = match envelope.envelope_type() {
+        EnvelopeType::Type0 | EnvelopeType::Type1 => envelope
+            .decrypt(sym_key)
+            .with_context(|| format!("{label} failed to decrypt envelope"))?,
+        EnvelopeType::Type2 => envelope
+            .plaintext()
+            .with_context(|| format!("{label} failed to decode plaintext envelope"))?
+            .to_owned(),
+    };
+    let json: Value = serde_json::from_str(&plaintext)
+        .with_context(|| format!("{label} decrypted payload is not JSON"))?;
+
+    println!(
+        "{label} envelope_type={:?} decrypted_len={} jsonrpc={} id={} method={} params_keys={}",
+        envelope.envelope_type(),
+        plaintext.len(),
+        json.get("jsonrpc")
+            .and_then(Value::as_str)
+            .unwrap_or("<none>"),
+        json_id(&json),
+        json.get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("<none>"),
+        params_keys(&json)
+    );
+
+    Ok(())
+}
+
+fn json_id(json: &Value) -> String {
+    json.get("id")
+        .map_or_else(|| "<none>".to_owned(), ToString::to_string)
+}
+
+fn params_keys(json: &Value) -> String {
+    let Some(params) = json.get("params").and_then(Value::as_object) else {
+        return "<non-object>".to_owned();
+    };
+    let mut keys = params.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    format!("[{}]", keys.join(","))
 }
 
 async fn run_probe_matrix(config: &RelayProbeConfig) -> Result<()> {
