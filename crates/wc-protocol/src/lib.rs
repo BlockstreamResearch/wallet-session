@@ -4,3 +4,4 @@ mod encoding;
 pub mod envelope;
 pub mod pairing;
 pub mod relay;
+pub mod session;
