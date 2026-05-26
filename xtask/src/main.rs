@@ -4,43 +4,70 @@
 //!
 //! The first harness probes the Relay Server JSON-RPC contract before those
 //! request/response shapes are promoted into stable library types.
-//!
-//! References:
-//! - Relay project ID URL parameter: <https://docs.walletconnect.network/wallet-sdk/web/cloud/relay>
-//! - Relay Server RPC methods: <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc>
-//! - Relay Client publish/subscribe shape: <https://specs.walletconnect.com/2.0/specs/clients/core/relay/relay-client-api>
 
 use std::{
     env,
-    fmt::Write as _,
     future::Future,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, Utf8Bytes},
 };
+use wc_protocol::relay::{
+    DEFAULT_RELAY_URL, IrnFetchMessages, IrnFetchMessagesResponse, IrnPublish, IrnSubscribe,
+    IrnSubscription, IrnUnsubscribe, RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest,
+    RelayJsonRpcResponse, RelayJsonRpcSuccess, RelayRequest, RelayRpcId, RelayTopic,
+    relay_auth_audience,
+};
 
-type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-const DEFAULT_RELAY_URL: &str = "wss://relay.walletconnect.com/";
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
+const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
+type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("relay-probe") {
-        run_async(relay_probe())
+        run_async(relay_probe(parse_probe_mode()?))
     } else {
         eprintln!("usage: cargo run -p xtask -- relay-probe");
+        eprintln!("       cargo run -p xtask -- relay-probe --matrix");
         eprintln!("env: REOWN_PROJECT_ID=<project id>");
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeMode {
+    Basic,
+    Matrix,
+}
+
+fn parse_probe_mode() -> Result<ProbeMode> {
+    let mut mode = env::var("WC_RELAY_PROBE_MODE").unwrap_or_else(|_| "basic".to_owned());
+
+    for argument in env::args().skip(2) {
+        match argument.as_str() {
+            "--matrix" => "matrix".clone_into(&mut mode),
+            "--basic" => "basic".clone_into(&mut mode),
+            "--help" | "-h" => {
+                eprintln!("usage: cargo run -p xtask -- relay-probe [--basic|--matrix]");
+                eprintln!("env: WC_RELAY_PROBE_MODE=basic|matrix");
+                return Ok(ProbeMode::Basic);
+            }
+            other => bail!("unknown relay-probe argument: {other}"),
+        }
+    }
+
+    match mode.as_str() {
+        "basic" => Ok(ProbeMode::Basic),
+        "matrix" => Ok(ProbeMode::Matrix),
+        other => bail!("unknown WC_RELAY_PROBE_MODE: {other}"),
     }
 }
 
@@ -52,94 +79,204 @@ fn run_async(task: impl Future<Output = Result<()>>) -> Result<()> {
         .block_on(task)
 }
 
-async fn relay_probe() -> Result<()> {
+async fn relay_probe(mode: ProbeMode) -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    let project_id = env::var("REOWN_PROJECT_ID")
-        .or_else(|_| env::var("WALLETCONNECT_PROJECT_ID"))
-        .context("set REOWN_PROJECT_ID or WALLETCONNECT_PROJECT_ID")?;
-    let relay_url = env::var("REOWN_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_owned());
-    let relay_audience = relay_audience(&relay_url);
-    let user_agent = env::var("REOWN_RELAY_UA")
-        .unwrap_or_else(|_| "wc-2/rust-poc-0.1.0/macos/native".to_owned());
-    let topic = env::var("WC_RELAY_PROBE_TOPIC").unwrap_or_else(|_| generated_topic());
-    let probe_id = rpc_id();
+    let config = RelayProbeConfig::from_env()?;
+
+    match mode {
+        ProbeMode::Basic => run_basic_probe(&config).await,
+        ProbeMode::Matrix => run_probe_matrix(&config).await,
+    }
+}
+
+struct RelayProbeConfig {
+    project_id: String,
+    relay_url: String,
+    relay_audience: String,
+    user_agent: String,
+}
+
+impl RelayProbeConfig {
+    fn from_env() -> Result<Self> {
+        let project_id = env::var("REOWN_PROJECT_ID")
+            .or_else(|_| env::var("WALLETCONNECT_PROJECT_ID"))
+            .context("set REOWN_PROJECT_ID or WALLETCONNECT_PROJECT_ID")?;
+        let relay_url =
+            env::var("REOWN_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_owned());
+        let relay_audience = relay_auth_audience(&relay_url).to_owned();
+        let user_agent = env::var("REOWN_RELAY_UA")
+            .unwrap_or_else(|_| "wc-2/rust-poc-0.1.0/macos/native".to_owned());
+
+        Ok(Self {
+            project_id,
+            relay_url,
+            relay_audience,
+            user_agent,
+        })
+    }
+
+    fn connection_url(&self) -> Result<RelayConnectionUrl> {
+        let auth = client_auth_jwt(&self.relay_audience)?;
+        Ok(RelayConnectionUrl::new(
+            &self.relay_url,
+            &self.project_id,
+            auth.as_str(),
+            &self.user_agent,
+        ))
+    }
+
+    async fn connect(&self, role: &'static str) -> Result<RelaySocket> {
+        let url = self.connection_url()?;
+        RelaySocket::connect(role, url.as_str()).await
+    }
+}
+
+async fn run_basic_probe(config: &RelayProbeConfig) -> Result<()> {
+    let topic = match env::var("WC_RELAY_PROBE_TOPIC") {
+        Ok(topic) => RelayTopic::from_hex(topic)?,
+        Err(_) => generated_topic()?,
+    };
+    let probe_id = rpc_id()?;
     let message = env::var("WC_RELAY_PROBE_MESSAGE")
-        .unwrap_or_else(|_| format!("walletconnect-rs relay probe {probe_id}"));
+        .unwrap_or_else(|_| format!("walletconnect-rs relay probe {}", probe_id.as_u64()));
 
     println!(
         "relay-probe project_id={} relay_url={} topic={topic}",
-        redact(&project_id),
-        relay_url
+        redact(&config.project_id),
+        config.relay_url
     );
 
-    let subscriber_url = relay_url_with_auth(
-        &relay_url,
-        &project_id,
-        &client_auth_jwt(relay_audience)?,
-        &user_agent,
-    );
-    let mut subscriber = RelaySocket::connect("subscriber", &subscriber_url).await?;
-    let subscribe_id = subscriber
-        .call("irn_subscribe", json!({ "topic": topic }))
-        .await?;
-    let subscription_id = subscriber
-        .read_response(subscribe_id)
-        .await?
-        .get("result")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("irn_subscribe response did not contain a subscription id"))?
-        .to_owned();
-    println!("subscriber subscription_id={subscription_id}");
+    run_push_delivery(config, "basic", topic, vec![message]).await?;
 
-    let publisher_url = relay_url_with_auth(
-        &relay_url,
-        &project_id,
-        &client_auth_jwt(relay_audience)?,
-        &user_agent,
-    );
-    let mut publisher = RelaySocket::connect("publisher", &publisher_url).await?;
-    let publish_id = publisher
-        .call(
-            "irn_publish",
-            json!({
-                "topic": topic,
-                "message": message,
-                "ttl": 30,
-                "tag": 0,
-            }),
-        )
-        .await?;
-    publisher.read_response(publish_id).await?;
-    println!("publisher publish_ack=true");
+    Ok(())
+}
 
-    subscriber.read_subscription(&topic, &message).await?;
+async fn run_probe_matrix(config: &RelayProbeConfig) -> Result<()> {
+    println!(
+        "relay-probe matrix project_id={} relay_url={}",
+        redact(&config.project_id),
+        config.relay_url
+    );
+
+    let basic_topic = generated_topic()?;
+    let basic_message = format!("matrix basic {}", rpc_id()?.as_u64());
+    run_push_delivery(config, "matrix-basic", basic_topic, vec![basic_message]).await?;
+
+    let multi_topic = generated_topic()?;
+    let multi_probe_id = rpc_id()?.as_u64();
+    run_push_delivery(
+        config,
+        "matrix-multi-message",
+        multi_topic,
+        vec![
+            format!("matrix multi {multi_probe_id} message 1"),
+            format!("matrix multi {multi_probe_id} message 2"),
+            format!("matrix multi {multi_probe_id} message 3"),
+        ],
+    )
+    .await?;
+
+    let encoded_topic = generated_topic()?;
+    run_push_delivery(
+        config,
+        "matrix-encoded-message",
+        encoded_topic,
+        vec![format!(
+            "json edge id={} quote=\" backslash=\\ slash=/ newline=\n tab=\t braces={{}}",
+            rpc_id()?.as_u64()
+        )],
+    )
+    .await?;
+
+    run_unsubscribe_suppresses_delivery(config).await?;
+
+    println!("relay-probe matrix ok");
+
+    Ok(())
+}
+
+async fn run_push_delivery(
+    config: &RelayProbeConfig,
+    label: &str,
+    topic: RelayTopic,
+    messages: Vec<String>,
+) -> Result<()> {
+    println!("{label} topic={topic} messages={}", messages.len());
+
+    let mut subscriber = config.connect("subscriber").await?;
+    let subscribe_id = subscriber.call(IrnSubscribe::new(topic.clone())).await?;
+    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    println!("{label} subscriber subscription_id={subscription_id}");
+
+    let mut publisher = config.connect("publisher").await?;
+    for (index, message) in messages.iter().enumerate() {
+        let publish_id = publisher
+            .call(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
+            .await?;
+        let _: bool = publisher.read_response(publish_id).await?;
+        println!("{label} publisher publish_ack index={index}");
+
+        subscriber.read_subscription(&topic, message).await?;
+    }
 
     let fetch_id = subscriber
-        .call("irn_fetchMessages", json!({ "topic": topic }))
+        .call(IrnFetchMessages::new(topic.clone()))
         .await?;
-    let fetch_response = subscriber.read_response(fetch_id).await?;
-    let fetched_messages = fetch_response
-        .pointer("/result/messages")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
-    let has_more = fetch_response
-        .pointer("/result/hasMore")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    println!("subscriber fetch_messages count={fetched_messages} has_more={has_more}");
+    let fetch_response: IrnFetchMessagesResponse = subscriber.read_response(fetch_id).await?;
+    println!(
+        "{label} subscriber fetch_messages count={} has_more={}",
+        fetch_response.messages.len(),
+        fetch_response.has_more
+    );
+    if !fetch_response.messages.is_empty() || fetch_response.has_more {
+        bail!("{label} expected empty mailbox after live delivery ack");
+    }
 
     let unsubscribe_id = subscriber
-        .call(
-            "irn_unsubscribe",
-            json!({
-                "topic": topic,
-                "id": subscription_id,
-            }),
-        )
+        .call(IrnUnsubscribe::new(topic, subscription_id))
         .await?;
-    subscriber.read_response(unsubscribe_id).await?;
-    println!("subscriber unsubscribe_ack=true");
+    let _: bool = subscriber.read_response(unsubscribe_id).await?;
+    println!("{label} subscriber unsubscribe_ack=true");
+
+    Ok(())
+}
+
+async fn run_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) -> Result<()> {
+    let label = "matrix-unsubscribe-suppression";
+    let topic = generated_topic()?;
+    let message = format!("{label} {}", rpc_id()?.as_u64());
+    println!("{label} topic={topic}");
+
+    let mut subscriber = config.connect("subscriber").await?;
+    let subscribe_id = subscriber.call(IrnSubscribe::new(topic.clone())).await?;
+    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    println!("{label} subscriber subscription_id={subscription_id}");
+
+    let unsubscribe_id = subscriber
+        .call(IrnUnsubscribe::new(topic.clone(), subscription_id))
+        .await?;
+    let _: bool = subscriber.read_response(unsubscribe_id).await?;
+    println!("{label} subscriber unsubscribe_ack=true");
+
+    let mut publisher = config.connect("publisher").await?;
+    let publish_id = publisher
+        .call(IrnPublish::new(topic.clone(), message, 30, 0))
+        .await?;
+    let _: bool = publisher.read_response(publish_id).await?;
+    println!("{label} publisher publish_ack=true");
+
+    if let Some(subscription) = subscriber
+        .read_any_subscription_for_topic(&topic, NO_DELIVERY_TIMEOUT)
+        .await?
+    {
+        bail!(
+            "{label} received subscription after unsubscribe: {}",
+            subscription.data.message
+        );
+    }
+
+    println!("{label} no_delivery_after_unsubscribe=true");
 
     Ok(())
 }
@@ -158,28 +295,40 @@ impl RelaySocket {
         Ok(Self { role, stream })
     }
 
-    async fn call(&mut self, method: &str, params: Value) -> Result<u64> {
-        let id = rpc_id();
-        let request = json!({
-            "id": id,
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-        self.send_json(&request).await?;
-        println!("{} -> {method} id={id}", self.role);
+    async fn call<T>(&mut self, params: T) -> Result<RelayRpcId>
+    where
+        T: RelayRequest + serde::Serialize,
+    {
+        let id = rpc_id()?;
+        let request = RelayJsonRpcRequest::new(id, params);
+        let value = serde_json::to_value(&request).context("failed to serialize relay request")?;
+        self.send_json(&value).await?;
+        println!("{} -> {} id={}", self.role, request.method(), id.as_u64());
         Ok(id)
     }
 
-    async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
+    async fn read_response<T>(&mut self, expected_id: RelayRpcId) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
         loop {
             let value = self.read_json().await?;
-            if json_rpc_id_matches(value.get("id"), expected_id) {
-                if let Some(error) = value.get("error") {
-                    bail!("{} response error for id {expected_id}: {error}", self.role);
-                }
-                println!("{} <- response id={expected_id}", self.role);
-                return Ok(value);
+            if expected_id.matches_json_value(value.get("id")) {
+                let response = serde_json::from_value::<RelayJsonRpcResponse<T>>(value)
+                    .context("failed to parse relay response")?;
+
+                println!("{} <- response id={}", self.role, expected_id.as_u64());
+
+                return match response.into_result() {
+                    Ok(result) => Ok(result),
+                    Err(error) => bail!(
+                        "{} response error for id {}: code={} message={}",
+                        self.role,
+                        expected_id.as_u64(),
+                        error.code,
+                        error.message
+                    ),
+                };
             }
 
             println!("{} <- ignored json={value}", self.role);
@@ -188,54 +337,74 @@ impl RelaySocket {
 
     async fn read_subscription(
         &mut self,
-        expected_topic: &str,
+        expected_topic: &RelayTopic,
         expected_message: &str,
     ) -> Result<()> {
         loop {
             let value = self.read_json().await?;
-            if value.get("method").and_then(Value::as_str) != Some("irn_subscription") {
+            if value.get("method").and_then(Value::as_str)
+                != Some(<IrnSubscription as RelayRequest>::METHOD)
+            {
                 println!("{} <- ignored json={value}", self.role);
                 continue;
             }
 
-            let topic = value
-                .pointer("/params/data/topic")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let message = value
-                .pointer("/params/data/message")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let tag = value
-                .pointer("/params/data/tag")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            let published_at = value
-                .pointer("/params/data/publishedAt")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-
-            if let Some(id) = value.get("id").cloned() {
-                self.send_json(&json!({
-                    "id": id,
-                    "jsonrpc": "2.0",
-                    "result": true,
-                }))
-                .await?;
-                println!("{} -> irn_subscription ack id={id}", self.role);
-            }
+            let subscription = self.parse_and_ack_subscription(value).await?;
+            let data = &subscription.data;
 
             println!(
-                "{} <- irn_subscription topic_match={} message_match={} tag={tag} published_at={published_at}",
+                "{} <- irn_subscription topic_match={} message_match={} tag_present={} tag={} published_at={}",
                 self.role,
-                topic == expected_topic,
-                message == expected_message
+                data.topic == *expected_topic,
+                data.message == expected_message,
+                data.tag.is_some(),
+                data.tag.unwrap_or_default(),
+                data.published_at
             );
 
-            if topic == expected_topic && message == expected_message {
+            if data.topic == *expected_topic && data.message == expected_message {
                 return Ok(());
             }
         }
+    }
+
+    async fn read_any_subscription_for_topic(
+        &mut self,
+        expected_topic: &RelayTopic,
+        wait: Duration,
+    ) -> Result<Option<IrnSubscription>> {
+        loop {
+            let Some(value) = self.next_json(wait).await? else {
+                return Ok(None);
+            };
+
+            if value.get("method").and_then(Value::as_str)
+                != Some(<IrnSubscription as RelayRequest>::METHOD)
+            {
+                println!("{} <- ignored json={value}", self.role);
+                continue;
+            }
+
+            let subscription = self.parse_and_ack_subscription(value).await?;
+            if subscription.data.topic == *expected_topic {
+                return Ok(Some(subscription));
+            }
+        }
+    }
+
+    async fn parse_and_ack_subscription(&mut self, value: Value) -> Result<IrnSubscription> {
+        let request = serde_json::from_value::<RelayJsonRpcRequest<IrnSubscription>>(value)
+            .context("failed to parse irn_subscription")?;
+        let ack = RelayJsonRpcSuccess::new(request.id(), true);
+        let ack = serde_json::to_value(ack).context("failed to serialize subscription ack")?;
+        self.send_json(&ack).await?;
+        println!(
+            "{} -> irn_subscription ack id={}",
+            self.role,
+            request.id().as_u64()
+        );
+
+        Ok(request.params)
     }
 
     async fn send_json(&mut self, value: &Value) -> Result<()> {
@@ -246,20 +415,31 @@ impl RelaySocket {
     }
 
     async fn read_json(&mut self) -> Result<Value> {
+        self.next_json(READ_TIMEOUT)
+            .await?
+            .ok_or_else(|| anyhow!("{} timed out waiting for relay message", self.role))
+    }
+
+    async fn next_json(&mut self, wait: Duration) -> Result<Option<Value>> {
         loop {
-            let message = timeout(READ_TIMEOUT, self.stream.next())
-                .await
-                .with_context(|| format!("{} timed out waiting for relay message", self.role))?
-                .ok_or_else(|| anyhow!("{} relay stream ended", self.role))?
-                .with_context(|| format!("{} failed to read relay message", self.role))?;
+            let Ok(message) = timeout(wait, self.stream.next()).await else {
+                return Ok(None);
+            };
+
+            let Some(message) = message else {
+                bail!("{} relay stream ended", self.role);
+            };
+
+            let message =
+                message.with_context(|| format!("{} failed to read relay message", self.role))?;
 
             match message {
-                Message::Text(text) => return parse_json(&text, self.role),
+                Message::Text(text) => return parse_json(&text, self.role).map(Some),
                 Message::Binary(bytes) => {
                     let text = String::from_utf8(bytes.to_vec()).with_context(|| {
                         format!("{} received non-utf8 binary message", self.role)
                     })?;
-                    return parse_json(&text, self.role);
+                    return parse_json(&text, self.role).map(Some);
                 }
                 Message::Ping(bytes) => self.stream.send(Message::Pong(bytes)).await?,
                 Message::Pong(_) | Message::Frame(_) => {}
@@ -273,136 +453,29 @@ fn parse_json(text: &str, role: &str) -> Result<Value> {
     serde_json::from_str(text).with_context(|| format!("{role} received invalid json: {text}"))
 }
 
-fn json_rpc_id_matches(value: Option<&Value>, expected_id: u64) -> bool {
-    match value {
-        Some(Value::String(id)) => id.parse::<u64>().ok() == Some(expected_id),
-        Some(Value::Number(id)) => id.as_u64() == Some(expected_id),
-        _ => false,
-    }
-}
-
-fn client_auth_jwt(aud: &str) -> Result<String> {
+fn client_auth_jwt(audience: &str) -> Result<RelayAuthToken> {
     let mut seed = [0_u8; 32];
     getrandom::fill(&mut seed).context("failed to generate relay auth seed")?;
     let sub = random_hex(16)?;
     let iat = unix_timestamp();
-    client_auth_jwt_from_parts(&seed, &sub, aud, iat, 86_400)
+    RelayAuthToken::sign_with_seed(&seed, &sub, audience, iat, 86_400)
+        .context("failed to sign relay auth token")
 }
 
-fn client_auth_jwt_from_parts(
-    seed: &[u8; 32],
-    sub: &str,
-    aud: &str,
-    iat: u64,
-    ttl: u64,
-) -> Result<String> {
-    let signing_key = SigningKey::from_bytes(seed);
-    let public_key = signing_key.verifying_key().to_bytes();
-
-    let header = JwtHeader {
-        alg: "EdDSA",
-        typ: "JWT",
-    };
-    // The relay-auth package currently signs this compact claim set. The public
-    // spec also documents an `act = "client_auth"` claim, so keep this harness
-    // behavior tied to live relay observations until the core type is designed.
-    let payload = RelayAuthClaims {
-        iss: did_key_ed25519(&public_key),
-        sub,
-        aud,
-        iat,
-        exp: iat + ttl,
-    };
-    let encoded_header = base64url_json(&header)?;
-    let encoded_payload = base64url_json(&payload)?;
-    let data = format!("{encoded_header}.{encoded_payload}");
-    let signature = signing_key.sign(data.as_bytes());
-
-    Ok(format!(
-        "{data}.{}",
-        URL_SAFE_NO_PAD.encode(signature.to_bytes())
-    ))
-}
-
-#[derive(Serialize)]
-struct JwtHeader {
-    alg: &'static str,
-    typ: &'static str,
-}
-
-#[derive(Serialize)]
-struct RelayAuthClaims<'a> {
-    iss: String,
-    sub: &'a str,
-    aud: &'a str,
-    iat: u64,
-    exp: u64,
-}
-
-fn base64url_json(value: &impl Serialize) -> Result<String> {
-    let bytes = serde_json::to_vec(value).context("failed to encode jwt json")?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn did_key_ed25519(public_key: &[u8; 32]) -> String {
-    let mut multicodec = Vec::with_capacity(34);
-    multicodec.extend_from_slice(&[0xed, 0x01]);
-    multicodec.extend_from_slice(public_key);
-    format!("did:key:z{}", bs58::encode(multicodec).into_string())
-}
-
-fn relay_url_with_auth(relay_url: &str, project_id: &str, auth: &str, user_agent: &str) -> String {
-    let separator = if relay_url.contains('?') { '&' } else { '?' };
-    format!(
-        "{relay_url}{separator}auth={}&projectId={}&ua={}",
-        query_escape(auth),
-        query_escape(project_id),
-        query_escape(user_agent)
-    )
-}
-
-fn relay_audience(relay_url: &str) -> &str {
-    relay_url
-        .split('?')
-        .next()
-        .unwrap_or(relay_url)
-        .trim_end_matches('/')
-}
-
-fn query_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                escaped.push(char::from(byte));
-            }
-            _ => write!(escaped, "%{byte:02X}").expect("writing to String cannot fail"),
-        }
-    }
-    escaped
-}
-
-fn rpc_id() -> u64 {
+fn rpc_id() -> Result<RelayRpcId> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let millis = u64::try_from(now.as_millis()).unwrap_or(u64::MAX / 1_000_000);
-    let entropy = u64::from(now.subsec_micros() % 1_000_000);
-    millis.saturating_mul(1_000_000).saturating_add(entropy)
+    let millis = u64::try_from(now.as_millis()).context("epoch millis do not fit in u64")?;
+    let entropy = now.subsec_micros() % 1_000_000;
+
+    RelayRpcId::from_millis_entropy(millis, entropy).context("failed to build relay rpc id")
 }
 
-fn generated_topic() -> String {
+fn generated_topic() -> Result<RelayTopic> {
     let mut bytes = [0_u8; 32];
-    if getrandom::fill(&mut bytes).is_ok() {
-        return hex_string(&bytes);
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mixed = now.rotate_left(37) ^ u128::from(std::process::id());
-    format!("{now:032x}{mixed:032x}")
+    getrandom::fill(&mut bytes).context("failed to generate relay topic")?;
+    Ok(RelayTopic::from_bytes(bytes))
 }
 
 fn random_hex(len: usize) -> Result<String> {
@@ -412,9 +485,12 @@ fn random_hex(len: usize) -> Result<String> {
 }
 
 fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
 }
@@ -431,33 +507,4 @@ fn redact(value: &str) -> String {
         return "<redacted>".to_owned();
     }
     format!("{}...{}", &value[..4], &value[value.len() - 4..])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn relay_auth_jwt_matches_walletconnect_relay_auth_vector() {
-        let mut seed = [0_u8; 32];
-        for (index, byte) in seed.iter_mut().enumerate() {
-            *byte = u8::try_from(index).expect("test seed index fits in u8");
-        }
-
-        let jwt = client_auth_jwt_from_parts(
-            &seed,
-            "sub",
-            "wss://relay.walletconnect.com",
-            1_700_000_000,
-            60,
-        )
-        .expect("jwt is generated");
-
-        assert_eq!(
-            jwt,
-            "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.\
-             eyJpc3MiOiJkaWQ6a2V5Ono2TWtlaFJnZjd5SmJnYUdmWXNkb0FzS2RCUEUzZGoyQ1lob3dRZGNqcVNKZ3ZWZCIsInN1YiI6InN1YiIsImF1ZCI6IndzczovL3JlbGF5LndhbGxldGNvbm5lY3QuY29tIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDAwNjB9.\
-             x2lbadyJJB5GiaCXCp5VY-kKjBPak4oblHd-BhfZjRtuknFDQ8PXGlKWXbweONjWwzlbKZKk2s25-7Q1Dy_xCg"
-        );
-    }
 }
