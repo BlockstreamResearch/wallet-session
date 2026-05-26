@@ -1,7 +1,9 @@
 //! `WalletConnect` protocol DTOs, parsers, and validation primitives.
 
+pub mod dto;
 mod encoding;
 pub mod envelope;
 pub mod pairing;
 pub mod relay;
-pub mod session;
+
+pub use dto::session;
