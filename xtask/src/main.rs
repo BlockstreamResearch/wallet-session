@@ -30,6 +30,7 @@ use wc_protocol::{
         RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse,
         RelayJsonRpcSuccess, RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
     },
+    session::{JsonRpcRequest, SessionProposeParams, WC_SESSION_PROPOSE_METHOD},
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
@@ -76,6 +77,7 @@ fn parse_probe_mode() -> Result<ProbeMode> {
                 );
                 eprintln!("env: WC_RELAY_PROBE_MODE=basic|matrix");
                 eprintln!("env: WC_PAIRING_URI=<wc uri>");
+                eprintln!("env: WC_PAIRING_URI_PRINT_JSON=1");
                 return Ok(ProbeMode::Basic);
             }
             other => bail!("unknown relay-probe argument: {other}"),
@@ -307,6 +309,50 @@ fn print_pairing_payload_metadata(
             .and_then(Value::as_str)
             .unwrap_or("<none>"),
         params_keys(&json)
+    );
+
+    if json.get("method").and_then(Value::as_str) == Some(WC_SESSION_PROPOSE_METHOD) {
+        print_session_proposal_summary(label, json.clone())?;
+    }
+
+    if pairing_uri_print_json() {
+        let pretty = serde_json::to_string_pretty(&json)
+            .with_context(|| format!("{label} failed to format decrypted JSON"))?;
+        println!("{label} decrypted_json=\n{pretty}");
+    }
+
+    Ok(())
+}
+
+fn print_session_proposal_summary(label: &str, json: Value) -> Result<()> {
+    let request = serde_json::from_value::<JsonRpcRequest<SessionProposeParams>>(json)
+        .with_context(|| format!("{label} failed to parse wc_sessionPropose DTO"))?;
+    let proposal = request.params;
+    let expiry = proposal
+        .effective_expiry_timestamp()
+        .map_or_else(|| "<none>".to_owned(), |expiry| expiry.to_string());
+    let pairing_topic = proposal
+        .pairing_topic
+        .as_ref()
+        .map_or_else(|| "<from relay topic>".to_owned(), ToString::to_string);
+    let relays = proposal
+        .relays
+        .iter()
+        .map(|relay| relay.protocol.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    println!(
+        "{label} session_proposal id={} pairing_topic={} expiry={} relays=[{}] required_namespaces={} optional_namespaces={} dapp_name={} dapp_url={} icons={}",
+        proposal.effective_id(request.id),
+        pairing_topic,
+        expiry,
+        relays,
+        proposal.required_namespaces.len(),
+        proposal.optional_namespaces.len(),
+        proposal.proposer.metadata.name,
+        proposal.proposer.metadata.url,
+        proposal.proposer.metadata.icons.len()
     );
 
     Ok(())
@@ -951,6 +997,13 @@ fn pairing_uri_wait_timeout() -> Duration {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(Duration::from_secs(5), Duration::from_secs)
+}
+
+fn pairing_uri_print_json() -> bool {
+    matches!(
+        env::var("WC_PAIRING_URI_PRINT_JSON").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
 }
 
 fn redact(value: &str) -> String {
