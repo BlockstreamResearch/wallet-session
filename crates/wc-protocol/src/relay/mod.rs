@@ -5,7 +5,7 @@
 //! - topic validation
 //! - JSON-RPC request/response envelopes
 //! - `irn_subscribe`, `irn_publish`, `irn_subscription`,
-//!   `irn_fetchMessages`, and `irn_unsubscribe` DTOs
+//!   `irn_fetchMessages`, `irn_unsubscribe`, and batch DTOs
 
 pub mod auth;
 pub mod rpc;
@@ -16,8 +16,9 @@ pub use auth::{
     relay_auth_audience,
 };
 pub use rpc::{
-    IrnFetchMessages, IrnFetchMessagesResponse, IrnPublish, IrnSubscribe, IrnSubscription,
-    IrnSubscriptionData, IrnUnsubscribe, JSON_RPC_VERSION, RelayJsonRpcErrorData,
+    IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchPublish, IrnBatchSubscribe,
+    IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse, IrnPublish, IrnSubscribe,
+    IrnSubscription, IrnSubscriptionData, IrnUnsubscribe, JSON_RPC_VERSION, RelayJsonRpcErrorData,
     RelayJsonRpcErrorResponse, RelayJsonRpcRequest, RelayJsonRpcResponse, RelayJsonRpcSuccess,
     RelayRequest, RelayRpcId, RelayRpcIdError,
 };

@@ -293,6 +293,37 @@ impl RelayRequest for IrnSubscribe {
     const METHOD: &'static str = "irn_subscribe";
 }
 
+/// `irn_batchSubscribe` params.
+///
+/// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#batch-subscribe>
+///
+/// > Used when a client subscribes multiple topics.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/jsonrpc.ts#L18>
+///
+/// > batchSubscribe: "irn_batchSubscribe",
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/types.ts#L17-L19>
+///
+/// > topics: string[];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrnBatchSubscribe {
+    /// Relay routing keys to register on the current connection.
+    pub topics: Vec<RelayTopic>,
+}
+
+impl IrnBatchSubscribe {
+    /// Builds params for `irn_batchSubscribe`.
+    #[must_use]
+    pub const fn new(topics: Vec<RelayTopic>) -> Self {
+        Self { topics }
+    }
+}
+
+impl RelayRequest for IrnBatchSubscribe {
+    const METHOD: &'static str = "irn_batchSubscribe";
+}
+
 /// `irn_publish` params.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#publish>
@@ -308,6 +339,9 @@ impl RelayRequest for IrnSubscribe {
 /// > topic: string;
 /// > message: string;
 /// > ttl: number;
+/// > prompt?: boolean;
+/// > tag?: number;
+/// > attestation?: string;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrnPublish {
     /// Relay routing key that receives the message.
@@ -318,6 +352,12 @@ pub struct IrnPublish {
     pub ttl: u64,
     /// `WalletConnect` message classifier used above the relay layer.
     pub tag: u64,
+    /// Whether the relay should prompt the peer transport when supported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<bool>,
+    /// Verify attestation JWT forwarded with the relay message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
 }
 
 impl IrnPublish {
@@ -329,12 +369,63 @@ impl IrnPublish {
             message: message.into(),
             ttl,
             tag,
+            prompt: None,
+            attestation: None,
         }
+    }
+
+    /// Includes the optional relay prompt flag.
+    #[must_use]
+    pub const fn with_prompt(mut self, prompt: bool) -> Self {
+        self.prompt = Some(prompt);
+        self
+    }
+
+    /// Includes an optional Verify attestation JWT.
+    #[must_use]
+    pub fn with_attestation(mut self, attestation: impl Into<String>) -> Self {
+        self.attestation = Some(attestation.into());
+        self
     }
 }
 
 impl RelayRequest for IrnPublish {
     const METHOD: &'static str = "irn_publish";
+}
+
+/// `irn_batchPublish` params.
+///
+/// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#batch-publish>
+///
+/// > Used when a client publishes multiple messages to a server.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/jsonrpc.ts#L16>
+///
+/// > batchPublish: "irn_batchPublish",
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/types.ts#L38-L40>
+///
+/// > messages: PublishParams[];
+///
+/// The live relay matrix probes this DTO separately. The public relay currently
+/// rejects the spec/JS shapes with JSON-RPC `-32600`, so callers should prefer
+/// single-message `irn_publish` until an accepted deployed shape is observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrnBatchPublish {
+    /// Relay publish payloads sent in one request.
+    pub messages: Vec<IrnPublish>,
+}
+
+impl IrnBatchPublish {
+    /// Builds params for `irn_batchPublish`.
+    #[must_use]
+    pub const fn new(messages: Vec<IrnPublish>) -> Self {
+        Self { messages }
+    }
+}
+
+impl RelayRequest for IrnBatchPublish {
+    const METHOD: &'static str = "irn_batchPublish";
 }
 
 /// `irn_subscription` params sent by the relay to a subscriber.
@@ -403,6 +494,37 @@ impl RelayRequest for IrnFetchMessages {
     const METHOD: &'static str = "irn_fetchMessages";
 }
 
+/// `irn_batchFetchMessages` params.
+///
+/// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#batch-fetch-messages>
+///
+/// > Used when a client wants to fetch all undelivered messages matching multiple topics before subscribing.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/jsonrpc.ts#L22>
+///
+/// > batchFetchMessages: "irn_batchFetchMessages",
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/types.ts#L21-L23>
+///
+/// > topics: string[];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrnBatchFetchMessages {
+    /// Relay routing keys whose pending mailboxes are requested.
+    pub topics: Vec<RelayTopic>,
+}
+
+impl IrnBatchFetchMessages {
+    /// Builds params for `irn_batchFetchMessages`.
+    #[must_use]
+    pub const fn new(topics: Vec<RelayTopic>) -> Self {
+        Self { topics }
+    }
+}
+
+impl RelayRequest for IrnBatchFetchMessages {
+    const METHOD: &'static str = "irn_batchFetchMessages";
+}
+
 /// `irn_fetchMessages` result.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#fetch-messages>
@@ -415,6 +537,21 @@ pub struct IrnFetchMessagesResponse {
     pub has_more: bool,
     /// Messages retained by the relay for this topic.
     pub messages: Vec<IrnSubscriptionData>,
+}
+
+/// `irn_batchFetchMessages` result.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/core/src/controllers/subscriber.ts#L346-L375>
+///
+/// > result = (await fetchMessagesPromise) as {
+/// > messages: RelayerTypes.MessageEvent[];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrnBatchFetchMessagesResponse {
+    /// Messages retained by the relay for the requested topics.
+    pub messages: Vec<IrnSubscriptionData>,
+    /// Relay pagination flag when present in deployed responses.
+    #[serde(rename = "hasMore", default)]
+    pub has_more: bool,
 }
 
 /// `irn_unsubscribe` params.
@@ -449,6 +586,37 @@ impl RelayRequest for IrnUnsubscribe {
     const METHOD: &'static str = "irn_unsubscribe";
 }
 
+/// `irn_batchUnsubscribe` params.
+///
+/// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#batch-unsubscribe>
+///
+/// > Used when a client unsubscribes multiple topics.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/jsonrpc.ts#L21>
+///
+/// > batchUnsubscribe: "irn_batchUnsubscribe",
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/relay/relay-api/src/types.ts#L25-L27>
+///
+/// > subscriptions: UnsubscribeParams[];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrnBatchUnsubscribe {
+    /// Relay subscription records to remove.
+    pub subscriptions: Vec<IrnUnsubscribe>,
+}
+
+impl IrnBatchUnsubscribe {
+    /// Builds params for `irn_batchUnsubscribe`.
+    #[must_use]
+    pub const fn new(subscriptions: Vec<IrnUnsubscribe>) -> Self {
+        Self { subscriptions }
+    }
+}
+
+impl RelayRequest for IrnBatchUnsubscribe {
+    const METHOD: &'static str = "irn_batchUnsubscribe";
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -469,6 +637,110 @@ mod tests {
                 "params": {
                     "topic": "1111111111111111111111111111111111111111111111111111111111111111",
                 },
+            })
+        );
+    }
+
+    #[test]
+    fn batch_requests_serialize_with_method_names() {
+        let topic_a = RelayTopic::from_bytes([0x11; 32]);
+        let topic_b = RelayTopic::from_bytes([0x22; 32]);
+        let publish = IrnPublish::new(topic_a.clone(), "hello", 30, 0);
+
+        assert_eq!(
+            serde_json::to_value(RelayJsonRpcRequest::new(
+                RelayRpcId::new(1),
+                IrnBatchSubscribe::new(vec![topic_a, topic_b.clone()])
+            ))
+            .expect("batch subscribe request serializes"),
+            json!({
+                "id": 1,
+                "jsonrpc": "2.0",
+                "method": "irn_batchSubscribe",
+                "params": {
+                    "topics": [
+                        "1111111111111111111111111111111111111111111111111111111111111111",
+                        "2222222222222222222222222222222222222222222222222222222222222222",
+                    ],
+                },
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RelayJsonRpcRequest::new(
+                RelayRpcId::new(2),
+                IrnBatchPublish::new(vec![publish])
+            ))
+            .expect("batch publish request serializes"),
+            json!({
+                "id": 2,
+                "jsonrpc": "2.0",
+                "method": "irn_batchPublish",
+                "params": {
+                    "messages": [{
+                        "topic": "1111111111111111111111111111111111111111111111111111111111111111",
+                        "message": "hello",
+                        "ttl": 30,
+                        "tag": 0,
+                    }],
+                },
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(RelayJsonRpcRequest::new(
+                RelayRpcId::new(3),
+                IrnBatchUnsubscribe::new(vec![IrnUnsubscribe::new(topic_b, "subscription-id")])
+            ))
+            .expect("batch unsubscribe request serializes"),
+            json!({
+                "id": 3,
+                "jsonrpc": "2.0",
+                "method": "irn_batchUnsubscribe",
+                "params": {
+                    "subscriptions": [{
+                        "topic": "2222222222222222222222222222222222222222222222222222222222222222",
+                        "id": "subscription-id",
+                    }],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn batch_fetch_response_deserializes_live_relay_shape() {
+        let value = json!({
+            "messages": [{
+                "topic": "185355c71cc41c2891b71fdb80d6f13730f78cd8b47bf90e26eae52b55904f4b",
+                "message": "cached",
+                "publishedAt": 1_779_792_668_077_u64,
+            }],
+        });
+
+        let response = serde_json::from_value::<IrnBatchFetchMessagesResponse>(value)
+            .expect("batch fetch response parses");
+
+        assert!(!response.has_more);
+        assert_eq!(response.messages[0].message, "cached");
+        assert_eq!(response.messages[0].tag, None);
+    }
+
+    #[test]
+    fn publish_serializes_optional_prompt_and_attestation() {
+        let topic = RelayTopic::from_bytes([0x11; 32]);
+        let publish = IrnPublish::new(topic, "hello", 30, 0)
+            .with_prompt(false)
+            .with_attestation("attestation-jwt");
+
+        assert_eq!(
+            serde_json::to_value(publish).expect("publish params serialize"),
+            json!({
+                "topic": "1111111111111111111111111111111111111111111111111111111111111111",
+                "message": "hello",
+                "ttl": 30,
+                "tag": 0,
+                "prompt": false,
+                "attestation": "attestation-jwt",
             })
         );
     }
