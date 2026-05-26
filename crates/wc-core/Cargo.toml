@@ -1,0 +1,18 @@
+[package]
+name = "wc-core"
+version = "0.1.0"
+description = "Core WalletConnect client primitives."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["walletconnect", "client"]
+categories = ["cryptography::cryptocurrencies", "network-programming"]
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
