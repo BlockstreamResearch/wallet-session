@@ -1,5 +1,6 @@
 //! Sign API session DTOs.
 
+mod authenticate;
 mod delete;
 mod event;
 mod extend;
@@ -12,6 +13,7 @@ mod settle;
 mod types;
 mod update;
 
+pub use authenticate::{AuthPayload, SessionAuthenticateParams};
 pub use delete::SessionDeleteParams;
 pub use event::{SessionEvent, SessionEventParams};
 pub use extend::SessionExtendParams;

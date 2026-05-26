@@ -124,4 +124,10 @@ impl<T> JsonRpcRequest<T> {
     pub fn is_session_event(&self) -> bool {
         self.method == SignMethod::SessionEvent
     }
+
+    /// Classifies an already-deserialized Sign request as `wc_sessionAuthenticate`.
+    #[must_use]
+    pub fn is_session_authenticate(&self) -> bool {
+        self.method == SignMethod::SessionAuthenticate
+    }
 }
