@@ -9,7 +9,7 @@ use base64::{
 use serde::Serialize;
 
 use crate::{
-    encoding::decode_validated_hex,
+    encoding::{decode_validated_hex, hex_lower},
     relay::{RelayTopic, RelayTopicError},
 };
 
@@ -188,6 +188,17 @@ impl PairingSymKey {
         Ok(Self(value.to_ascii_lowercase()))
     }
 
+    /// Creates a symmetric key from raw key bytes.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/crypto.ts#L49-L55>
+    ///
+    /// > const symKey = hkdf(sha256, sharedKey, undefined, undefined, KEY_LENGTH);
+    /// > return toString(symKey, BASE16);
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; PAIRING_SYM_KEY_BYTES]) -> Self {
+        Self(hex_lower(&bytes))
+    }
+
     /// Lowercase hex form from the URI query string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -333,10 +344,10 @@ pub enum PairingSymKeyError {
 }
 
 /// Pairing `symKey` size before hex encoding.
-const PAIRING_SYM_KEY_BYTES: usize = 32;
+pub const PAIRING_SYM_KEY_BYTES: usize = 32;
 
 /// Pairing `symKey` size after lowercase hex encoding.
-const PAIRING_SYM_KEY_HEX: usize = PAIRING_SYM_KEY_BYTES * 2;
+pub const PAIRING_SYM_KEY_HEX: usize = PAIRING_SYM_KEY_BYTES * 2;
 
 /// Query parameter accumulator used before required fields are known.
 ///
