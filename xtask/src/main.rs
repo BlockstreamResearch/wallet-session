@@ -6,8 +6,9 @@
 //! request/response shapes are promoted into stable library types.
 
 use std::{
-    env,
+    env, fs,
     future::Future,
+    io::{self, Read},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +20,10 @@ use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, Utf8Bytes},
+};
+use wc_protocol::session::{
+    Cacao, JsonRpcResponse as SignJsonRpcResponse, SessionAuthenticateParams,
+    SessionAuthenticateResult,
 };
 use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
@@ -38,15 +43,28 @@ const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
 type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn main() -> Result<()> {
-    if env::args().nth(1).as_deref() == Some("relay-probe") {
-        run_async(relay_probe(parse_probe_mode()?))
-    } else {
-        eprintln!("usage: cargo run -p xtask -- relay-probe");
-        eprintln!("       cargo run -p xtask -- relay-probe --matrix");
-        eprintln!("       cargo run -p xtask -- relay-probe --pairing-uri '<wc uri>'");
-        eprintln!("env: REOWN_PROJECT_ID=<project id>");
-        Ok(())
+    match env::args().nth(1).as_deref() {
+        Some("relay-probe") => run_async(relay_probe(parse_probe_mode()?)),
+        Some("auth-probe") => auth_probe(parse_auth_probe_input()?),
+        Some("--help" | "-h") | None => {
+            print_usage();
+            Ok(())
+        }
+        Some(other) => bail!("unknown xtask command: {other}"),
     }
+}
+
+fn print_usage() {
+    eprintln!("usage: cargo run -p xtask -- relay-probe");
+    eprintln!("       cargo run -p xtask -- relay-probe --matrix");
+    eprintln!("       cargo run -p xtask -- relay-probe --pairing-uri '<wc uri>'");
+    eprintln!("       cargo run -p xtask -- auth-probe --sample");
+    eprintln!("       cargo run -p xtask -- auth-probe --json '<json>'");
+    eprintln!("       cargo run -p xtask -- auth-probe --file payload.json");
+    eprintln!("       cargo run -p xtask -- auth-probe --stdin");
+    eprintln!("env: REOWN_PROJECT_ID=<project id>");
+    eprintln!("env: WC_AUTH_PROBE_JSON=<json>");
+    eprintln!("env: WC_AUTH_PROBE_FILE=<path>");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +72,60 @@ enum ProbeMode {
     Basic,
     Matrix,
     PairingUri(String),
+}
+
+enum AuthProbeInput {
+    Json(String),
+    Sample,
+}
+
+fn parse_auth_probe_input() -> Result<AuthProbeInput> {
+    let mut arguments = env::args().skip(2);
+    let Some(argument) = arguments.next() else {
+        if let Ok(json) = env::var("WC_AUTH_PROBE_JSON") {
+            return Ok(AuthProbeInput::Json(json));
+        }
+
+        if let Ok(path) = env::var("WC_AUTH_PROBE_FILE") {
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read auth probe file {path}"))?;
+            return Ok(AuthProbeInput::Json(json));
+        }
+
+        return Ok(AuthProbeInput::Sample);
+    };
+
+    match argument.as_str() {
+        "--sample" => Ok(AuthProbeInput::Sample),
+        "--json" => {
+            let json = arguments
+                .next()
+                .or_else(|| env::var("WC_AUTH_PROBE_JSON").ok())
+                .context("pass JSON after --json or set WC_AUTH_PROBE_JSON")?;
+            Ok(AuthProbeInput::Json(json))
+        }
+        "--file" => {
+            let path = arguments
+                .next()
+                .or_else(|| env::var("WC_AUTH_PROBE_FILE").ok())
+                .context("pass a path after --file or set WC_AUTH_PROBE_FILE")?;
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read auth probe file {path}"))?;
+            Ok(AuthProbeInput::Json(json))
+        }
+        "--stdin" => {
+            let mut json = String::new();
+            io::stdin()
+                .read_to_string(&mut json)
+                .context("failed to read auth probe JSON from stdin")?;
+            Ok(AuthProbeInput::Json(json))
+        }
+        "--help" | "-h" => {
+            print_usage();
+            Ok(AuthProbeInput::Sample)
+        }
+        other => bail!("unknown auth-probe argument: {other}"),
+    }
 }
 
 fn parse_probe_mode() -> Result<ProbeMode> {
@@ -110,6 +182,148 @@ async fn relay_probe(mode: ProbeMode) -> Result<()> {
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
 }
+
+fn auth_probe(input: AuthProbeInput) -> Result<()> {
+    let json = match input {
+        AuthProbeInput::Json(json) => json,
+        AuthProbeInput::Sample => SAMPLE_AUTH_RESULT_JSON.to_owned(),
+    };
+    let value = serde_json::from_str::<Value>(&json).context("auth probe input is not JSON")?;
+
+    println!(
+        "auth-probe shape={} bytes={}",
+        auth_probe_shape(&value),
+        json.len()
+    );
+
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        println!("auth-probe jsonrpc_method={method}");
+    }
+
+    if value.get("method").and_then(Value::as_str) == Some("wc_sessionAuthenticate") {
+        let request = serde_json::from_value::<JsonRpcRequest<SessionAuthenticateParams>>(value)
+            .context("failed to parse wc_sessionAuthenticate request")?;
+        println!(
+            "auth-probe authenticate_request id={} requester={} expiry={} chains=[{}] domain={} aud={} resources={}",
+            request.id,
+            request.params.requester.metadata.name,
+            request.params.expiry_timestamp,
+            request
+                .params
+                .auth_payload
+                .chains
+                .iter()
+                .map(wc_protocol::caip::Caip2ChainId::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+            request.params.auth_payload.domain,
+            request.params.auth_payload.aud,
+            request.params.auth_payload.resources.len()
+        );
+        return Ok(());
+    }
+
+    if value
+        .get("result")
+        .and_then(|result| result.get("cacaos"))
+        .is_some()
+    {
+        let response =
+            serde_json::from_value::<SignJsonRpcResponse<SessionAuthenticateResult>>(value)
+                .context("failed to parse wc_sessionAuthenticate result")?;
+        println!(
+            "auth-probe authenticate_result id={} responder={} cacaos={}",
+            response.id,
+            response.result.responder.metadata.name,
+            response.result.cacaos.len()
+        );
+        for (index, cacao) in response.result.cacaos.iter().enumerate() {
+            print_cacao_summary(index, cacao);
+        }
+        return Ok(());
+    }
+
+    if value.get("h").is_some() && value.get("p").is_some() && value.get("s").is_some() {
+        let cacao = serde_json::from_value::<Cacao>(value).context("failed to parse CACAO")?;
+        print_cacao_summary(0, &cacao);
+        return Ok(());
+    }
+
+    bail!("unsupported auth probe JSON shape")
+}
+
+fn auth_probe_shape(value: &Value) -> &'static str {
+    if value.get("method").and_then(Value::as_str) == Some("wc_sessionAuthenticate") {
+        "wc_sessionAuthenticate-request"
+    } else if value
+        .get("result")
+        .and_then(|result| result.get("cacaos"))
+        .is_some()
+    {
+        "wc_sessionAuthenticate-result"
+    } else if value.get("h").is_some() && value.get("p").is_some() && value.get("s").is_some() {
+        "cacao"
+    } else {
+        "unknown"
+    }
+}
+
+fn print_cacao_summary(index: usize, cacao: &Cacao) {
+    println!(
+        "auth-probe cacao index={} header={} signature_type={} iss={} account={} chain={} address={} domain={} aud={} resources={}",
+        index,
+        cacao.h.kind.as_str(),
+        cacao.s.kind.as_str(),
+        cacao.p.iss.as_str(),
+        cacao.p.iss.account_id_str(),
+        cacao.p.iss.chain_id(),
+        cacao.p.iss.address(),
+        cacao.p.domain,
+        cacao.p.aud,
+        cacao.p.resources.len()
+    );
+}
+
+const SAMPLE_AUTH_RESULT_JSON: &str = r#"{
+  "id": 1779862258791507,
+  "jsonrpc": "2.0",
+  "result": {
+    "cacaos": [
+      {
+        "h": {
+          "t": "caip122"
+        },
+        "p": {
+          "iss": "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87",
+          "domain": "example.com",
+          "aud": "https://example.com/login",
+          "version": "1",
+          "nonce": "1234567890",
+          "iat": "2026-05-27T06:10:58.791Z",
+          "statement": "",
+          "resources": [
+            "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ"
+          ]
+        },
+        "s": {
+          "t": "eip191",
+          "s": "0x5851cc642b66ba30b0073bd3a46c141d46d426eb013465aead257597ca3282a5530db47176d8400e79ac6ed0f8e53ffe87f5d52df421d712be2cbeb02e4768011b"
+        }
+      }
+    ],
+    "responder": {
+      "publicKey": "977b7da860028df30993e70f25cc6d4f8dd67c4c2e8bb7a84b091a0f9cc37809",
+      "metadata": {
+        "name": "wc-rs live auth wallet",
+        "description": "Temporary live probe wallet",
+        "url": "https://example.com/wallet",
+        "icons": [
+          ""
+        ]
+      }
+    }
+  }
+}"#;
 
 struct RelayProbeConfig {
     project_id: String,
