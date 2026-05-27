@@ -1,0 +1,24 @@
+{
+  "name": "walletconnect-client-poc-js-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.3.13",
+  "description": "Repo-local WalletConnect JS harnesses for live protocol probes.",
+  "scripts": {
+    "check": "bun run check:supply-chain && bun run check:types",
+    "check:supply-chain": "bun run src/check-supply-chain.ts",
+    "check:types": "tsc --noEmit",
+    "propose-session": "bun run src/propose-session.ts"
+  },
+  "trustedDependencies": [],
+  "dependencies": {
+    "@walletconnect/sign-client": "2.23.9"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "@types/node": "25.9.1",
+    "undici-types": "7.24.6",
+    "typescript": "6.0.3"
+  }
+}
