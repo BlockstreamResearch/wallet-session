@@ -1,4 +1,6 @@
 use serde_json::json;
+
+use super::account_strings;
 use wc_protocol::session::{Session, SessionTransportType};
 
 const LIVE_WALLET_AUTHENTICATED_SESSION_JSON: &str = r#"{
@@ -154,7 +156,7 @@ fn deserializes_live_wallet_authenticated_session_shape() {
     assert!(!session.is_expired_at(1_700_000_000));
     assert!(session.is_expired_at(1_800_000_000));
     assert_eq!(
-        session.namespaces["eip155"].accounts,
+        account_strings(&session.namespaces["eip155"].accounts),
         ["eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"]
     );
     assert_eq!(

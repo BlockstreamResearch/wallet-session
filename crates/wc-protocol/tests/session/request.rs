@@ -1,4 +1,6 @@
 use serde_json::json;
+
+use super::chain;
 use wc_protocol::session::{JsonRpcRequest, SessionRequest, SessionRequestParams, SignMethod};
 
 const LIVE_PERSONAL_SIGN_JSON: &str = r#"{
@@ -26,7 +28,7 @@ fn deserializes_live_personal_sign_shape() {
 
     assert!(request.is_session_request());
     assert_eq!(request.method, SignMethod::SessionRequest);
-    assert_eq!(request.params.chain_id, "eip155:1");
+    assert_eq!(request.params.chain_id.as_str(), "eip155:1");
     assert_eq!(request.params.request.method, "personal_sign");
     assert_eq!(
         request.params.request.params,
@@ -66,7 +68,7 @@ fn deserializes_spec_expiry_alias() {
     let request =
         serde_json::from_value::<JsonRpcRequest<SessionRequestParams>>(value).expect("parses");
 
-    assert_eq!(request.params.chain_id, "eip155:5");
+    assert_eq!(request.params.chain_id.as_str(), "eip155:5");
     assert_eq!(request.params.request.method, "eth_signTransaction");
     assert_eq!(request.params.request.expiry_timestamp, Some(1_700_000_300));
 }
@@ -77,7 +79,7 @@ fn serializes_current_expiry_timestamp_name() {
         9,
         SignMethod::SessionRequest,
         SessionRequestParams {
-            chain_id: "eip155:1".to_owned(),
+            chain_id: chain("eip155:1"),
             request: SessionRequest {
                 method: "personal_sign".to_owned(),
                 params: json!(["0x68656c6c6f", "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]),

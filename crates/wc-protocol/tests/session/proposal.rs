@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use serde_json::json;
+
+use super::chain_strings;
 use wc_protocol::{
     relay::RelayTopic,
     session::{
@@ -90,12 +92,11 @@ fn deserializes_spec_event_shape() {
     );
     assert_eq!(request.params.relays[0].protocol, "irn");
     assert_eq!(request.params.proposer.metadata.name, "React App");
-    assert_eq!(
-        request.params.required_namespaces["eip155"]
-            .chains
-            .as_deref(),
-        Some(["eip155:5".to_owned()].as_slice())
-    );
+    let required_chains = request.params.required_namespaces["eip155"]
+        .chains
+        .as_deref()
+        .expect("required chains");
+    assert_eq!(chain_strings(required_chains), ["eip155:5"]);
     assert_eq!(
         request.params.optional_namespaces["eip155:42161"]
             .chains

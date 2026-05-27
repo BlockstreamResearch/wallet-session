@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::caip::Caip2ChainId;
+
 /// Decrypted `wc_sessionEvent` params.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionevent>
@@ -66,7 +68,7 @@ pub struct SessionEventParams {
     pub event: SessionEvent,
     /// Target chain in CAIP-2 format.
     #[serde(rename = "chainId")]
-    pub chain_id: String,
+    pub chain_id: Caip2ChainId,
 }
 
 /// Chain-specific event payload inside `wc_sessionEvent`.

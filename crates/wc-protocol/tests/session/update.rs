@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use serde_json::json;
+
+use super::{account, account_strings, chain, chain_strings};
 use wc_protocol::session::{JsonRpcRequest, SessionNamespace, SessionUpdateParams, SignMethod};
 
 const LIVE_SESSION_UPDATE_JSON: &str = r#"{
@@ -37,12 +39,13 @@ fn deserializes_live_update_shape() {
 
     assert!(request.is_session_update());
     assert_eq!(request.method, SignMethod::SessionUpdate);
+    let chains = request.params.namespaces["eip155"]
+        .chains
+        .as_deref()
+        .expect("chains");
+    assert_eq!(chain_strings(chains), ["eip155:1"]);
     assert_eq!(
-        request.params.namespaces["eip155"].chains.as_deref(),
-        Some(["eip155:1".to_owned()].as_slice())
-    );
-    assert_eq!(
-        request.params.namespaces["eip155"].accounts,
+        account_strings(&request.params.namespaces["eip155"].accounts),
         [
             "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
             "eip155:1:0x1111111111111111111111111111111111111111"
@@ -57,12 +60,12 @@ fn serializes_namespace_replacement() {
         SignMethod::SessionUpdate,
         SessionUpdateParams {
             namespaces: BTreeMap::from([(
-                "eip155".to_owned(),
+                "eip155".parse().expect("namespace key parses"),
                 SessionNamespace {
-                    chains: Some(vec!["eip155:1".to_owned()]),
+                    chains: Some(vec![chain("eip155:1")]),
                     accounts: vec![
-                        "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".to_owned(),
-                        "eip155:1:0x1111111111111111111111111111111111111111".to_owned(),
+                        account("eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"),
+                        account("eip155:1:0x1111111111111111111111111111111111111111"),
                     ],
                     methods: vec!["personal_sign".to_owned()],
                     events: vec!["accountsChanged".to_owned(), "chainChanged".to_owned()],
@@ -99,7 +102,7 @@ fn preserves_namespace_without_chains() {
 
     assert_eq!(params.namespaces["eip155:42161"].chains, None);
     assert_eq!(
-        params.namespaces["eip155:42161"].accounts,
+        account_strings(&params.namespaces["eip155:42161"].accounts),
         ["eip155:42161:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]
     );
 }

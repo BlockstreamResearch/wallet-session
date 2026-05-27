@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::relay::RelayTopic;
+use crate::{
+    caip::{Caip2ChainId, NamespaceKey},
+    relay::RelayTopic,
+};
 
 /// Decrypted `wc_sessionPropose` params.
 ///
@@ -159,7 +162,7 @@ pub struct SessionProposeResult {
 ///
 /// > There will be two objects that will be included, `requiredNamespaces` and
 /// > `optionalNamespaces`.
-pub type ProposalNamespaces = BTreeMap<String, ProposalNamespace>;
+pub type ProposalNamespaces = BTreeMap<NamespaceKey, ProposalNamespace>;
 
 /// Methods, events, and optional chains requested for one proposal namespace.
 ///
@@ -173,7 +176,7 @@ pub type ProposalNamespaces = BTreeMap<String, ProposalNamespace>;
 pub struct ProposalNamespace {
     /// CAIP-2 chains requested under this namespace key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chains: Option<Vec<String>>,
+    pub chains: Option<Vec<Caip2ChainId>>,
     /// JSON-RPC methods requested under this namespace key.
     pub methods: Vec<String>,
     /// Session events requested under this namespace key.

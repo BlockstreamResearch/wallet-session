@@ -1,6 +1,12 @@
 //! CAIP identifier primitives.
 
-use std::{fmt, str::FromStr};
+use std::{
+    borrow::Borrow,
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -52,6 +58,12 @@ impl FromStr for CaipNamespace {
 impl fmt::Display for CaipNamespace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for CaipNamespace {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -162,6 +174,12 @@ impl FromStr for Caip2ChainId {
 impl fmt::Display for Caip2ChainId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for Caip2ChainId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -305,6 +323,12 @@ impl fmt::Display for Caip10AccountId {
     }
 }
 
+impl AsRef<str> for Caip10AccountId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 impl Serialize for Caip10AccountId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -333,7 +357,7 @@ impl<'de> Deserialize<'de> for Caip10AccountId {
 ///
 /// > // check if chainId is provided in the key as `eip155:1` or in the namespace as chains[]
 /// > return namespace.includes(":") ? [namespace] : namespaceProps.chains || [];
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceKey {
     /// Bare CAIP namespace key.
     Namespace(CaipNamespace),
@@ -390,6 +414,36 @@ impl FromStr for NamespaceKey {
 impl fmt::Display for NamespaceKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for NamespaceKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for NamespaceKey {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialOrd for NamespaceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NamespaceKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for NamespaceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 

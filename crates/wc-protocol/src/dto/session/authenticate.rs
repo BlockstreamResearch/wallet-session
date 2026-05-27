@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::SessionParticipant;
+use crate::caip::Caip2ChainId;
 
 /// Decrypted `wc_sessionAuthenticate` params.
 ///
@@ -118,7 +119,7 @@ pub struct AuthPayload {
     #[serde(rename = "type")]
     pub kind: String,
     /// Requested CAIP-2 chains.
-    pub chains: Vec<String>,
+    pub chains: Vec<Caip2ChainId>,
     /// URI identifying the authentication audience.
     pub aud: String,
     /// Domain requesting authentication.

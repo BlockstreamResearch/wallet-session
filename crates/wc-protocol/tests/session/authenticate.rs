@@ -1,4 +1,6 @@
 use serde_json::json;
+
+use super::{chain, chain_strings};
 use wc_protocol::session::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
     CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
@@ -105,7 +107,10 @@ fn deserializes_live_authenticate_shape() {
         "wc-rs live auth dapp"
     );
     assert_eq!(request.params.auth_payload.kind, "caip122");
-    assert_eq!(request.params.auth_payload.chains, ["eip155:1"]);
+    assert_eq!(
+        chain_strings(&request.params.auth_payload.chains),
+        ["eip155:1"]
+    );
     assert_eq!(request.params.auth_payload.statement.as_deref(), Some(""));
     assert_eq!(request.params.auth_payload.aud, "https://example.com/login");
     assert_eq!(request.params.auth_payload.domain, "example.com");
@@ -140,7 +145,7 @@ fn serializes_authenticate_request_with_optional_fields() {
             },
             auth_payload: AuthPayload {
                 kind: "caip122".to_owned(),
-                chains: vec!["eip155:1".to_owned()],
+                chains: vec![chain("eip155:1")],
                 aud: "https://example.com/login".to_owned(),
                 domain: "example.com".to_owned(),
                 version: "1".to_owned(),

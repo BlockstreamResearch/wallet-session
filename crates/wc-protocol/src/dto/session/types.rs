@@ -6,7 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::{Cacao, DappMetadata, ProposalNamespaces, RelayProtocolOptions};
-use crate::relay::RelayTopic;
+use crate::{
+    caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
+    relay::RelayTopic,
+};
 
 /// Stored Sign API session.
 ///
@@ -207,7 +210,7 @@ impl<'de> Deserialize<'de> for SessionTransportType {
 ///
 /// > type Namespace = BaseNamespace;
 /// > type Namespaces = Record<string, Namespace>;
-pub type SessionNamespaces = BTreeMap<String, SessionNamespace>;
+pub type SessionNamespaces = BTreeMap<NamespaceKey, SessionNamespace>;
 
 /// Approved chains, accounts, methods, and events for one namespace.
 ///
@@ -220,9 +223,9 @@ pub type SessionNamespaces = BTreeMap<String, SessionNamespace>;
 pub struct SessionNamespace {
     /// Approved CAIP-2 chains under this namespace key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chains: Option<Vec<String>>,
+    pub chains: Option<Vec<Caip2ChainId>>,
     /// Approved CAIP-10 accounts.
-    pub accounts: Vec<String>,
+    pub accounts: Vec<Caip10AccountId>,
     /// Approved JSON-RPC methods.
     pub methods: Vec<String>,
     /// Approved session events.

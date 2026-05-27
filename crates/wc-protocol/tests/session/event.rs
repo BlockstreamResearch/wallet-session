@@ -1,4 +1,6 @@
 use serde_json::json;
+
+use super::chain;
 use wc_protocol::session::{JsonRpcRequest, SessionEvent, SessionEventParams, SignMethod};
 
 const LIVE_SESSION_EVENT_JSON: &str = r#"{
@@ -24,7 +26,7 @@ fn deserializes_live_event_shape() {
 
     assert!(request.is_session_event());
     assert_eq!(request.method, SignMethod::SessionEvent);
-    assert_eq!(request.params.chain_id, "eip155:1");
+    assert_eq!(request.params.chain_id.as_str(), "eip155:1");
     assert_eq!(request.params.event.name, "accountsChanged");
     assert_eq!(
         request.params.event.data,
@@ -45,7 +47,7 @@ fn serializes_chain_specific_object_data() {
                     "networkVersion": "1"
                 }),
             },
-            chain_id: "eip155:1".to_owned(),
+            chain_id: chain("eip155:1"),
         },
     );
 
@@ -70,6 +72,6 @@ fn preserves_null_and_scalar_data() {
         .expect("parses");
 
         assert_eq!(params.event.name, "chainChanged");
-        assert_eq!(params.chain_id, "eip155:1");
+        assert_eq!(params.chain_id.as_str(), "eip155:1");
     }
 }

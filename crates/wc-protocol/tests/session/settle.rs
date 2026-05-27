@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
 use serde_json::json;
+
+use super::{account, account_strings, chain, chain_strings};
 use wc_protocol::session::{
     DappMetadata, JsonRpcRequest, RelayProtocolOptions, SessionConfig, SessionNamespace,
     SessionParticipant, SessionSettleParams, SignMethod, SpecialNamespace,
@@ -63,12 +65,13 @@ fn deserializes_live_settle_shape() {
         request.params.controller.metadata.name,
         "wc-rs live settle wallet"
     );
+    let chains = request.params.namespaces["eip155"]
+        .chains
+        .as_deref()
+        .expect("chains");
+    assert_eq!(chain_strings(chains), ["eip155:1"]);
     assert_eq!(
-        request.params.namespaces["eip155"].chains.as_deref(),
-        Some(["eip155:1".to_owned()].as_slice())
-    );
-    assert_eq!(
-        request.params.namespaces["eip155"].accounts,
+        account_strings(&request.params.namespaces["eip155"].accounts),
         ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]
     );
     assert_eq!(request.params.expiry, 1_780_418_257);
@@ -86,12 +89,12 @@ fn serializes_current_optional_fields() {
                 data: Some("relay-data".to_owned()),
             },
             namespaces: BTreeMap::from([(
-                "eip155".to_owned(),
+                "eip155".parse().expect("namespace key parses"),
                 SessionNamespace {
-                    chains: Some(vec!["eip155:1".to_owned()]),
-                    accounts: vec![
-                        "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".to_owned(),
-                    ],
+                    chains: Some(vec![chain("eip155:1")]),
+                    accounts: vec![account(
+                        "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
+                    )],
                     methods: vec!["personal_sign".to_owned()],
                     events: vec!["accountsChanged".to_owned()],
                 },

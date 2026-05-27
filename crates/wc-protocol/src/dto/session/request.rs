@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::caip::Caip2ChainId;
+
 /// Decrypted `wc_sessionRequest` params.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>
@@ -27,7 +29,7 @@ use serde_json::Value;
 pub struct SessionRequestParams {
     /// Requested chain in CAIP-2 format.
     #[serde(rename = "chainId")]
-    pub chain_id: String,
+    pub chain_id: Caip2ChainId,
     /// Dapp JSON-RPC request routed through the session.
     pub request: SessionRequest,
 }
@@ -73,7 +75,7 @@ impl SessionRequestParams {
 /// }"#;
 ///
 /// let params = serde_json::from_str::<SessionRequestParams>(json)?;
-/// assert_eq!(params.chain_id, "eip155:1");
+/// assert_eq!(params.chain_id.as_str(), "eip155:1");
 /// assert_eq!(params.request.method, "personal_sign");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
