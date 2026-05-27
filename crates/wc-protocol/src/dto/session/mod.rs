@@ -32,7 +32,7 @@ pub use rpc::{
 };
 pub use settle::{SessionSettleParams, SpecialNamespace, SpecialNamespaces};
 pub use types::{
-    ScopedProperties, SessionConfig, SessionNamespace, SessionNamespaces, SessionParticipant,
-    SessionProperties,
+    ScopedProperties, Session, SessionConfig, SessionNamespace, SessionNamespaces,
+    SessionParticipant, SessionProperties, SessionTransportType,
 };
 pub use update::SessionUpdateParams;

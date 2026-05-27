@@ -9,5 +9,6 @@ mod session {
     mod proposal;
     mod request;
     mod settle;
+    mod types;
     mod update;
 }
