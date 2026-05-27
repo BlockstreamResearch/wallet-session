@@ -1,6 +1,7 @@
 //! Sign API JSON-RPC envelopes.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::SignMethod;
 use crate::relay::JSON_RPC_VERSION;
@@ -212,5 +213,270 @@ impl<T> JsonRpcResponse<T> {
             jsonrpc: JSON_RPC_VERSION.to_owned(),
             result,
         }
+    }
+}
+
+/// JSON-RPC error response envelope for Sign API methods.
+///
+/// <https://www.jsonrpc.org/specification#response_object>
+///
+/// > This member is REQUIRED on error.
+/// > This member MUST NOT exist if there was no error triggered during invocation.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/jsonrpc/types/src/jsonrpc.ts#L23-L33>
+///
+/// > export interface JsonRpcError {
+/// > id: number;
+/// > jsonrpc: string;
+/// > error: ErrorResponse;
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1852-L1855>
+///
+/// > const payload = formatJsonRpcError(id, error);
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{
+///     JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
+/// };
+///
+/// let response = JsonRpcErrorResponse::new(
+///     1,
+///     JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+/// );
+///
+/// let value = serde_json::to_value(response)?;
+/// assert_eq!(value["jsonrpc"], "2.0");
+/// assert_eq!(value["error"]["code"], 5000);
+/// assert_eq!(value["error"]["message"], "User rejected.");
+/// assert!(value.get("result").is_none());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonRpcErrorResponse {
+    /// Request identifier from the failed Sign API request.
+    pub id: u64,
+    /// JSON-RPC protocol version.
+    pub jsonrpc: String,
+    /// JSON-RPC error object.
+    pub error: JsonRpcError,
+}
+
+impl JsonRpcErrorResponse {
+    /// Builds a Sign API JSON-RPC error response envelope.
+    #[must_use]
+    pub fn new(id: u64, error: JsonRpcError) -> Self {
+        Self {
+            id,
+            jsonrpc: JSON_RPC_VERSION.to_owned(),
+            error,
+        }
+    }
+}
+
+/// JSON-RPC error object.
+///
+/// <https://www.jsonrpc.org/specification#error_object>
+///
+/// > code
+/// > A Number that indicates the error type that occurred.
+/// > This MUST be an integer.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/48a79efd8c6929fc3421bcb327ae906a197a9837/jsonrpc/types/src/jsonrpc.ts#L29-L33>
+///
+/// > export interface ErrorResponse {
+/// > code: number;
+/// > message: string;
+/// > data?: string;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonRpcError {
+    /// Numeric JSON-RPC or `WalletConnect` SDK error code.
+    pub code: JsonRpcErrorCode,
+    /// Concise error message.
+    pub message: String,
+    /// Optional error data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl JsonRpcError {
+    /// Builds a JSON-RPC error object without `data`.
+    #[must_use]
+    pub fn new(code: JsonRpcErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// Builds a JSON-RPC error object with `data`.
+    #[must_use]
+    pub fn with_data(code: JsonRpcErrorCode, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
+    }
+}
+
+/// Numeric JSON-RPC and `WalletConnect` SDK error code.
+///
+/// <https://www.jsonrpc.org/specification#error_object>
+///
+/// > The error codes from and including -32768 to -32000 are reserved for
+/// > pre-defined errors.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/errors.ts#L10-L100>
+///
+/// > export const SDK_ERRORS = {
+/// > /* ----- INVALID (1xxx) ----- */
+/// > INVALID_METHOD: {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JsonRpcErrorCode {
+    /// JSON-RPC parse error, `-32700`.
+    ParseError,
+    /// JSON-RPC invalid request, `-32600`.
+    InvalidRequest,
+    /// JSON-RPC method not found, `-32601`.
+    MethodNotFound,
+    /// JSON-RPC invalid params, `-32602`.
+    InvalidParams,
+    /// JSON-RPC internal error, `-32603`.
+    InternalError,
+    /// `WalletConnect` invalid method, `1001`.
+    InvalidMethod,
+    /// `WalletConnect` invalid event, `1002`.
+    InvalidEvent,
+    /// `WalletConnect` invalid update request, `1003`.
+    InvalidUpdateRequest,
+    /// `WalletConnect` invalid extend request, `1004`.
+    InvalidExtendRequest,
+    /// `WalletConnect` invalid session settle request, `1005`.
+    InvalidSessionSettleRequest,
+    /// `WalletConnect` unauthorized method, `3001`.
+    UnauthorizedMethod,
+    /// `WalletConnect` unauthorized event, `3002`.
+    UnauthorizedEvent,
+    /// `WalletConnect` unauthorized update request, `3003`.
+    UnauthorizedUpdateRequest,
+    /// `WalletConnect` unauthorized extend request, `3004`.
+    UnauthorizedExtendRequest,
+    /// `WalletConnect` user rejection, `5000`.
+    UserRejected,
+    /// `WalletConnect` user rejected chains, `5001`.
+    UserRejectedChains,
+    /// `WalletConnect` user rejected methods, `5002`.
+    UserRejectedMethods,
+    /// `WalletConnect` user rejected events, `5003`.
+    UserRejectedEvents,
+    /// `WalletConnect` unsupported chains, `5100`.
+    UnsupportedChains,
+    /// `WalletConnect` unsupported methods, `5101`.
+    UnsupportedMethods,
+    /// `WalletConnect` unsupported events, `5102`.
+    UnsupportedEvents,
+    /// `WalletConnect` unsupported accounts, `5103`.
+    UnsupportedAccounts,
+    /// `WalletConnect` unsupported namespace key, `5104`.
+    UnsupportedNamespaceKey,
+    /// `WalletConnect` user disconnected, `6000`.
+    UserDisconnected,
+    /// `WalletConnect` session settlement failed, `7000`.
+    SessionSettlementFailed,
+    /// `WalletConnect` unsupported `wc_` method, `10001`.
+    WcMethodUnsupported,
+    /// Unrecognized error code preserved for compatibility.
+    Other(i64),
+}
+
+impl JsonRpcErrorCode {
+    /// Converts a numeric wire code into a known variant or `Other`.
+    #[must_use]
+    pub const fn from_i64(value: i64) -> Self {
+        match value {
+            -32700 => Self::ParseError,
+            -32600 => Self::InvalidRequest,
+            -32601 => Self::MethodNotFound,
+            -32602 => Self::InvalidParams,
+            -32603 => Self::InternalError,
+            1001 => Self::InvalidMethod,
+            1002 => Self::InvalidEvent,
+            1003 => Self::InvalidUpdateRequest,
+            1004 => Self::InvalidExtendRequest,
+            1005 => Self::InvalidSessionSettleRequest,
+            3001 => Self::UnauthorizedMethod,
+            3002 => Self::UnauthorizedEvent,
+            3003 => Self::UnauthorizedUpdateRequest,
+            3004 => Self::UnauthorizedExtendRequest,
+            5000 => Self::UserRejected,
+            5001 => Self::UserRejectedChains,
+            5002 => Self::UserRejectedMethods,
+            5003 => Self::UserRejectedEvents,
+            5100 => Self::UnsupportedChains,
+            5101 => Self::UnsupportedMethods,
+            5102 => Self::UnsupportedEvents,
+            5103 => Self::UnsupportedAccounts,
+            5104 => Self::UnsupportedNamespaceKey,
+            6000 => Self::UserDisconnected,
+            7000 => Self::SessionSettlementFailed,
+            10001 => Self::WcMethodUnsupported,
+            _ => Self::Other(value),
+        }
+    }
+
+    /// Numeric wire value.
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        match self {
+            Self::ParseError => -32700,
+            Self::InvalidRequest => -32600,
+            Self::MethodNotFound => -32601,
+            Self::InvalidParams => -32602,
+            Self::InternalError => -32603,
+            Self::InvalidMethod => 1001,
+            Self::InvalidEvent => 1002,
+            Self::InvalidUpdateRequest => 1003,
+            Self::InvalidExtendRequest => 1004,
+            Self::InvalidSessionSettleRequest => 1005,
+            Self::UnauthorizedMethod => 3001,
+            Self::UnauthorizedEvent => 3002,
+            Self::UnauthorizedUpdateRequest => 3003,
+            Self::UnauthorizedExtendRequest => 3004,
+            Self::UserRejected => 5000,
+            Self::UserRejectedChains => 5001,
+            Self::UserRejectedMethods => 5002,
+            Self::UserRejectedEvents => 5003,
+            Self::UnsupportedChains => 5100,
+            Self::UnsupportedMethods => 5101,
+            Self::UnsupportedEvents => 5102,
+            Self::UnsupportedAccounts => 5103,
+            Self::UnsupportedNamespaceKey => 5104,
+            Self::UserDisconnected => 6000,
+            Self::SessionSettlementFailed => 7000,
+            Self::WcMethodUnsupported => 10001,
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl Serialize for JsonRpcErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i64(self.as_i64())
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = i64::deserialize(deserializer)?;
+        Ok(Self::from_i64(value))
     }
 }

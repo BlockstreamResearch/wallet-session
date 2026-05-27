@@ -1,8 +1,9 @@
 use serde_json::json;
 use wc_protocol::session::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-    CacaoSignatureType, DappMetadata, JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams,
-    SessionAuthenticateResult, SessionParticipant, SignMethod,
+    CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
+    JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams, SessionAuthenticateResult,
+    SessionParticipant, SignMethod,
 };
 
 const LIVE_SESSION_AUTHENTICATE_JSON: &str = r#"{
@@ -78,6 +79,15 @@ const LIVE_SESSION_AUTHENTICATE_APPROVE_JSON: &str = r#"{
         ]
       }
     }
+  }
+}"#;
+
+const LIVE_SESSION_AUTHENTICATE_REJECT_JSON: &str = r#"{
+  "id": 1779863175935310,
+  "jsonrpc": "2.0",
+  "error": {
+    "code": 5000,
+    "message": "User rejected."
   }
 }"#;
 
@@ -318,4 +328,67 @@ fn cacao_type_values_preserve_known_and_unknown_wire_names() {
         serde_json::to_value(header).expect("serializes")["t"],
         "future-header"
     );
+}
+
+#[test]
+fn deserializes_live_authenticate_reject_shape() {
+    let response =
+        serde_json::from_str::<JsonRpcErrorResponse>(LIVE_SESSION_AUTHENTICATE_REJECT_JSON)
+            .expect("session authenticate rejection parses");
+
+    assert_eq!(response.id, 1_779_863_175_935_310);
+    assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+    assert_eq!(response.error.code.as_i64(), 5000);
+    assert_eq!(response.error.message, "User rejected.");
+    assert_eq!(response.error.data, None);
+}
+
+#[test]
+fn serializes_authenticate_reject_wire_shape() {
+    let response = JsonRpcErrorResponse::new(
+        7,
+        JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+    );
+
+    let value = serde_json::to_value(response).expect("serializes");
+
+    assert_eq!(value["id"], 7);
+    assert_eq!(value["jsonrpc"], "2.0");
+    assert_eq!(value["error"]["code"], 5000);
+    assert_eq!(value["error"]["message"], "User rejected.");
+    assert!(value["error"].get("data").is_none());
+    assert!(value.get("result").is_none());
+}
+
+#[test]
+fn error_codes_preserve_known_and_unknown_wire_numbers() {
+    assert_eq!(
+        JsonRpcErrorCode::from_i64(-32602),
+        JsonRpcErrorCode::InvalidParams
+    );
+    assert_eq!(
+        JsonRpcErrorCode::from_i64(10001),
+        JsonRpcErrorCode::WcMethodUnsupported
+    );
+    assert_eq!(
+        JsonRpcErrorCode::from_i64(42_000),
+        JsonRpcErrorCode::Other(42_000)
+    );
+
+    let error = JsonRpcError::with_data(
+        JsonRpcErrorCode::Other(42_000),
+        "Custom error.",
+        json!({
+            "source": "test"
+        }),
+    );
+
+    let value = serde_json::to_value(error).expect("serializes");
+
+    assert_eq!(value["code"], 42_000);
+    assert_eq!(value["message"], "Custom error.");
+    assert_eq!(value["data"]["source"], "test");
+
+    let parsed = serde_json::from_value::<JsonRpcError>(value).expect("deserializes");
+    assert_eq!(parsed.code, JsonRpcErrorCode::Other(42_000));
 }

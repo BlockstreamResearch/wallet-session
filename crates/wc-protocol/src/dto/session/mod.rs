@@ -27,7 +27,9 @@ pub use proposal::{
     RelayProtocolOptions, SessionProposeParams,
 };
 pub use request::{SessionRequest, SessionRequestParams};
-pub use rpc::{JsonRpcRequest, JsonRpcResponse};
+pub use rpc::{
+    JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+};
 pub use settle::{SessionSettleParams, SpecialNamespace, SpecialNamespaces};
 pub use types::{
     ScopedProperties, SessionConfig, SessionNamespace, SessionNamespaces, SessionParticipant,
