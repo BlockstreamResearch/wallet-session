@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/wc-core",
     "crates/wc-protocol",
+    "crates/wc-transport",
     "xtask",
 ]
 

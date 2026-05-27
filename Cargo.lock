@@ -967,6 +967,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wc-transport"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "wc-protocol",
+]
+
+[[package]]
 name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1065,14 +1079,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures-util",
  "getrandom 0.3.4",
- "rustls",
  "serde",
  "serde_json",
  "tokio",
- "tokio-tungstenite",
  "wc-protocol",
+ "wc-transport",
 ]
 
 [[package]]

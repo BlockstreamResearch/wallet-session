@@ -14,14 +14,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::{net::TcpStream, time::timeout};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, Utf8Bytes},
-};
+use tokio::time::timeout;
 use wc_protocol::session::{
     Cacao, JsonRpcErrorResponse, JsonRpcResponse as SignJsonRpcResponse, SessionAckResponse,
     SessionAuthenticateParams, SessionAuthenticateResult, SessionDeleteParams, SessionEventParams,
@@ -40,14 +35,14 @@ use wc_protocol::{
         IrnBatchSubscribe, IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse,
         IrnPublish, IrnSubscribe, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse,
-        RelayJsonRpcSuccess, RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
+        RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
     },
     session::{JsonRpcRequest, Session, SessionProposeParams, SignMethod},
 };
+use wc_transport::NativeRelayTransport;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
-type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
@@ -301,8 +296,6 @@ fn run_async(task: impl Future<Output = Result<()>>) -> Result<()> {
 }
 
 async fn relay_probe(mode: ProbeMode) -> Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
     let config = RelayProbeConfig::from_env()?;
 
     match mode {
@@ -1796,16 +1789,19 @@ async fn run_batch_publish_probe(config: &RelayProbeConfig) -> Result<()> {
 
 struct RelaySocket {
     role: &'static str,
-    stream: RelayStream,
+    stream: NativeRelayTransport,
 }
 
 impl RelaySocket {
     async fn connect(role: &'static str, url: &str) -> Result<Self> {
-        let (stream, response) = connect_async(url)
+        let connection = NativeRelayTransport::connect(url)
             .await
             .with_context(|| format!("{role} failed to connect to relay"))?;
-        println!("{role} connected status={}", response.status());
-        Ok(Self { role, stream })
+        println!("{role} connected status={}", connection.status());
+        Ok(Self {
+            role,
+            stream: connection.into_transport(),
+        })
     }
 
     async fn call<T>(&mut self, params: T) -> Result<RelayRpcId>
@@ -1997,9 +1993,10 @@ impl RelaySocket {
     async fn parse_and_ack_subscription(&mut self, value: Value) -> Result<IrnSubscription> {
         let request = serde_json::from_value::<RelayJsonRpcRequest<IrnSubscription>>(value)
             .context("failed to parse irn_subscription")?;
-        let ack = RelayJsonRpcSuccess::new(request.id(), true);
-        let ack = serde_json::to_value(ack).context("failed to serialize subscription ack")?;
-        self.send_json(&ack).await?;
+        self.stream
+            .ack_subscription(&request)
+            .await
+            .context("failed to acknowledge irn_subscription")?;
         println!(
             "{} -> irn_subscription ack id={}",
             self.role,
@@ -2011,7 +2008,7 @@ impl RelaySocket {
 
     async fn send_json(&mut self, value: &Value) -> Result<()> {
         self.stream
-            .send(Message::Text(Utf8Bytes::from(value.to_string())))
+            .send_json(value)
             .await
             .with_context(|| format!("{} failed to send json", self.role))
     }
@@ -2023,36 +2020,12 @@ impl RelaySocket {
     }
 
     async fn next_json(&mut self, wait: Duration) -> Result<Option<Value>> {
-        loop {
-            let Ok(message) = timeout(wait, self.stream.next()).await else {
-                return Ok(None);
-            };
+        let Ok(message) = timeout(wait, self.stream.next_json()).await else {
+            return Ok(None);
+        };
 
-            let Some(message) = message else {
-                bail!("{} relay stream ended", self.role);
-            };
-
-            let message =
-                message.with_context(|| format!("{} failed to read relay message", self.role))?;
-
-            match message {
-                Message::Text(text) => return parse_json(&text, self.role).map(Some),
-                Message::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec()).with_context(|| {
-                        format!("{} received non-utf8 binary message", self.role)
-                    })?;
-                    return parse_json(&text, self.role).map(Some);
-                }
-                Message::Ping(bytes) => self.stream.send(Message::Pong(bytes)).await?,
-                Message::Pong(_) | Message::Frame(_) => {}
-                Message::Close(frame) => bail!("{} relay closed: {frame:?}", self.role),
-            }
-        }
+        message.with_context(|| format!("{} failed to read relay websocket message", self.role))
     }
-}
-
-fn parse_json(text: &str, role: &str) -> Result<Value> {
-    serde_json::from_str(text).with_context(|| format!("{role} received invalid json: {text}"))
 }
 
 fn client_auth_jwt(audience: &str, seed: &[u8; 32]) -> Result<RelayAuthToken> {
