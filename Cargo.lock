@@ -1096,6 +1096,12 @@ dependencies = [
 [[package]]
 name = "wc-core"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "wc-protocol",
+ "wc-transport",
+]
 
 [[package]]
 name = "wc-protocol"
@@ -1233,6 +1239,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wc-core",
  "wc-protocol",
  "wc-transport",
 ]

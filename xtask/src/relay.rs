@@ -13,6 +13,7 @@ use crate::util::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
+use wc_core::{PairingClient, PairingClientConfig, PairingReceivedMessage};
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding},
@@ -36,6 +37,7 @@ pub enum ProbeMode {
     Basic,
     Matrix,
     JsProposal,
+    CoreJsProposal,
     PairingUri(String),
 }
 
@@ -46,6 +48,7 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::Basic => run_basic_probe(&config).await,
         ProbeMode::Matrix => run_probe_matrix(&config).await,
         ProbeMode::JsProposal => run_js_proposal_probe(&config).await,
+        ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
 }
@@ -231,6 +234,43 @@ async fn run_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
     Ok(())
 }
 
+async fn run_core_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let harness_dir = workspace_root.join("tools/js-harness");
+    let uri_file = workspace_root.join(JS_HARNESS_URI_FILE);
+    if let Some(parent) = uri_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(&uri_file);
+
+    let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+    println!(
+        "core-js-proposal harness_dir={} uri_file={} hold_ms={hold_ms}",
+        harness_dir.display(),
+        uri_file.display()
+    );
+
+    let child = Command::new("bun")
+        .args(["run", "propose-session"])
+        .current_dir(&harness_dir)
+        .env("WC_JS_URI_FILE", &uri_file)
+        .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+        .env_remove("WC_JS_PRINT_URI")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
+    let mut harness = ChildGuard::new(child);
+    let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
+
+    run_core_pairing_uri_probe(config, uri.trim()).await?;
+    harness.terminate();
+
+    Ok(())
+}
+
 async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
     let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
     let now = unix_timestamp();
@@ -312,6 +352,60 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
     Ok(())
 }
 
+async fn run_core_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
+    let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    println!(
+        "core-pairing project_id={} relay_url={} topic={} version={} relay_protocol={} sym_key={} expiry={:?} expired_now={}",
+        redact(&config.project_id),
+        config.relay_url,
+        pairing.topic(),
+        pairing.version(),
+        pairing.relay().protocol(),
+        redact(pairing.sym_key().as_str()),
+        pairing.expiry_timestamp(),
+        pairing.is_expired_at(unix_timestamp())
+    );
+
+    let mut client = PairingClient::connect(&client_config).await?;
+    println!("core-pairing connected status={}", client.status());
+
+    let fetched = client.fetch_pairing_messages(&pairing).await?;
+    println!("core-pairing fetch_messages count={}", fetched.len());
+    for (index, message) in fetched.iter().enumerate() {
+        print_core_pairing_payload_metadata(
+            &format!("core-pairing fetched index={index}"),
+            message,
+        )?;
+    }
+
+    let subscription = client.subscribe_pairing(&pairing).await?;
+    println!(
+        "core-pairing subscription_id={}",
+        subscription.subscription_id()
+    );
+
+    match client.next_pairing_message(&subscription).await? {
+        Some(message) => {
+            print_core_pairing_payload_metadata("core-pairing live_message", &message)?;
+        }
+        None => println!("core-pairing live_message=false"),
+    }
+
+    let unsubscribe_result = client.unsubscribe_pairing(&subscription).await?;
+    println!("core-pairing unsubscribe_ack={unsubscribe_result}");
+
+    Ok(())
+}
+
 fn print_pairing_payload_metadata(
     label: &str,
     data: &IrnSubscriptionData,
@@ -322,6 +416,58 @@ fn print_pairing_payload_metadata(
 
     println!(
         "{label} envelope_type={:?} decrypted_len={} jsonrpc={} id={} method={} params_keys={}",
+        payload.envelope_type(),
+        payload.plaintext().len(),
+        payload
+            .json()
+            .get("jsonrpc")
+            .and_then(Value::as_str)
+            .unwrap_or("<none>"),
+        json_id(payload.json()),
+        pairing_message_method_label(payload.method()),
+        params_keys(payload.json())
+    );
+
+    match payload.method() {
+        PairingMessageMethod::Sign(SignMethod::SessionPropose) => {
+            print_session_proposal_summary(label, payload.json().clone())?;
+        }
+        PairingMessageMethod::Sign(method) => {
+            println!("{label} sign_request method={method}");
+        }
+        PairingMessageMethod::Pairing(method) => {
+            print_pairing_payload_summary(label, *method, payload.json().clone())?;
+        }
+        PairingMessageMethod::Unknown(method) => {
+            println!("{label} unknown_request method={method}");
+        }
+        PairingMessageMethod::Missing => {
+            println!("{label} missing_method=true");
+        }
+    }
+
+    if pairing_uri_print_json() {
+        let pretty = serde_json::to_string_pretty(payload.json())
+            .with_context(|| format!("{label} failed to format decrypted JSON"))?;
+        println!("{label} decrypted_json=\n{pretty}");
+    }
+
+    Ok(())
+}
+
+fn print_core_pairing_payload_metadata(
+    label: &str,
+    received: &PairingReceivedMessage,
+) -> Result<()> {
+    let payload = received.message();
+
+    println!(
+        "{label} topic={} message_len={} tag_present={} tag={} published_at={} envelope_type={:?} decrypted_len={} jsonrpc={} id={} method={} params_keys={}",
+        received.topic(),
+        received.encoded_message_len(),
+        received.tag().is_some(),
+        received.tag().unwrap_or_default(),
+        received.published_at(),
         payload.envelope_type(),
         payload.plaintext().len(),
         payload

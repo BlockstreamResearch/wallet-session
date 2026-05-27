@@ -45,8 +45,17 @@ struct RelayProbeArgs {
     #[arg(long)]
     js_proposal: bool,
 
+    #[command(flatten)]
+    core: CoreRelayProbeArgs,
+
     #[arg(long, value_name = "URI")]
     pairing_uri: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CoreRelayProbeArgs {
+    #[arg(long)]
+    core_js_proposal: bool,
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +100,7 @@ impl RelayProbeArgs {
         let selected_count = usize::from(self.basic)
             + usize::from(self.matrix)
             + usize::from(self.js_proposal)
+            + usize::from(self.core.core_js_proposal)
             + usize::from(self.pairing_uri.is_some());
         if selected_count > 1 {
             bail!("choose only one relay probe mode");
@@ -105,6 +115,9 @@ impl RelayProbeArgs {
         if self.js_proposal {
             return Ok(relay::ProbeMode::JsProposal);
         }
+        if self.core.core_js_proposal {
+            return Ok(relay::ProbeMode::CoreJsProposal);
+        }
         if let Some(uri) = self.pairing_uri {
             return Ok(relay::ProbeMode::PairingUri(uri));
         }
@@ -113,6 +126,7 @@ impl RelayProbeArgs {
             Ok("basic") | Err(_) => Ok(relay::ProbeMode::Basic),
             Ok("matrix") => Ok(relay::ProbeMode::Matrix),
             Ok("js-proposal") => Ok(relay::ProbeMode::JsProposal),
+            Ok("core-js-proposal") => Ok(relay::ProbeMode::CoreJsProposal),
             Ok("pairing-uri") => {
                 let uri = env::var("WC_PAIRING_URI")
                     .context("set WC_PAIRING_URI when WC_RELAY_PROBE_MODE=pairing-uri")?;
