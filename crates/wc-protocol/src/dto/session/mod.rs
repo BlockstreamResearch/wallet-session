@@ -13,7 +13,10 @@ mod settle;
 mod types;
 mod update;
 
-pub use authenticate::{AuthPayload, SessionAuthenticateParams};
+pub use authenticate::{
+    AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
+    CacaoSignatureType, SessionAuthenticateParams, SessionAuthenticateResult,
+};
 pub use delete::SessionDeleteParams;
 pub use event::{SessionEvent, SessionEventParams};
 pub use extend::SessionExtendParams;
@@ -24,7 +27,7 @@ pub use proposal::{
     RelayProtocolOptions, SessionProposeParams,
 };
 pub use request::{SessionRequest, SessionRequestParams};
-pub use rpc::JsonRpcRequest;
+pub use rpc::{JsonRpcRequest, JsonRpcResponse};
 pub use settle::{SessionSettleParams, SpecialNamespace, SpecialNamespaces};
 pub use types::{
     ScopedProperties, SessionConfig, SessionNamespace, SessionNamespaces, SessionParticipant,

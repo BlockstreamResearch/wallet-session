@@ -131,3 +131,86 @@ impl<T> JsonRpcRequest<T> {
         self.method == SignMethod::SessionAuthenticate
     }
 }
+
+/// JSON-RPC success response envelope for Sign API methods.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L62-L65>
+///
+/// > interface EventCallback<T extends JsonRpcRequest | JsonRpcResponse> {
+/// > topic: string;
+/// > payload: T;
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{
+///     Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature, CacaoSignatureType,
+///     DappMetadata, JsonRpcResponse, SessionAuthenticateResult, SessionParticipant,
+/// };
+///
+/// let response = JsonRpcResponse::new(
+///     1,
+///     SessionAuthenticateResult {
+///         responder: SessionParticipant {
+///             public_key: "wallet-public-key".to_owned(),
+///             metadata: DappMetadata {
+///                 name: "Wallet".to_owned(),
+///                 description: "Wallet".to_owned(),
+///                 url: "https://example.com/wallet".to_owned(),
+///                 icons: vec![],
+///                 verify_url: None,
+///                 redirect: None,
+///             },
+///         },
+///         cacaos: vec![Cacao {
+///             h: CacaoHeader {
+///                 kind: CacaoHeaderType::Caip122,
+///             },
+///             p: CacaoPayload {
+///                 iss: "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".to_owned(),
+///                 domain: "example.com".to_owned(),
+///                 aud: "https://example.com/login".to_owned(),
+///                 version: "1".to_owned(),
+///                 nonce: "1234567890".to_owned(),
+///                 iat: "2026-05-27T06:10:58.791Z".to_owned(),
+///                 statement: Some(String::new()),
+///                 exp: None,
+///                 nbf: None,
+///                 request_id: None,
+///                 resources: vec![],
+///             },
+///             s: CacaoSignature {
+///                 kind: CacaoSignatureType::Eip191,
+///                 signature: "0x00".to_owned(),
+///                 meta: None,
+///             },
+///         }],
+///     },
+/// );
+///
+/// let value = serde_json::to_value(response)?;
+/// assert_eq!(value["jsonrpc"], "2.0");
+/// assert_eq!(value["result"]["cacaos"][0]["h"]["t"], "caip122");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonRpcResponse<T> {
+    /// Request identifier from the answered Sign API request.
+    pub id: u64,
+    /// JSON-RPC protocol version.
+    pub jsonrpc: String,
+    /// Method-specific success payload.
+    pub result: T,
+}
+
+impl<T> JsonRpcResponse<T> {
+    /// Builds a Sign API JSON-RPC success response envelope.
+    #[must_use]
+    pub fn new(id: u64, result: T) -> Self {
+        Self {
+            id,
+            jsonrpc: JSON_RPC_VERSION.to_owned(),
+            result,
+        }
+    }
+}
