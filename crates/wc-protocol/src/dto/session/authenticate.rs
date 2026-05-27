@@ -68,6 +68,7 @@ use crate::{caip::Caip2ChainId, did::DidPkh};
 /// let request = serde_json::from_str::<JsonRpcRequest<SessionAuthenticateParams>>(json)?;
 /// assert_eq!(request.method, SignMethod::SessionAuthenticate);
 /// assert_eq!(request.params.auth_payload.domain, "example.com");
+/// assert_eq!(request.params.auth_payload.kind.as_str(), "caip122");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,9 +116,24 @@ impl SessionAuthenticateParams {
 /// > } & RequestParams;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthPayload {
-    /// Payload type, normally `caip122`.
+    /// Payload format requested for the authentication message.
+    ///
+    /// Current Sign clients default this field to `caip122`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1026-L1039>
+    ///
+    /// > authPayload: {
+    /// > type: type ?? "caip122",
+    ///
+    /// The public TypeScript API still accepts a string, so unknown values are
+    /// preserved.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L77-L91>
+    ///
+    /// > interface BaseAuthRequestParams {
+    /// > type?: string;
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: CacaoHeaderType,
     /// Requested CAIP-2 chains.
     pub chains: Vec<Caip2ChainId>,
     /// URI identifying the authentication audience.
@@ -179,6 +195,17 @@ impl CacaoHeaderType {
             Self::Other(value) => value,
         }
     }
+
+    /// Converts a wire value into a known type or a lossless fallback.
+    #[must_use]
+    pub fn from_wire(value: impl Into<String>) -> Self {
+        let value = value.into();
+        match value.as_str() {
+            "caip122" => Self::Caip122,
+            "eip4361" => Self::Eip4361,
+            _ => Self::Other(value),
+        }
+    }
 }
 
 impl Serialize for CacaoHeaderType {
@@ -196,11 +223,7 @@ impl<'de> Deserialize<'de> for CacaoHeaderType {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "caip122" => Self::Caip122,
-            "eip4361" => Self::Eip4361,
-            _ => Self::Other(value),
-        })
+        Ok(Self::from_wire(value))
     }
 }
 

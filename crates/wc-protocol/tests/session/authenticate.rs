@@ -106,7 +106,7 @@ fn deserializes_live_authenticate_shape() {
         request.params.requester.metadata.name,
         "wc-rs live auth dapp"
     );
-    assert_eq!(request.params.auth_payload.kind, "caip122");
+    assert_eq!(request.params.auth_payload.kind, CacaoHeaderType::Caip122);
     assert_eq!(
         chain_strings(&request.params.auth_payload.chains),
         ["eip155:1"]
@@ -145,7 +145,7 @@ fn serializes_authenticate_request_with_optional_fields() {
                 },
             },
             auth_payload: AuthPayload {
-                kind: "caip122".to_owned(),
+                kind: CacaoHeaderType::Caip122,
                 chains: vec![chain("eip155:1")],
                 aud: "https://example.com/login".to_owned(),
                 domain: "example.com".to_owned(),
@@ -203,6 +203,42 @@ fn optional_auth_payload_fields_can_be_absent() {
     assert_eq!(params.auth_payload.statement, None);
     assert_eq!(params.auth_payload.resources, Vec::<String>::new());
     assert!(!params.is_expired_at(1_700_000_000));
+}
+
+#[test]
+fn auth_payload_type_preserves_unknown_wire_values() {
+    let value = json!({
+        "authPayload": {
+            "type": "future-auth-type",
+            "chains": ["eip155:1"],
+            "aud": "https://example.com/login",
+            "domain": "example.com",
+            "version": "1",
+            "nonce": "1234567890",
+            "iat": "2026-05-26T17:16:14.225Z"
+        },
+        "requester": {
+            "publicKey": "351b54461d6075e0bcc0084f3f901cb7cdf4b16135e8ffa46a3a7193c6125b2e",
+            "metadata": {
+                "name": "Dapp",
+                "description": "Dapp",
+                "url": "https://example.com/dapp",
+                "icons": []
+            }
+        },
+        "expiryTimestamp": 1_779_819_374
+    });
+
+    let params = serde_json::from_value::<SessionAuthenticateParams>(value).expect("parses");
+
+    assert_eq!(
+        params.auth_payload.kind,
+        CacaoHeaderType::Other("future-auth-type".to_owned())
+    );
+    assert_eq!(
+        serde_json::to_value(params).expect("serializes")["authPayload"]["type"],
+        "future-auth-type"
+    );
 }
 
 #[test]
