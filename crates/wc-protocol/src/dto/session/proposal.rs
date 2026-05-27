@@ -109,6 +109,50 @@ impl SessionProposeParams {
     }
 }
 
+/// Success result for an approved `wc_sessionPropose`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/jsonrpc.ts#L84-L91>
+///
+/// > wc_sessionPropose: {
+/// > relay: RelayerTypes.ProtocolOptions;
+/// > responderPublicKey: string;
+/// > };
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L528-L537>
+///
+/// > pairingProposalResponse: {
+/// > relay: {
+/// > protocol: relayProtocol ?? "irn",
+/// > },
+/// > responderPublicKey: selfPublicKey,
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{JsonRpcResponse, SessionProposeResult};
+///
+/// let json = r#"{
+///   "id": 1779866466221833,
+///   "jsonrpc": "2.0",
+///   "result": {
+///     "relay": {"protocol": "irn"},
+///     "responderPublicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
+///   }
+/// }"#;
+///
+/// let response = serde_json::from_str::<JsonRpcResponse<SessionProposeResult>>(json)?;
+/// assert_eq!(response.result.relay.protocol, "irn");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionProposeResult {
+    /// Relay protocol selected by the wallet for the session.
+    pub relay: RelayProtocolOptions,
+    /// Wallet public key used by the dapp to derive the session topic.
+    #[serde(rename = "responderPublicKey")]
+    pub responder_public_key: String,
+}
+
 /// Proposal namespace map keyed by namespace or CAIP-2 chain ID.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/clients/sign/namespaces#proposal-namespace>

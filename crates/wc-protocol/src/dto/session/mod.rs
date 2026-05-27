@@ -24,7 +24,7 @@ pub use method::SignMethod;
 pub use ping::SessionPingParams;
 pub use proposal::{
     DappMetadata, DappRedirect, ProposalNamespace, ProposalNamespaces, ProposalRequests, Proposer,
-    RelayProtocolOptions, SessionProposeParams,
+    RelayProtocolOptions, SessionProposeParams, SessionProposeResult,
 };
 pub use request::{SessionRequest, SessionRequestParams};
 pub use rpc::{

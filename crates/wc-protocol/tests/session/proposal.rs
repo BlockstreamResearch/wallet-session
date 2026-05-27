@@ -4,8 +4,8 @@ use serde_json::json;
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        DappMetadata, JsonRpcRequest, ProposalNamespaces, ProposalRequests, Proposer,
-        RelayProtocolOptions, SessionProposeParams, SignMethod,
+        DappMetadata, JsonRpcRequest, JsonRpcResponse, ProposalNamespaces, ProposalRequests,
+        Proposer, RelayProtocolOptions, SessionProposeParams, SessionProposeResult, SignMethod,
     },
 };
 
@@ -51,6 +51,17 @@ const SESSION_PROPOSE_JSON: &str = r#"{
         }
       }
     }
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_APPROVE_JSON: &str = r#"{
+  "id": 1779866466221833,
+  "jsonrpc": "2.0",
+  "result": {
+    "relay": {
+      "protocol": "irn"
+    },
+    "responderPublicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
   }
 }"#;
 
@@ -219,4 +230,44 @@ fn serializes_current_type_names() {
         Some("encrypted-id")
     );
     assert!(value["params"].get("expiry").is_none());
+}
+
+#[test]
+fn deserializes_live_proposal_approval_result_shape() {
+    let response = serde_json::from_str::<JsonRpcResponse<SessionProposeResult>>(
+        LIVE_SESSION_PROPOSE_APPROVE_JSON,
+    )
+    .expect("session proposal approval parses");
+
+    assert_eq!(response.id, 1_779_866_466_221_833);
+    assert_eq!(response.result.relay.protocol, "irn");
+    assert_eq!(
+        response.result.responder_public_key,
+        "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
+    );
+}
+
+#[test]
+fn serializes_proposal_approval_result_wire_shape() {
+    let response = JsonRpcResponse::new(
+        43,
+        SessionProposeResult {
+            relay: RelayProtocolOptions {
+                protocol: "irn".to_owned(),
+                data: Some("relay-data".to_owned()),
+            },
+            responder_public_key:
+                "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337".to_owned(),
+        },
+    );
+
+    let value = serde_json::to_value(response).expect("serializes");
+
+    assert_eq!(value["jsonrpc"], "2.0");
+    assert_eq!(value["result"]["relay"]["protocol"], "irn");
+    assert_eq!(value["result"]["relay"]["data"], "relay-data");
+    assert_eq!(
+        value["result"]["responderPublicKey"],
+        "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
+    );
 }
