@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     caip::{Caip2ChainId, Caip10AccountId, CaipNamespace, NamespaceKey},
-    session::{ProposalNamespace, ProposalNamespaces, SessionNamespaces},
+    session::{
+        ProposalNamespace, ProposalNamespaces, SessionEventName, SessionMethod, SessionNamespaces,
+    },
 };
 
 /// Validates that approved session namespaces satisfy required proposal namespaces.
@@ -43,8 +45,8 @@ use crate::{
 ///     NamespaceKey::parse("eip155")?,
 ///     ProposalNamespace {
 ///         chains: Some(vec![Caip2ChainId::parse("eip155:1")?]),
-///         methods: vec!["personal_sign".to_owned()],
-///         events: vec!["accountsChanged".to_owned()],
+///         methods: vec!["personal_sign".parse()?],
+///         events: vec!["accountsChanged".parse()?],
 ///     },
 /// );
 ///
@@ -56,8 +58,8 @@ use crate::{
 ///         accounts: vec![Caip10AccountId::parse(
 ///             "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
 ///         )?],
-///         methods: vec!["personal_sign".to_owned()],
-///         events: vec!["accountsChanged".to_owned()],
+///         methods: vec!["personal_sign".parse()?],
+///         events: vec!["accountsChanged".parse()?],
 ///     },
 /// );
 ///
@@ -248,7 +250,7 @@ pub enum NamespaceValidationError {
         /// Chain whose method set is incomplete.
         chain_id: Caip2ChainId,
         /// Missing JSON-RPC method.
-        method: String,
+        method: SessionMethod,
     },
 
     /// A required event is not present in the approved chain permissions.
@@ -257,21 +259,21 @@ pub enum NamespaceValidationError {
         /// Chain whose event set is incomplete.
         chain_id: Caip2ChainId,
         /// Missing session event.
-        event: String,
+        event: SessionEventName,
     },
 }
 
 #[derive(Debug, Default)]
 struct ChainRequirements {
-    methods: BTreeSet<String>,
-    events: BTreeSet<String>,
+    methods: BTreeSet<SessionMethod>,
+    events: BTreeSet<SessionEventName>,
 }
 
 #[derive(Debug, Default)]
 struct ChainPermissions {
     account_count: usize,
-    methods: BTreeSet<String>,
-    events: BTreeSet<String>,
+    methods: BTreeSet<SessionMethod>,
+    events: BTreeSet<SessionEventName>,
 }
 
 fn proposal_requirements_by_chain(

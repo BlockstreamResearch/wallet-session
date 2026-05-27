@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::rpc::{JsonRpcError, JsonRpcErrorResponse, JsonRpcResponse};
+use super::{
+    SessionMethod,
+    rpc::{JsonRpcError, JsonRpcErrorResponse, JsonRpcResponse},
+};
 use crate::caip::Caip2ChainId;
 
 /// Decrypted `wc_sessionRequest` params.
@@ -77,13 +80,13 @@ impl SessionRequestParams {
 ///
 /// let params = serde_json::from_str::<SessionRequestParams>(json)?;
 /// assert_eq!(params.chain_id.as_str(), "eip155:1");
-/// assert_eq!(params.request.method, "personal_sign");
+/// assert_eq!(params.request.method.as_str(), "personal_sign");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRequest {
     /// Chain-specific JSON-RPC method.
-    pub method: String,
+    pub method: SessionMethod,
     /// Chain-specific JSON-RPC params preserved as JSON.
     pub params: Value,
     /// Request expiry timestamp in unix seconds.

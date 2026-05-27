@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    RelayProtocolOptions, ScopedProperties, SessionConfig, SessionNamespaces, SessionParticipant,
-    SessionProperties,
+    RelayProtocolOptions, ScopedProperties, SessionConfig, SessionEventName, SessionMethod,
+    SessionNamespaces, SessionParticipant, SessionProperties,
 };
 
 /// Decrypted `wc_sessionSettle` params.
@@ -64,7 +64,7 @@ use super::{
 ///
 /// let request = serde_json::from_str::<JsonRpcRequest<SessionSettleParams>>(json)?;
 /// assert_eq!(request.method, SignMethod::SessionSettle);
-/// assert_eq!(request.params.namespaces["eip155"].methods, ["personal_sign"]);
+/// assert_eq!(request.params.namespaces["eip155"].methods[0].as_str(), "personal_sign");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +135,7 @@ pub type SpecialNamespaces = BTreeMap<String, SpecialNamespace>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecialNamespace {
     /// Approved JSON-RPC methods.
-    pub methods: Vec<String>,
+    pub methods: Vec<SessionMethod>,
     /// Approved session events.
-    pub events: Vec<String>,
+    pub events: Vec<SessionEventName>,
 }

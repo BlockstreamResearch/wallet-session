@@ -1,5 +1,6 @@
 //! Sign API session DTOs.
 
+mod action;
 mod authenticate;
 mod delete;
 mod event;
@@ -13,6 +14,7 @@ mod settle;
 mod types;
 mod update;
 
+pub use action::{SessionEventName, SessionEventNameError, SessionMethod, SessionMethodError};
 pub use authenticate::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
     CacaoSignatureType, SessionAuthenticateParams, SessionAuthenticateResult,

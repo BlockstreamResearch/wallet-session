@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::chain;
+use super::{chain, method};
 use wc_protocol::session::{
     JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionRequest,
     SessionRequestErrorResponse, SessionRequestParams, SessionRequestResponse, SignMethod,
@@ -75,7 +75,7 @@ fn deserializes_live_personal_sign_shape() {
     assert!(request.is_session_request());
     assert_eq!(request.method, SignMethod::SessionRequest);
     assert_eq!(request.params.chain_id.as_str(), "eip155:1");
-    assert_eq!(request.params.request.method, "personal_sign");
+    assert_eq!(request.params.request.method.as_str(), "personal_sign");
     assert_eq!(
         request.params.request.params,
         json!([
@@ -115,7 +115,10 @@ fn deserializes_spec_expiry_alias() {
         serde_json::from_value::<JsonRpcRequest<SessionRequestParams>>(value).expect("parses");
 
     assert_eq!(request.params.chain_id.as_str(), "eip155:5");
-    assert_eq!(request.params.request.method, "eth_signTransaction");
+    assert_eq!(
+        request.params.request.method.as_str(),
+        "eth_signTransaction"
+    );
     assert_eq!(request.params.request.expiry_timestamp, Some(1_700_000_300));
 }
 
@@ -127,7 +130,7 @@ fn serializes_current_expiry_timestamp_name() {
         SessionRequestParams {
             chain_id: chain("eip155:1"),
             request: SessionRequest {
-                method: "personal_sign".to_owned(),
+                method: method("personal_sign"),
                 params: json!(["0x68656c6c6f", "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]),
                 expiry_timestamp: Some(1_700_000_300),
             },

@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::rpc::{JsonRpcError, JsonRpcErrorResponse};
+use super::{
+    SessionEventName, SessionMethod,
+    rpc::{JsonRpcError, JsonRpcErrorResponse},
+};
 use crate::{
     caip::{Caip2ChainId, NamespaceKey},
     key::X25519PublicKey,
@@ -228,9 +231,9 @@ pub struct ProposalNamespace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chains: Option<Vec<Caip2ChainId>>,
     /// JSON-RPC methods requested under this namespace key.
-    pub methods: Vec<String>,
+    pub methods: Vec<SessionMethod>,
     /// Session events requested under this namespace key.
-    pub events: Vec<String>,
+    pub events: Vec<SessionEventName>,
 }
 
 /// Relay protocol option used by the proposal.

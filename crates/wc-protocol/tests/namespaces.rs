@@ -8,7 +8,10 @@ use wc_protocol::{
         NamespaceValidationError, is_chain_authorized, is_event_authorized, is_method_authorized,
         validate_approved_namespaces, validate_required_namespaces,
     },
-    session::{ProposalNamespace, ProposalNamespaces, SessionNamespace, SessionNamespaces},
+    session::{
+        ProposalNamespace, ProposalNamespaces, SessionEventName, SessionMethod, SessionNamespace,
+        SessionNamespaces,
+    },
 };
 
 fn chain(value: &str) -> Caip2ChainId {
@@ -23,6 +26,14 @@ fn key(value: &str) -> NamespaceKey {
     NamespaceKey::parse(value).expect("namespace key parses")
 }
 
+fn method(value: &str) -> SessionMethod {
+    value.parse().expect("method parses")
+}
+
+fn event_name(value: &str) -> SessionEventName {
+    value.parse().expect("event parses")
+}
+
 fn proposal_namespace(
     chains: Option<Vec<&str>>,
     methods: Vec<&str>,
@@ -30,8 +41,8 @@ fn proposal_namespace(
 ) -> ProposalNamespace {
     ProposalNamespace {
         chains: chains.map(|chains| chains.into_iter().map(chain).collect()),
-        methods: methods.into_iter().map(str::to_owned).collect(),
-        events: events.into_iter().map(str::to_owned).collect(),
+        methods: methods.into_iter().map(method).collect(),
+        events: events.into_iter().map(event_name).collect(),
     }
 }
 
@@ -43,8 +54,8 @@ fn session_namespace(
     SessionNamespace {
         chains: None,
         accounts: accounts.into_iter().map(account).collect(),
-        methods: methods.into_iter().map(str::to_owned).collect(),
-        events: events.into_iter().map(str::to_owned).collect(),
+        methods: methods.into_iter().map(method).collect(),
+        events: events.into_iter().map(event_name).collect(),
     }
 }
 
@@ -233,7 +244,7 @@ fn rejects_missing_required_method() {
         error,
         NamespaceValidationError::MissingMethod {
             chain_id: chain("eip155:1"),
-            method: "eth_signTypedData".to_owned()
+            method: method("eth_signTypedData")
         }
     );
 }
@@ -263,7 +274,7 @@ fn rejects_missing_required_event() {
         error,
         NamespaceValidationError::MissingEvent {
             chain_id: chain("eip155:1"),
-            event: "chainChanged".to_owned()
+            event: event_name("chainChanged")
         }
     );
 }

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::SessionEventName;
 use crate::caip::Caip2ChainId;
 
 /// Decrypted `wc_sessionEvent` params.
@@ -59,7 +60,7 @@ use crate::caip::Caip2ChainId;
 ///
 /// let request = serde_json::from_str::<JsonRpcRequest<SessionEventParams>>(json)?;
 /// assert_eq!(request.method, SignMethod::SessionEvent);
-/// assert_eq!(request.params.event.name, "accountsChanged");
+/// assert_eq!(request.params.event.name.as_str(), "accountsChanged");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +82,8 @@ pub struct SessionEventParams {
 /// > this.client.events.emit("session_event", { id, topic, params });
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEvent {
-    /// Namespace-approved event name, for example `accountsChanged`.
-    pub name: String,
+    /// Namespace-approved event name.
+    pub name: SessionEventName,
     /// Event data preserved as JSON because the Sign API leaves the value
     /// chain-specific.
     pub data: Value,

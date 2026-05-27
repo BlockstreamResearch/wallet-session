@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::{account, account_strings, chain, chain_strings, public_key};
+use super::{account, account_strings, chain, chain_strings, event_name, method, public_key};
 use wc_protocol::session::{
     DappMetadata, JsonRpcRequest, RelayProtocolOptions, SessionConfig, SessionNamespace,
     SessionParticipant, SessionSettleParams, SignMethod, SpecialNamespace,
@@ -95,8 +95,8 @@ fn serializes_current_optional_fields() {
                     accounts: vec![account(
                         "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
                     )],
-                    methods: vec!["personal_sign".to_owned()],
-                    events: vec!["accountsChanged".to_owned()],
+                    methods: vec![method("personal_sign")],
+                    events: vec![event_name("accountsChanged")],
                 },
             )]),
             controller: SessionParticipant {
@@ -127,7 +127,7 @@ fn serializes_current_optional_fields() {
             special_namespaces: Some(BTreeMap::from([(
                 "cosmos".to_owned(),
                 SpecialNamespace {
-                    methods: vec!["cosmos_signDirect".to_owned()],
+                    methods: vec![method("cosmos_signDirect")],
                     events: vec![],
                 },
             )])),

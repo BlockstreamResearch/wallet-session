@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use super::{Cacao, DappMetadata, ProposalNamespaces, RelayProtocolOptions};
+use super::{
+    Cacao, DappMetadata, ProposalNamespaces, RelayProtocolOptions, SessionEventName, SessionMethod,
+};
 use crate::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
     key::X25519PublicKey,
@@ -66,7 +68,7 @@ use crate::{
 /// }"#;
 ///
 /// let session = serde_json::from_str::<Session>(json)?;
-/// assert_eq!(session.namespaces["eip155"].methods, ["personal_sign"]);
+/// assert_eq!(session.namespaces["eip155"].methods[0].as_str(), "personal_sign");
 /// assert!(!session.is_expired_at(1_700_000_000));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -228,9 +230,9 @@ pub struct SessionNamespace {
     /// Approved CAIP-10 accounts.
     pub accounts: Vec<Caip10AccountId>,
     /// Approved JSON-RPC methods.
-    pub methods: Vec<String>,
+    pub methods: Vec<SessionMethod>,
     /// Approved session events.
-    pub events: Vec<String>,
+    pub events: Vec<SessionEventName>,
 }
 
 /// Participant public key and metadata.

@@ -4,6 +4,7 @@ mod session {
     use wc_protocol::caip::{Caip2ChainId, Caip10AccountId};
     use wc_protocol::did::DidPkh;
     use wc_protocol::key::X25519PublicKey;
+    use wc_protocol::session::{SessionEventName, SessionMethod};
 
     fn chain(value: &str) -> Caip2ChainId {
         value.parse().expect("test chain ID parses")
@@ -21,6 +22,14 @@ mod session {
         value.parse().expect("test X25519 public key parses")
     }
 
+    fn method(value: &str) -> SessionMethod {
+        value.parse().expect("test session method parses")
+    }
+
+    fn event_name(value: &str) -> SessionEventName {
+        value.parse().expect("test session event name parses")
+    }
+
     fn chain_strings(values: &[Caip2ChainId]) -> Vec<&str> {
         values.iter().map(Caip2ChainId::as_str).collect()
     }
@@ -29,6 +38,7 @@ mod session {
         values.iter().map(Caip10AccountId::as_str).collect()
     }
 
+    mod action;
     mod authenticate;
     mod delete;
     mod event;

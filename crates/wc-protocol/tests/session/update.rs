@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::{account, account_strings, chain, chain_strings};
+use super::{account, account_strings, chain, chain_strings, event_name, method};
 use wc_protocol::session::{JsonRpcRequest, SessionNamespace, SessionUpdateParams, SignMethod};
 
 const LIVE_SESSION_UPDATE_JSON: &str = r#"{
@@ -67,8 +67,8 @@ fn serializes_namespace_replacement() {
                         account("eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"),
                         account("eip155:1:0x1111111111111111111111111111111111111111"),
                     ],
-                    methods: vec!["personal_sign".to_owned()],
-                    events: vec!["accountsChanged".to_owned(), "chainChanged".to_owned()],
+                    methods: vec![method("personal_sign")],
+                    events: vec![event_name("accountsChanged"), event_name("chainChanged")],
                 },
             )]),
         },
