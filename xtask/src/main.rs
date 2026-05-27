@@ -6,6 +6,7 @@
 //! request/response shapes are promoted into stable library types.
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     future::Future,
     io::{self, Read},
@@ -28,6 +29,10 @@ use wc_protocol::session::{
     SessionRequestResponse, SessionSettleParams, SessionUpdateParams,
 };
 use wc_protocol::{
+    dto::pairing::{
+        PairingDeleteParams, PairingJsonRpcRequest, PairingJsonRpcResponse, PairingMethod,
+        PairingPingParams,
+    },
     envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
     pairing::{PairingSymKey, PairingUri},
     relay::{
@@ -49,6 +54,7 @@ fn main() -> Result<()> {
         Some("relay-probe") => run_async(relay_probe(parse_probe_mode()?)),
         Some("auth-probe") => auth_probe(parse_auth_probe_input()?),
         Some("session-probe") => session_probe(parse_session_probe_input()?),
+        Some("pairing-probe") => pairing_probe(parse_pairing_probe_input()?),
         Some("--help" | "-h") | None => {
             print_usage();
             Ok(())
@@ -65,6 +71,10 @@ fn print_usage() {
     eprintln!("       cargo run -p xtask -- auth-probe --json '<json>'");
     eprintln!("       cargo run -p xtask -- auth-probe --file payload.json");
     eprintln!("       cargo run -p xtask -- auth-probe --stdin");
+    eprintln!("       cargo run -p xtask -- pairing-probe --sample");
+    eprintln!("       cargo run -p xtask -- pairing-probe --json '<json>'");
+    eprintln!("       cargo run -p xtask -- pairing-probe --file payload.json");
+    eprintln!("       cargo run -p xtask -- pairing-probe --stdin");
     eprintln!("       cargo run -p xtask -- session-probe --sample");
     eprintln!("       cargo run -p xtask -- session-probe --json '<json>'");
     eprintln!("       cargo run -p xtask -- session-probe --file payload.json");
@@ -72,6 +82,8 @@ fn print_usage() {
     eprintln!("env: REOWN_PROJECT_ID=<project id>");
     eprintln!("env: WC_AUTH_PROBE_JSON=<json>");
     eprintln!("env: WC_AUTH_PROBE_FILE=<path>");
+    eprintln!("env: WC_PAIRING_PROBE_JSON=<json>");
+    eprintln!("env: WC_PAIRING_PROBE_FILE=<path>");
     eprintln!("env: WC_SESSION_PROBE_JSON=<json>");
     eprintln!("env: WC_SESSION_PROBE_FILE=<path>");
 }
@@ -89,6 +101,11 @@ enum AuthProbeInput {
 }
 
 enum SessionProbeInput {
+    Json(String),
+    Sample,
+}
+
+enum PairingProbeInput {
     Json(String),
     Sample,
 }
@@ -188,6 +205,55 @@ fn parse_session_probe_input() -> Result<SessionProbeInput> {
             Ok(SessionProbeInput::Sample)
         }
         other => bail!("unknown session-probe argument: {other}"),
+    }
+}
+
+fn parse_pairing_probe_input() -> Result<PairingProbeInput> {
+    let mut arguments = env::args().skip(2);
+    let Some(argument) = arguments.next() else {
+        if let Ok(json) = env::var("WC_PAIRING_PROBE_JSON") {
+            return Ok(PairingProbeInput::Json(json));
+        }
+
+        if let Ok(path) = env::var("WC_PAIRING_PROBE_FILE") {
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read pairing probe file {path}"))?;
+            return Ok(PairingProbeInput::Json(json));
+        }
+
+        return Ok(PairingProbeInput::Sample);
+    };
+
+    match argument.as_str() {
+        "--sample" => Ok(PairingProbeInput::Sample),
+        "--json" => {
+            let json = arguments
+                .next()
+                .or_else(|| env::var("WC_PAIRING_PROBE_JSON").ok())
+                .context("pass JSON after --json or set WC_PAIRING_PROBE_JSON")?;
+            Ok(PairingProbeInput::Json(json))
+        }
+        "--file" => {
+            let path = arguments
+                .next()
+                .or_else(|| env::var("WC_PAIRING_PROBE_FILE").ok())
+                .context("pass a path after --file or set WC_PAIRING_PROBE_FILE")?;
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read pairing probe file {path}"))?;
+            Ok(PairingProbeInput::Json(json))
+        }
+        "--stdin" => {
+            let mut json = String::new();
+            io::stdin()
+                .read_to_string(&mut json)
+                .context("failed to read pairing probe JSON from stdin")?;
+            Ok(PairingProbeInput::Json(json))
+        }
+        "--help" | "-h" => {
+            print_usage();
+            Ok(PairingProbeInput::Sample)
+        }
+        other => bail!("unknown pairing-probe argument: {other}"),
     }
 }
 
@@ -325,16 +391,56 @@ fn session_probe(input: SessionProbeInput) -> Result<()> {
         Value::Array(values) => values,
         value => vec![value],
     };
+    let context = session_probe_context(&values);
 
     println!("session-probe items={} bytes={}", values.len(), json.len());
 
     for (index, value) in values.iter().enumerate() {
         let shape = session_probe_shape(value);
         println!("session-probe item={index} shape={shape}");
-        session_probe_value(index, value)?;
+        session_probe_value(index, value, &context)?;
     }
 
     Ok(())
+}
+
+fn pairing_probe(input: PairingProbeInput) -> Result<()> {
+    let json = match input {
+        PairingProbeInput::Json(json) => json,
+        PairingProbeInput::Sample => SAMPLE_PAIRING_PROBE_JSON.to_owned(),
+    };
+    let value = serde_json::from_str::<Value>(&json).context("pairing probe input is not JSON")?;
+    let values = match value {
+        Value::Array(values) => values,
+        value => vec![value],
+    };
+
+    println!("pairing-probe items={} bytes={}", values.len(), json.len());
+
+    for (index, value) in values.iter().enumerate() {
+        let shape = pairing_probe_shape(value);
+        println!("pairing-probe item={index} shape={shape}");
+        pairing_probe_value(index, value)?;
+    }
+
+    Ok(())
+}
+
+struct SessionProbeContext {
+    proposal_ids: BTreeSet<u64>,
+}
+
+fn session_probe_context(values: &[Value]) -> SessionProbeContext {
+    let proposal_ids = values
+        .iter()
+        .filter(|value| value.get("method").and_then(Value::as_str) == Some("wc_sessionPropose"))
+        .filter_map(|value| {
+            serde_json::from_value::<JsonRpcRequest<SessionProposeParams>>(value.clone()).ok()
+        })
+        .flat_map(|request| [request.id, request.params.effective_id(request.id)])
+        .collect();
+
+    SessionProbeContext { proposal_ids }
 }
 
 fn session_probe_shape(value: &Value) -> String {
@@ -368,7 +474,23 @@ fn session_probe_shape(value: &Value) -> String {
     "unknown".to_owned()
 }
 
-fn session_probe_value(index: usize, value: &Value) -> Result<()> {
+fn pairing_probe_shape(value: &Value) -> String {
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        return format!("{method}-request");
+    }
+
+    if value.get("error").is_some() {
+        return "jsonrpc-error".to_owned();
+    }
+
+    if let Some(result) = value.get("result") {
+        return format!("pairing-result-{}", json_kind(result));
+    }
+
+    "unknown".to_owned()
+}
+
+fn session_probe_value(index: usize, value: &Value, context: &SessionProbeContext) -> Result<()> {
     if let Some(method) = value.get("method").and_then(Value::as_str) {
         let method = SignMethod::from_wire(method)
             .with_context(|| format!("session-probe item={index} unknown Sign method {method}"))?;
@@ -376,103 +498,167 @@ fn session_probe_value(index: usize, value: &Value) -> Result<()> {
     }
 
     if value.get("error").is_some() {
-        let response =
-            serde_json::from_value::<JsonRpcErrorResponse>(value.clone()).with_context(|| {
-                format!("session-probe item={index} failed to parse error response")
-            })?;
-        println!(
-            "session-probe item={index} error id={} code={} message={} data_present={}",
-            response.id,
-            response.error.code.as_i64(),
-            response.error.message,
-            response.error.data.is_some()
-        );
-        return Ok(());
+        return session_probe_error(index, value, context);
     }
 
     if let Some(result) = value.get("result") {
-        if result.get("cacaos").is_some() {
-            let response =
-                serde_json::from_value::<SignJsonRpcResponse<SessionAuthenticateResult>>(
-                    value.clone(),
-                )
-                .with_context(|| {
-                    format!("session-probe item={index} failed to parse authenticate result")
-                })?;
-            println!(
-                "session-probe item={index} authenticate_result id={} responder={} cacaos={}",
-                response.id,
-                response.result.responder.metadata.name,
-                response.result.cacaos.len()
-            );
-            for (cacao_index, cacao) in response.result.cacaos.iter().enumerate() {
-                print_cacao_summary("session-probe", cacao_index, cacao);
-            }
-            return Ok(());
-        }
-
-        if result.get("responderPublicKey").is_some() {
-            let response =
-                serde_json::from_value::<SignJsonRpcResponse<SessionProposeResult>>(value.clone())
-                    .with_context(|| {
-                        format!("session-probe item={index} failed to parse session propose result")
-                    })?;
-            println!(
-                "session-probe item={index} propose_result id={} relay={} responder_public_key={}",
-                response.id, response.result.relay.protocol, response.result.responder_public_key
-            );
-            return Ok(());
-        }
-
-        if result.is_boolean() {
-            let response = serde_json::from_value::<SessionAckResponse>(value.clone())
-                .with_context(|| {
-                    format!("session-probe item={index} failed to parse session ack result")
-                })?;
-            println!(
-                "session-probe item={index} session_ack id={} result=true",
-                response.id
-            );
-            return Ok(());
-        }
-
-        let response = serde_json::from_value::<SessionRequestResponse>(value.clone())
-            .with_context(|| {
-                format!("session-probe item={index} failed to parse session request result")
-            })?;
-        println!(
-            "session-probe item={index} session_request_result id={} result_kind={}",
-            response.id,
-            json_kind(response.result.as_value())
-        );
-        return Ok(());
+        return session_probe_result(index, value, result);
     }
 
     if value.get("topic").is_some()
         && value.get("pairingTopic").is_some()
         && value.get("namespaces").is_some()
     {
-        let session = serde_json::from_value::<Session>(value.clone()).with_context(|| {
-            format!("session-probe item={index} failed to parse stored session")
+        return session_probe_stored_session(index, value);
+    }
+
+    bail!("session-probe item={index} unsupported JSON shape")
+}
+
+fn session_probe_error(index: usize, value: &Value, context: &SessionProbeContext) -> Result<()> {
+    let response = serde_json::from_value::<JsonRpcErrorResponse>(value.clone())
+        .with_context(|| format!("session-probe item={index} failed to parse error response"))?;
+    let label = if context.proposal_ids.contains(&response.id) {
+        "proposal_rejection"
+    } else {
+        "error"
+    };
+    println!(
+        "session-probe item={index} {label} id={} code={} message={} data_present={} data_kind={}",
+        response.id,
+        response.error.code.as_i64(),
+        response.error.message,
+        response.error.data.is_some(),
+        response.error.data.as_ref().map_or("<none>", json_kind)
+    );
+    Ok(())
+}
+
+fn session_probe_result(index: usize, value: &Value, result: &Value) -> Result<()> {
+    if result.get("cacaos").is_some() {
+        return session_probe_authenticate_result(index, value);
+    }
+
+    if result.get("responderPublicKey").is_some() {
+        return session_probe_proposal_approval(index, value);
+    }
+
+    if result.is_boolean() {
+        return session_probe_ack(index, value);
+    }
+
+    let response =
+        serde_json::from_value::<SessionRequestResponse>(value.clone()).with_context(|| {
+            format!("session-probe item={index} failed to parse session request result")
         })?;
+    println!(
+        "session-probe item={index} session_request_result id={} result_kind={}",
+        response.id,
+        json_kind(response.result.as_value())
+    );
+    Ok(())
+}
+
+fn session_probe_authenticate_result(index: usize, value: &Value) -> Result<()> {
+    let response =
+        serde_json::from_value::<SignJsonRpcResponse<SessionAuthenticateResult>>(value.clone())
+            .with_context(|| {
+                format!("session-probe item={index} failed to parse authenticate result")
+            })?;
+    println!(
+        "session-probe item={index} authenticate_result id={} responder={} cacaos={}",
+        response.id,
+        response.result.responder.metadata.name,
+        response.result.cacaos.len()
+    );
+    for (cacao_index, cacao) in response.result.cacaos.iter().enumerate() {
+        print_cacao_summary("session-probe", cacao_index, cacao);
+    }
+    Ok(())
+}
+
+fn session_probe_proposal_approval(index: usize, value: &Value) -> Result<()> {
+    let response =
+        serde_json::from_value::<SignJsonRpcResponse<SessionProposeResult>>(value.clone())
+            .with_context(|| {
+                format!("session-probe item={index} failed to parse session propose result")
+            })?;
+    println!(
+        "session-probe item={index} proposal_approval id={} relay={} responder_public_key={}",
+        response.id, response.result.relay.protocol, response.result.responder_public_key
+    );
+    Ok(())
+}
+
+fn session_probe_ack(index: usize, value: &Value) -> Result<()> {
+    let response =
+        serde_json::from_value::<SessionAckResponse>(value.clone()).with_context(|| {
+            format!("session-probe item={index} failed to parse session ack result")
+        })?;
+    println!(
+        "session-probe item={index} session_ack id={} result=true",
+        response.id
+    );
+    Ok(())
+}
+
+fn session_probe_stored_session(index: usize, value: &Value) -> Result<()> {
+    let session = serde_json::from_value::<Session>(value.clone())
+        .with_context(|| format!("session-probe item={index} failed to parse stored session"))?;
+    println!(
+        "session-probe item={index} stored_session topic={} pairing_topic={} self={} peer={} namespaces={} expiry={} expired_now={} transport={}",
+        session.topic,
+        session.pairing_topic,
+        session.self_participant.metadata.name,
+        session.peer.metadata.name,
+        session.namespaces.len(),
+        session.expiry,
+        session.is_expired_at(unix_timestamp()),
+        session
+            .transport_type
+            .as_ref()
+            .map_or("<none>", wc_protocol::session::SessionTransportType::as_str)
+    );
+    Ok(())
+}
+
+fn pairing_probe_value(index: usize, value: &Value) -> Result<()> {
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        let method = PairingMethod::from_wire(method).with_context(|| {
+            format!("pairing-probe item={index} unknown Pairing method {method}")
+        })?;
+        return pairing_probe_request(index, method, value);
+    }
+
+    if value.get("error").is_some() {
+        let response =
+            serde_json::from_value::<JsonRpcErrorResponse>(value.clone()).with_context(|| {
+                format!("pairing-probe item={index} failed to parse error response")
+            })?;
         println!(
-            "session-probe item={index} stored_session topic={} pairing_topic={} self={} peer={} namespaces={} expiry={} expired_now={} transport={}",
-            session.topic,
-            session.pairing_topic,
-            session.self_participant.metadata.name,
-            session.peer.metadata.name,
-            session.namespaces.len(),
-            session.expiry,
-            session.is_expired_at(unix_timestamp()),
-            session
-                .transport_type
-                .as_ref()
-                .map_or("<none>", wc_protocol::session::SessionTransportType::as_str)
+            "pairing-probe item={index} error id={} code={} message={} data_present={} data_kind={}",
+            response.id,
+            response.error.code.as_i64(),
+            response.error.message,
+            response.error.data.is_some(),
+            response.error.data.as_ref().map_or("<none>", json_kind)
         );
         return Ok(());
     }
 
-    bail!("session-probe item={index} unsupported JSON shape")
+    if value.get("result").is_some() {
+        let response = serde_json::from_value::<PairingJsonRpcResponse<bool>>(value.clone())
+            .with_context(|| {
+                format!("pairing-probe item={index} failed to parse pairing result")
+            })?;
+        println!(
+            "pairing-probe item={index} pairing_ack id={} result={}",
+            response.id, response.result
+        );
+        return Ok(());
+    }
+
+    bail!("pairing-probe item={index} unsupported JSON shape")
 }
 
 fn session_probe_request(index: usize, method: SignMethod, value: &Value) -> Result<()> {
@@ -487,6 +673,35 @@ fn session_probe_request(index: usize, method: SignMethod, value: &Value) -> Res
         SignMethod::SessionEvent => print_session_event_request(index, value),
         SignMethod::SessionAuthenticate => print_session_authenticate_request(index, value),
     }
+}
+
+fn pairing_probe_request(index: usize, method: PairingMethod, value: &Value) -> Result<()> {
+    match method {
+        PairingMethod::Ping => {
+            let parsed =
+                serde_json::from_value::<PairingJsonRpcRequest<PairingPingParams>>(value.clone());
+            let request = parsed.with_context(|| {
+                format!("pairing-probe item={index} failed to parse wc_pairingPing")
+            })?;
+            println!(
+                "pairing-probe item={index} request method={} id={} params=empty",
+                request.method, request.id
+            );
+        }
+        PairingMethod::Delete => {
+            let parsed =
+                serde_json::from_value::<PairingJsonRpcRequest<PairingDeleteParams>>(value.clone());
+            let request = parsed.with_context(|| {
+                format!("pairing-probe item={index} failed to parse wc_pairingDelete")
+            })?;
+            println!(
+                "pairing-probe item={index} request method={} id={} code={} message={}",
+                request.method, request.id, request.params.code, request.params.message
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn print_session_propose_request(index: usize, value: &Value) -> Result<()> {
@@ -709,6 +924,11 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     }
   },
   {
+    "id": 1,
+    "jsonrpc": "2.0",
+    "error": {"code": 5000, "message": "User rejected."}
+  },
+  {
     "id": 2,
     "jsonrpc": "2.0",
     "method": "wc_sessionSettle",
@@ -897,6 +1117,29 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
       }
     },
     "transportType": "relay"
+  }
+]"#;
+
+const SAMPLE_PAIRING_PROBE_JSON: &str = r#"[
+  {
+    "id": 1779866795062281,
+    "jsonrpc": "2.0",
+    "method": "wc_pairingPing",
+    "params": {}
+  },
+  {
+    "id": 1779866795062281,
+    "jsonrpc": "2.0",
+    "result": true
+  },
+  {
+    "id": 1779866796850380,
+    "jsonrpc": "2.0",
+    "method": "wc_pairingDelete",
+    "params": {
+      "message": "User disconnected.",
+      "code": 6000
+    }
   }
 ]"#;
 
@@ -1150,10 +1393,42 @@ fn print_pairing_payload_metadata(
         print_session_proposal_summary(label, json.clone())?;
     }
 
+    if let Some(method) = json
+        .get("method")
+        .and_then(Value::as_str)
+        .and_then(PairingMethod::from_wire)
+    {
+        print_pairing_payload_summary(label, method, json.clone())?;
+    }
+
     if pairing_uri_print_json() {
         let pretty = serde_json::to_string_pretty(&json)
             .with_context(|| format!("{label} failed to format decrypted JSON"))?;
         println!("{label} decrypted_json=\n{pretty}");
+    }
+
+    Ok(())
+}
+
+fn print_pairing_payload_summary(label: &str, method: PairingMethod, json: Value) -> Result<()> {
+    match method {
+        PairingMethod::Ping => {
+            let request = serde_json::from_value::<PairingJsonRpcRequest<PairingPingParams>>(json)
+                .with_context(|| format!("{label} failed to parse wc_pairingPing DTO"))?;
+            println!(
+                "{label} pairing_request method={} id={} params=empty",
+                request.method, request.id
+            );
+        }
+        PairingMethod::Delete => {
+            let request =
+                serde_json::from_value::<PairingJsonRpcRequest<PairingDeleteParams>>(json)
+                    .with_context(|| format!("{label} failed to parse wc_pairingDelete DTO"))?;
+            println!(
+                "{label} pairing_request method={} id={} code={} message={}",
+                request.method, request.id, request.params.code, request.params.message
+            );
+        }
     }
 
     Ok(())
