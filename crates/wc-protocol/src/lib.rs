@@ -5,6 +5,7 @@ pub mod did;
 pub mod dto;
 mod encoding;
 pub mod envelope;
+pub mod namespaces;
 pub mod pairing;
 pub mod relay;
 
