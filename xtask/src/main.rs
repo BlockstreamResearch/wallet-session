@@ -28,12 +28,13 @@ use wc_protocol::{
         PairingDeleteParams, PairingJsonRpcRequest, PairingJsonRpcResponse, PairingMethod,
         PairingPingParams,
     },
-    envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
+    envelope::{Envelope, EnvelopeEncoding},
     key::{
         X25519KeyPair, X25519PrivateKey, X25519PublicKey, derive_shared_sym_key,
         derive_topic_from_sym_key,
     },
     pairing::{PairingSymKey, PairingUri},
+    pairing_message::{PairingMessage, PairingMessageMethod},
     relay::{
         DEFAULT_RELAY_URL, IrnBatchFetchMessagesResponse, IrnBatchPublish,
         IrnFetchMessagesResponse, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
@@ -1408,58 +1409,57 @@ fn print_pairing_payload_metadata(
     data: &IrnSubscriptionData,
     sym_key: &PairingSymKey,
 ) -> Result<()> {
-    let envelope = Envelope::decode(&data.message, EnvelopeEncoding::Base64)
-        .with_context(|| format!("{label} failed to decode envelope"))?;
-    let plaintext = match envelope.envelope_type() {
-        EnvelopeType::Type0 | EnvelopeType::Type1 => envelope
-            .decrypt(sym_key)
-            .with_context(|| format!("{label} failed to decrypt envelope"))?,
-        EnvelopeType::Type2 => envelope
-            .plaintext()
-            .with_context(|| format!("{label} failed to decode plaintext envelope"))?
-            .to_owned(),
-    };
-    let json: Value = serde_json::from_str(&plaintext)
-        .with_context(|| format!("{label} decrypted payload is not JSON"))?;
+    let payload = PairingMessage::decode_relay_message(&data.message, sym_key)
+        .with_context(|| format!("{label} failed to decode pairing message"))?;
 
     println!(
         "{label} envelope_type={:?} decrypted_len={} jsonrpc={} id={} method={} params_keys={}",
-        envelope.envelope_type(),
-        plaintext.len(),
-        json.get("jsonrpc")
+        payload.envelope_type(),
+        payload.plaintext().len(),
+        payload
+            .json()
+            .get("jsonrpc")
             .and_then(Value::as_str)
             .unwrap_or("<none>"),
-        json_id(&json),
-        json.get("method")
-            .and_then(Value::as_str)
-            .unwrap_or("<none>"),
-        params_keys(&json)
+        json_id(payload.json()),
+        pairing_message_method_label(payload.method()),
+        params_keys(payload.json())
     );
 
-    if json
-        .get("method")
-        .and_then(Value::as_str)
-        .and_then(SignMethod::from_wire)
-        == Some(SignMethod::SessionPropose)
-    {
-        print_session_proposal_summary(label, json.clone())?;
-    }
-
-    if let Some(method) = json
-        .get("method")
-        .and_then(Value::as_str)
-        .and_then(PairingMethod::from_wire)
-    {
-        print_pairing_payload_summary(label, method, json.clone())?;
+    match payload.method() {
+        PairingMessageMethod::Sign(SignMethod::SessionPropose) => {
+            print_session_proposal_summary(label, payload.json().clone())?;
+        }
+        PairingMessageMethod::Sign(method) => {
+            println!("{label} sign_request method={method}");
+        }
+        PairingMessageMethod::Pairing(method) => {
+            print_pairing_payload_summary(label, *method, payload.json().clone())?;
+        }
+        PairingMessageMethod::Unknown(method) => {
+            println!("{label} unknown_request method={method}");
+        }
+        PairingMessageMethod::Missing => {
+            println!("{label} missing_method=true");
+        }
     }
 
     if pairing_uri_print_json() {
-        let pretty = serde_json::to_string_pretty(&json)
+        let pretty = serde_json::to_string_pretty(payload.json())
             .with_context(|| format!("{label} failed to format decrypted JSON"))?;
         println!("{label} decrypted_json=\n{pretty}");
     }
 
     Ok(())
+}
+
+fn pairing_message_method_label(method: &PairingMessageMethod) -> String {
+    match method {
+        PairingMessageMethod::Sign(method) => method.to_string(),
+        PairingMessageMethod::Pairing(method) => method.to_string(),
+        PairingMessageMethod::Unknown(method) => method.clone(),
+        PairingMessageMethod::Missing => "<none>".to_owned(),
+    }
 }
 
 fn print_pairing_payload_summary(label: &str, method: PairingMethod, json: Value) -> Result<()> {

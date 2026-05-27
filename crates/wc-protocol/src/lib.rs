@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod key;
 pub mod namespaces;
 pub mod pairing;
+pub mod pairing_message;
 pub mod relay;
 
 pub use dto::session;
