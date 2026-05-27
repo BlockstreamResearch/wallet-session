@@ -31,15 +31,14 @@ use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
     pairing::{PairingSymKey, PairingUri},
     relay::{
-        DEFAULT_RELAY_URL, IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchPublish,
-        IrnBatchSubscribe, IrnBatchUnsubscribe, IrnFetchMessages, IrnFetchMessagesResponse,
-        IrnPublish, IrnSubscribe, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
-        RelayAuthToken, RelayConnectionUrl, RelayJsonRpcRequest, RelayJsonRpcResponse,
-        RelayRequest, RelayRpcId, RelayTopic, relay_auth_audience,
+        DEFAULT_RELAY_URL, IrnBatchFetchMessagesResponse, IrnBatchPublish,
+        IrnFetchMessagesResponse, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
+        RelayAuthToken, RelayConnectionUrl, RelayJsonRpcResponse, RelayRequest, RelayRpcId,
+        RelayTopic, relay_auth_audience,
     },
     session::{JsonRpcRequest, Session, SessionProposeParams, SignMethod},
 };
-use wc_transport::NativeRelayTransport;
+use wc_transport::{NativeRelayTransport, RelayClient};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1231,6 +1230,11 @@ impl RelayProbeConfig {
         let url = self.connection_url(role)?;
         RelaySocket::connect(role, url.as_str()).await
     }
+
+    async fn connect_raw(&self, role: &'static str) -> Result<RawRelaySocket> {
+        let url = self.connection_url(role)?;
+        RawRelaySocket::connect(role, url.as_str()).await
+    }
 }
 
 async fn run_basic_probe(config: &RelayProbeConfig) -> Result<()> {
@@ -1275,10 +1279,7 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
 
     let mut subscriber = config.connect("subscriber").await?;
 
-    let fetch_id = subscriber
-        .call(IrnFetchMessages::new(pairing.topic().clone()))
-        .await?;
-    let fetch_response: IrnFetchMessagesResponse = subscriber.read_response(fetch_id).await?;
+    let fetch_response = subscriber.fetch_messages(pairing.topic().clone()).await?;
     println!(
         "pairing-uri fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1300,10 +1301,7 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
         )?;
     }
 
-    let subscribe_id = subscriber
-        .call(IrnSubscribe::new(pairing.topic().clone()))
-        .await?;
-    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    let subscription_id = subscriber.subscribe(pairing.topic().clone()).await?;
     println!("pairing-uri subscription_id={subscription_id}");
 
     let wait = pairing_uri_wait_timeout();
@@ -1332,13 +1330,9 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
         ),
     }
 
-    let unsubscribe_id = subscriber
-        .call(IrnUnsubscribe::new(
-            pairing.topic().clone(),
-            subscription_id,
-        ))
+    let unsubscribe_result = subscriber
+        .unsubscribe(pairing.topic().clone(), subscription_id)
         .await?;
-    let unsubscribe_result: bool = subscriber.read_response(unsubscribe_id).await?;
     println!("pairing-uri unsubscribe_ack={unsubscribe_result}");
 
     Ok(())
@@ -1532,25 +1526,20 @@ async fn run_push_delivery(
     println!("{label} topic={topic} messages={}", messages.len());
 
     let mut subscriber = config.connect("subscriber").await?;
-    let subscribe_id = subscriber.call(IrnSubscribe::new(topic.clone())).await?;
-    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    let subscription_id = subscriber.subscribe(topic.clone()).await?;
     println!("{label} subscriber subscription_id={subscription_id}");
 
     let mut publisher = config.connect("publisher").await?;
     for (index, message) in messages.iter().enumerate() {
-        let publish_id = publisher
-            .call(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
+        publisher
+            .publish(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
             .await?;
-        let _: bool = publisher.read_response(publish_id).await?;
         println!("{label} publisher publish_ack index={index}");
 
         subscriber.read_subscription(&topic, message).await?;
     }
 
-    let fetch_id = subscriber
-        .call(IrnFetchMessages::new(topic.clone()))
-        .await?;
-    let fetch_response: IrnFetchMessagesResponse = subscriber.read_response(fetch_id).await?;
+    let fetch_response = subscriber.fetch_messages(topic.clone()).await?;
     println!(
         "{label} subscriber fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1560,10 +1549,7 @@ async fn run_push_delivery(
         bail!("{label} expected empty mailbox after live delivery ack");
     }
 
-    let unsubscribe_id = subscriber
-        .call(IrnUnsubscribe::new(topic, subscription_id))
-        .await?;
-    let _: bool = subscriber.read_response(unsubscribe_id).await?;
+    subscriber.unsubscribe(topic, subscription_id).await?;
     println!("{label} subscriber unsubscribe_ack=true");
 
     Ok(())
@@ -1576,21 +1562,18 @@ async fn run_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) -> Resul
     println!("{label} topic={topic}");
 
     let mut subscriber = config.connect("subscriber").await?;
-    let subscribe_id = subscriber.call(IrnSubscribe::new(topic.clone())).await?;
-    let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+    let subscription_id = subscriber.subscribe(topic.clone()).await?;
     println!("{label} subscriber subscription_id={subscription_id}");
 
-    let unsubscribe_id = subscriber
-        .call(IrnUnsubscribe::new(topic.clone(), subscription_id))
+    subscriber
+        .unsubscribe(topic.clone(), subscription_id)
         .await?;
-    let _: bool = subscriber.read_response(unsubscribe_id).await?;
     println!("{label} subscriber unsubscribe_ack=true");
 
     let mut publisher = config.connect("publisher").await?;
-    let publish_id = publisher
-        .call(IrnPublish::new(topic.clone(), message, 30, 0))
+    publisher
+        .publish(IrnPublish::new(topic.clone(), message, 30, 0))
         .await?;
-    let _: bool = publisher.read_response(publish_id).await?;
     println!("{label} publisher publish_ack=true");
 
     if let Some(subscription) = subscriber
@@ -1623,18 +1606,18 @@ async fn run_batch_subscribe_delivery(config: &RelayProbeConfig) -> Result<()> {
     );
 
     let mut subscriber = config.connect("subscriber").await?;
-    let subscribe_id = subscriber
-        .call(IrnBatchSubscribe::new(topics.clone()))
-        .await?;
-    let subscribe_result: Value = subscriber.read_response(subscribe_id).await?;
-    println!("{label} subscriber batch_subscribe_result={subscribe_result}");
+    let subscribe_result = subscriber.batch_subscribe(topics.clone()).await?;
+    println!(
+        "{label} subscriber batch_subscribe_result={}",
+        serde_json::to_string(&subscribe_result)
+            .context("failed to print batch subscribe result")?
+    );
 
     let mut publisher = config.connect("publisher").await?;
     for (index, (topic, message)) in topics.iter().zip(messages.iter()).enumerate() {
-        let publish_id = publisher
-            .call(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
+        publisher
+            .publish(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
             .await?;
-        let _: bool = publisher.read_response(publish_id).await?;
         println!("{label} publisher publish_ack index={index}");
         subscriber.read_subscription(topic, message).await?;
     }
@@ -1658,10 +1641,7 @@ async fn run_batch_fetch_offline_messages(config: &RelayProbeConfig) -> Result<(
 
     let subscription_ids = {
         let mut subscriber = config.connect("subscriber").await?;
-        let subscribe_id = subscriber
-            .call(IrnBatchSubscribe::new(topics.clone()))
-            .await?;
-        let subscription_ids: Vec<String> = subscriber.read_response(subscribe_id).await?;
+        let subscription_ids = subscriber.batch_subscribe(topics.clone()).await?;
         println!(
             "{label} subscriber initial_batch_subscribe_ids={}",
             subscription_ids.len()
@@ -1671,18 +1651,14 @@ async fn run_batch_fetch_offline_messages(config: &RelayProbeConfig) -> Result<(
 
     let mut publisher = config.connect("publisher").await?;
     for (index, (topic, message)) in topics.iter().zip(messages.iter()).enumerate() {
-        let publish_id = publisher
-            .call(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
+        publisher
+            .publish(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
             .await?;
-        let _: bool = publisher.read_response(publish_id).await?;
         println!("{label} publisher publish_ack index={index}");
     }
 
     let mut subscriber = config.connect("subscriber").await?;
-    let fetch_id = subscriber
-        .call(IrnBatchFetchMessages::new(topics.clone()))
-        .await?;
-    let fetch_response: IrnBatchFetchMessagesResponse = subscriber.read_response(fetch_id).await?;
+    let fetch_response = subscriber.batch_fetch_messages(topics.clone()).await?;
     println!(
         "{label} subscriber batch_fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1697,16 +1673,15 @@ async fn run_batch_fetch_offline_messages(config: &RelayProbeConfig) -> Result<(
     });
     println!("{label} offline_cache_observed={offline_cache_observed}");
 
-    let unsubscribe_id = subscriber
-        .call(IrnBatchUnsubscribe::new(
+    let unsubscribe_result = subscriber
+        .batch_unsubscribe(
             topics
                 .into_iter()
                 .zip(subscription_ids)
                 .map(|(topic, id)| IrnUnsubscribe::new(topic, id))
                 .collect(),
-        ))
+        )
         .await?;
-    let unsubscribe_result: Value = subscriber.read_response(unsubscribe_id).await?;
     println!("{label} subscriber batch_unsubscribe_result={unsubscribe_result}");
 
     Ok(())
@@ -1729,24 +1704,19 @@ async fn run_batch_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) ->
     let mut subscriber = config.connect("subscriber").await?;
     let mut subscriptions = Vec::with_capacity(topics.len());
     for topic in &topics {
-        let subscribe_id = subscriber.call(IrnSubscribe::new(topic.clone())).await?;
-        let subscription_id: String = subscriber.read_response(subscribe_id).await?;
+        let subscription_id = subscriber.subscribe(topic.clone()).await?;
         println!("{label} subscriber subscription_id={subscription_id}");
         subscriptions.push(IrnUnsubscribe::new(topic.clone(), subscription_id));
     }
 
-    let unsubscribe_id = subscriber
-        .call(IrnBatchUnsubscribe::new(subscriptions))
-        .await?;
-    let unsubscribe_result: Value = subscriber.read_response(unsubscribe_id).await?;
+    let unsubscribe_result = subscriber.batch_unsubscribe(subscriptions).await?;
     println!("{label} subscriber batch_unsubscribe_result={unsubscribe_result}");
 
     let mut publisher = config.connect("publisher").await?;
     for (index, (topic, message)) in topics.iter().zip(messages).enumerate() {
-        let publish_id = publisher
-            .call(IrnPublish::new(topic.clone(), message, 30, 0))
+        publisher
+            .publish(IrnPublish::new(topic.clone(), message, 30, 0))
             .await?;
-        let _: bool = publisher.read_response(publish_id).await?;
         println!("{label} publisher publish_ack index={index}");
     }
 
@@ -1778,7 +1748,7 @@ async fn run_batch_publish_probe(config: &RelayProbeConfig) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     println!("{label} messages={}", messages.len());
 
-    let mut publisher = config.connect("publisher").await?;
+    let mut publisher = config.connect_raw("publisher").await?;
     match publisher.probe_batch_publish_shapes(messages).await? {
         Some(result) => println!("{label} accepted=true result={result}"),
         None => println!("{label} accepted=false relay_error=-32600"),
@@ -1789,10 +1759,197 @@ async fn run_batch_publish_probe(config: &RelayProbeConfig) -> Result<()> {
 
 struct RelaySocket {
     role: &'static str,
-    stream: NativeRelayTransport,
+    client: RelayClient,
 }
 
 impl RelaySocket {
+    async fn connect(role: &'static str, url: &str) -> Result<Self> {
+        let client = RelayClient::connect(url)
+            .await
+            .with_context(|| format!("{role} failed to connect to relay"))?;
+        println!("{role} connected status={}", client.status());
+        Ok(Self { role, client })
+    }
+
+    async fn subscribe(&mut self, topic: RelayTopic) -> Result<String> {
+        println!("{} -> irn_subscribe", self.role);
+        let subscription_id = self
+            .client
+            .subscribe(topic)
+            .await
+            .with_context(|| format!("{} failed to subscribe relay topic", self.role))?;
+        println!("{} <- irn_subscribe result", self.role);
+        Ok(subscription_id)
+    }
+
+    async fn batch_subscribe(&mut self, topics: Vec<RelayTopic>) -> Result<Vec<String>> {
+        println!(
+            "{} -> irn_batchSubscribe topics={}",
+            self.role,
+            topics.len()
+        );
+        let subscription_ids = self
+            .client
+            .batch_subscribe(topics)
+            .await
+            .with_context(|| format!("{} failed to batch subscribe relay topics", self.role))?;
+        println!("{} <- irn_batchSubscribe result", self.role);
+        Ok(subscription_ids)
+    }
+
+    async fn publish(&mut self, params: IrnPublish) -> Result<bool> {
+        println!("{} -> irn_publish", self.role);
+        let ack = self
+            .client
+            .publish(params)
+            .await
+            .with_context(|| format!("{} failed to publish relay message", self.role))?;
+        println!("{} <- irn_publish result={ack}", self.role);
+        Ok(ack)
+    }
+
+    async fn fetch_messages(&mut self, topic: RelayTopic) -> Result<IrnFetchMessagesResponse> {
+        println!("{} -> irn_fetchMessages", self.role);
+        let response = self
+            .client
+            .fetch_messages(topic)
+            .await
+            .with_context(|| format!("{} failed to fetch relay messages", self.role))?;
+        println!("{} <- irn_fetchMessages result", self.role);
+        Ok(response)
+    }
+
+    async fn batch_fetch_messages(
+        &mut self,
+        topics: Vec<RelayTopic>,
+    ) -> Result<IrnBatchFetchMessagesResponse> {
+        println!(
+            "{} -> irn_batchFetchMessages topics={}",
+            self.role,
+            topics.len()
+        );
+        let response = self
+            .client
+            .batch_fetch_messages(topics)
+            .await
+            .with_context(|| format!("{} failed to batch fetch relay messages", self.role))?;
+        println!("{} <- irn_batchFetchMessages result", self.role);
+        Ok(response)
+    }
+
+    async fn unsubscribe(&mut self, topic: RelayTopic, subscription_id: String) -> Result<bool> {
+        println!("{} -> irn_unsubscribe", self.role);
+        let ack = self
+            .client
+            .unsubscribe(topic, subscription_id)
+            .await
+            .with_context(|| format!("{} failed to unsubscribe relay topic", self.role))?;
+        println!("{} <- irn_unsubscribe result={ack}", self.role);
+        Ok(ack)
+    }
+
+    async fn batch_unsubscribe(&mut self, subscriptions: Vec<IrnUnsubscribe>) -> Result<bool> {
+        println!(
+            "{} -> irn_batchUnsubscribe subscriptions={}",
+            self.role,
+            subscriptions.len()
+        );
+        let ack = self
+            .client
+            .batch_unsubscribe(subscriptions)
+            .await
+            .with_context(|| format!("{} failed to batch unsubscribe relay topics", self.role))?;
+        println!("{} <- irn_batchUnsubscribe result={ack}", self.role);
+        Ok(ack)
+    }
+
+    async fn read_subscription(
+        &mut self,
+        expected_topic: &RelayTopic,
+        expected_message: &str,
+    ) -> Result<()> {
+        loop {
+            let Some(subscription) = self
+                .read_any_subscription_for_topic(expected_topic, READ_TIMEOUT)
+                .await?
+            else {
+                bail!("{} timed out waiting for relay subscription", self.role);
+            };
+            let data = &subscription.data;
+
+            println!(
+                "{} <- irn_subscription topic_match={} message_match={} tag_present={} tag={} published_at={}",
+                self.role,
+                data.topic == *expected_topic,
+                data.message == expected_message,
+                data.tag.is_some(),
+                data.tag.unwrap_or_default(),
+                data.published_at
+            );
+
+            if data.topic == *expected_topic && data.message == expected_message {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn read_any_subscription_for_topic(
+        &mut self,
+        expected_topic: &RelayTopic,
+        wait: Duration,
+    ) -> Result<Option<IrnSubscription>> {
+        loop {
+            let Some(subscription) = self.next_subscription(wait).await? else {
+                return Ok(None);
+            };
+
+            if subscription.data.topic == *expected_topic {
+                return Ok(Some(subscription));
+            }
+
+            println!(
+                "{} <- ignored irn_subscription topic={}",
+                self.role, subscription.data.topic
+            );
+        }
+    }
+
+    async fn read_any_subscription_for_topics(
+        &mut self,
+        expected_topics: &[RelayTopic],
+        wait: Duration,
+    ) -> Result<Option<IrnSubscription>> {
+        loop {
+            let Some(subscription) = self.next_subscription(wait).await? else {
+                return Ok(None);
+            };
+
+            if expected_topics.contains(&subscription.data.topic) {
+                return Ok(Some(subscription));
+            }
+
+            println!(
+                "{} <- ignored irn_subscription topic={}",
+                self.role, subscription.data.topic
+            );
+        }
+    }
+
+    async fn next_subscription(&mut self, wait: Duration) -> Result<Option<IrnSubscription>> {
+        let Ok(message) = timeout(wait, self.client.next_message()).await else {
+            return Ok(None);
+        };
+
+        message.with_context(|| format!("{} failed to read relay subscription", self.role))
+    }
+}
+
+struct RawRelaySocket {
+    role: &'static str,
+    stream: NativeRelayTransport,
+}
+
+impl RawRelaySocket {
     async fn connect(role: &'static str, url: &str) -> Result<Self> {
         let connection = NativeRelayTransport::connect(url)
             .await
@@ -1802,18 +1959,6 @@ impl RelaySocket {
             role,
             stream: connection.into_transport(),
         })
-    }
-
-    async fn call<T>(&mut self, params: T) -> Result<RelayRpcId>
-    where
-        T: RelayRequest + serde::Serialize,
-    {
-        let id = rpc_id()?;
-        let request = RelayJsonRpcRequest::new(id, params);
-        let value = serde_json::to_value(&request).context("failed to serialize relay request")?;
-        self.send_json(&value).await?;
-        println!("{} -> {} id={}", self.role, request.method(), id.as_u64());
-        Ok(id)
     }
 
     async fn call_raw(&mut self, method: &str, params: Value) -> Result<RelayRpcId> {
@@ -1909,103 +2054,6 @@ impl RelaySocket {
         }
     }
 
-    async fn read_subscription(
-        &mut self,
-        expected_topic: &RelayTopic,
-        expected_message: &str,
-    ) -> Result<()> {
-        loop {
-            let value = self.read_json().await?;
-            if value.get("method").and_then(Value::as_str)
-                != Some(<IrnSubscription as RelayRequest>::METHOD)
-            {
-                println!("{} <- ignored json={value}", self.role);
-                continue;
-            }
-
-            let subscription = self.parse_and_ack_subscription(value).await?;
-            let data = &subscription.data;
-
-            println!(
-                "{} <- irn_subscription topic_match={} message_match={} tag_present={} tag={} published_at={}",
-                self.role,
-                data.topic == *expected_topic,
-                data.message == expected_message,
-                data.tag.is_some(),
-                data.tag.unwrap_or_default(),
-                data.published_at
-            );
-
-            if data.topic == *expected_topic && data.message == expected_message {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn read_any_subscription_for_topic(
-        &mut self,
-        expected_topic: &RelayTopic,
-        wait: Duration,
-    ) -> Result<Option<IrnSubscription>> {
-        loop {
-            let Some(value) = self.next_json(wait).await? else {
-                return Ok(None);
-            };
-
-            if value.get("method").and_then(Value::as_str)
-                != Some(<IrnSubscription as RelayRequest>::METHOD)
-            {
-                println!("{} <- ignored json={value}", self.role);
-                continue;
-            }
-
-            let subscription = self.parse_and_ack_subscription(value).await?;
-            if subscription.data.topic == *expected_topic {
-                return Ok(Some(subscription));
-            }
-        }
-    }
-
-    async fn read_any_subscription_for_topics(
-        &mut self,
-        expected_topics: &[RelayTopic],
-        wait: Duration,
-    ) -> Result<Option<IrnSubscription>> {
-        loop {
-            let Some(value) = self.next_json(wait).await? else {
-                return Ok(None);
-            };
-
-            if value.get("method").and_then(Value::as_str)
-                != Some(<IrnSubscription as RelayRequest>::METHOD)
-            {
-                println!("{} <- ignored json={value}", self.role);
-                continue;
-            }
-
-            let subscription = self.parse_and_ack_subscription(value).await?;
-            if expected_topics.contains(&subscription.data.topic) {
-                return Ok(Some(subscription));
-            }
-        }
-    }
-
-    async fn parse_and_ack_subscription(&mut self, value: Value) -> Result<IrnSubscription> {
-        let request = serde_json::from_value::<RelayJsonRpcRequest<IrnSubscription>>(value)
-            .context("failed to parse irn_subscription")?;
-        self.stream
-            .ack_subscription(&request)
-            .await
-            .context("failed to acknowledge irn_subscription")?;
-        println!(
-            "{} -> irn_subscription ack id={}",
-            self.role,
-            request.id().as_u64()
-        );
-
-        Ok(request.params)
-    }
-
     async fn send_json(&mut self, value: &Value) -> Result<()> {
         self.stream
             .send_json(value)
@@ -2014,17 +2062,13 @@ impl RelaySocket {
     }
 
     async fn read_json(&mut self) -> Result<Value> {
-        self.next_json(READ_TIMEOUT)
-            .await?
-            .ok_or_else(|| anyhow!("{} timed out waiting for relay message", self.role))
-    }
-
-    async fn next_json(&mut self, wait: Duration) -> Result<Option<Value>> {
-        let Ok(message) = timeout(wait, self.stream.next_json()).await else {
-            return Ok(None);
+        let Ok(message) = timeout(READ_TIMEOUT, self.stream.next_json()).await else {
+            bail!("{} timed out waiting for relay message", self.role);
         };
 
-        message.with_context(|| format!("{} failed to read relay websocket message", self.role))
+        message
+            .with_context(|| format!("{} failed to read relay websocket message", self.role))?
+            .ok_or_else(|| anyhow!("{} relay stream ended", self.role))
     }
 }
 

@@ -12,6 +12,10 @@
 //!
 //! > This document aims to create the JsonRpc contract between a client and a server.
 
+mod client;
+
+pub use client::{RelayClient, RelayClientError};
+
 use std::{fmt, string::FromUtf8Error};
 
 use futures_util::{SinkExt, StreamExt};
