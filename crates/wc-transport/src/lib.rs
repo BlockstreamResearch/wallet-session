@@ -36,6 +36,24 @@ use wc_protocol::relay::{
 
 type RelayStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Default maximum WebSocket text or binary frame size accepted from the relay.
+pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Runtime limits for the native WebSocket transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRelayTransportConfig {
+    /// Maximum incoming text or binary frame size before JSON parsing.
+    pub max_incoming_frame_bytes: usize,
+}
+
+impl Default for NativeRelayTransportConfig {
+    fn default() -> Self {
+        Self {
+            max_incoming_frame_bytes: DEFAULT_MAX_INCOMING_FRAME_BYTES,
+        }
+    }
+}
+
 /// Native WebSocket transport for the `WalletConnect` relay.
 ///
 /// The transport reads and writes WebSocket frames, parses JSON frames into
@@ -47,6 +65,7 @@ type RelayStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// > The following definitions are shared concepts across all JSON-RPC methods for the Relay API
 pub struct NativeRelayTransport {
     stream: RelayStream,
+    config: NativeRelayTransportConfig,
 }
 
 impl NativeRelayTransport {
@@ -67,6 +86,14 @@ impl NativeRelayTransport {
     ///
     /// > Where websocket headers are not supported i.e. browsers, use the URL query param `?auth=<signed jwt>`.
     pub async fn connect(url: &str) -> Result<RelayConnection, TransportError> {
+        Self::connect_with_config(url, NativeRelayTransportConfig::default()).await
+    }
+
+    /// Opens a native WebSocket connection with explicit transport limits.
+    pub async fn connect_with_config(
+        url: &str,
+        config: NativeRelayTransportConfig,
+    ) -> Result<RelayConnection, TransportError> {
         // Installs Rustls's `aws-lc-rs` provider when no application provider exists.
         //
         // `install_default` returns the provider on failure, which includes the
@@ -79,7 +106,7 @@ impl NativeRelayTransport {
             .map_err(|source| TransportError::Connect { source })?;
 
         Ok(RelayConnection {
-            transport: Self { stream },
+            transport: Self { stream, config },
             status: response.status().as_u16(),
         })
     }
@@ -139,8 +166,12 @@ impl NativeRelayTransport {
             let message = message.map_err(|source| TransportError::Read { source })?;
 
             match message {
-                Message::Text(text) => return parse_json(&text).map(Some),
+                Message::Text(text) => {
+                    self.ensure_incoming_frame_size(text.len())?;
+                    return parse_json(&text).map(Some);
+                }
                 Message::Binary(bytes) => {
+                    self.ensure_incoming_frame_size(bytes.len())?;
                     let text = String::from_utf8(bytes.to_vec())
                         .map_err(|source| TransportError::Utf8 { source })?;
                     return parse_json(&text).map(Some);
@@ -204,6 +235,15 @@ impl NativeRelayTransport {
             .close(None)
             .await
             .map_err(|source| TransportError::Close { source })
+    }
+
+    const fn ensure_incoming_frame_size(&self, actual: usize) -> Result<(), TransportError> {
+        let limit = self.config.max_incoming_frame_bytes;
+        if actual > limit {
+            return Err(TransportError::FrameTooLarge { actual, limit });
+        }
+
+        Ok(())
     }
 }
 
@@ -327,6 +367,15 @@ pub enum TransportError {
         /// Source UTF-8 conversion error.
         #[source]
         source: FromUtf8Error,
+    },
+
+    /// Incoming text or binary frame exceeded the configured size limit.
+    #[error("relay websocket frame too large: {actual} bytes exceeds {limit} bytes")]
+    FrameTooLarge {
+        /// Incoming frame size in bytes.
+        actual: usize,
+        /// Configured maximum frame size in bytes.
+        limit: usize,
     },
 
     /// The peer ended the WebSocket stream without a close frame.

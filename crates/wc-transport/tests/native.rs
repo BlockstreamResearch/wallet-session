@@ -15,7 +15,7 @@ use wc_protocol::relay::{
     IrnSubscribe, IrnSubscription, IrnSubscriptionData, RelayJsonRpcRequest, RelayJsonRpcResponse,
     RelayRequest, RelayRpcId, RelayTopic,
 };
-use wc_transport::{NativeRelayTransport, TransportError};
+use wc_transport::{NativeRelayTransport, NativeRelayTransportConfig, TransportError};
 
 #[tokio::test]
 async fn native_transport_sends_typed_relay_request() {
@@ -343,6 +343,90 @@ async fn native_transport_reports_non_utf8_binary_frame() {
         .expect_err("non-utf8 binary is reported");
 
     assert!(matches!(error, TransportError::Utf8 { .. }));
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn native_transport_rejects_oversized_text_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        websocket
+            .send(Message::Text(r#"{"large":true}"#.into()))
+            .await
+            .expect("sends oversized text frame");
+    });
+
+    let connection = NativeRelayTransport::connect_with_config(
+        &format!("ws://{address}"),
+        NativeRelayTransportConfig {
+            max_incoming_frame_bytes: 4,
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+    let mut transport = connection.into_transport();
+
+    let error = transport
+        .next_json()
+        .await
+        .expect_err("oversized text frame is rejected");
+
+    match error {
+        TransportError::FrameTooLarge { actual, limit } => {
+            assert_eq!(actual, r#"{"large":true}"#.len());
+            assert_eq!(limit, 4);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn native_transport_rejects_oversized_binary_frame_before_utf8_decode() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        websocket
+            .send(Message::Binary(vec![0xff, 0xff, 0xff, 0xff, 0xff].into()))
+            .await
+            .expect("sends oversized binary frame");
+    });
+
+    let connection = NativeRelayTransport::connect_with_config(
+        &format!("ws://{address}"),
+        NativeRelayTransportConfig {
+            max_incoming_frame_bytes: 4,
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+    let mut transport = connection.into_transport();
+
+    let error = transport
+        .next_json()
+        .await
+        .expect_err("oversized binary frame is rejected");
+
+    match error {
+        TransportError::FrameTooLarge { actual, limit } => {
+            assert_eq!(actual, 5);
+            assert_eq!(limit, 4);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
     server.await.expect("server task joins");
 }
 

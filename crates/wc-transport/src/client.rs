@@ -16,7 +16,10 @@ use wc_protocol::relay::{
     RelayRpcId, RelayRpcIdError, RelayTopic,
 };
 
-use crate::{NativeRelayTransport, TransportError};
+use crate::{
+    DEFAULT_MAX_INCOMING_FRAME_BYTES, NativeRelayTransport, NativeRelayTransportConfig,
+    TransportError,
+};
 
 static RPC_ENTROPY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -42,6 +45,8 @@ pub struct RelayClientConfig {
     pub max_queued_messages: usize,
     /// Maximum number of relay push messages handled while one response is pending.
     pub max_pushes_while_waiting: usize,
+    /// Maximum WebSocket text or binary frame size accepted from the relay.
+    pub max_incoming_frame_bytes: usize,
 }
 
 impl Default for RelayClientConfig {
@@ -50,6 +55,7 @@ impl Default for RelayClientConfig {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_queued_messages: DEFAULT_MAX_QUEUED_MESSAGES,
             max_pushes_while_waiting: DEFAULT_MAX_PUSHES_WHILE_WAITING,
+            max_incoming_frame_bytes: DEFAULT_MAX_INCOMING_FRAME_BYTES,
         }
     }
 }
@@ -86,7 +92,13 @@ impl RelayClient {
         url: &str,
         config: RelayClientConfig,
     ) -> Result<Self, RelayClientError> {
-        let connection = NativeRelayTransport::connect(url).await?;
+        let connection = NativeRelayTransport::connect_with_config(
+            url,
+            NativeRelayTransportConfig {
+                max_incoming_frame_bytes: config.max_incoming_frame_bytes,
+            },
+        )
+        .await?;
         Ok(Self {
             status: connection.status(),
             transport: connection.into_transport(),

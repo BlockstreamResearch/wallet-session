@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use wc_protocol::relay::{IrnPublish, IrnUnsubscribe, RelayTopic};
-use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
+use wc_transport::{RelayClient, RelayClientConfig, RelayClientError, TransportError};
 
 #[tokio::test]
 async fn relay_client_subscribe_returns_subscription_id() {
@@ -100,6 +100,61 @@ async fn relay_client_publish_returns_relay_ack() {
         .expect("publishes");
 
     assert!(ack);
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_applies_incoming_frame_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": request["id"],
+                    "jsonrpc": "2.0",
+                    "result": "subscription-id",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("sends oversized response");
+    });
+
+    let mut client = RelayClient::connect_with_config(
+        &format!("ws://{address}"),
+        RelayClientConfig {
+            max_incoming_frame_bytes: 4,
+            ..RelayClientConfig::default()
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(RelayTopic::from_bytes([0x23; 32]))
+        .await
+        .expect_err("oversized response is rejected");
+
+    match error {
+        RelayClientError::Transport {
+            source: TransportError::FrameTooLarge { actual, limit },
+        } => {
+            assert!(actual > limit);
+            assert_eq!(limit, 4);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
     server.await.expect("server task joins");
 }
 
