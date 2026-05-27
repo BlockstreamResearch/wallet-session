@@ -1,5 +1,7 @@
 //! Session authentication DTOs.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use super::SessionParticipant;
@@ -333,6 +335,17 @@ impl CacaoSignatureType {
             Self::Other(value) => value,
         }
     }
+
+    /// Converts a wire value into a known type or a lossless fallback.
+    #[must_use]
+    pub fn from_wire(value: impl Into<String>) -> Self {
+        let value = value.into();
+        match value.as_str() {
+            "eip191" => Self::Eip191,
+            "eip1271" => Self::Eip1271,
+            _ => Self::Other(value),
+        }
+    }
 }
 
 impl Serialize for CacaoSignatureType {
@@ -350,11 +363,74 @@ impl<'de> Deserialize<'de> for CacaoSignatureType {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "eip191" => Self::Eip191,
-            "eip1271" => Self::Eip1271,
-            _ => Self::Other(value),
-        })
+        Ok(Self::from_wire(value))
+    }
+}
+
+/// CACAO signature bytes as represented by the `WalletConnect` Sign wire format.
+///
+/// CAIP-74 models the field as bytes.
+///
+/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
+///
+/// > type Signature struct {
+/// > t String
+/// > m optional SignatureMeta
+/// > s Bytes
+///
+/// `WalletConnect`'s current public type carries those bytes as a string.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L117-L120>
+///
+/// > interface CacaoSignature {
+/// > t: "eip191" | "eip1271";
+/// > s: string;
+///
+/// The maintained helper passes the signature object through unchanged, so this
+/// type preserves the wire string instead of assuming a single hex convention.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/cacao.ts#L121-L149>
+///
+/// > s: signature,
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::CacaoSignatureValue;
+///
+/// let live = CacaoSignatureValue::from_wire("0x5851cc642b66ba30");
+/// assert_eq!(live.as_str(), "0x5851cc642b66ba30");
+///
+/// let caip_example = CacaoSignatureValue::from_wire("5ccb134ad3d874c");
+/// assert_eq!(caip_example.to_string(), "5ccb134ad3d874c");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CacaoSignatureValue(String);
+
+impl CacaoSignatureValue {
+    /// Stores the SDK wire signature string without normalization.
+    #[must_use]
+    pub fn from_wire(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrows the preserved wire signature.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the preserved wire signature.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for CacaoSignatureValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -373,7 +449,7 @@ pub struct CacaoSignature {
     pub kind: CacaoSignatureType,
     /// Signature bytes encoded as the SDK wire string `s`.
     #[serde(rename = "s")]
-    pub signature: String,
+    pub signature: CacaoSignatureValue,
     /// Optional signature metadata serialized as `m`.
     #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<String>,

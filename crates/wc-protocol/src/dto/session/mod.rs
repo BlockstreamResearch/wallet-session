@@ -17,7 +17,7 @@ mod update;
 pub use action::{SessionEventName, SessionEventNameError, SessionMethod, SessionMethodError};
 pub use authenticate::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-    CacaoSignatureType, SessionAuthenticateParams, SessionAuthenticateResult,
+    CacaoSignatureType, CacaoSignatureValue, SessionAuthenticateParams, SessionAuthenticateResult,
 };
 pub use delete::SessionDeleteParams;
 pub use event::{SessionEvent, SessionEventParams};

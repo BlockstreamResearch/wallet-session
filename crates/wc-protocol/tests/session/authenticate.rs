@@ -3,9 +3,9 @@ use serde_json::json;
 use super::{chain, chain_strings, did_pkh, public_key};
 use wc_protocol::session::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-    CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
-    JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams, SessionAuthenticateResult,
-    SessionParticipant, SignMethod,
+    CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
+    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams,
+    SessionAuthenticateResult, SessionParticipant, SignMethod,
 };
 
 const LIVE_SESSION_AUTHENTICATE_JSON: &str = r#"{
@@ -271,7 +271,7 @@ fn deserializes_live_authenticate_approve_result_shape() {
         ["urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ"]
     );
     assert_eq!(cacao.s.kind, CacaoSignatureType::Eip191);
-    assert!(cacao.s.signature.starts_with("0x"));
+    assert!(cacao.s.signature.as_str().starts_with("0x"));
 
     let payload_value = serde_json::to_value(&cacao.p).expect("serializes payload");
     assert!(payload_value.get("chains").is_none());
@@ -314,7 +314,7 @@ fn serializes_authenticate_approve_result_wire_shape() {
                 },
                 s: CacaoSignature {
                     kind: CacaoSignatureType::Eip191,
-                    signature: "0x00".to_owned(),
+                    signature: CacaoSignatureValue::from_wire("0x00"),
                     meta: None,
                 },
             }],
@@ -359,6 +359,7 @@ fn cacao_type_values_preserve_known_and_unknown_wire_names() {
     assert_eq!(cacao.s.kind, CacaoSignatureType::Eip1271);
     assert_eq!(cacao.s.kind.as_str(), "eip1271");
     assert_eq!(cacao.s.meta.as_deref(), Some("contract-wallet"));
+    assert_eq!(cacao.s.signature.as_str(), "0x01");
     assert_eq!(
         cacao.p.iss.account_id_str(),
         "eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
@@ -376,6 +377,25 @@ fn cacao_type_values_preserve_known_and_unknown_wire_names() {
         serde_json::to_value(header).expect("serializes")["t"],
         "future-header"
     );
+}
+
+#[test]
+fn cacao_signature_value_preserves_wire_string_without_hex_normalization() {
+    for signature in [
+        "0x00",
+        "5ccb134ad3d874cbb40a32b399549cd32c953dc5dc87dc64624a3e3dc0684d7d4833043dd7e9f4a6894853f8dc555f97bc7e3c7dd3fcc66409eb982bff3a44671b",
+        "",
+        "not-hex",
+    ] {
+        let parsed = serde_json::from_value::<CacaoSignatureValue>(json!(signature))
+            .expect("signature wire string parses");
+
+        assert_eq!(parsed.as_str(), signature);
+        assert_eq!(
+            serde_json::to_value(parsed).expect("serializes"),
+            json!(signature)
+        );
+    }
 }
 
 #[test]

@@ -148,7 +148,8 @@ impl<T> JsonRpcRequest<T> {
 /// use wc_protocol::did::DidPkh;
 /// use wc_protocol::session::{
 ///     Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature, CacaoSignatureType,
-///     DappMetadata, JsonRpcResponse, SessionAuthenticateResult, SessionParticipant,
+///     CacaoSignatureValue, DappMetadata, JsonRpcResponse, SessionAuthenticateResult,
+///     SessionParticipant,
 /// };
 ///
 /// let response = JsonRpcResponse::new(
@@ -188,7 +189,7 @@ impl<T> JsonRpcRequest<T> {
 ///             },
 ///             s: CacaoSignature {
 ///                 kind: CacaoSignatureType::Eip191,
-///                 signature: "0x00".to_owned(),
+///                 signature: CacaoSignatureValue::from_wire("0x00"),
 ///                 meta: None,
 ///             },
 ///         }],
