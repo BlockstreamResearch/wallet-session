@@ -1,11 +1,14 @@
 //! Local WebSocket tests for the relay client behavior layer.
 
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use wc_protocol::relay::{IrnPublish, IrnUnsubscribe, RelayTopic};
-use wc_transport::{RelayClient, RelayClientError};
+use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
 
 #[tokio::test]
 async fn relay_client_subscribe_returns_subscription_id() {
@@ -106,13 +109,21 @@ async fn relay_client_next_message_acknowledges_subscription_push() {
         .await
         .expect("binds local websocket listener");
     let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x33; 32]);
+    let server_topic = topic.clone();
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accepts client");
         let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+        send_result(&mut websocket, &request, json!("push-subscription-id")).await;
+
         websocket
             .send(Message::Text(
-                subscription_push_json(9001).to_string().into(),
+                subscription_push_json(9001, &server_topic)
+                    .to_string()
+                    .into(),
             ))
             .await
             .expect("sends subscription push");
@@ -125,6 +136,12 @@ async fn relay_client_next_message_acknowledges_subscription_push() {
     let mut client = RelayClient::connect(&format!("ws://{address}"))
         .await
         .expect("connects to local websocket");
+    let subscription_id = client
+        .subscribe(topic.clone())
+        .await
+        .expect("subscribes before reading pushes");
+    assert_eq!(subscription_id, "push-subscription-id");
+
     let message = client
         .next_message()
         .await
@@ -133,7 +150,7 @@ async fn relay_client_next_message_acknowledges_subscription_push() {
 
     assert_eq!(message.id, "push-subscription-id");
     assert_eq!(message.data.message, "encrypted-payload");
-    assert_eq!(message.data.topic, RelayTopic::from_bytes([0x33; 32]));
+    assert_eq!(message.data.topic, topic);
 
     server.await.expect("server task joins");
 }
@@ -144,6 +161,8 @@ async fn relay_client_queues_subscription_push_while_waiting_for_response() {
         .await
         .expect("binds local websocket listener");
     let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x44; 32]);
+    let server_topic = topic.clone();
 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accepts client");
@@ -152,7 +171,9 @@ async fn relay_client_queues_subscription_push_while_waiting_for_response() {
 
         websocket
             .send(Message::Text(
-                subscription_push_json(9002).to_string().into(),
+                subscription_push_json(9002, &server_topic)
+                    .to_string()
+                    .into(),
             ))
             .await
             .expect("sends subscription push before response");
@@ -179,7 +200,7 @@ async fn relay_client_queues_subscription_push_while_waiting_for_response() {
         .await
         .expect("connects to local websocket");
     let subscription_id = client
-        .subscribe(RelayTopic::from_bytes([0x44; 32]))
+        .subscribe(topic)
         .await
         .expect("subscribes after queued push");
     assert_eq!(subscription_id, "subscription-id");
@@ -254,6 +275,69 @@ async fn relay_client_maps_relay_error_response() {
 }
 
 #[tokio::test]
+async fn relay_client_failed_subscribe_prunes_pending_pushes() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x5a; 32]);
+    let server_topic = topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9003, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends pending subscription push");
+
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9003);
+        assert_eq!(ack["result"], true);
+
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": request["id"],
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid payload",
+                    },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("sends relay error response");
+
+        sleep(Duration::from_millis(120)).await;
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+    let error = client
+        .subscribe(topic)
+        .await
+        .expect_err("subscribe fails after pending push");
+
+    assert!(matches!(error, RelayClientError::Relay { .. }));
+
+    let no_queued_message = timeout(Duration::from_millis(30), client.next_message()).await;
+    assert!(no_queued_message.is_err());
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
 async fn relay_client_batch_methods_use_relay_shapes() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -309,7 +393,7 @@ async fn relay_client_batch_methods_use_relay_shapes() {
     assert_eq!(subscription_ids, ["sub-a", "sub-b"]);
 
     let fetched = client
-        .batch_fetch_messages(vec![topic_a.clone(), topic_b.clone()])
+        .batch_fetch_messages(&[topic_a.clone(), topic_b.clone()])
         .await
         .expect("batch fetches");
     assert!(!fetched.has_more);
@@ -317,13 +401,360 @@ async fn relay_client_batch_methods_use_relay_shapes() {
     assert_eq!(fetched.messages[0].message, "cached");
 
     let unsubscribed = client
-        .batch_unsubscribe(vec![
+        .batch_unsubscribe(&[
             IrnUnsubscribe::new(topic_a, "sub-a"),
             IrnUnsubscribe::new(topic_b, "sub-b"),
         ])
         .await
         .expect("batch unsubscribes");
     assert!(unsubscribed);
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_times_out_waiting_for_response() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+        sleep(Duration::from_millis(120)).await;
+    });
+
+    let mut client = RelayClient::connect_with_config(
+        &format!("ws://{address}"),
+        RelayClientConfig {
+            request_timeout: Duration::from_millis(20),
+            ..RelayClientConfig::default()
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(RelayTopic::from_bytes([0x88; 32]))
+        .await
+        .expect_err("request times out");
+
+    match error {
+        RelayClientError::RequestTimedOut { timeout } => {
+            assert_eq!(timeout, Duration::from_millis(20));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_pushes_do_not_extend_response_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x89; 32]);
+    let server_topic = topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        for id in [9010_u64, 9011, 9012] {
+            websocket
+                .send(Message::Text(
+                    subscription_push_json(id, &server_topic).to_string().into(),
+                ))
+                .await
+                .expect("sends subscription push");
+
+            let ack = read_json_frame(&mut websocket).await;
+            assert_eq!(ack["id"], id);
+            assert_eq!(ack["result"], true);
+        }
+
+        sleep(Duration::from_millis(120)).await;
+    });
+
+    let mut client = RelayClient::connect_with_config(
+        &format!("ws://{address}"),
+        RelayClientConfig {
+            request_timeout: Duration::from_millis(40),
+            ..RelayClientConfig::default()
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(topic)
+        .await
+        .expect_err("request times out after queued pushes");
+
+    match error {
+        RelayClientError::RequestTimedOut { timeout } => {
+            assert_eq!(timeout, Duration::from_millis(40));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_rejects_too_many_pushes_while_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x8a; 32]);
+    let server_topic = topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9020, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends first push");
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9021, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends second push");
+
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9020);
+        assert_eq!(ack["result"], true);
+    });
+
+    let mut client = RelayClient::connect_with_config(
+        &format!("ws://{address}"),
+        RelayClientConfig {
+            max_pushes_while_waiting: 1,
+            ..RelayClientConfig::default()
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(topic)
+        .await
+        .expect_err("second push exceeds per-request limit");
+
+    match error {
+        RelayClientError::PushLimitExceeded { limit } => assert_eq!(limit, 1),
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_rejects_queue_overflow() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x8b; 32]);
+    let server_topic = topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9030, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends subscription push");
+
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9030);
+        assert_eq!(ack["result"], true);
+    });
+
+    let mut client = RelayClient::connect_with_config(
+        &format!("ws://{address}"),
+        RelayClientConfig {
+            max_queued_messages: 0,
+            ..RelayClientConfig::default()
+        },
+    )
+    .await
+    .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(topic)
+        .await
+        .expect_err("queue capacity rejects push");
+
+    match error {
+        RelayClientError::QueueFull { limit } => assert_eq!(limit, 0),
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_rejects_unexpected_subscription_topic() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let expected_topic = RelayTopic::from_bytes([0x8c; 32]);
+    let unexpected_topic = RelayTopic::from_bytes([0x8d; 32]);
+    let server_topic = unexpected_topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_subscribe");
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9040, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends subscription push");
+
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9040);
+        assert_eq!(ack["result"], true);
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+
+    let error = client
+        .subscribe(expected_topic)
+        .await
+        .expect_err("unexpected topic is rejected");
+
+    match error {
+        RelayClientError::UnexpectedSubscriptionTopic { topic } => {
+            assert_eq!(topic, unexpected_topic);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_rejects_batch_subscribe_length_mismatch() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        let request = read_json_frame(&mut websocket).await;
+        assert_eq!(request["method"], "irn_batchSubscribe");
+        send_result(&mut websocket, &request, json!(["only-one-id"])).await;
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+    let error = client
+        .batch_subscribe(vec![
+            RelayTopic::from_bytes([0x8e; 32]),
+            RelayTopic::from_bytes([0x8f; 32]),
+        ])
+        .await
+        .expect_err("batch response length mismatch is rejected");
+
+    match error {
+        RelayClientError::BatchSubscribeLength { expected, actual } => {
+            assert_eq!(expected, 2);
+            assert_eq!(actual, 1);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_unsubscribe_prunes_queued_topic_messages() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic = RelayTopic::from_bytes([0x90; 32]);
+    let server_topic = topic.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+
+        let subscribe = read_json_frame(&mut websocket).await;
+        assert_eq!(subscribe["method"], "irn_subscribe");
+        send_result(&mut websocket, &subscribe, json!("sub-id")).await;
+
+        let unsubscribe = read_json_frame(&mut websocket).await;
+        assert_eq!(unsubscribe["method"], "irn_unsubscribe");
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9050, &server_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends push during unsubscribe");
+
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9050);
+        assert_eq!(ack["result"], true);
+        send_result(&mut websocket, &unsubscribe, json!(true)).await;
+        sleep(Duration::from_millis(120)).await;
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+    let subscription_id = client.subscribe(topic.clone()).await.expect("subscribes");
+    assert_eq!(subscription_id, "sub-id");
+
+    let unsubscribed = client
+        .unsubscribe(&topic, &subscription_id)
+        .await
+        .expect("unsubscribes");
+    assert!(unsubscribed);
+
+    let no_queued_message = timeout(Duration::from_millis(30), client.next_message()).await;
+    assert!(no_queued_message.is_err());
 
     server.await.expect("server task joins");
 }
@@ -362,7 +793,7 @@ async fn send_result(
         .expect("sends result");
 }
 
-fn subscription_push_json(id: u64) -> Value {
+fn subscription_push_json(id: u64, topic: &RelayTopic) -> Value {
     json!({
         "id": id,
         "jsonrpc": "2.0",
@@ -370,7 +801,7 @@ fn subscription_push_json(id: u64) -> Value {
         "params": {
             "id": "push-subscription-id",
             "data": {
-                "topic": "3333333333333333333333333333333333333333333333333333333333333333",
+                "topic": topic.as_str(),
                 "message": "encrypted-payload",
                 "publishedAt": 1_779_882_524_426_u64,
             },

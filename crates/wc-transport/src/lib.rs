@@ -14,7 +14,10 @@
 
 mod client;
 
-pub use client::{RelayClient, RelayClientError};
+pub use client::{
+    DEFAULT_MAX_PUSHES_WHILE_WAITING, DEFAULT_MAX_QUEUED_MESSAGES, DEFAULT_REQUEST_TIMEOUT,
+    RelayClient, RelayClientConfig, RelayClientError,
+};
 
 use std::{fmt, string::FromUtf8Error};
 

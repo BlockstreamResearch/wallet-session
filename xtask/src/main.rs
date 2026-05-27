@@ -1279,7 +1279,7 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
 
     let mut subscriber = config.connect("subscriber").await?;
 
-    let fetch_response = subscriber.fetch_messages(pairing.topic().clone()).await?;
+    let fetch_response = subscriber.fetch_messages(pairing.topic()).await?;
     println!(
         "pairing-uri fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1331,7 +1331,7 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
     }
 
     let unsubscribe_result = subscriber
-        .unsubscribe(pairing.topic().clone(), subscription_id)
+        .unsubscribe(pairing.topic(), &subscription_id)
         .await?;
     println!("pairing-uri unsubscribe_ack={unsubscribe_result}");
 
@@ -1539,7 +1539,7 @@ async fn run_push_delivery(
         subscriber.read_subscription(&topic, message).await?;
     }
 
-    let fetch_response = subscriber.fetch_messages(topic.clone()).await?;
+    let fetch_response = subscriber.fetch_messages(&topic).await?;
     println!(
         "{label} subscriber fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1549,7 +1549,7 @@ async fn run_push_delivery(
         bail!("{label} expected empty mailbox after live delivery ack");
     }
 
-    subscriber.unsubscribe(topic, subscription_id).await?;
+    subscriber.unsubscribe(&topic, &subscription_id).await?;
     println!("{label} subscriber unsubscribe_ack=true");
 
     Ok(())
@@ -1565,9 +1565,7 @@ async fn run_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) -> Resul
     let subscription_id = subscriber.subscribe(topic.clone()).await?;
     println!("{label} subscriber subscription_id={subscription_id}");
 
-    subscriber
-        .unsubscribe(topic.clone(), subscription_id)
-        .await?;
+    subscriber.unsubscribe(&topic, &subscription_id).await?;
     println!("{label} subscriber unsubscribe_ack=true");
 
     let mut publisher = config.connect("publisher").await?;
@@ -1658,7 +1656,7 @@ async fn run_batch_fetch_offline_messages(config: &RelayProbeConfig) -> Result<(
     }
 
     let mut subscriber = config.connect("subscriber").await?;
-    let fetch_response = subscriber.batch_fetch_messages(topics.clone()).await?;
+    let fetch_response = subscriber.batch_fetch_messages(&topics).await?;
     println!(
         "{label} subscriber batch_fetch_messages count={} has_more={}",
         fetch_response.messages.len(),
@@ -1673,15 +1671,12 @@ async fn run_batch_fetch_offline_messages(config: &RelayProbeConfig) -> Result<(
     });
     println!("{label} offline_cache_observed={offline_cache_observed}");
 
-    let unsubscribe_result = subscriber
-        .batch_unsubscribe(
-            topics
-                .into_iter()
-                .zip(subscription_ids)
-                .map(|(topic, id)| IrnUnsubscribe::new(topic, id))
-                .collect(),
-        )
-        .await?;
+    let subscriptions = topics
+        .into_iter()
+        .zip(subscription_ids)
+        .map(|(topic, id)| IrnUnsubscribe::new(topic, id))
+        .collect::<Vec<_>>();
+    let unsubscribe_result = subscriber.batch_unsubscribe(&subscriptions).await?;
     println!("{label} subscriber batch_unsubscribe_result={unsubscribe_result}");
 
     Ok(())
@@ -1709,7 +1704,7 @@ async fn run_batch_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) ->
         subscriptions.push(IrnUnsubscribe::new(topic.clone(), subscription_id));
     }
 
-    let unsubscribe_result = subscriber.batch_unsubscribe(subscriptions).await?;
+    let unsubscribe_result = subscriber.batch_unsubscribe(&subscriptions).await?;
     println!("{label} subscriber batch_unsubscribe_result={unsubscribe_result}");
 
     let mut publisher = config.connect("publisher").await?;
@@ -1808,7 +1803,7 @@ impl RelaySocket {
         Ok(ack)
     }
 
-    async fn fetch_messages(&mut self, topic: RelayTopic) -> Result<IrnFetchMessagesResponse> {
+    async fn fetch_messages(&mut self, topic: &RelayTopic) -> Result<IrnFetchMessagesResponse> {
         println!("{} -> irn_fetchMessages", self.role);
         let response = self
             .client
@@ -1821,7 +1816,7 @@ impl RelaySocket {
 
     async fn batch_fetch_messages(
         &mut self,
-        topics: Vec<RelayTopic>,
+        topics: &[RelayTopic],
     ) -> Result<IrnBatchFetchMessagesResponse> {
         println!(
             "{} -> irn_batchFetchMessages topics={}",
@@ -1837,7 +1832,7 @@ impl RelaySocket {
         Ok(response)
     }
 
-    async fn unsubscribe(&mut self, topic: RelayTopic, subscription_id: String) -> Result<bool> {
+    async fn unsubscribe(&mut self, topic: &RelayTopic, subscription_id: &str) -> Result<bool> {
         println!("{} -> irn_unsubscribe", self.role);
         let ack = self
             .client
@@ -1848,7 +1843,7 @@ impl RelaySocket {
         Ok(ack)
     }
 
-    async fn batch_unsubscribe(&mut self, subscriptions: Vec<IrnUnsubscribe>) -> Result<bool> {
+    async fn batch_unsubscribe(&mut self, subscriptions: &[IrnUnsubscribe]) -> Result<bool> {
         println!(
             "{} -> irn_batchUnsubscribe subscriptions={}",
             self.role,
