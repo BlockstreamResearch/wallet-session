@@ -29,6 +29,11 @@ ed25519-dalek = "2"
 # and 32-byte symmetric key in the maintained JavaScript implementation.
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["std"] }
 
+# Envelope encryption needs OS randomness for the 12-byte ChaCha20-Poly1305 IV.
+# TODO(wasm): wasm32-unknown-unknown needs an explicit getrandom backend; decide
+# whether wc-wasm owns IV generation or enables getrandom's wasm_js backend.
+getrandom = "0.3"
+
 thiserror = "2"
 
 serde = { version = "1", features = ["derive"] }

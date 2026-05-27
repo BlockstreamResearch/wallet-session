@@ -1506,6 +1506,7 @@ async fn run_probe_matrix(config: &RelayProbeConfig) -> Result<()> {
     )
     .await?;
 
+    run_encrypted_envelope_delivery(config).await?;
     run_unsubscribe_suppresses_delivery(config).await?;
     run_batch_subscribe_delivery(config).await?;
     run_batch_fetch_offline_messages(config).await?;
@@ -1513,6 +1514,82 @@ async fn run_probe_matrix(config: &RelayProbeConfig) -> Result<()> {
     run_batch_publish_probe(config).await?;
 
     println!("relay-probe matrix ok");
+
+    Ok(())
+}
+
+async fn run_encrypted_envelope_delivery(config: &RelayProbeConfig) -> Result<()> {
+    let label = "matrix-encrypted-envelope";
+    let topic = generated_topic()?;
+    let sym_key = generated_sym_key()?;
+    let payload = json!({
+        "id": rpc_id()?.as_u64(),
+        "jsonrpc": "2.0",
+        "method": "wc_probeEncryptedEnvelope",
+        "params": {
+            "label": label,
+            "quote": "\"",
+            "backslash": "\\",
+            "slash": "/",
+            "newline": "\n",
+            "tab": "\t",
+            "unicode_escape": "\u{2603}",
+            "empty_object": {},
+            "empty_array": [],
+            "nested": {
+                "numbers": [0, 1, -1],
+                "bools": [true, false]
+            }
+        }
+    });
+    let plaintext = serde_json::to_string(&payload).context("failed to serialize probe payload")?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, &sym_key)
+        .context("failed to encrypt relay probe envelope")?;
+    let message = envelope.encode(EnvelopeEncoding::Base64);
+    println!(
+        "{label} topic={topic} plaintext_len={} encrypted_len={}",
+        plaintext.len(),
+        message.len()
+    );
+
+    let mut subscriber = config.connect("subscriber").await?;
+    let subscription_id = subscriber.subscribe(topic.clone()).await?;
+    println!("{label} subscriber subscription_id={subscription_id}");
+
+    let mut publisher = config.connect("publisher").await?;
+    publisher
+        .publish(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
+        .await?;
+    println!("{label} publisher publish_ack=true");
+
+    let subscription = subscriber
+        .read_any_subscription_for_topic(&topic, READ_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("{label} timed out waiting for encrypted subscription"))?;
+    if subscription.data.message != message {
+        bail!("{label} encrypted message changed in transit");
+    }
+
+    let received = Envelope::decode(&subscription.data.message, EnvelopeEncoding::Base64)
+        .context("failed to decode received encrypted envelope")?;
+    let decrypted = received
+        .decrypt(&sym_key)
+        .context("failed to decrypt received envelope")?;
+    let decoded_payload =
+        serde_json::from_str::<Value>(&decrypted).context("decrypted envelope was not JSON")?;
+    if decoded_payload != payload {
+        bail!("{label} decrypted payload mismatch");
+    }
+
+    println!(
+        "{label} decrypt_ok=true envelope_type={:?} json_id={} params_keys={}",
+        received.envelope_type(),
+        json_id(&decoded_payload),
+        params_keys(&decoded_payload)
+    );
+
+    subscriber.unsubscribe(&topic, &subscription_id).await?;
+    println!("{label} subscriber unsubscribe_ack=true");
 
     Ok(())
 }
@@ -2088,6 +2165,12 @@ fn generated_topic() -> Result<RelayTopic> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).context("failed to generate relay topic")?;
     Ok(RelayTopic::from_bytes(bytes))
+}
+
+fn generated_sym_key() -> Result<PairingSymKey> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).context("failed to generate symmetric key")?;
+    PairingSymKey::from_hex(hex_string(&bytes)).context("failed to build symmetric key")
 }
 
 fn random_hex(len: usize) -> Result<String> {
