@@ -144,6 +144,7 @@ impl<T> JsonRpcRequest<T> {
 /// # Examples
 ///
 /// ```
+/// use wc_protocol::did::DidPkh;
 /// use wc_protocol::session::{
 ///     Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature, CacaoSignatureType,
 ///     DappMetadata, JsonRpcResponse, SessionAuthenticateResult, SessionParticipant,
@@ -168,7 +169,9 @@ impl<T> JsonRpcRequest<T> {
 ///                 kind: CacaoHeaderType::Caip122,
 ///             },
 ///             p: CacaoPayload {
-///                 iss: "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".to_owned(),
+///                 iss: DidPkh::parse(
+///                     "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87",
+///                 )?,
 ///                 domain: "example.com".to_owned(),
 ///                 aud: "https://example.com/login".to_owned(),
 ///                 version: "1".to_owned(),

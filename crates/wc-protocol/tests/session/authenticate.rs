@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{chain, chain_strings};
+use super::{chain, chain_strings, did_pkh};
 use wc_protocol::session::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
     CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
@@ -220,7 +220,7 @@ fn deserializes_live_authenticate_approve_result_shape() {
     let cacao = response.result.cacaos.first().expect("live cacao");
     assert_eq!(cacao.h.kind, CacaoHeaderType::Caip122);
     assert_eq!(
-        cacao.p.iss,
+        cacao.p.iss.as_str(),
         "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
     );
     assert_eq!(cacao.p.domain, "example.com");
@@ -261,7 +261,7 @@ fn serializes_authenticate_approve_result_wire_shape() {
                     kind: CacaoHeaderType::Caip122,
                 },
                 p: CacaoPayload {
-                    iss: "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".to_owned(),
+                    iss: did_pkh("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"),
                     domain: "example.com".to_owned(),
                     aud: "https://example.com/login".to_owned(),
                     version: "1".to_owned(),
@@ -320,6 +320,10 @@ fn cacao_type_values_preserve_known_and_unknown_wire_names() {
     assert_eq!(cacao.s.kind, CacaoSignatureType::Eip1271);
     assert_eq!(cacao.s.kind.as_str(), "eip1271");
     assert_eq!(cacao.s.meta.as_deref(), Some("contract-wallet"));
+    assert_eq!(
+        cacao.p.iss.account_id_str(),
+        "eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
+    );
 
     let header = serde_json::from_value::<CacaoHeader>(json!({
         "t": "future-header"

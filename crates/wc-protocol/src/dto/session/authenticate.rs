@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::SessionParticipant;
-use crate::caip::Caip2ChainId;
+use crate::{caip::Caip2ChainId, did::DidPkh};
 
 /// Decrypted `wc_sessionAuthenticate` params.
 ///
@@ -227,23 +227,26 @@ pub struct CacaoHeader {
 
 /// CACAO payload.
 ///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification>
+/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
 ///
 /// > type Payload struct {
 /// > domain String // =domain
 /// > iss String // = DID pkh
 /// > aud String // =uri
 ///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/cacao.ts#L134-L146>
+/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
 ///
-/// > p: {
-/// > iss,
-/// > domain: requestPayload.domain,
-/// > aud: requestPayload.aud,
+/// > issuer here is [did:pkh](https://github.com/w3c-ccg/did-pkh/blob/main/did-pkh-method-draft.md), which includes both blockchain address and blockchain network information.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L121-L128>
+///
+/// > if (!iss.includes("did:pkh:")) {
+/// > iss = `did:pkh:${iss}`;
+/// > }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacaoPayload {
     /// DID PKH issuer containing the account namespace, reference, and address.
-    pub iss: String,
+    pub iss: DidPkh,
     /// Domain requesting authentication.
     pub domain: String,
     /// URI identifying the authentication audience.

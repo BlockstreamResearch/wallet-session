@@ -2,6 +2,7 @@
 
 mod session {
     use wc_protocol::caip::{Caip2ChainId, Caip10AccountId};
+    use wc_protocol::did::DidPkh;
 
     fn chain(value: &str) -> Caip2ChainId {
         value.parse().expect("test chain ID parses")
@@ -9,6 +10,10 @@ mod session {
 
     fn account(value: &str) -> Caip10AccountId {
         value.parse().expect("test account ID parses")
+    }
+
+    fn did_pkh(value: &str) -> DidPkh {
+        value.parse().expect("test DID PKH parses")
     }
 
     fn chain_strings(values: &[Caip2ChainId]) -> Vec<&str> {
