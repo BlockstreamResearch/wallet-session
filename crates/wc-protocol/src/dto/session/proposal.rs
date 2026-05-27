@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::rpc::{JsonRpcError, JsonRpcErrorResponse};
 use crate::{
     caip::{Caip2ChainId, NamespaceKey},
+    key::X25519PublicKey,
     relay::RelayTopic,
 };
 
@@ -154,7 +155,7 @@ pub struct SessionProposeResult {
     pub relay: RelayProtocolOptions,
     /// Wallet public key used by the dapp to derive the session topic.
     #[serde(rename = "responderPublicKey")]
-    pub responder_public_key: String,
+    pub responder_public_key: X25519PublicKey,
 }
 
 /// JSON-RPC error response for a rejected `wc_sessionPropose`.
@@ -259,7 +260,7 @@ pub struct RelayProtocolOptions {
 pub struct Proposer {
     /// Dapp public key used later for session key agreement.
     #[serde(rename = "publicKey")]
-    pub public_key: String,
+    pub public_key: X25519PublicKey,
     /// Dapp metadata suitable for wallet UI.
     pub metadata: DappMetadata,
 }

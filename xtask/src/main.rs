@@ -897,7 +897,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
       "expiryTimestamp": 4102444800,
       "relays": [{"protocol": "irn"}],
       "proposer": {
-        "publicKey": "dapp-public-key",
+        "publicKey": "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
         "metadata": {
           "name": "Probe Dapp",
           "description": "Probe dapp",
@@ -920,7 +920,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     "jsonrpc": "2.0",
     "result": {
       "relay": {"protocol": "irn"},
-      "responderPublicKey": "wallet-public-key"
+      "responderPublicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
     }
   },
   {
@@ -943,7 +943,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
         }
       },
       "controller": {
-        "publicKey": "wallet-public-key",
+        "publicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
         "metadata": {
           "name": "Probe Wallet",
           "description": "Probe wallet",
@@ -1022,7 +1022,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     "method": "wc_sessionAuthenticate",
     "params": {
       "requester": {
-        "publicKey": "dapp-public-key",
+        "publicKey": "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
         "metadata": {
           "name": "Probe Dapp",
           "description": "Probe dapp",
@@ -1048,7 +1048,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     "jsonrpc": "2.0",
     "result": {
       "responder": {
-        "publicKey": "wallet-public-key",
+        "publicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
         "metadata": {
           "name": "Probe Wallet",
           "description": "Probe wallet",
@@ -1087,7 +1087,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     "relay": {"protocol": "irn"},
     "expiry": 4102444800,
     "acknowledged": true,
-    "controller": "wallet-public-key",
+    "controller": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
     "namespaces": {
       "eip155": {
         "chains": ["eip155:1"],
@@ -1099,7 +1099,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
     "requiredNamespaces": {},
     "optionalNamespaces": {},
     "self": {
-      "publicKey": "wallet-public-key",
+      "publicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
       "metadata": {
         "name": "Probe Wallet",
         "description": "Probe wallet",
@@ -1108,7 +1108,7 @@ const SAMPLE_SESSION_PROBE_JSON: &str = r#"[
       }
     },
     "peer": {
-      "publicKey": "dapp-public-key",
+      "publicKey": "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
       "metadata": {
         "name": "Probe Dapp",
         "description": "Probe dapp",

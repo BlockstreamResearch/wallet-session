@@ -144,6 +144,7 @@ impl<T> JsonRpcRequest<T> {
 /// # Examples
 ///
 /// ```
+/// use wc_protocol::key::X25519PublicKey;
 /// use wc_protocol::did::DidPkh;
 /// use wc_protocol::session::{
 ///     Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature, CacaoSignatureType,
@@ -154,7 +155,9 @@ impl<T> JsonRpcRequest<T> {
 ///     1,
 ///     SessionAuthenticateResult {
 ///         responder: SessionParticipant {
-///             public_key: "wallet-public-key".to_owned(),
+///             public_key: X25519PublicKey::from_hex(
+///                 "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
+///             )?,
 ///             metadata: DappMetadata {
 ///                 name: "Wallet".to_owned(),
 ///                 description: "Wallet".to_owned(),

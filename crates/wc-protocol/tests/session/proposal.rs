@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::chain_strings;
+use super::{chain_strings, public_key};
 use wc_protocol::{
     relay::RelayTopic,
     session::{
@@ -295,8 +295,9 @@ fn serializes_current_type_names() {
                 data: None,
             }],
             proposer: Proposer {
-                public_key: "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207"
-                    .to_owned(),
+                public_key: public_key(
+                    "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
+                ),
                 metadata: DappMetadata {
                     name: "Example".to_owned(),
                     description: "Example dapp".to_owned(),
@@ -357,7 +358,7 @@ fn deserializes_live_proposal_approval_result_shape() {
     assert_eq!(response.id, 1_779_866_466_221_833);
     assert_eq!(response.result.relay.protocol, "irn");
     assert_eq!(
-        response.result.responder_public_key,
+        response.result.responder_public_key.as_str(),
         "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
     );
 }
@@ -371,8 +372,9 @@ fn serializes_proposal_approval_result_wire_shape() {
                 protocol: "irn".to_owned(),
                 data: Some("relay-data".to_owned()),
             },
-            responder_public_key:
-                "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337".to_owned(),
+            responder_public_key: public_key(
+                "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
+            ),
         },
     );
 

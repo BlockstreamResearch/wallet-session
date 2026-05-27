@@ -8,6 +8,7 @@ use serde_json::Value;
 use super::{Cacao, DappMetadata, ProposalNamespaces, RelayProtocolOptions};
 use crate::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
+    key::X25519PublicKey,
     relay::RelayTopic,
 };
 
@@ -42,7 +43,7 @@ use crate::{
 ///   "relay": {"protocol": "irn"},
 ///   "expiry": 1780470684,
 ///   "acknowledged": true,
-///   "controller": "wallet-public-key",
+///   "controller": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
 ///   "namespaces": {
 ///     "eip155": {
 ///       "accounts": ["eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"],
@@ -54,11 +55,11 @@ use crate::{
 ///   "requiredNamespaces": {},
 ///   "optionalNamespaces": {},
 ///   "self": {
-///     "publicKey": "wallet-public-key",
+///     "publicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
 ///     "metadata": {"name": "Wallet", "description": "Wallet", "url": "https://example.com/wallet", "icons": []}
 ///   },
 ///   "peer": {
-///     "publicKey": "dapp-public-key",
+///     "publicKey": "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
 ///     "metadata": {"name": "Dapp", "description": "Dapp", "url": "https://example.com/dapp", "icons": []}
 ///   },
 ///   "transportType": "relay"
@@ -83,7 +84,7 @@ pub struct Session {
     /// Whether the local SDK has acknowledged the session.
     pub acknowledged: bool,
     /// Public key that controls this local session view.
-    pub controller: String,
+    pub controller: X25519PublicKey,
     /// Approved namespaces available to session requests and events.
     pub namespaces: SessionNamespaces,
     /// Required namespaces copied from the proposal.
@@ -243,7 +244,7 @@ pub struct SessionNamespace {
 pub struct SessionParticipant {
     /// Participant public key.
     #[serde(rename = "publicKey")]
-    pub public_key: String,
+    pub public_key: X25519PublicKey,
     /// Participant metadata suitable for the peer's UI.
     pub metadata: DappMetadata,
 }

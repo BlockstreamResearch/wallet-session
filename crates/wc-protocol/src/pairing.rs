@@ -8,7 +8,10 @@ use base64::{
 };
 use serde::Serialize;
 
-use crate::relay::{RelayTopic, RelayTopicError};
+use crate::{
+    encoding::decode_validated_hex,
+    relay::{RelayTopic, RelayTopicError},
+};
 
 /// `WalletConnect` v2 pairing URI.
 ///
@@ -200,9 +203,7 @@ impl PairingSymKey {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; PAIRING_SYM_KEY_BYTES] {
         let mut bytes = [0_u8; PAIRING_SYM_KEY_BYTES];
-        for (index, chunk) in self.0.as_bytes().chunks_exact(2).enumerate() {
-            bytes[index] = hex_pair(chunk[0], chunk[1]);
-        }
+        decode_validated_hex(&self.0, &mut bytes);
         bytes
     }
 }
@@ -559,24 +560,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T, key: &'static str) -> Result<(), 
     }
 
     Ok(())
-}
-
-/// Decodes a validated lowercase hex byte pair.
-///
-/// `PairingSymKey::from_hex` already checks width and ASCII hex characters, so
-/// this helper can stay infallible and avoid reparsing errors at every caller.
-fn hex_pair(high: u8, low: u8) -> u8 {
-    (hex_nibble(high) << 4) | hex_nibble(low)
-}
-
-/// Maps one validated ASCII hex character to its numeric nibble.
-fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        b'A'..=b'F' => value - b'A' + 10,
-        _ => unreachable!("PairingSymKey::from_hex validates ASCII hex input"),
-    }
 }
 
 #[cfg(test)]

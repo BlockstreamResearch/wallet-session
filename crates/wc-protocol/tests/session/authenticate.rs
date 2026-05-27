@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{chain, chain_strings, did_pkh};
+use super::{chain, chain_strings, did_pkh, public_key};
 use wc_protocol::session::{
     AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
     CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
@@ -132,8 +132,9 @@ fn serializes_authenticate_request_with_optional_fields() {
         SignMethod::SessionAuthenticate,
         SessionAuthenticateParams {
             requester: SessionParticipant {
-                public_key: "351b54461d6075e0bcc0084f3f901cb7cdf4b16135e8ffa46a3a7193c6125b2e"
-                    .to_owned(),
+                public_key: public_key(
+                    "351b54461d6075e0bcc0084f3f901cb7cdf4b16135e8ffa46a3a7193c6125b2e",
+                ),
                 metadata: DappMetadata {
                     name: "Dapp".to_owned(),
                     description: "Dapp".to_owned(),
@@ -246,7 +247,9 @@ fn serializes_authenticate_approve_result_wire_shape() {
         42,
         SessionAuthenticateResult {
             responder: SessionParticipant {
-                public_key: "wallet-public-key".to_owned(),
+                public_key: public_key(
+                    "977b7da860028df30993e70f25cc6d4f8dd67c4c2e8bb7a84b091a0f9cc37809",
+                ),
                 metadata: DappMetadata {
                     name: "Wallet".to_owned(),
                     description: "Wallet".to_owned(),

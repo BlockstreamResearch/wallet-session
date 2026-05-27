@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::{account, account_strings, chain, chain_strings};
+use super::{account, account_strings, chain, chain_strings, public_key};
 use wc_protocol::session::{
     DappMetadata, JsonRpcRequest, RelayProtocolOptions, SessionConfig, SessionNamespace,
     SessionParticipant, SessionSettleParams, SignMethod, SpecialNamespace,
@@ -58,7 +58,7 @@ fn deserializes_live_settle_shape() {
     assert_eq!(request.method, SignMethod::SessionSettle);
     assert_eq!(request.params.relay.protocol, "irn");
     assert_eq!(
-        request.params.controller.public_key,
+        request.params.controller.public_key.as_str(),
         "316472c516263b72d3b79e1e4a8260e4c2dfbf908c25698fee126c0888ea445f"
     );
     assert_eq!(
@@ -100,8 +100,9 @@ fn serializes_current_optional_fields() {
                 },
             )]),
             controller: SessionParticipant {
-                public_key: "316472c516263b72d3b79e1e4a8260e4c2dfbf908c25698fee126c0888ea445f"
-                    .to_owned(),
+                public_key: public_key(
+                    "316472c516263b72d3b79e1e4a8260e4c2dfbf908c25698fee126c0888ea445f",
+                ),
                 metadata: DappMetadata {
                     name: "Wallet".to_owned(),
                     description: "Wallet app".to_owned(),
