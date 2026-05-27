@@ -1572,6 +1572,7 @@ async fn run_probe_matrix(config: &RelayProbeConfig) -> Result<()> {
     .await?;
 
     run_encrypted_envelope_delivery(config).await?;
+    run_key_agreement_envelope_delivery(config).await?;
     run_unsubscribe_suppresses_delivery(config).await?;
     run_batch_subscribe_delivery(config).await?;
     run_batch_fetch_offline_messages(config).await?;
@@ -1617,23 +1618,7 @@ async fn run_encrypted_envelope_delivery(config: &RelayProbeConfig) -> Result<()
         message.len()
     );
 
-    let mut subscriber = config.connect("subscriber").await?;
-    let subscription_id = subscriber.subscribe(topic.clone()).await?;
-    println!("{label} subscriber subscription_id={subscription_id}");
-
-    let mut publisher = config.connect("publisher").await?;
-    publisher
-        .publish(IrnPublish::new(topic.clone(), message.clone(), 30, 0))
-        .await?;
-    println!("{label} publisher publish_ack=true");
-
-    let subscription = subscriber
-        .read_any_subscription_for_topic(&topic, READ_TIMEOUT)
-        .await?
-        .ok_or_else(|| anyhow!("{label} timed out waiting for encrypted subscription"))?;
-    if subscription.data.message != message {
-        bail!("{label} encrypted message changed in transit");
-    }
+    let subscription = publish_and_receive_once(config, label, &topic, &message).await?;
 
     let received = Envelope::decode(&subscription.data.message, EnvelopeEncoding::Base64)
         .context("failed to decode received encrypted envelope")?;
@@ -1653,10 +1638,102 @@ async fn run_encrypted_envelope_delivery(config: &RelayProbeConfig) -> Result<()
         params_keys(&decoded_payload)
     );
 
-    subscriber.unsubscribe(&topic, &subscription_id).await?;
-    println!("{label} subscriber unsubscribe_ack=true");
+    Ok(())
+}
+
+async fn run_key_agreement_envelope_delivery(config: &RelayProbeConfig) -> Result<()> {
+    let label = "matrix-key-agreement-envelope";
+    let proposer = X25519KeyPair::generate().context("failed to generate proposer key pair")?;
+    let responder = X25519KeyPair::generate().context("failed to generate responder key pair")?;
+    let proposer_sym_key = derive_shared_sym_key(proposer.private_key(), responder.public_key());
+    let responder_sym_key = derive_shared_sym_key(responder.private_key(), proposer.public_key());
+    if proposer_sym_key != responder_sym_key {
+        bail!("{label} derived asymmetric symKeys");
+    }
+
+    // Maintained JS derives the symmetric key from the local private key plus
+    // peer public key, then hashes that symmetric key into the relay topic:
+    // https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/crypto.ts#L49-L61
+    // https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/crypto.ts#L81-L85
+    let topic = derive_topic_from_sym_key(&proposer_sym_key);
+    let payload = json!({
+        "id": rpc_id()?.as_u64(),
+        "jsonrpc": "2.0",
+        "method": "wc_probeKeyAgreementEnvelope",
+        "params": {
+            "label": label,
+            "proposerPublicKey": proposer.public_key().as_str(),
+            "responderPublicKey": responder.public_key().as_str(),
+            "derivedTopic": topic.as_str(),
+            "edgeCases": {
+                "empty": "",
+                "unicode": "\u{2603}",
+                "nested": [{ "ok": true }, { "count": 2 }]
+            }
+        }
+    });
+    let plaintext =
+        serde_json::to_string(&payload).context("failed to serialize key-agreement payload")?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, &proposer_sym_key)
+        .context("failed to encrypt key-agreement envelope")?;
+    let message = envelope.encode(EnvelopeEncoding::Base64);
+    println!(
+        "{label} topic={topic} plaintext_len={} encrypted_len={} public_key_len={}",
+        plaintext.len(),
+        message.len(),
+        proposer.public_key().as_str().len()
+    );
+
+    let subscription = publish_and_receive_once(config, label, &topic, &message).await?;
+    let received = Envelope::decode(&subscription.data.message, EnvelopeEncoding::Base64)
+        .context("failed to decode received key-agreement envelope")?;
+    let decrypted = received
+        .decrypt(&responder_sym_key)
+        .context("failed to decrypt key-agreement envelope with responder key")?;
+    let decoded_payload =
+        serde_json::from_str::<Value>(&decrypted).context("decrypted envelope was not JSON")?;
+    if decoded_payload != payload {
+        bail!("{label} decrypted payload mismatch");
+    }
+
+    println!(
+        "{label} decrypt_ok=true derived_sym_key_match=true envelope_type={:?} json_id={} params_keys={}",
+        received.envelope_type(),
+        json_id(&decoded_payload),
+        params_keys(&decoded_payload)
+    );
 
     Ok(())
+}
+
+async fn publish_and_receive_once(
+    config: &RelayProbeConfig,
+    label: &str,
+    topic: &RelayTopic,
+    message: &str,
+) -> Result<IrnSubscription> {
+    let mut subscriber = config.connect("subscriber").await?;
+    let subscription_id = subscriber.subscribe(topic.clone()).await?;
+    println!("{label} subscriber subscription_id={subscription_id}");
+
+    let mut publisher = config.connect("publisher").await?;
+    publisher
+        .publish(IrnPublish::new(topic.clone(), message, 30, 0))
+        .await?;
+    println!("{label} publisher publish_ack=true");
+
+    let subscription = subscriber
+        .read_any_subscription_for_topic(topic, READ_TIMEOUT)
+        .await?
+        .ok_or_else(|| anyhow!("{label} timed out waiting for subscription"))?;
+    if subscription.data.message != message {
+        bail!("{label} message changed in transit");
+    }
+
+    subscriber.unsubscribe(topic, &subscription_id).await?;
+    println!("{label} subscriber unsubscribe_ack=true");
+
+    Ok(subscription)
 }
 
 async fn run_push_delivery(
