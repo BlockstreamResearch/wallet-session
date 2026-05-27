@@ -24,8 +24,8 @@ use tokio_tungstenite::{
 use wc_protocol::session::{
     Cacao, JsonRpcErrorResponse, JsonRpcResponse as SignJsonRpcResponse, SessionAuthenticateParams,
     SessionAuthenticateResult, SessionDeleteParams, SessionEventParams, SessionExtendParams,
-    SessionPingParams, SessionProposeResult, SessionRequestParams, SessionSettleParams,
-    SessionUpdateParams,
+    SessionPingParams, SessionProposeResult, SessionRequestParams, SessionRequestResponse,
+    SessionSettleParams, SessionUpdateParams,
 };
 use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
@@ -436,14 +436,14 @@ fn session_probe_value(index: usize, value: &Value) -> Result<()> {
             return Ok(());
         }
 
-        let response = serde_json::from_value::<SignJsonRpcResponse<Value>>(value.clone())
+        let response = serde_json::from_value::<SessionRequestResponse>(value.clone())
             .with_context(|| {
-                format!("session-probe item={index} failed to parse generic result")
+                format!("session-probe item={index} failed to parse session request result")
             })?;
         println!(
-            "session-probe item={index} generic_result id={} result_kind={}",
+            "session-probe item={index} session_request_result id={} result_kind={}",
             response.id,
-            json_kind(&response.result)
+            json_kind(response.result.as_value())
         );
         return Ok(());
     }

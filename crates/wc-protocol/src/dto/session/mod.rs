@@ -26,7 +26,10 @@ pub use proposal::{
     DappMetadata, DappRedirect, ProposalNamespace, ProposalNamespaces, ProposalRequests, Proposer,
     RelayProtocolOptions, SessionProposeParams, SessionProposeResult,
 };
-pub use request::{SessionRequest, SessionRequestParams};
+pub use request::{
+    SessionRequest, SessionRequestErrorResponse, SessionRequestParams, SessionRequestResponse,
+    SessionRequestResult, session_request_error_response, session_request_success_response,
+};
 pub use rpc::{
     JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
 };
