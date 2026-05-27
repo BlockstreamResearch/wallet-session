@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::rpc::{JsonRpcError, JsonRpcErrorResponse};
 use crate::{
     caip::{Caip2ChainId, NamespaceKey},
     relay::RelayTopic,
@@ -154,6 +155,54 @@ pub struct SessionProposeResult {
     /// Wallet public key used by the dapp to derive the session topic.
     #[serde(rename = "responderPublicKey")]
     pub responder_public_key: String,
+}
+
+/// JSON-RPC error response for a rejected `wc_sessionPropose`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/engine.ts#L123-L126>
+///
+/// > interface RejectParams {
+/// > id: number;
+/// > reason: ErrorResponse;
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L593-L599>
+///
+/// > await this.sendError({
+/// > id,
+/// > topic: pairingTopic,
+/// > error: reason,
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{
+///     JsonRpcError, JsonRpcErrorCode, SessionProposeErrorResponse,
+///     session_propose_error_response,
+/// };
+///
+/// let response = session_propose_error_response(
+///     1,
+///     JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+/// );
+/// let value = serde_json::to_value(response)?;
+/// assert_eq!(value["jsonrpc"], "2.0");
+/// assert_eq!(value["error"]["code"], 5000);
+///
+/// let parsed = serde_json::from_value::<SessionProposeErrorResponse>(value)?;
+/// assert_eq!(parsed.error.code, JsonRpcErrorCode::UserRejected);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub type SessionProposeErrorResponse = JsonRpcErrorResponse;
+
+/// Builds a `wc_sessionPropose` error response.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/format.ts#L36-L45>
+///
+/// > export function formatJsonRpcError(
+/// > error: formatErrorMessage(error, data),
+#[must_use]
+pub fn session_propose_error_response(id: u64, error: JsonRpcError) -> SessionProposeErrorResponse {
+    JsonRpcErrorResponse::new(id, error)
 }
 
 /// Proposal namespace map keyed by namespace or CAIP-2 chain ID.

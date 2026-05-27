@@ -6,8 +6,10 @@ use super::chain_strings;
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        DappMetadata, JsonRpcRequest, JsonRpcResponse, ProposalNamespaces, ProposalRequests,
-        Proposer, RelayProtocolOptions, SessionProposeParams, SessionProposeResult, SignMethod,
+        DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
+        JsonRpcResponse, ProposalNamespaces, ProposalRequests, Proposer, RelayProtocolOptions,
+        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult, SignMethod,
+        session_propose_error_response,
     },
 };
 
@@ -64,6 +66,118 @@ const LIVE_SESSION_PROPOSE_APPROVE_JSON: &str = r#"{
       "protocol": "irn"
     },
     "responderPublicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_REJECT_USER_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "User rejected.",
+    "code": 5000
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_REJECT_CHAINS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "User rejected chains.",
+    "code": 5001
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_REJECT_METHODS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "User rejected methods.",
+    "code": 5002
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_REJECT_EVENTS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "User rejected events.",
+    "code": 5003
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_UNSUPPORTED_CHAINS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "Unsupported chains.",
+    "code": 5100
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_UNSUPPORTED_METHODS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "Unsupported methods.",
+    "code": 5101
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_UNSUPPORTED_EVENTS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "Unsupported events.",
+    "code": 5102
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_UNSUPPORTED_ACCOUNTS_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "Unsupported accounts.",
+    "code": 5103
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_UNSUPPORTED_NAMESPACE_KEY_JSON: &str = r#"{
+  "id": 1779812558761960,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "Unsupported namespace key.",
+    "code": 5104
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_REJECT_WITH_DATA_JSON: &str = r#"{
+  "id": 1779812558761961,
+  "jsonrpc": "2.0",
+  "error": {
+    "message": "User rejected.",
+    "code": 5000,
+    "data": "wallet rejected proposal"
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_CUSTOM_ERROR_JSON: &str = r#"{
+  "id": 1779812558761962,
+  "jsonrpc": "2.0",
+  "error": {
+    "code": 4999,
+    "message": "Custom proposal rejection.",
+    "data": {
+      "reason": "custom object"
+    }
+  }
+}"#;
+
+const LIVE_SESSION_PROPOSE_STRING_ERROR_JSON: &str = r#"{
+  "id": 1779812558761963,
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32000,
+    "message": "Rejected by wallet"
   }
 }"#;
 
@@ -271,4 +385,124 @@ fn serializes_proposal_approval_result_wire_shape() {
         value["result"]["responderPublicKey"],
         "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337"
     );
+}
+
+#[test]
+fn deserializes_live_proposal_rejection_sdk_errors() {
+    for (json, code, message) in [
+        (
+            LIVE_SESSION_PROPOSE_REJECT_USER_JSON,
+            JsonRpcErrorCode::UserRejected,
+            "User rejected.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_REJECT_CHAINS_JSON,
+            JsonRpcErrorCode::UserRejectedChains,
+            "User rejected chains.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_REJECT_METHODS_JSON,
+            JsonRpcErrorCode::UserRejectedMethods,
+            "User rejected methods.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_REJECT_EVENTS_JSON,
+            JsonRpcErrorCode::UserRejectedEvents,
+            "User rejected events.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_UNSUPPORTED_CHAINS_JSON,
+            JsonRpcErrorCode::UnsupportedChains,
+            "Unsupported chains.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_UNSUPPORTED_METHODS_JSON,
+            JsonRpcErrorCode::UnsupportedMethods,
+            "Unsupported methods.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_UNSUPPORTED_EVENTS_JSON,
+            JsonRpcErrorCode::UnsupportedEvents,
+            "Unsupported events.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_UNSUPPORTED_ACCOUNTS_JSON,
+            JsonRpcErrorCode::UnsupportedAccounts,
+            "Unsupported accounts.",
+        ),
+        (
+            LIVE_SESSION_PROPOSE_UNSUPPORTED_NAMESPACE_KEY_JSON,
+            JsonRpcErrorCode::UnsupportedNamespaceKey,
+            "Unsupported namespace key.",
+        ),
+    ] {
+        let response =
+            serde_json::from_str::<SessionProposeErrorResponse>(json).expect("rejection parses");
+
+        assert_eq!(response.id, 1_779_812_558_761_960);
+        assert_eq!(response.error.code, code);
+        assert_eq!(response.error.message, message);
+        assert_eq!(response.error.data, None);
+    }
+}
+
+#[test]
+fn deserializes_live_proposal_rejection_with_data() {
+    let response = serde_json::from_str::<SessionProposeErrorResponse>(
+        LIVE_SESSION_PROPOSE_REJECT_WITH_DATA_JSON,
+    )
+    .expect("rejection with data parses");
+
+    assert_eq!(response.id, 1_779_812_558_761_961);
+    assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+    assert_eq!(response.error.message, "User rejected.");
+    assert_eq!(response.error.data, Some(json!("wallet rejected proposal")));
+}
+
+#[test]
+fn deserializes_live_proposal_rejection_custom_errors() {
+    let custom =
+        serde_json::from_str::<SessionProposeErrorResponse>(LIVE_SESSION_PROPOSE_CUSTOM_ERROR_JSON)
+            .expect("custom error parses");
+    let string_error =
+        serde_json::from_str::<JsonRpcErrorResponse>(LIVE_SESSION_PROPOSE_STRING_ERROR_JSON)
+            .expect("string error parses");
+
+    assert_eq!(custom.error.code, JsonRpcErrorCode::Other(4999));
+    assert_eq!(custom.error.message, "Custom proposal rejection.");
+    assert_eq!(custom.error.data, Some(json!({"reason": "custom object"})));
+    assert_eq!(string_error.error.code, JsonRpcErrorCode::Other(-32000));
+    assert_eq!(string_error.error.message, "Rejected by wallet");
+    assert_eq!(string_error.error.data, None);
+}
+
+#[test]
+fn serializes_proposal_rejection_wire_shape() {
+    let response = session_propose_error_response(
+        1_779_812_558_761_960,
+        JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+    );
+    let value = serde_json::to_value(response).expect("serializes");
+    let live = serde_json::from_str::<serde_json::Value>(LIVE_SESSION_PROPOSE_REJECT_USER_JSON)
+        .expect("live fixture parses");
+
+    assert_eq!(value, live);
+}
+
+#[test]
+fn serializes_proposal_rejection_with_data_wire_shape() {
+    let response = session_propose_error_response(
+        1_779_812_558_761_961,
+        JsonRpcError::with_data(
+            JsonRpcErrorCode::UserRejected,
+            "User rejected.",
+            json!("wallet rejected proposal"),
+        ),
+    );
+    let value = serde_json::to_value(response).expect("serializes");
+    let live =
+        serde_json::from_str::<serde_json::Value>(LIVE_SESSION_PROPOSE_REJECT_WITH_DATA_JSON)
+            .expect("live fixture parses");
+
+    assert_eq!(value, live);
 }
