@@ -1,6 +1,6 @@
 //! Sign API JSON-RPC envelopes.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 
 use super::SignMethod;
@@ -217,6 +217,144 @@ impl<T> JsonRpcResponse<T> {
             result,
         }
     }
+}
+
+/// Success payload for Sign RPC methods whose response result is JSON `true`.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionupdate>
+///
+/// > // Success result
+/// > true
+///
+/// The maintained Sign Client sends the value through the shared JSON-RPC
+/// result formatter.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1789-L1792>
+///
+/// > const payload = formatJsonRpcResult(id, result);
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2322-L2326>
+///
+/// > await this.sendResult<"wc_sessionUpdate">({
+/// > id,
+/// > topic,
+/// > result: true,
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{
+///     SessionAck, SessionAckResponse, session_ack_response,
+/// };
+///
+/// let response = session_ack_response(1);
+/// let value = serde_json::to_value(response)?;
+/// assert_eq!(value["jsonrpc"], "2.0");
+/// assert_eq!(value["result"], true);
+///
+/// let parsed = serde_json::from_value::<SessionAckResponse>(value)?;
+/// assert_eq!(parsed.result, SessionAck);
+/// assert!(
+///     serde_json::from_str::<SessionAckResponse>(
+///         r#"{"id":1,"jsonrpc":"2.0","result":false}"#
+///     )
+///     .is_err()
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SessionAck;
+
+impl Serialize for SessionAck {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bool(true)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionAck {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = bool::deserialize(deserializer)?;
+        if value {
+            Ok(Self)
+        } else {
+            Err(de::Error::custom("expected true acknowledgment"))
+        }
+    }
+}
+
+/// JSON-RPC success response for Sign RPC acknowledgements.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/format.ts#L28-L34>
+///
+/// > id,
+/// > jsonrpc: "2.0",
+/// > result,
+pub type SessionAckResponse = JsonRpcResponse<SessionAck>;
+
+/// `wc_sessionSettle` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionsettle>
+///
+/// > // Success result
+/// > true
+pub type SessionSettleResponse = SessionAckResponse;
+
+/// `wc_sessionUpdate` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionupdate>
+///
+/// > // Success result
+/// > true
+pub type SessionUpdateResponse = SessionAckResponse;
+
+/// `wc_sessionExtend` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionextend>
+///
+/// > // Success result
+/// > true
+pub type SessionExtendResponse = SessionAckResponse;
+
+/// `wc_sessionPing` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionping>
+///
+/// > // Success result
+/// > true
+pub type SessionPingResponse = SessionAckResponse;
+
+/// `wc_sessionEvent` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionevent>
+///
+/// > // Success result
+/// > true
+pub type SessionEventResponse = SessionAckResponse;
+
+/// `wc_sessionDelete` success response.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessiondelete>
+///
+/// > // Success result
+/// > true
+pub type SessionDeleteResponse = SessionAckResponse;
+
+/// Builds a Sign RPC acknowledgement response.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/format.ts#L28-L34>
+///
+/// > export function formatJsonRpcResult<T = any>(id: number, result: T):
+/// > JsonRpcResult<T> {
+/// > result,
+#[must_use]
+pub fn session_ack_response(id: u64) -> SessionAckResponse {
+    JsonRpcResponse::new(id, SessionAck)
 }
 
 /// JSON-RPC error response envelope for Sign API methods.
@@ -468,7 +606,7 @@ impl JsonRpcErrorCode {
 impl Serialize for JsonRpcErrorCode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         serializer.serialize_i64(self.as_i64())
     }
@@ -477,7 +615,7 @@ impl Serialize for JsonRpcErrorCode {
 impl<'de> Deserialize<'de> for JsonRpcErrorCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let value = i64::deserialize(deserializer)?;
         Ok(Self::from_i64(value))

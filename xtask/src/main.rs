@@ -22,10 +22,10 @@ use tokio_tungstenite::{
     tungstenite::{Message, Utf8Bytes},
 };
 use wc_protocol::session::{
-    Cacao, JsonRpcErrorResponse, JsonRpcResponse as SignJsonRpcResponse, SessionAuthenticateParams,
-    SessionAuthenticateResult, SessionDeleteParams, SessionEventParams, SessionExtendParams,
-    SessionPingParams, SessionProposeResult, SessionRequestParams, SessionRequestResponse,
-    SessionSettleParams, SessionUpdateParams,
+    Cacao, JsonRpcErrorResponse, JsonRpcResponse as SignJsonRpcResponse, SessionAckResponse,
+    SessionAuthenticateParams, SessionAuthenticateResult, SessionDeleteParams, SessionEventParams,
+    SessionExtendParams, SessionPingParams, SessionProposeResult, SessionRequestParams,
+    SessionRequestResponse, SessionSettleParams, SessionUpdateParams,
 };
 use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
@@ -425,13 +425,13 @@ fn session_probe_value(index: usize, value: &Value) -> Result<()> {
         }
 
         if result.is_boolean() {
-            let response = serde_json::from_value::<SignJsonRpcResponse<bool>>(value.clone())
+            let response = serde_json::from_value::<SessionAckResponse>(value.clone())
                 .with_context(|| {
-                    format!("session-probe item={index} failed to parse boolean result")
+                    format!("session-probe item={index} failed to parse session ack result")
                 })?;
             println!(
-                "session-probe item={index} bool_result id={} result={}",
-                response.id, response.result
+                "session-probe item={index} session_ack id={} result=true",
+                response.id
             );
             return Ok(());
         }

@@ -31,6 +31,7 @@ mod session {
     mod ping;
     mod proposal;
     mod request;
+    mod rpc;
     mod settle;
     mod types;
     mod update;

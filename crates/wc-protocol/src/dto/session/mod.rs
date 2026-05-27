@@ -32,6 +32,9 @@ pub use request::{
 };
 pub use rpc::{
     JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+    SessionAck, SessionAckResponse, SessionDeleteResponse, SessionEventResponse,
+    SessionExtendResponse, SessionPingResponse, SessionSettleResponse, SessionUpdateResponse,
+    session_ack_response,
 };
 pub use settle::{SessionSettleParams, SpecialNamespace, SpecialNamespaces};
 pub use types::{
