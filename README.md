@@ -6,6 +6,11 @@ Rust workspace for the WalletConnect client proof of concept.
 
 - `wc-core`: core WalletConnect single-session client primitives.
 
+## Docs
+
+- [Architecture](docs/architecture.md)
+- [API contract](docs/api-contract.md)
+
 ## Checks
 
 Run the same checks locally that CI runs:

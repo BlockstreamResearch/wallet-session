@@ -6,6 +6,8 @@ This document records the architecture decisions that guide the current implemen
 It is not a final production architecture. 
 When a change revises one of these decisions, the change should update this document in the same commit.
 
+The current wallet-facing API behavior is specified in [`api-contract.md`](./api-contract.md).
+
 ## Goals
 
 The repository builds a Rust WalletConnect client from small, live-tested primitives.
@@ -297,7 +299,6 @@ These are intentionally not finalized:
 - reconnect behavior after repeated established-connection loss;
 - durable storage and restore;
 - persisted symmetric key handling;
-- queue capacity as public API;
 - explicit drop policy reporting for flooded event queues;
 - browser/Wasm transport;
 - UniFFI and mobile bindings;
