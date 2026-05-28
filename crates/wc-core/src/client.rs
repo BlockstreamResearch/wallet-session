@@ -1,14 +1,21 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+};
 
 use wc_protocol::{
     relay::RelayTopic,
-    session::{JsonRpcError, JsonRpcRequest, Session, SessionDeleteParams, SessionProposeParams},
+    session::{
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, Session, SessionDeleteParams,
+        SessionEventParams, SessionNamespaces, SessionProposeParams,
+    },
 };
 
 use crate::pairing::{
-    PairingClient, PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,
-    PairingSubscription, SessionClientEvent, SessionLifecycleRequest, SessionProposalApproval,
-    SessionReceivedMessage, SessionSubscription,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingClientError,
+    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionClientEvent,
+    SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
 };
 
 /// Runtime client configuration.
@@ -273,6 +280,132 @@ impl Client {
         Ok(ack)
     }
 
+    /// Publishes `wc_sessionUpdate`, waits for acknowledgement, then stores namespaces.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L638-L650>
+    ///
+    /// > method: "wc_sessionUpdate",
+    /// > params: { namespaces },
+    /// > await this.client.session.update(topic, { namespaces });
+    pub async fn update_session(
+        &mut self,
+        topic: &RelayTopic,
+        namespaces: &SessionNamespaces,
+    ) -> Result<SessionLifecycleResponseMessage, ClientError> {
+        let session = self
+            .sessions
+            .get(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .clone();
+        let request = self
+            .pairing
+            .update_session(&session.subscription, &session.session, namespaces)
+            .await
+            .map_err(ClientError::from)?;
+        let response = self
+            .pairing
+            .next_session_lifecycle_response(&session.subscription, &request)
+            .await
+            .map_err(ClientError::from)?
+            .ok_or_else(|| ClientError::SessionLifecycleResponseMissing {
+                topic: topic.clone(),
+                request_id: request.request_id(),
+            })?;
+
+        ensure_session_lifecycle_success(&response)?;
+        self.sessions
+            .get_mut(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .session
+            .namespaces
+            .clone_from(namespaces);
+
+        Ok(response)
+    }
+
+    /// Publishes `wc_sessionExtend`, waits for acknowledgement, then refreshes expiry.
+    ///
+    /// Current Sign Client traffic sends empty params and updates local expiry
+    /// with `calcExpiry(SESSION_EXPIRY)`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L678-L685>
+    ///
+    /// > await this.setExpiry(topic, calcExpiry(SESSION_EXPIRY));
+    /// > method: "wc_sessionExtend",
+    /// > params: {},
+    pub async fn extend_session(
+        &mut self,
+        topic: &RelayTopic,
+    ) -> Result<SessionLifecycleResponseMessage, ClientError> {
+        let session = self
+            .sessions
+            .get(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .clone();
+        let request = self
+            .pairing
+            .extend_session(&session.subscription, &session.session)
+            .await
+            .map_err(ClientError::from)?;
+        let response = self
+            .pairing
+            .next_session_lifecycle_response(&session.subscription, &request)
+            .await
+            .map_err(ClientError::from)?
+            .ok_or_else(|| ClientError::SessionLifecycleResponseMissing {
+                topic: topic.clone(),
+                request_id: request.request_id(),
+            })?;
+
+        ensure_session_lifecycle_success(&response)?;
+        let new_expiry = now_unix_seconds()?
+            .checked_add(DEFAULT_SESSION_EXPIRY_SECONDS)
+            .ok_or(ClientError::SessionExpiryOverflow)?;
+        self.sessions
+            .get_mut(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .session
+            .expiry = new_expiry;
+
+        Ok(response)
+    }
+
+    /// Publishes `wc_sessionEvent` for an acknowledged session.
+    ///
+    /// Current Sign Client traffic validates the event, emits it to listeners,
+    /// and does not send a success acknowledgement.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L881-L896>
+    ///
+    /// > method: "wc_sessionEvent",
+    /// > params: { event, chainId },
+    /// > throwOnFailedPublish: true,
+    pub async fn emit_session_event(
+        &mut self,
+        topic: &RelayTopic,
+        params: &SessionEventParams,
+    ) -> Result<SessionLifecycleRequest, ClientError> {
+        let session = self
+            .sessions
+            .get(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .clone();
+        self.pairing
+            .emit_session_event(&session.subscription, &session.session, params)
+            .await
+            .map_err(ClientError::from)
+    }
+
     /// Publishes `wc_sessionDelete` and removes the acknowledged session locally.
     ///
     /// The maintained Sign Client removes local session state after the relay
@@ -427,10 +560,58 @@ pub enum ClientError {
         /// Session topic waiting for settlement acknowledgement.
         topic: RelayTopic,
     },
+
+    /// The peer did not answer an update or extend request.
+    #[error("client session lifecycle response missing")]
+    SessionLifecycleResponseMissing {
+        /// Session topic waiting for lifecycle acknowledgement.
+        topic: RelayTopic,
+        /// Pending JSON-RPC request id.
+        request_id: u64,
+    },
+
+    /// The peer rejected an update or extend request.
+    #[error("client session lifecycle rejected")]
+    SessionLifecycleRejected {
+        /// JSON-RPC error response received from the peer.
+        response: JsonRpcErrorResponse,
+    },
+
+    /// System clock failed while refreshing session expiry.
+    #[error("client clock failed")]
+    Clock {
+        /// Source system time error.
+        #[source]
+        source: SystemTimeError,
+    },
+
+    /// Default session extension exceeded `u64`.
+    #[error("client session expiry overflow")]
+    SessionExpiryOverflow,
 }
 
 impl From<PairingClientError> for ClientError {
     fn from(source: PairingClientError) -> Self {
         Self::Pairing { source }
     }
+}
+
+fn ensure_session_lifecycle_success(
+    response: &SessionLifecycleResponseMessage,
+) -> Result<(), ClientError> {
+    match response.payload() {
+        SessionLifecycleResponsePayload::Success(_) => Ok(()),
+        SessionLifecycleResponsePayload::Error(response) => {
+            Err(ClientError::SessionLifecycleRejected {
+                response: response.clone(),
+            })
+        }
+    }
+}
+
+fn now_unix_seconds() -> Result<u64, ClientError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|source| ClientError::Clock { source })
 }

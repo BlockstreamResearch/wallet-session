@@ -60,6 +60,7 @@ pub enum ProbeMode {
     CoreJsSessionRequest,
     CoreJsSessionLifecycle,
     CoreClientSessionRequest,
+    CoreClientSessionLifecycle,
     CoreClientDisconnect,
     PairingUri(String),
 }
@@ -82,6 +83,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         }
         ProbeMode::CoreClientSessionRequest => {
             Box::pin(run_core_client_session_request_probe(&config)).await
+        }
+        ProbeMode::CoreClientSessionLifecycle => {
+            Box::pin(run_core_client_session_lifecycle_probe(&config)).await
         }
         ProbeMode::CoreClientDisconnect => {
             Box::pin(run_core_client_disconnect_probe(&config)).await
@@ -693,6 +697,79 @@ async fn run_core_client_disconnect_probe(config: &RelayProbeConfig) -> Result<(
     Ok(())
 }
 
+async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> Result<()> {
+    let action = CoreClientSessionLifecycleAction::from_env()?;
+    let (mut harness, uri) = SessionHarness::start(action.harness_action(), action.label()).await?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-client-lifecycle-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    println!(
+        "core-client-session-lifecycle connected status={}",
+        client.status()
+    );
+    let pairing_topic = client.pair(uri.trim()).await?;
+    println!("core-client-session-lifecycle pairing_topic={pairing_topic}");
+
+    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    println!(
+        "core-client-session-lifecycle proposal_id={} pairing_topic={}",
+        proposal.proposal_id(),
+        proposal.pairing_topic()
+    );
+    let approval = approval_for_probe(proposal.request())?;
+    let session = client.approve_session(&proposal, approval).await?;
+    println!(
+        "core-client-session-lifecycle active_session topic={} acknowledged={} namespaces={} expiry={}",
+        session.topic,
+        session.acknowledged,
+        session.namespaces.len(),
+        session.expiry
+    );
+
+    match action {
+        CoreClientSessionLifecycleAction::Update => {
+            let response = client
+                .update_session(&session.topic, &session.namespaces)
+                .await?;
+            print_session_lifecycle_response(&response);
+        }
+        CoreClientSessionLifecycleAction::Extend => {
+            let response = client.extend_session(&session.topic).await?;
+            print_session_lifecycle_response(&response);
+            let active_expiry = client
+                .active_sessions()
+                .first()
+                .map(|session| session.expiry)
+                .context("extended session was not retained")?;
+            println!("core-client-session-lifecycle active_session_expiry={active_expiry}");
+        }
+        CoreClientSessionLifecycleAction::Event => {
+            let params = session_event_params()?;
+            let request = client.emit_session_event(&session.topic, &params).await?;
+            println!(
+                "core-client-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
+                request.request_id(),
+                request.method(),
+                request.request_tag(),
+                request.publish_ack()
+            );
+        }
+    }
+
+    let result = harness.expect_result(action.expected_outcome()).await?;
+    println!("core-client-session-lifecycle js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
 async fn run_core_valid_session_request_probe(
     client: &mut PairingClient,
     subscription: &wc_core::SessionSubscription,
@@ -767,6 +844,54 @@ enum CoreJsSessionLifecycleAction {
     Update,
     Extend,
     Event,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreClientSessionLifecycleAction {
+    Update,
+    Extend,
+    Event,
+}
+
+impl CoreClientSessionLifecycleAction {
+    fn from_env() -> Result<Self> {
+        let value =
+            env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "update".to_owned());
+        match value.as_str() {
+            "update" => Ok(Self::Update),
+            "extend" => Ok(Self::Extend),
+            "event" => Ok(Self::Event),
+            other => {
+                bail!(
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected update, extend, or event"
+                )
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Extend => "extend",
+            Self::Event => "event",
+        }
+    }
+
+    const fn harness_action(self) -> &'static str {
+        match self {
+            Self::Update => "wait_session_update",
+            Self::Extend => "wait_session_extend",
+            Self::Event => "wait_session_event",
+        }
+    }
+
+    const fn expected_outcome(self) -> &'static str {
+        match self {
+            Self::Update => "session_update_received",
+            Self::Extend => "session_extend_received",
+            Self::Event => "session_event_received",
+        }
+    }
 }
 
 impl CoreJsSessionLifecycleAction {

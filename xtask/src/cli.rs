@@ -173,6 +173,7 @@ impl RelayProbeArgs {
             Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
             Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
             Ok("core-client-session-request") => Ok(relay::ProbeMode::CoreClientSessionRequest),
+            Ok("core-client-session-lifecycle") => Ok(relay::ProbeMode::CoreClientSessionLifecycle),
             Ok("core-client-disconnect") => Ok(relay::ProbeMode::CoreClientDisconnect),
             Ok("pairing-uri") => {
                 let uri = env::var("WC_PAIRING_URI")
