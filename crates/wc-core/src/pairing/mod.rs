@@ -6,6 +6,8 @@ mod approval;
 mod client;
 mod codec;
 mod error;
+mod publish;
+mod session_request;
 mod types;
 
 #[cfg(test)]
@@ -94,3 +96,21 @@ pub const SESSION_SETTLE_REQUEST_TTL_SECONDS: u64 = 5 * 60;
 /// > TTL     | 300
 /// > Tag     | 1103
 pub const SESSION_SETTLE_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay tag used for `wc_sessionRequest` responses.
+///
+/// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>
+///
+/// > // Success result
+/// > any
+/// > TTL     | 300
+/// > Tag     | 1109
+pub const SESSION_REQUEST_RESPONSE_TAG: u64 = 1109;
+
+/// Relay retention window for `wc_sessionRequest` responses.
+///
+/// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>
+///
+/// > TTL     | 300
+/// > Tag     | 1109
+pub const SESSION_REQUEST_RESPONSE_TTL_SECONDS: u64 = 5 * 60;

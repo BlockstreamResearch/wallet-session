@@ -4,7 +4,6 @@ use std::{
 };
 
 use wc_protocol::{
-    envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
     namespaces::validate_approved_namespaces,
     pairing::PairingSymKey,
@@ -21,6 +20,7 @@ use super::{
     SESSION_PROPOSE_RESPONSE_TTL_SECONDS, SESSION_SETTLE_REQUEST_TAG,
     SESSION_SETTLE_REQUEST_TTL_SECONDS,
     error::{PairingClientError, SignRpcIdError},
+    publish::encrypted_json_publish,
     types::{PairingSubscription, SessionProposalApproval},
 };
 
@@ -175,26 +175,6 @@ fn validate_session_proposal_approval(
 
     validate_approved_namespaces(&proposal.params.required_namespaces, &approval.namespaces)
         .map_err(|source| PairingClientError::Namespace { source })
-}
-
-/// Serializes a Sign JSON-RPC payload and encrypts it as a relay publish message.
-fn encrypted_json_publish<T>(
-    topic: RelayTopic,
-    sym_key: &PairingSymKey,
-    payload: &T,
-    ttl: u64,
-    tag: u64,
-) -> Result<IrnPublish, PairingClientError>
-where
-    T: serde::Serialize,
-{
-    let plaintext = serde_json::to_string(payload)
-        .map_err(|source| PairingClientError::PairingPayload { source })?;
-    let envelope = Envelope::encrypt_type_0(&plaintext, sym_key)
-        .map_err(|source| PairingClientError::Envelope { source })?;
-    let message = envelope.encode(EnvelopeEncoding::Base64);
-
-    Ok(IrnPublish::new(topic, message, ttl, tag))
 }
 
 /// Builds the encrypted relay publish payload for proposal rejection.

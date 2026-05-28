@@ -120,6 +120,14 @@ pub enum PairingClientError {
         source: serde_json::Error,
     },
 
+    /// Outbound Sign JSON-RPC payload serialization failed.
+    #[error("outbound sign payload failed")]
+    OutboundPayload {
+        /// Source DTO serialization error.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// Session-topic envelope decoding, decryption, or plaintext handling failed.
     #[error("session envelope failed")]
     SessionEnvelope {
@@ -152,6 +160,10 @@ pub enum PairingClientError {
     /// Session settle response was neither a JSON-RPC result nor error.
     #[error("session settle response payload is unsupported")]
     SessionSettleUnsupportedPayload,
+
+    /// A session request response was built from a non-request session message.
+    #[error("session response target is not a session request")]
+    SessionResponseTargetNotRequest,
 
     /// Peer rejected the session settlement request.
     #[error("session settle rejected")]

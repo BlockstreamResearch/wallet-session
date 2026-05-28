@@ -17,6 +17,8 @@ const uriFile = process.env.WC_JS_URI_FILE;
 const resultFile = process.env.WC_JS_RESULT_FILE;
 const printUri = process.env.WC_JS_PRINT_URI === "1";
 const sendSessionRequest = process.env.WC_JS_SEND_SESSION_REQUEST === "1";
+const waitForSessionRequestResponse =
+  process.env.WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE === "1";
 
 if (!uriFile && !printUri) {
   console.error("set WC_JS_URI_FILE or set WC_JS_PRINT_URI=1 to print the full pairing URI");
@@ -88,7 +90,7 @@ try {
     });
   }
 } catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = errorMessage(error);
   console.error(`js-harness approval_error=${message}`);
   await writeResult({
     outcome: "approval_error",
@@ -130,6 +132,46 @@ async function startSessionRequest(topic: string): Promise<void> {
     expiry,
   });
 
+  console.error(
+    `js-harness session_request_started=true topic=${topic} chain_id=${chainId} method=${method} hold_ms=${sessionRequestHoldMs}`,
+  );
+
+  if (waitForSessionRequestResponse) {
+    const response = await Promise.race([
+      request.then(
+        (result) => {
+          console.error(`js-harness session_request_response=${JSON.stringify(result)}`);
+          return {
+            outcome: "session_request_response",
+            topic,
+            chainId,
+            method,
+            result: JSON.stringify(result),
+          };
+        },
+        (error) => {
+          const message = errorMessage(error);
+          console.error(`js-harness session_request_error=${message}`);
+          return {
+            outcome: "session_request_error",
+            topic,
+            chainId,
+            method,
+            message,
+          };
+        },
+      ),
+      sleep(sessionRequestHoldMs).then(() => ({
+        outcome: "session_request_timeout",
+        topic,
+        chainId,
+        method,
+      })),
+    ]);
+    await writeResult(response);
+    return;
+  }
+
   void request
     .then(async (result) => {
       console.error(`js-harness session_request_response=${JSON.stringify(result)}`);
@@ -142,7 +184,7 @@ async function startSessionRequest(topic: string): Promise<void> {
       });
     })
     .catch(async (error) => {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = errorMessage(error);
       console.error(`js-harness session_request_error=${message}`);
       await writeResult({
         outcome: "session_request_error",
@@ -153,9 +195,6 @@ async function startSessionRequest(topic: string): Promise<void> {
       });
     });
 
-  console.error(
-    `js-harness session_request_started=true topic=${topic} chain_id=${chainId} method=${method} hold_ms=${sessionRequestHoldMs}`,
-  );
   await writeResult({
     outcome: "session_request_started",
     topic,
@@ -175,6 +214,18 @@ function sessionRequestParams(): unknown {
     process.env.WC_JS_SESSION_REQUEST_ACCOUNT_ADDRESS ??
     "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb";
   return ["0x68656c6c6f", address];
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "object" && error !== null) {
+    return JSON.stringify(error);
+  }
+
+  return String(error);
 }
 
 function sleep(milliseconds: number): Promise<void> {

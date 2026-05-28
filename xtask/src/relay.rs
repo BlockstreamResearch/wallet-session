@@ -169,6 +169,10 @@ async fn wait_for_js_result(result_file: &Path, child: &mut Child) -> Result<Val
     }
 }
 
+fn parse_json_env(value: &str) -> Result<Value> {
+    serde_json::from_str(value).with_context(|| format!("failed to parse JSON env value: {value}"))
+}
+
 struct RelayProbeConfig {
     project_id: String,
     relay_url: String,
@@ -458,6 +462,7 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
         .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
         .env("WC_JS_SESSION_REQUEST_HOLD_MS", &request_hold_ms)
         .env("WC_JS_SEND_SESSION_REQUEST", "1")
+        .env("WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE", "1")
         .env_remove("WC_JS_PRINT_URI")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -469,17 +474,54 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
 
     let (mut client, pairing_subscription, approved, session) =
         run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
-    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
-    if result.get("outcome").and_then(Value::as_str) != Some("session_request_started") {
-        bail!("expected JS session_request_started result, got {result}");
-    }
-    println!("core-js-session-request js_result={result}");
-
     let session_message = client
         .next_session_message(approved.subscription(), &session)
         .await?
         .context("no wc_sessionRequest message received")?;
     print_session_message("core-js-session-request live_message", &session_message);
+
+    let response_mode =
+        env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
+    let response_ack = match response_mode.as_str() {
+        "success" => {
+            let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
+                |_| Ok(json!("0xsigned-by-rust")),
+                |value| parse_json_env(&value),
+            )?;
+            client
+                .respond_session_request_success(approved.subscription(), &session_message, result)
+                .await?
+        }
+        "error" => {
+            client
+                .respond_session_request_error(
+                    approved.subscription(),
+                    &session_message,
+                    JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
+                )
+                .await?
+        }
+        other => {
+            bail!("unknown WC_CORE_SESSION_REQUEST_RESPONSE={other}; expected success or error")
+        }
+    };
+    println!("core-js-session-request response_ack={response_ack} mode={response_mode}");
+
+    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
+    match response_mode.as_str() {
+        "success" => {
+            if result.get("outcome").and_then(Value::as_str) != Some("session_request_response") {
+                bail!("expected JS session_request_response result, got {result}");
+            }
+        }
+        "error" => {
+            if result.get("outcome").and_then(Value::as_str) != Some("session_request_error") {
+                bail!("expected JS session_request_error result, got {result}");
+            }
+        }
+        _ => unreachable!("validated response mode"),
+    }
+    println!("core-js-session-request js_result={result}");
 
     let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
     println!("core-js-session-request pairing_unsubscribe_ack={unsubscribe_result}");

@@ -18,6 +18,7 @@ use super::{
         decode_session_message_data, decode_session_settle_response_data, decode_subscription_data,
     },
     error::PairingClientError,
+    session_request::{session_request_error_publish, session_request_success_publish},
     types::{
         ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
         SessionReceivedMessage, SessionSettleResponseMessage, SessionSubscription,
@@ -379,6 +380,52 @@ impl PairingClient {
             now_unix_seconds()?,
         )
         .map(Some)
+    }
+
+    /// Publishes a success response for a received `wc_sessionRequest`.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>
+    ///
+    /// > Response
+    /// > // Success result
+    /// > any
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L3694-L3708>
+    ///
+    /// > if (isJsonRpcResult(response)) {
+    /// > await this.sendResult({
+    /// > id,
+    pub async fn respond_session_request_success(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+        result: impl Into<serde_json::Value>,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_request_success_publish(subscription, message, result.into())?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes an error response for a received `wc_sessionRequest`.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>
+    ///
+    /// > The client should immediately reject the request and respond an error
+    /// > if the target session permissions doesn't include the requested method
+    /// > or chain ID.
+    pub async fn respond_session_request_error(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+        error: JsonRpcError,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_request_error_publish(subscription, message, error)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
     }
 
     /// Publishes a `wc_sessionPropose` JSON-RPC error response.

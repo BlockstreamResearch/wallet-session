@@ -4,6 +4,7 @@ use super::{
     codec::{
         decode_session_message_data, decode_session_settle_response_data, decode_subscription_data,
     },
+    session_request::{session_request_error_publish, session_request_success_publish},
     *,
 };
 use wc_protocol::{
@@ -575,6 +576,123 @@ fn rejects_unauthorized_session_request_method() -> Result<(), Box<dyn std::erro
             .expect_err("unauthorized method should be rejected"),
         PairingClientError::SessionUnauthorizedMethod { chain_id, method }
             if chain_id.as_str() == "eip155:1" && method.as_str() == "eth_sendTransaction"
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_request_success_response_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1108),
+    )?;
+    let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+    let publish =
+        session_request_success_publish(&subscription, &received, serde_json::json!("0xsigned"))?;
+    let response: wc_protocol::session::SessionRequestResponse =
+        decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_REQUEST_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_REQUEST_RESPONSE_TAG);
+    assert_eq!(response.id, 77);
+    assert_eq!(response.result.as_value(), &serde_json::json!("0xsigned"));
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_request_error_response_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1108),
+    )?;
+    let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+    let publish = session_request_error_publish(
+        &subscription,
+        &received,
+        JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
+    )?;
+    let response: wc_protocol::session::SessionRequestErrorResponse =
+        decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_REQUEST_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_REQUEST_RESPONSE_TAG);
+    assert_eq!(response.id, 77);
+    assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+    assert_eq!(response.error.message, "User rejected request.");
+
+    Ok(())
+}
+
+#[test]
+fn rejects_session_request_response_for_wrong_topic() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+    let received = SessionReceivedMessage {
+        topic: RelayTopic::from_hex("55".repeat(32))?,
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1108),
+        payload: SessionPayload::SessionRequest(Box::new(request)),
+    };
+
+    assert!(matches!(
+        session_request_success_publish(&subscription, &received, serde_json::json!("0xsigned"))
+            .expect_err("wrong topic is rejected"),
+        PairingClientError::UnexpectedTopic { .. }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn rejects_non_request_session_response_target() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let received = SessionReceivedMessage {
+        topic: subscription.topic().clone(),
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1114),
+        payload: SessionPayload::Sign(SignMethod::SessionPing),
+    };
+
+    assert!(matches!(
+        session_request_error_publish(
+            &subscription,
+            &received,
+            JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
+        )
+        .expect_err("non-request payload is rejected"),
+        PairingClientError::SessionResponseTargetNotRequest
     ));
 
     Ok(())
