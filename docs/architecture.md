@@ -33,6 +33,7 @@ Boundary rules:
 - `wc-protocol` must not own networking or runtime session state.
 - `wc-transport` must not decide wallet approval policy.
 - `wc-core` owns wallet behavior: pairing/session orchestration, event emission, approval planning, and request response APIs.
+- `wc-core` top-level exports should describe the single-session wallet API. Lower-level protocol-step primitives belong under `wc_core::low_level` so harness code can use them without making them look like the recommended app surface.
 - `xtask` may use production primitives, but production crates must not depend on `xtask`.
 - Future UniFFI/Wasm layers should be wrappers only: type conversion, async adaptation, memory/lifetime adaptation, and packaging.
 
@@ -85,7 +86,12 @@ Current event model:
 - pairing proposals become `SingleSessionClientEvent::SessionProposal`;
 - non-proposal pairing messages remain visible as `SingleSessionClientEvent::PairingMessage`;
 - session-topic messages become `SingleSessionClientEvent::Session`;
+- session requests and session updates are tracked as one-shot pending decisions after they are surfaced, so response helpers cannot be reused to answer the same user-significant request twice;
 - an expired active session becomes `SingleSessionClientEvent::SessionExpired` and is removed from the in-memory runtime before another session message is polled;
+- a closed relay socket during polling triggers one bounded reconnect attempt and resubscribes the single active topic before polling resumes;
+- repeated receive timeouts are treated as a stale-connection signal after a configured threshold;
+- automatic reconnects have a cross-call cooldown so repeated peer closes cannot turn polling into relay pressure;
+- explicit shutdown marks the client as user-disconnected and disables automatic reconnect;
 - invalid session requests are auto-rejected by the receive path when the rejection is deterministic and does not require user approval.
 - permission-changing session updates are surfaced as events and require an explicit approve/reject API call.
 
@@ -213,6 +219,10 @@ Current security defaults:
 - incoming WebSocket frame size limit;
 - request timeouts;
 - bounded relay connect retry/backoff;
+- bounded automatic reconnect from `SingleSessionClient::next_event`;
+- reconnect cooldown across `next_event` calls;
+- receive-timeout liveness threshold for quiet sockets;
+- explicit user-disconnected state that automatic reconnect must respect;
 - closed relay connections are surfaced as explicit runtime errors;
 - strict JSON-RPC response ID matching;
 - subscribed-topic routing;
@@ -284,7 +294,7 @@ Rationale: live tests confirm deployed WalletConnect behavior. Local tests cover
 
 These are intentionally not finalized:
 
-- resubscribe behavior after an established relay connection is lost;
+- reconnect behavior after repeated established-connection loss;
 - durable storage and restore;
 - persisted symmetric key handling;
 - queue capacity as public API;

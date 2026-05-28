@@ -1,6 +1,7 @@
 use std::{
-    collections::VecDeque,
-    time::{SystemTime, SystemTimeError, UNIX_EPOCH},
+    collections::{HashSet, VecDeque},
+    num::NonZeroUsize,
+    time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 use wc_protocol::{
@@ -10,13 +11,14 @@ use wc_protocol::{
         SessionEventParams, SessionNamespaces, SessionProposeParams,
     },
 };
-use wc_transport::RelayReconnectConfig;
+use wc_transport::{RelayClientError, RelayReconnectConfig};
 
 use crate::pairing::{
-    DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingClientError,
-    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionClientEvent,
-    SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
-    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig as SingleSessionRelayConfig,
+    PairingClientError, PairingPayload, PairingReceivedMessage, PairingSubscription,
+    SessionClientEvent, SessionLifecycleRequest, SessionLifecycleResponseMessage,
+    SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
+    SessionReceivedMessage, SessionSubscription,
 };
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
@@ -24,18 +26,27 @@ use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 /// Default number of fetched or internally queued events retained by `SingleSessionClient`.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
 
+/// Default cooldown between automatic reconnect cycles started by `next_event`.
+pub const DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Default receive-timeout count before `next_event` treats the socket as stale.
+pub const DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT: NonZeroUsize =
+    NonZeroUsize::new(2).expect("non-zero");
+
 /// `SingleSessionClient` configuration.
 #[derive(Debug, Clone)]
 pub struct SingleSessionClientConfig {
-    pairing: PairingClientConfig,
+    pairing: SingleSessionRelayConfig,
     max_queued_events: usize,
     reconnect: RelayReconnectConfig,
+    automatic_reconnect_cooldown: Duration,
+    receive_timeouts_before_reconnect: NonZeroUsize,
 }
 
 impl SingleSessionClientConfig {
     /// Builds a single-session client configuration from the native relay config.
     #[must_use]
-    pub const fn new(pairing: PairingClientConfig) -> Self {
+    pub const fn new(pairing: SingleSessionRelayConfig) -> Self {
         Self {
             pairing,
             max_queued_events: DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
@@ -44,12 +55,15 @@ impl SingleSessionClientConfig {
                 wc_transport::DEFAULT_CONNECT_RETRY_INITIAL_DELAY,
                 wc_transport::DEFAULT_CONNECT_RETRY_MAX_DELAY,
             ),
+            automatic_reconnect_cooldown: DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN,
+            receive_timeouts_before_reconnect:
+                DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
         }
     }
 
     /// Native pairing relay configuration used by `SingleSessionClient`.
     #[must_use]
-    pub const fn pairing(&self) -> &PairingClientConfig {
+    pub const fn pairing(&self) -> &SingleSessionRelayConfig {
         &self.pairing
     }
 
@@ -65,6 +79,18 @@ impl SingleSessionClientConfig {
         &self.reconnect
     }
 
+    /// Minimum time between automatic reconnect cycles started by `next_event`.
+    #[must_use]
+    pub const fn automatic_reconnect_cooldown(&self) -> Duration {
+        self.automatic_reconnect_cooldown
+    }
+
+    /// Receive-timeout count before `next_event` probes liveness by reconnecting.
+    #[must_use]
+    pub const fn receive_timeouts_before_reconnect(&self) -> NonZeroUsize {
+        self.receive_timeouts_before_reconnect
+    }
+
     /// Sets the event queue bound used for retained relay messages.
     #[must_use]
     pub const fn with_max_queued_events(mut self, max_queued_events: usize) -> Self {
@@ -78,26 +104,61 @@ impl SingleSessionClientConfig {
         self.reconnect = reconnect;
         self
     }
+
+    /// Sets the automatic reconnect cooldown used by `next_event`.
+    #[must_use]
+    pub const fn with_automatic_reconnect_cooldown(mut self, cooldown: Duration) -> Self {
+        assert!(
+            !cooldown.is_zero(),
+            "automatic reconnect cooldown must be non-zero"
+        );
+        self.automatic_reconnect_cooldown = cooldown;
+        self
+    }
+
+    /// Sets how many consecutive receive timeouts make `next_event` reconnect.
+    #[must_use]
+    pub const fn with_receive_timeouts_before_reconnect(mut self, count: NonZeroUsize) -> Self {
+        self.receive_timeouts_before_reconnect = count;
+        self
+    }
 }
 
-impl From<PairingClientConfig> for SingleSessionClientConfig {
-    fn from(pairing: PairingClientConfig) -> Self {
+impl From<SingleSessionRelayConfig> for SingleSessionClientConfig {
+    fn from(pairing: SingleSessionRelayConfig) -> Self {
         Self::new(pairing)
     }
+}
+
+/// Relay connection state tracked by `SingleSessionClient`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleSessionClientConnectionState {
+    /// Relay socket is expected to be usable.
+    Connected,
+    /// Runtime is currently opening a replacement relay socket.
+    Reconnecting,
+    /// Caller explicitly closed the relay socket.
+    DisconnectedByUser,
+    /// Automatic reconnect failed or is cooling down.
+    Unavailable,
 }
 
 /// In-memory single-session runtime over the current pairing/session primitives.
 ///
 /// This first runtime owns one relay connection, at most one active pairing or
-/// session topic, and a small event queue. Persistence, restore, reconnect,
-/// and background polling are separate follow-up layers.
+/// session topic, bounded reconnect behavior, and a small event queue.
+/// Persistence, restore, and background polling are separate follow-up layers.
 ///
 /// Applications should create one `SingleSessionClient` and reuse it for the
 /// wallet runtime. Creating multiple instances to hold multiple active sessions
 /// bypasses the trust boundary this type is designed to enforce.
 pub struct SingleSessionClient {
+    config: SingleSessionClientConfig,
     pairing: PairingClient,
     state: SingleSessionClientState,
+    connection_state: SingleSessionClientConnectionState,
+    last_automatic_reconnect: Option<Instant>,
+    consecutive_receive_timeouts: usize,
     queued_events: BoundedQueue<SingleSessionClientEvent>,
 }
 
@@ -111,8 +172,12 @@ impl SingleSessionClient {
             .map_err(SingleSessionClientError::from)?;
 
         Ok(Self {
+            config: config.clone(),
             pairing,
             state: SingleSessionClientState::Idle,
+            connection_state: SingleSessionClientConnectionState::Connected,
+            last_automatic_reconnect: None,
+            consecutive_receive_timeouts: 0,
             queued_events: BoundedQueue::new(config.max_queued_events()),
         })
     }
@@ -121,6 +186,24 @@ impl SingleSessionClient {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.pairing.status()
+    }
+
+    /// Current relay connection state for this single-session runtime.
+    #[must_use]
+    pub const fn connection_state(&self) -> SingleSessionClientConnectionState {
+        self.connection_state
+    }
+
+    /// Closes the relay socket and prevents automatic reconnect.
+    ///
+    /// Call `reconnect` explicitly to reopen the socket after shutdown.
+    pub async fn shutdown(&mut self) -> Result<(), SingleSessionClientError> {
+        let close_result = self.pairing.close().await;
+        self.state = SingleSessionClientState::Idle;
+        self.queued_events.clear();
+        self.connection_state = SingleSessionClientConnectionState::DisconnectedByUser;
+        self.consecutive_receive_timeouts = 0;
+        close_result.map_err(SingleSessionClientError::from)
     }
 
     /// Reopens the relay connection and resubscribes the one active topic.
@@ -133,10 +216,15 @@ impl SingleSessionClient {
     /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
     ///
     /// > Used when a client subscribes a given topic.
-    pub async fn reconnect(
-        &mut self,
-        config: &SingleSessionClientConfig,
-    ) -> Result<(), SingleSessionClientError> {
+    pub async fn reconnect(&mut self) -> Result<(), SingleSessionClientError> {
+        self.reconnect_inner().await?;
+        self.connection_state = SingleSessionClientConnectionState::Connected;
+        self.consecutive_receive_timeouts = 0;
+        Ok(())
+    }
+
+    async fn reconnect_inner(&mut self) -> Result<(), SingleSessionClientError> {
+        let config = self.config.clone();
         let previous_state = self.state.clone();
         self.pairing
             .reconnect(config.pairing(), config.reconnect().clone())
@@ -239,12 +327,58 @@ impl SingleSessionClient {
     /// side effects are handled before the event is returned.
     /// `wc_sessionUpdate` is returned without acknowledgement because it
     /// replaces session permissions.
+    /// Closed relay sockets are reopened at most once per call with the
+    /// configured reconnect policy. Consecutive receive timeouts also trigger
+    /// one reconnect after the configured liveness threshold. Automatic
+    /// reconnects obey a cross-call cooldown so a peer that repeatedly closes
+    /// the socket cannot make the caller hammer the relay by polling in a loop.
     ///
     /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/session-events.md#session_request>
     ///
     /// > Triggered when a session request is received and should be presented
     /// > to the user for approval or rejection.
     pub async fn next_event(
+        &mut self,
+    ) -> Result<Option<SingleSessionClientEvent>, SingleSessionClientError> {
+        if self.connection_state == SingleSessionClientConnectionState::DisconnectedByUser {
+            return Err(SingleSessionClientError::DisconnectedByUser);
+        }
+
+        let mut reconnected = false;
+
+        loop {
+            match self.next_event_once().await {
+                Ok(event) => {
+                    self.consecutive_receive_timeouts = 0;
+                    if self.connection_state
+                        != SingleSessionClientConnectionState::DisconnectedByUser
+                    {
+                        self.connection_state = SingleSessionClientConnectionState::Connected;
+                    }
+                    return Ok(event);
+                }
+                Err(error) if !reconnected && error.is_relay_connection_closed() => {
+                    reconnected = true;
+                    self.reconnect_automatically().await?;
+                }
+                Err(error) if !reconnected && error.is_receive_timed_out() => {
+                    if self.record_receive_timeout_requires_reconnect() {
+                        reconnected = true;
+                        self.reconnect_automatically().await?;
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.is_relay_connection_closed() => {
+                    self.connection_state = SingleSessionClientConnectionState::Unavailable;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn next_event_once(
         &mut self,
     ) -> Result<Option<SingleSessionClientEvent>, SingleSessionClientError> {
         if let Some(event) = self.take_expired_session()? {
@@ -288,6 +422,59 @@ impl SingleSessionClient {
         Ok(None)
     }
 
+    async fn reconnect_automatically(&mut self) -> Result<(), SingleSessionClientError> {
+        match self.ensure_automatic_reconnect_allowed() {
+            Ok(()) => {}
+            Err(SingleSessionClientError::DisconnectedByUser) => {
+                return Err(SingleSessionClientError::DisconnectedByUser);
+            }
+            Err(error) => {
+                self.connection_state = SingleSessionClientConnectionState::Unavailable;
+                return Err(error);
+            }
+        }
+
+        self.connection_state = SingleSessionClientConnectionState::Reconnecting;
+        self.last_automatic_reconnect = Some(Instant::now());
+
+        match self.reconnect_inner().await {
+            Ok(()) => {
+                self.connection_state = SingleSessionClientConnectionState::Connected;
+                self.consecutive_receive_timeouts = 0;
+                Ok(())
+            }
+            Err(error) => {
+                self.connection_state = SingleSessionClientConnectionState::Unavailable;
+                Err(error)
+            }
+        }
+    }
+
+    fn ensure_automatic_reconnect_allowed(&self) -> Result<(), SingleSessionClientError> {
+        if self.connection_state == SingleSessionClientConnectionState::DisconnectedByUser {
+            return Err(SingleSessionClientError::DisconnectedByUser);
+        }
+
+        let Some(last_reconnect) = self.last_automatic_reconnect else {
+            return Ok(());
+        };
+
+        let cooldown = self.config.automatic_reconnect_cooldown();
+        let elapsed = last_reconnect.elapsed();
+        if elapsed >= cooldown {
+            return Ok(());
+        }
+
+        Err(SingleSessionClientError::ReconnectCoolingDown {
+            remaining: cooldown.saturating_sub(elapsed),
+        })
+    }
+
+    const fn record_receive_timeout_requires_reconnect(&mut self) -> bool {
+        self.consecutive_receive_timeouts = self.consecutive_receive_timeouts.saturating_add(1);
+        self.consecutive_receive_timeouts >= self.config.receive_timeouts_before_reconnect().get()
+    }
+
     /// Approves a queued `wc_sessionPropose` event and stores the active session.
     ///
     /// The lower-level primitive publishes the proposal response and
@@ -311,10 +498,10 @@ impl SingleSessionClient {
             .await
             .map_err(SingleSessionClientError::from)?;
         let session_topic = approved.session_topic().clone();
-        self.state = SingleSessionClientState::Session(Box::new(ActiveSession {
-            subscription: approved.subscription().clone(),
-            session: approved.pending_session().clone(),
-        }));
+        self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            approved.subscription().clone(),
+            approved.pending_session().clone(),
+        )));
 
         let settle_response = match self.pairing.next_session_settle_response(&approved).await {
             Ok(Some(response)) => response,
@@ -365,11 +552,21 @@ impl SingleSessionClient {
         message: &SessionReceivedMessage,
         result: impl Into<serde_json::Value>,
     ) -> Result<bool, SingleSessionClientError> {
+        let request_id = session_request_id(message)?;
+        self.client_session(message.topic())?
+            .ensure_pending_session_request(request_id)?;
         let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
+        let response_ack = self
+            .pairing
             .respond_session_request_success(&subscription, message, result)
             .await
-            .map_err(SingleSessionClientError::from)
+            .map_err(SingleSessionClientError::from)?;
+        if response_ack {
+            self.client_session_mut(message.topic())?
+                .complete_session_request(request_id);
+        }
+
+        Ok(response_ack)
     }
 
     /// Publishes an error response for a `SessionClientEvent::SessionRequest`.
@@ -378,11 +575,21 @@ impl SingleSessionClient {
         message: &SessionReceivedMessage,
         error: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
+        let request_id = session_request_id(message)?;
+        self.client_session(message.topic())?
+            .ensure_pending_session_request(request_id)?;
         let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
+        let response_ack = self
+            .pairing
             .respond_session_request_error(&subscription, message, error)
             .await
-            .map_err(SingleSessionClientError::from)
+            .map_err(SingleSessionClientError::from)?;
+        if response_ack {
+            self.client_session_mut(message.topic())?
+                .complete_session_request(request_id);
+        }
+
+        Ok(response_ack)
     }
 
     /// Extracts wallet-facing review data from a `SessionClientEvent::SessionRequest`.
@@ -394,25 +601,11 @@ impl SingleSessionClient {
         &self,
         message: &SessionReceivedMessage,
     ) -> Result<SessionRequestReview, SingleSessionClientError> {
-        self.client_session(message.topic())?;
+        let request_id = session_request_id(message)?;
+        self.client_session(message.topic())?
+            .ensure_pending_session_request(request_id)?;
         SessionRequestReview::from_message(message)
             .map_err(|source| SingleSessionClientError::SessionRequestReview { source })
-    }
-
-    /// Publishes a success response for a `SessionClientEvent::SessionPing`.
-    ///
-    /// `SingleSessionClient::next_event` already responds to session pings it returns. This
-    /// method is retained for callers that receive a session message through a
-    /// lower-level path.
-    pub async fn respond_session_ping(
-        &mut self,
-        message: &SessionReceivedMessage,
-    ) -> Result<bool, SingleSessionClientError> {
-        let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
-            .respond_session_ping(&subscription, message)
-            .await
-            .map_err(SingleSessionClientError::from)
     }
 
     /// Approves a `SessionClientEvent::SessionUpdate`.
@@ -434,6 +627,9 @@ impl SingleSessionClient {
                 source: PairingClientError::SessionResponseTargetNotUpdate,
             });
         };
+        let request_id = request.id;
+        self.client_session(message.topic())?
+            .ensure_pending_session_update(request_id)?;
         let namespaces = request.params.namespaces.clone();
         let publish_ack = self
             .pairing
@@ -442,7 +638,9 @@ impl SingleSessionClient {
             .map_err(SingleSessionClientError::from)?;
 
         if publish_ack {
-            self.client_session_mut(message.topic())?.session.namespaces = namespaces;
+            let session = self.client_session_mut(message.topic())?;
+            session.session.namespaces = namespaces;
+            session.complete_session_update(request_id);
         }
 
         Ok(publish_ack)
@@ -462,6 +660,7 @@ impl SingleSessionClient {
                 source: PairingClientError::SessionResponseTargetNotUpdate,
             });
         };
+        session.ensure_pending_session_update(request.id)?;
 
         Ok(diff_session_namespaces(
             &session.session.namespaces,
@@ -478,47 +677,21 @@ impl SingleSessionClient {
         message: &SessionReceivedMessage,
         error: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
+        let request_id = session_update_id(message)?;
+        self.client_session(message.topic())?
+            .ensure_pending_session_update(request_id)?;
         let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
+        let response_ack = self
+            .pairing
             .reject_session_update(&subscription, message, error)
             .await
-            .map_err(SingleSessionClientError::from)
-    }
-
-    /// Publishes a success response for a `SessionClientEvent::SessionExtend`.
-    ///
-    /// `SingleSessionClient::next_event` already responds to session extends it returns and
-    /// refreshes local expiry. This method is retained for callers that receive
-    /// a session message through a lower-level path.
-    pub async fn respond_session_extend(
-        &mut self,
-        message: &SessionReceivedMessage,
-    ) -> Result<bool, SingleSessionClientError> {
-        let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
-            .respond_session_extend(&subscription, message)
-            .await
-            .map_err(SingleSessionClientError::from)
-    }
-
-    /// Publishes a success response for a `SessionClientEvent::SessionDelete`.
-    ///
-    /// `SingleSessionClient::next_event` already responds to session deletes it returns and
-    /// removes the local session. This method is retained for callers that
-    /// receive a session message through a lower-level path.
-    pub async fn respond_session_delete(
-        &mut self,
-        message: &SessionReceivedMessage,
-    ) -> Result<bool, SingleSessionClientError> {
-        let subscription = self.session_subscription(message.topic())?.clone();
-        let ack = self
-            .pairing
-            .respond_session_delete(&subscription, message)
-            .await
             .map_err(SingleSessionClientError::from)?;
-        self.clear_session(message.topic());
+        if response_ack {
+            self.client_session_mut(message.topic())?
+                .complete_session_update(request_id);
+        }
 
-        Ok(ack)
+        Ok(response_ack)
     }
 
     /// Publishes `wc_sessionUpdate`, waits for acknowledgement, then stores namespaces.
@@ -854,9 +1027,25 @@ impl SingleSessionClient {
                     .map_err(SingleSessionClientError::from)?;
                 self.clear_session(message.topic());
             }
-            SessionClientEvent::SessionRequest(_)
-            | SessionClientEvent::SessionUpdate(_)
-            | SessionClientEvent::SessionEvent(_)
+            SessionClientEvent::SessionRequest(message) => {
+                let request_id = session_request_id(message)?;
+                if !self
+                    .client_session_mut(message.topic())?
+                    .mark_session_request_pending(request_id)
+                {
+                    return Ok(None);
+                }
+            }
+            SessionClientEvent::SessionUpdate(message) => {
+                let request_id = session_update_id(message)?;
+                if !self
+                    .client_session_mut(message.topic())?
+                    .mark_session_update_pending(request_id)
+                {
+                    return Ok(None);
+                }
+            }
+            SessionClientEvent::SessionEvent(_)
             | SessionClientEvent::Unsupported(_)
             | SessionClientEvent::RejectedSessionRequest(_) => {}
         }
@@ -974,6 +1163,63 @@ impl SessionExpired {
 struct ActiveSession {
     subscription: SessionSubscription,
     session: Session,
+    pending_session_requests: HashSet<u64>,
+    pending_session_updates: HashSet<u64>,
+}
+
+impl ActiveSession {
+    fn new(subscription: SessionSubscription, session: Session) -> Self {
+        Self {
+            subscription,
+            session,
+            pending_session_requests: HashSet::new(),
+            pending_session_updates: HashSet::new(),
+        }
+    }
+
+    fn mark_session_request_pending(&mut self, request_id: u64) -> bool {
+        self.pending_session_requests.insert(request_id)
+    }
+
+    fn ensure_pending_session_request(
+        &self,
+        request_id: u64,
+    ) -> Result<(), SingleSessionClientError> {
+        if self.pending_session_requests.contains(&request_id) {
+            return Ok(());
+        }
+
+        Err(SingleSessionClientError::SessionRequestDecisionMissing {
+            topic: self.session.topic.clone(),
+            request_id,
+        })
+    }
+
+    fn complete_session_request(&mut self, request_id: u64) {
+        self.pending_session_requests.remove(&request_id);
+    }
+
+    fn mark_session_update_pending(&mut self, request_id: u64) -> bool {
+        self.pending_session_updates.insert(request_id)
+    }
+
+    fn ensure_pending_session_update(
+        &self,
+        request_id: u64,
+    ) -> Result<(), SingleSessionClientError> {
+        if self.pending_session_updates.contains(&request_id) {
+            return Ok(());
+        }
+
+        Err(SingleSessionClientError::SessionUpdateDecisionMissing {
+            topic: self.session.topic.clone(),
+            request_id,
+        })
+    }
+
+    fn complete_session_update(&mut self, request_id: u64) {
+        self.pending_session_updates.remove(&request_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1119,6 +1365,17 @@ pub enum SingleSessionClientError {
         incoming: usize,
     },
 
+    /// Automatic reconnect is delayed by the cross-call cooldown.
+    #[error("single-session client reconnect cooling down for {remaining:?}")]
+    ReconnectCoolingDown {
+        /// Remaining cooldown duration.
+        remaining: Duration,
+    },
+
+    /// Caller explicitly shut down the relay connection.
+    #[error("single-session client disconnected by user")]
+    DisconnectedByUser,
+
     /// A session-topic message could not be converted to request review data.
     #[error("single-session client session request review failed")]
     SessionRequestReview {
@@ -1126,11 +1383,51 @@ pub enum SingleSessionClientError {
         #[source]
         source: SessionRequestReviewError,
     },
+
+    /// No pending caller decision exists for this session request.
+    #[error("single-session client session request decision is not pending")]
+    SessionRequestDecisionMissing {
+        /// Active session topic.
+        topic: RelayTopic,
+        /// JSON-RPC request id.
+        request_id: u64,
+    },
+
+    /// No pending caller decision exists for this session update.
+    #[error("single-session client session update decision is not pending")]
+    SessionUpdateDecisionMissing {
+        /// Active session topic.
+        topic: RelayTopic,
+        /// JSON-RPC request id.
+        request_id: u64,
+    },
 }
 
 impl From<PairingClientError> for SingleSessionClientError {
     fn from(source: PairingClientError) -> Self {
         Self::Pairing { source }
+    }
+}
+
+impl SingleSessionClientError {
+    const fn is_relay_connection_closed(&self) -> bool {
+        matches!(
+            self,
+            Self::Pairing {
+                source: PairingClientError::Relay {
+                    source: RelayClientError::ConnectionClosed { .. }
+                }
+            }
+        )
+    }
+
+    const fn is_receive_timed_out(&self) -> bool {
+        matches!(
+            self,
+            Self::Pairing {
+                source: PairingClientError::ReceiveTimedOut { .. }
+            }
+        )
     }
 }
 
@@ -1144,6 +1441,28 @@ fn ensure_session_lifecycle_success(
                 response: response.clone(),
             })
         }
+    }
+}
+
+const fn session_request_id(
+    message: &SessionReceivedMessage,
+) -> Result<u64, SingleSessionClientError> {
+    match message.payload() {
+        SessionPayload::SessionRequest(request) => Ok(request.id),
+        _ => Err(SingleSessionClientError::Pairing {
+            source: PairingClientError::SessionResponseTargetNotRequest,
+        }),
+    }
+}
+
+const fn session_update_id(
+    message: &SessionReceivedMessage,
+) -> Result<u64, SingleSessionClientError> {
+    match message.payload() {
+        SessionPayload::SessionUpdate(request) => Ok(request.id),
+        _ => Err(SingleSessionClientError::Pairing {
+            source: PairingClientError::SessionResponseTargetNotUpdate,
+        }),
     }
 }
 
@@ -1166,14 +1485,22 @@ mod tests {
 
     use super::{
         ActiveSession, BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
-        SingleSessionClient, SingleSessionClientConfig, SingleSessionClientError,
+        DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
+        DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SingleSessionClient,
+        SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
         SingleSessionClientState, take_expired_session_from_state,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tokio::time::sleep;
-    use tokio_tungstenite::{accept_async, tungstenite::Message};
+    use tokio_tungstenite::{
+        accept_async,
+        tungstenite::{
+            Message,
+            protocol::{CloseFrame, frame::coding::CloseCode},
+        },
+    };
     use wc_protocol::{
         key::X25519PublicKey,
         pairing::PairingSymKey,
@@ -1184,26 +1511,54 @@ mod tests {
     };
 
     use crate::{
-        PairingClientConfig, PairingSubscription, RelayReconnectConfig, SessionSubscription,
+        PairingClientError, RelayReconnectConfig, SingleSessionRelayConfig,
+        low_level::{PairingSubscription, SessionSubscription},
     };
 
     #[test]
     fn client_config_uses_default_event_queue_capacity() {
-        let pairing = PairingClientConfig::new("project", [7; 32], "subject");
+        let pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
         let config = SingleSessionClientConfig::new(pairing);
 
         assert_eq!(
             config.max_queued_events(),
             DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY
         );
+        assert_eq!(
+            config.automatic_reconnect_cooldown(),
+            DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN
+        );
+        assert_eq!(
+            config.receive_timeouts_before_reconnect(),
+            DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT
+        );
     }
 
     #[test]
-    fn client_config_sets_event_queue_capacity() {
-        let pairing = PairingClientConfig::new("project", [7; 32], "subject");
-        let config = SingleSessionClientConfig::new(pairing).with_max_queued_events(2);
+    fn client_config_sets_runtime_limits() {
+        let pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
+        let config = SingleSessionClientConfig::new(pairing)
+            .with_max_queued_events(2)
+            .with_automatic_reconnect_cooldown(Duration::from_millis(17))
+            .with_receive_timeouts_before_reconnect(NonZeroUsize::new(3).expect("non-zero"));
 
         assert_eq!(config.max_queued_events(), 2);
+        assert_eq!(
+            config.automatic_reconnect_cooldown(),
+            Duration::from_millis(17)
+        );
+        assert_eq!(
+            config.receive_timeouts_before_reconnect(),
+            NonZeroUsize::new(3).expect("non-zero")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "automatic reconnect cooldown must be non-zero")]
+    fn client_config_rejects_zero_automatic_reconnect_cooldown() {
+        let pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
+        let _config = SingleSessionClientConfig::new(pairing)
+            .with_automatic_reconnect_cooldown(Duration::ZERO);
     }
 
     #[test]
@@ -1231,13 +1586,10 @@ mod tests {
     fn expired_session_event_is_taken_once_and_clears_session() {
         let topic = RelayTopic::from_bytes([0x44; 32]);
         let expiry = 1;
-        let mut state = SingleSessionClientState::Session(Box::new(ActiveSession {
-            subscription: SessionSubscription::for_test(
-                topic.clone(),
-                PairingSymKey::from_bytes([0x55; 32]),
-            ),
-            session: test_session(topic.clone(), expiry),
-        }));
+        let mut state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x55; 32])),
+            test_session(topic.clone(), expiry),
+        )));
 
         let expired = take_expired_session_from_state(&mut state, expiry)
             .expect("expired session event is emitted");
@@ -1246,6 +1598,64 @@ mod tests {
         assert_eq!(expired.expiry(), expiry);
         assert!(matches!(state, SingleSessionClientState::Idle));
         assert_eq!(take_expired_session_from_state(&mut state, expiry), None);
+    }
+
+    #[test]
+    fn active_session_tracks_one_shot_session_request_decisions() {
+        let topic = RelayTopic::from_bytes([0x56; 32]);
+        let mut session = ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x57; 32])),
+            test_session(topic.clone(), 1_779_999_999),
+        );
+
+        assert!(session.mark_session_request_pending(42));
+        assert!(!session.mark_session_request_pending(42));
+        assert!(session.ensure_pending_session_request(42).is_ok());
+
+        session.complete_session_request(42);
+
+        match session
+            .ensure_pending_session_request(42)
+            .expect_err("completed request decision is no longer pending")
+        {
+            SingleSessionClientError::SessionRequestDecisionMissing {
+                topic: actual_topic,
+                request_id,
+            } => {
+                assert_eq!(actual_topic, topic);
+                assert_eq!(request_id, 42);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_session_tracks_one_shot_session_update_decisions() {
+        let topic = RelayTopic::from_bytes([0x58; 32]);
+        let mut session = ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x59; 32])),
+            test_session(topic.clone(), 1_779_999_999),
+        );
+
+        assert!(session.mark_session_update_pending(99));
+        assert!(!session.mark_session_update_pending(99));
+        assert!(session.ensure_pending_session_update(99).is_ok());
+
+        session.complete_session_update(99);
+
+        match session
+            .ensure_pending_session_update(99)
+            .expect_err("completed update decision is no longer pending")
+        {
+            SingleSessionClientError::SessionUpdateDecisionMissing {
+                topic: actual_topic,
+                request_id,
+            } => {
+                assert_eq!(actual_topic, topic);
+                assert_eq!(request_id, 99);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1287,7 +1697,7 @@ mod tests {
             PairingSymKey::from_bytes([0x46; 32]),
         ));
 
-        client.reconnect(&config).await.expect("reconnects");
+        client.reconnect().await.expect("reconnects");
 
         match &client.state {
             SingleSessionClientState::Pairing(subscription) => {
@@ -1334,15 +1744,12 @@ mod tests {
         let mut client = SingleSessionClient::connect(&config)
             .await
             .expect("connects to first relay websocket");
-        client.state = SingleSessionClientState::Session(Box::new(ActiveSession {
-            subscription: SessionSubscription::for_test(
-                topic.clone(),
-                PairingSymKey::from_bytes([0x48; 32]),
-            ),
-            session: test_session(topic.clone(), 1_779_999_999),
-        }));
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x48; 32])),
+            test_session(topic.clone(), 1_779_999_999),
+        )));
 
-        client.reconnect(&config).await.expect("reconnects");
+        client.reconnect().await.expect("reconnects");
 
         match &client.state {
             SingleSessionClientState::Session(session) => {
@@ -1355,6 +1762,288 @@ mod tests {
             }
             other => panic!("unexpected state: {other:?}"),
         }
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn next_event_reconnects_pairing_topic_after_close() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x49; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let mut first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+            send_close_frame(&mut first_websocket).await;
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("poll-resubscribed-pairing"),
+            )
+            .await;
+            sleep(Duration::from_millis(100)).await;
+        });
+
+        let config = reconnect_test_config(address);
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            PairingSymKey::from_bytes([0x4a; 32]),
+        ));
+
+        let error = client
+            .next_event()
+            .await
+            .expect_err("poll should reconnect and then time out waiting for data");
+
+        assert_receive_timed_out(error);
+        match &client.state {
+            SingleSessionClientState::Pairing(subscription) => {
+                assert_eq!(subscription.topic(), &topic);
+                assert_eq!(subscription.subscription_id(), "poll-resubscribed-pairing");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn next_event_reconnects_session_topic_after_close() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x4b; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let mut first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+            send_close_frame(&mut first_websocket).await;
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("poll-resubscribed-session"),
+            )
+            .await;
+            sleep(Duration::from_millis(100)).await;
+        });
+
+        let config = reconnect_test_config(address);
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x4c; 32])),
+            test_session(topic.clone(), 1_779_999_999),
+        )));
+
+        let error = client
+            .next_event()
+            .await
+            .expect_err("poll should reconnect and then time out waiting for data");
+
+        assert_receive_timed_out(error);
+        match &client.state {
+            SingleSessionClientState::Session(session) => {
+                assert_eq!(session.subscription.topic(), &topic);
+                assert_eq!(
+                    session.subscription.subscription_id(),
+                    "poll-resubscribed-session"
+                );
+                assert_eq!(session.session.topic, topic);
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn next_event_reconnect_cooldown_blocks_repeated_close_loop() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x4d; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let mut first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+            send_close_frame(&mut first_websocket).await;
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("cooldown-resubscribed"),
+            )
+            .await;
+            send_close_frame(&mut second_websocket).await;
+        });
+
+        let config = reconnect_test_config(address)
+            .with_automatic_reconnect_cooldown(Duration::from_secs(60));
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            PairingSymKey::from_bytes([0x4e; 32]),
+        ));
+
+        let first_error = client
+            .next_event()
+            .await
+            .expect_err("first poll reconnects once and sees the replacement close");
+        assert!(first_error.is_relay_connection_closed());
+
+        let second_error = client
+            .next_event()
+            .await
+            .expect_err("cooldown should block a second automatic reconnect");
+        match second_error {
+            SingleSessionClientError::ReconnectCoolingDown { remaining } => {
+                assert!(remaining > Duration::ZERO);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            client.connection_state(),
+            SingleSessionClientConnectionState::Unavailable
+        );
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn repeated_receive_timeouts_reconnect_active_pairing_topic() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x4f; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let _first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("timeout-resubscribed"),
+            )
+            .await;
+            sleep(Duration::from_millis(80)).await;
+        });
+
+        let config = reconnect_test_config(address)
+            .with_automatic_reconnect_cooldown(Duration::from_millis(1))
+            .with_receive_timeouts_before_reconnect(NonZeroUsize::new(2).expect("non-zero"));
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            PairingSymKey::from_bytes([0x50; 32]),
+        ));
+
+        let first_error = client
+            .next_event()
+            .await
+            .expect_err("first quiet poll only records one timeout");
+        assert_receive_timed_out(first_error);
+
+        let second_error = client
+            .next_event()
+            .await
+            .expect_err("second quiet poll reconnects and then times out waiting for data");
+        assert_receive_timed_out(second_error);
+        match &client.state {
+            SingleSessionClientState::Pairing(subscription) => {
+                assert_eq!(subscription.topic(), &topic);
+                assert_eq!(subscription.subscription_id(), "timeout-resubscribed");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn shutdown_blocks_next_event_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accepts client");
+            let mut websocket = accept_async(stream).await.expect("accepts websocket");
+            while websocket.next().await.is_some() {}
+        });
+
+        let config = reconnect_test_config(address);
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to relay websocket");
+        client
+            .shutdown()
+            .await
+            .expect("explicit shutdown closes the relay socket");
+
+        assert_eq!(
+            client.connection_state(),
+            SingleSessionClientConnectionState::DisconnectedByUser
+        );
+        assert!(matches!(
+            client
+                .next_event()
+                .await
+                .expect_err("shutdown disables automatic reconnect"),
+            SingleSessionClientError::DisconnectedByUser
+        ));
 
         server.await.expect("server task joins");
     }
@@ -1401,13 +2090,23 @@ mod tests {
     }
 
     fn reconnect_test_config(address: std::net::SocketAddr) -> SingleSessionClientConfig {
-        let mut pairing = PairingClientConfig::new("project", [7; 32], "subject");
+        let mut pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
         pairing.relay_url = format!("ws://{address}");
+        pairing.receive_timeout = Duration::from_millis(20);
         SingleSessionClientConfig::new(pairing).with_reconnect(RelayReconnectConfig::new(
             NonZeroUsize::new(2).expect("non-zero"),
             Duration::ZERO,
             Duration::ZERO,
         ))
+    }
+
+    fn assert_receive_timed_out(error: SingleSessionClientError) {
+        match error {
+            SingleSessionClientError::Pairing {
+                source: PairingClientError::ReceiveTimedOut { timeout },
+            } => assert_eq!(timeout, Duration::from_millis(20)),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     async fn read_json_frame(
@@ -1444,5 +2143,17 @@ mod tests {
             ))
             .await
             .expect("sends result");
+    }
+
+    async fn send_close_frame(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        websocket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "server restart".into(),
+            })))
+            .await
+            .expect("sends close frame");
     }
 }

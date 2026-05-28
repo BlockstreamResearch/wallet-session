@@ -65,7 +65,7 @@ const MAX_SESSION_LIFECYCLE_RESPONSE_DELIVERIES: usize = 4;
 /// # Examples
 ///
 /// ```
-/// use wc_core::{PairingClientConfig, DEFAULT_PAIRING_RECEIVE_TIMEOUT};
+/// use wc_core::{low_level::PairingClientConfig, DEFAULT_PAIRING_RECEIVE_TIMEOUT};
 ///
 /// let config = PairingClientConfig::new("project-id", [7; 32], "client-subject");
 ///
@@ -127,7 +127,7 @@ impl PairingClientConfig {
 /// # Examples
 ///
 /// ```no_run
-/// use wc_core::{PairingClient, PairingClientConfig};
+/// use wc_core::low_level::{PairingClient, PairingClientConfig};
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut client = PairingClient::connect(&PairingClientConfig::new(
@@ -164,6 +164,17 @@ impl PairingClient {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.relay.status()
+    }
+
+    /// Closes the relay socket and clears relay routing state.
+    ///
+    /// Core runtime uses this for explicit wallet shutdown. Automatic reconnect
+    /// must not reopen the socket after the caller has requested shutdown.
+    pub async fn close(&mut self) -> Result<(), PairingClientError> {
+        self.relay
+            .close()
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
     }
 
     /// Reopens the relay WebSocket with a fresh Relay Auth URL.

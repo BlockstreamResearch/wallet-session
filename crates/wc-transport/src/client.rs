@@ -227,6 +227,18 @@ impl RelayClient {
         Ok(())
     }
 
+    /// Sends a WebSocket close frame and drops local relay routing state.
+    ///
+    /// This is an explicit caller shutdown path. Reconnect policy belongs to
+    /// higher runtime code and should not reopen a socket after this method has
+    /// been called.
+    pub async fn close(&mut self) -> Result<(), RelayClientError> {
+        self.transport.close().await?;
+        self.subscriptions.clear();
+        self.queued_messages.clear();
+        Ok(())
+    }
+
     /// HTTP status returned during the WebSocket upgrade.
     #[must_use]
     pub const fn status(&self) -> u16 {

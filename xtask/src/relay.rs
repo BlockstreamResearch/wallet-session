@@ -14,14 +14,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
-    ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PAIRING_PING_RESPONSE_TAG, PairingClient,
-    PairingClientConfig, PairingPayload, PairingReceivedMessage, PairingSubscription,
-    SESSION_REQUEST_RESPONSE_TAG, SessionClientEvent, SessionLifecycleResponseMessage,
-    SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
-    SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
-    SessionSettleResponseMessage, SessionSettleResponsePayload, SingleSessionClient,
-    SingleSessionClientConfig, SingleSessionClientEvent, SingleSessionProposal, WalletCapabilities,
-    WalletChainCapability,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage, SessionClientEvent,
+    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
+    SingleSessionClient, SingleSessionClientConfig, SingleSessionClientEvent,
+    SingleSessionProposal, WalletCapabilities, WalletChainCapability,
+    low_level::{
+        ApprovedSession, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
+        PairingSubscription, SESSION_REQUEST_RESPONSE_TAG, SessionSettleResponseMessage,
+        SessionSettleResponsePayload, SessionSubscription,
+    },
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId},
@@ -1230,7 +1232,7 @@ fn validate_incoming_session_event(message: &SessionReceivedMessage) -> Result<(
 
 async fn run_core_valid_session_request_probe(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     response_mode: &str,
     harness: &mut SessionHarness,
@@ -1486,7 +1488,7 @@ impl CoreJsSessionLifecycleAction {
 
 async fn run_core_js_session_lifecycle_action(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     action: CoreJsSessionLifecycleAction,
 ) -> Result<()> {
@@ -1508,7 +1510,7 @@ async fn run_core_js_session_lifecycle_action(
 
 async fn publish_js_session_lifecycle_request(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     action: CoreJsSessionLifecycleAction,
 ) -> Result<()> {
@@ -1549,7 +1551,7 @@ async fn publish_js_session_lifecycle_request(
 
 async fn publish_js_session_event(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
 ) -> Result<()> {
     let params = session_event_params()?;
@@ -1569,7 +1571,7 @@ async fn publish_js_session_event(
 
 async fn respond_to_js_session_lifecycle_message(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     action: CoreJsSessionLifecycleAction,
 ) -> Result<()> {
@@ -1607,7 +1609,7 @@ async fn respond_to_js_session_lifecycle_message(
 
 async fn wait_for_session_lifecycle_message(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     lifecycle_action: &str,
 ) -> Result<SessionReceivedMessage> {
@@ -1645,7 +1647,7 @@ fn session_event_params() -> Result<SessionEventParams> {
 
 async fn wait_for_valid_session_request_message(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
 ) -> Result<SessionReceivedMessage> {
     loop {
@@ -1802,7 +1804,7 @@ fn print_ignored_single_session_client_event(event: &SessionClientEvent) {
 async fn run_core_raw_invalid_session_request_probe(
     config: &RelayProbeConfig,
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
     response_mode: &str,
 ) -> Result<()> {
@@ -1840,7 +1842,7 @@ struct RawInvalidSessionRequest {
 }
 
 impl RawInvalidSessionRequest {
-    fn new(response_mode: &str, subscription: &wc_core::SessionSubscription) -> Result<Self> {
+    fn new(response_mode: &str, subscription: &SessionSubscription) -> Result<Self> {
         let now = unix_timestamp();
         let (chain_id, method, expiry_timestamp, expected_code) = match response_mode {
             "auto-reject-unauthorized-method" => (
@@ -1909,7 +1911,7 @@ fn raw_session_request_json(
 
 async fn publish_raw_invalid_session_request(
     peer: &mut RelaySocket,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     request: &RawInvalidSessionRequest,
 ) -> Result<()> {
     peer.publish(
@@ -1931,7 +1933,7 @@ async fn publish_raw_invalid_session_request(
 
 async fn wait_for_session_request_rejection(
     client: &mut PairingClient,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     session: &Session,
 ) -> Result<SessionRequestRejection> {
     loop {
@@ -2045,7 +2047,7 @@ fn validate_session_request_rejection(
 
 async fn read_session_request_error_response(
     peer: &mut RelaySocket,
-    subscription: &wc_core::SessionSubscription,
+    subscription: &SessionSubscription,
     request: &RawInvalidSessionRequest,
 ) -> Result<JsonRpcErrorResponse> {
     for _ in 0..4 {
