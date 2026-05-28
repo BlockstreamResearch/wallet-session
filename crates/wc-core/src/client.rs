@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
@@ -20,27 +20,27 @@ use crate::pairing::{
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 
-/// Default number of fetched or internally queued events retained for `next_event`.
-pub const DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
+/// Default number of fetched or internally queued events retained by `SingleSessionClient`.
+pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
 
-/// Runtime client configuration.
+/// `SingleSessionClient` configuration.
 #[derive(Debug, Clone)]
-pub struct ClientConfig {
+pub struct SingleSessionClientConfig {
     pairing: PairingClientConfig,
     max_queued_events: usize,
 }
 
-impl ClientConfig {
-    /// Builds a client configuration from the native pairing relay config.
+impl SingleSessionClientConfig {
+    /// Builds a single-session client configuration from the native relay config.
     #[must_use]
     pub const fn new(pairing: PairingClientConfig) -> Self {
         Self {
             pairing,
-            max_queued_events: DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY,
+            max_queued_events: DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
         }
     }
 
-    /// Native pairing relay configuration used by the first runtime client.
+    /// Native pairing relay configuration used by `SingleSessionClient`.
     #[must_use]
     pub const fn pairing(&self) -> &PairingClientConfig {
         &self.pairing
@@ -60,35 +60,39 @@ impl ClientConfig {
     }
 }
 
-impl From<PairingClientConfig> for ClientConfig {
+impl From<PairingClientConfig> for SingleSessionClientConfig {
     fn from(pairing: PairingClientConfig) -> Self {
         Self::new(pairing)
     }
 }
 
-/// In-memory client runtime over the current pairing/session primitives.
+/// In-memory single-session runtime over the current pairing/session primitives.
 ///
-/// This first runtime owns one relay connection, pairing subscriptions, active
-/// sessions, and a small event queue. Persistence, restore, reconnect, and
-/// background polling are separate follow-up layers.
-pub struct Client {
+/// This first runtime owns one relay connection, at most one active pairing or
+/// session topic, and a small event queue. Persistence, restore, reconnect,
+/// and background polling are separate follow-up layers.
+///
+/// Applications should create one `SingleSessionClient` and reuse it for the
+/// wallet runtime. Creating multiple instances to hold multiple active sessions
+/// bypasses the trust boundary this type is designed to enforce.
+pub struct SingleSessionClient {
     pairing: PairingClient,
-    pairings: BTreeMap<RelayTopic, PairingSubscription>,
-    sessions: BTreeMap<RelayTopic, ClientSession>,
-    queued_events: BoundedQueue<ClientEvent>,
+    state: SingleSessionClientState,
+    queued_events: BoundedQueue<SingleSessionClientEvent>,
 }
 
-impl Client {
+impl SingleSessionClient {
     /// Opens an authenticated relay connection.
-    pub async fn connect(config: &ClientConfig) -> Result<Self, ClientError> {
+    pub async fn connect(
+        config: &SingleSessionClientConfig,
+    ) -> Result<Self, SingleSessionClientError> {
         let pairing = PairingClient::connect(config.pairing())
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
 
         Ok(Self {
             pairing,
-            pairings: BTreeMap::new(),
-            sessions: BTreeMap::new(),
+            state: SingleSessionClientState::Idle,
             queued_events: BoundedQueue::new(config.max_queued_events()),
         })
     }
@@ -111,9 +115,10 @@ impl Client {
     /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
     ///
     /// > Used when a client subscribes a given topic.
-    pub async fn pair(&mut self, uri: &str) -> Result<RelayTopic, ClientError> {
+    pub async fn pair(&mut self, uri: &str) -> Result<RelayTopic, SingleSessionClientError> {
+        self.ensure_idle_for_pairing()?;
         let pairing_uri = wc_protocol::pairing::PairingUri::parse(uri).map_err(|source| {
-            ClientError::Pairing {
+            SingleSessionClientError::Pairing {
                 source: PairingClientError::PairingUri { source },
             }
         })?;
@@ -121,14 +126,14 @@ impl Client {
             .pairing
             .fetch_pairing_messages(&pairing_uri)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
         self.queued_events.ensure_capacity_for(fetched.len())?;
 
         let subscription = self
             .pairing
             .subscribe_pairing(&pairing_uri)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
         let topic = subscription.topic().clone();
         let mut fetched_events = Vec::with_capacity(fetched.len());
         let mut pairing_deleted = false;
@@ -139,12 +144,9 @@ impl Client {
         }
 
         if pairing_deleted {
-            self.pairing
-                .unsubscribe_pairing(&subscription)
-                .await
-                .map_err(ClientError::from)?;
+            self.unsubscribe_pairing(&subscription).await?;
         } else {
-            self.pairings.insert(topic.clone(), subscription);
+            self.state = SingleSessionClientState::Pairing(subscription);
         }
         self.queued_events.extend_within_capacity(fetched_events);
         Ok(topic)
@@ -163,17 +165,23 @@ impl Client {
     ///
     /// > Triggered when a session request is received and should be presented
     /// > to the user for approval or rejection.
-    pub async fn next_event(&mut self) -> Result<Option<ClientEvent>, ClientError> {
+    pub async fn next_event(
+        &mut self,
+    ) -> Result<Option<SingleSessionClientEvent>, SingleSessionClientError> {
+        if let Some(event) = self.take_expired_session()? {
+            return Ok(Some(SingleSessionClientEvent::SessionExpired(event)));
+        }
+
         if let Some(event) = self.queued_events.pop_front() {
             return Ok(Some(event));
         }
 
-        if let Some(session) = self.sessions.values().next().cloned() {
+        if let Some(session) = self.active_client_session().cloned() {
             let event = self
                 .pairing
                 .next_session_event(&session.subscription, &session.session)
                 .await
-                .map_err(ClientError::from)?;
+                .map_err(SingleSessionClientError::from)?;
             if let Some(event) = event {
                 return self
                     .handle_session_event(&session.subscription, event)
@@ -181,12 +189,13 @@ impl Client {
             }
         }
 
-        if let Some(subscription) = self.pairings.values().next().cloned() {
+        if let SingleSessionClientState::Pairing(subscription) = &self.state {
+            let subscription = subscription.clone();
             let message = self
                 .pairing
                 .next_pairing_message(&subscription)
                 .await
-                .map_err(ClientError::from)?;
+                .map_err(SingleSessionClientError::from)?;
             if let Some(message) = message {
                 return self
                     .handle_pairing_message(&subscription, message)
@@ -213,40 +222,42 @@ impl Client {
     /// > proposal,
     pub async fn approve_session(
         &mut self,
-        proposal: &ClientSessionProposal,
+        proposal: &SingleSessionProposal,
         approval: SessionProposalApproval,
-    ) -> Result<Session, ClientError> {
-        let subscription = self
-            .pairings
-            .get(proposal.pairing_topic())
-            .ok_or_else(|| ClientError::PairingSubscriptionMissing {
-                topic: proposal.pairing_topic().clone(),
-            })?
-            .clone();
+    ) -> Result<Session, SingleSessionClientError> {
+        let subscription = self.active_pairing(proposal.pairing_topic())?.clone();
         let approved = self
             .pairing
             .approve_session_proposal(&subscription, proposal.request(), approval)
             .await
-            .map_err(ClientError::from)?;
-        let settle_response = self
-            .pairing
-            .next_session_settle_response(&approved)
-            .await
-            .map_err(ClientError::from)?
-            .ok_or_else(|| ClientError::SessionSettleResponseMissing {
-                topic: approved.session_topic().clone(),
-            })?;
-        let session = approved
-            .acknowledged_session(&settle_response)
-            .map_err(ClientError::from)?;
-        self.sessions.insert(
-            session.topic.clone(),
-            ClientSession {
-                subscription: approved.subscription().clone(),
-                session: session.clone(),
-            },
-        );
-        self.pairings.remove(proposal.pairing_topic());
+            .map_err(SingleSessionClientError::from)?;
+        let session_topic = approved.session_topic().clone();
+        self.state = SingleSessionClientState::Session(Box::new(ActiveSession {
+            subscription: approved.subscription().clone(),
+            session: approved.pending_session().clone(),
+        }));
+
+        let settle_response = match self.pairing.next_session_settle_response(&approved).await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                self.clear_session(&session_topic);
+                return Err(SingleSessionClientError::SessionSettleResponseMissing {
+                    topic: session_topic,
+                });
+            }
+            Err(source) => {
+                self.clear_session(&session_topic);
+                return Err(SingleSessionClientError::from(source));
+            }
+        };
+        let session = match approved.acknowledged_session(&settle_response) {
+            Ok(session) => session,
+            Err(source) => {
+                self.clear_session(&session_topic);
+                return Err(SingleSessionClientError::from(source));
+            }
+        };
+        self.client_session_mut(&session_topic)?.session = session.clone();
 
         Ok(session)
     }
@@ -254,22 +265,17 @@ impl Client {
     /// Rejects a queued `wc_sessionPropose` event on the pairing topic.
     pub async fn reject_session(
         &mut self,
-        proposal: &ClientSessionProposal,
+        proposal: &SingleSessionProposal,
         reason: JsonRpcError,
-    ) -> Result<bool, ClientError> {
-        let subscription = self
-            .pairings
-            .get(proposal.pairing_topic())
-            .ok_or_else(|| ClientError::PairingSubscriptionMissing {
-                topic: proposal.pairing_topic().clone(),
-            })?
-            .clone();
+    ) -> Result<bool, SingleSessionClientError> {
+        let subscription = self.active_pairing(proposal.pairing_topic())?.clone();
         let ack = self
             .pairing
             .reject_session_proposal(&subscription, proposal.proposal_id(), reason)
             .await
-            .map_err(ClientError::from)?;
-        self.pairings.remove(proposal.pairing_topic());
+            .map_err(SingleSessionClientError::from)?;
+        self.unsubscribe_pairing(&subscription).await?;
+        self.state = SingleSessionClientState::Idle;
 
         Ok(ack)
     }
@@ -279,12 +285,12 @@ impl Client {
         &mut self,
         message: &SessionReceivedMessage,
         result: impl Into<serde_json::Value>,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         self.pairing
             .respond_session_request_success(&subscription, message, result)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Publishes an error response for a `SessionClientEvent::SessionRequest`.
@@ -292,12 +298,12 @@ impl Client {
         &mut self,
         message: &SessionReceivedMessage,
         error: JsonRpcError,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         self.pairing
             .respond_session_request_error(&subscription, message, error)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Extracts wallet-facing review data from a `SessionClientEvent::SessionRequest`.
@@ -308,26 +314,26 @@ impl Client {
     pub fn session_request_review(
         &self,
         message: &SessionReceivedMessage,
-    ) -> Result<SessionRequestReview, ClientError> {
+    ) -> Result<SessionRequestReview, SingleSessionClientError> {
         self.client_session(message.topic())?;
         SessionRequestReview::from_message(message)
-            .map_err(|source| ClientError::SessionRequestReview { source })
+            .map_err(|source| SingleSessionClientError::SessionRequestReview { source })
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionPing`.
     ///
-    /// `Client::next_event` already responds to session pings it returns. This
+    /// `SingleSessionClient::next_event` already responds to session pings it returns. This
     /// method is retained for callers that receive a session message through a
     /// lower-level path.
     pub async fn respond_session_ping(
         &mut self,
         message: &SessionReceivedMessage,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         self.pairing
             .respond_session_ping(&subscription, message)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Approves a `SessionClientEvent::SessionUpdate`.
@@ -342,10 +348,10 @@ impl Client {
     pub async fn approve_session_update(
         &mut self,
         message: &SessionReceivedMessage,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         let SessionPayload::SessionUpdate(request) = message.payload() else {
-            return Err(ClientError::Pairing {
+            return Err(SingleSessionClientError::Pairing {
                 source: PairingClientError::SessionResponseTargetNotUpdate,
             });
         };
@@ -354,16 +360,10 @@ impl Client {
             .pairing
             .respond_session_update(&subscription, message)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
 
         if publish_ack {
-            self.sessions
-                .get_mut(message.topic())
-                .ok_or_else(|| ClientError::SessionMissing {
-                    topic: message.topic().clone(),
-                })?
-                .session
-                .namespaces = namespaces;
+            self.client_session_mut(message.topic())?.session.namespaces = namespaces;
         }
 
         Ok(publish_ack)
@@ -376,10 +376,10 @@ impl Client {
     pub fn session_update_diff(
         &self,
         message: &SessionReceivedMessage,
-    ) -> Result<SessionNamespacesDiff, ClientError> {
+    ) -> Result<SessionNamespacesDiff, SingleSessionClientError> {
         let session = self.client_session(message.topic())?;
         let SessionPayload::SessionUpdate(request) = message.payload() else {
-            return Err(ClientError::Pairing {
+            return Err(SingleSessionClientError::Pairing {
                 source: PairingClientError::SessionResponseTargetNotUpdate,
             });
         };
@@ -398,46 +398,46 @@ impl Client {
         &mut self,
         message: &SessionReceivedMessage,
         error: JsonRpcError,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         self.pairing
             .reject_session_update(&subscription, message, error)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionExtend`.
     ///
-    /// `Client::next_event` already responds to session extends it returns and
+    /// `SingleSessionClient::next_event` already responds to session extends it returns and
     /// refreshes local expiry. This method is retained for callers that receive
     /// a session message through a lower-level path.
     pub async fn respond_session_extend(
         &mut self,
         message: &SessionReceivedMessage,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         self.pairing
             .respond_session_extend(&subscription, message)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionDelete`.
     ///
-    /// `Client::next_event` already responds to session deletes it returns and
+    /// `SingleSessionClient::next_event` already responds to session deletes it returns and
     /// removes the local session. This method is retained for callers that
     /// receive a session message through a lower-level path.
     pub async fn respond_session_delete(
         &mut self,
         message: &SessionReceivedMessage,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
         let ack = self
             .pairing
             .respond_session_delete(&subscription, message)
             .await
-            .map_err(ClientError::from)?;
-        self.sessions.remove(message.topic());
+            .map_err(SingleSessionClientError::from)?;
+        self.clear_session(message.topic());
 
         Ok(ack)
     }
@@ -453,35 +453,27 @@ impl Client {
         &mut self,
         topic: &RelayTopic,
         namespaces: &SessionNamespaces,
-    ) -> Result<SessionLifecycleResponseMessage, ClientError> {
-        let session = self
-            .sessions
-            .get(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
-            .clone();
+    ) -> Result<SessionLifecycleResponseMessage, SingleSessionClientError> {
+        let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
             .update_session(&session.subscription, &session.session, namespaces)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
         let response = self
             .pairing
             .next_session_lifecycle_response(&session.subscription, &request)
             .await
-            .map_err(ClientError::from)?
-            .ok_or_else(|| ClientError::SessionLifecycleResponseMissing {
-                topic: topic.clone(),
-                request_id: request.request_id(),
-            })?;
+            .map_err(SingleSessionClientError::from)?
+            .ok_or_else(
+                || SingleSessionClientError::SessionLifecycleResponseMissing {
+                    topic: topic.clone(),
+                    request_id: request.request_id(),
+                },
+            )?;
 
         ensure_session_lifecycle_success(&response)?;
-        self.sessions
-            .get_mut(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
+        self.client_session_mut(topic)?
             .session
             .namespaces
             .clone_from(namespaces);
@@ -502,38 +494,28 @@ impl Client {
     pub async fn extend_session(
         &mut self,
         topic: &RelayTopic,
-    ) -> Result<SessionLifecycleResponseMessage, ClientError> {
-        let session = self
-            .sessions
-            .get(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
-            .clone();
+    ) -> Result<SessionLifecycleResponseMessage, SingleSessionClientError> {
+        let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
             .extend_session(&session.subscription, &session.session)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
         let response = self
             .pairing
             .next_session_lifecycle_response(&session.subscription, &request)
             .await
-            .map_err(ClientError::from)?
-            .ok_or_else(|| ClientError::SessionLifecycleResponseMissing {
-                topic: topic.clone(),
-                request_id: request.request_id(),
-            })?;
+            .map_err(SingleSessionClientError::from)?
+            .ok_or_else(
+                || SingleSessionClientError::SessionLifecycleResponseMissing {
+                    topic: topic.clone(),
+                    request_id: request.request_id(),
+                },
+            )?;
 
         ensure_session_lifecycle_success(&response)?;
         let new_expiry = session_extended_expiry()?;
-        self.sessions
-            .get_mut(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
-            .session
-            .expiry = new_expiry;
+        self.client_session_mut(topic)?.session.expiry = new_expiry;
 
         Ok(response)
     }
@@ -552,18 +534,12 @@ impl Client {
         &mut self,
         topic: &RelayTopic,
         params: &SessionEventParams,
-    ) -> Result<SessionLifecycleRequest, ClientError> {
-        let session = self
-            .sessions
-            .get(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
-            .clone();
+    ) -> Result<SessionLifecycleRequest, SingleSessionClientError> {
+        let session = self.client_session(topic)?.clone();
         self.pairing
             .emit_session_event(&session.subscription, &session.session, params)
             .await
-            .map_err(ClientError::from)
+            .map_err(SingleSessionClientError::from)
     }
 
     /// Publishes `wc_sessionDelete` and removes the acknowledged session locally.
@@ -580,66 +556,155 @@ impl Client {
         &mut self,
         topic: &RelayTopic,
         reason: SessionDeleteParams,
-    ) -> Result<SessionLifecycleRequest, ClientError> {
-        let session = self
-            .sessions
-            .get(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })?
-            .clone();
+    ) -> Result<SessionLifecycleRequest, SingleSessionClientError> {
+        let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
             .disconnect_session(&session.subscription, &session.session, reason)
             .await
-            .map_err(ClientError::from)?;
+            .map_err(SingleSessionClientError::from)?;
         if request.publish_ack() {
-            self.sessions.remove(topic);
+            self.clear_session(topic);
         }
 
         Ok(request)
     }
 
-    /// Active sessions currently held by this in-memory runtime.
+    /// Active session currently held by this single-session runtime.
     #[must_use]
-    pub fn active_sessions(&self) -> Vec<&Session> {
-        self.sessions.values().map(|state| &state.session).collect()
+    pub fn active_session(&self) -> Option<&Session> {
+        self.active_client_session().map(|state| &state.session)
     }
 
     fn session_subscription(
         &self,
         topic: &RelayTopic,
-    ) -> Result<&SessionSubscription, ClientError> {
-        self.sessions
-            .get(topic)
-            .map(|state| &state.subscription)
-            .ok_or_else(|| ClientError::SessionMissing {
-                topic: topic.clone(),
-            })
+    ) -> Result<&SessionSubscription, SingleSessionClientError> {
+        self.client_session(topic).map(|state| &state.subscription)
     }
 
-    fn client_session(&self, topic: &RelayTopic) -> Result<&ClientSession, ClientError> {
-        self.sessions
-            .get(topic)
-            .ok_or_else(|| ClientError::SessionMissing {
+    fn client_session(
+        &self,
+        topic: &RelayTopic,
+    ) -> Result<&ActiveSession, SingleSessionClientError> {
+        match &self.state {
+            SingleSessionClientState::Session(state) if state.session.topic == *topic => Ok(state),
+            _ => Err(SingleSessionClientError::SessionMissing {
                 topic: topic.clone(),
-            })
+            }),
+        }
+    }
+
+    fn client_session_mut(
+        &mut self,
+        topic: &RelayTopic,
+    ) -> Result<&mut ActiveSession, SingleSessionClientError> {
+        match &mut self.state {
+            SingleSessionClientState::Session(state) if state.session.topic == *topic => Ok(state),
+            _ => Err(SingleSessionClientError::SessionMissing {
+                topic: topic.clone(),
+            }),
+        }
+    }
+
+    fn active_pairing(
+        &self,
+        topic: &RelayTopic,
+    ) -> Result<&PairingSubscription, SingleSessionClientError> {
+        match &self.state {
+            SingleSessionClientState::Pairing(subscription) if subscription.topic() == topic => {
+                Ok(subscription)
+            }
+            _ => Err(SingleSessionClientError::PairingSubscriptionMissing {
+                topic: topic.clone(),
+            }),
+        }
+    }
+
+    const fn active_client_session(&self) -> Option<&ActiveSession> {
+        match &self.state {
+            SingleSessionClientState::Session(state) => Some(&**state),
+            SingleSessionClientState::Idle | SingleSessionClientState::Pairing(_) => None,
+        }
+    }
+
+    fn clear_session(&mut self, topic: &RelayTopic) {
+        if matches!(&self.state, SingleSessionClientState::Session(state) if state.session.topic == *topic)
+        {
+            self.state = SingleSessionClientState::Idle;
+        }
+    }
+
+    fn ensure_idle_for_pairing(&self) -> Result<(), SingleSessionClientError> {
+        match &self.state {
+            SingleSessionClientState::Idle => Ok(()),
+            SingleSessionClientState::Pairing(subscription) => {
+                Err(SingleSessionClientError::ActivePairingExists {
+                    topic: subscription.topic().clone(),
+                })
+            }
+            SingleSessionClientState::Session(state) => {
+                Err(SingleSessionClientError::ActiveSessionExists {
+                    topic: state.session.topic.clone(),
+                })
+            }
+        }
+    }
+
+    async fn unsubscribe_pairing(
+        &mut self,
+        subscription: &PairingSubscription,
+    ) -> Result<(), SingleSessionClientError> {
+        let unsubscribed = self
+            .pairing
+            .unsubscribe_pairing(subscription)
+            .await
+            .map_err(SingleSessionClientError::from)?;
+        if !unsubscribed {
+            return Err(SingleSessionClientError::from(
+                PairingClientError::PairingUnsubscribeRejected {
+                    topic: subscription.topic().clone(),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn take_expired_session(&mut self) -> Result<Option<SessionExpired>, SingleSessionClientError> {
+        let SingleSessionClientState::Session(state) = &self.state else {
+            return Ok(None);
+        };
+        if !state.session.is_expired_at(now_unix_seconds()?) {
+            return Ok(None);
+        }
+
+        let topic = state.session.topic.clone();
+        let expiry = state.session.expiry;
+        self.state = SingleSessionClientState::Idle;
+
+        Ok(Some(SessionExpired { topic, expiry }))
     }
 
     async fn handle_pairing_message(
         &mut self,
         subscription: &PairingSubscription,
         message: PairingReceivedMessage,
-    ) -> Result<ClientEvent, ClientError> {
+    ) -> Result<SingleSessionClientEvent, SingleSessionClientError> {
         match message.payload() {
             PairingPayload::PairingPing(_) => {
                 self.pairing
                     .respond_pairing_ping(subscription, &message)
                     .await
-                    .map_err(ClientError::from)?;
+                    .map_err(SingleSessionClientError::from)?;
             }
             PairingPayload::PairingDelete(_) => {
-                self.pairings.remove(message.topic());
+                if matches!(
+                    &self.state,
+                    SingleSessionClientState::Pairing(subscription) if subscription.topic() == message.topic()
+                ) {
+                    self.state = SingleSessionClientState::Idle;
+                }
             }
             PairingPayload::SessionProposal(_)
             | PairingPayload::Sign(_)
@@ -647,7 +712,7 @@ impl Client {
             | PairingPayload::Missing => {}
         }
 
-        Ok(ClientEvent::from_pairing_message(message))
+        Ok(SingleSessionClientEvent::from_pairing_message(message))
     }
 
     /// Applies deterministic session-topic side effects for the polling API.
@@ -688,13 +753,13 @@ impl Client {
         &mut self,
         subscription: &SessionSubscription,
         event: SessionClientEvent,
-    ) -> Result<Option<ClientEvent>, ClientError> {
+    ) -> Result<Option<SingleSessionClientEvent>, SingleSessionClientError> {
         match &event {
             SessionClientEvent::SessionPing(message) => {
                 self.pairing
                     .respond_session_ping(subscription, message)
                     .await
-                    .map_err(ClientError::from)?;
+                    .map_err(SingleSessionClientError::from)?;
             }
             SessionClientEvent::SessionExtend(message) => {
                 let expiry = match message.payload() {
@@ -702,26 +767,20 @@ impl Client {
                         .params
                         .expiry
                         .map_or_else(session_extended_expiry, Ok)?,
-                    _ => return Ok(Some(ClientEvent::Session(event))),
+                    _ => return Ok(Some(SingleSessionClientEvent::Session(event))),
                 };
                 self.pairing
                     .respond_session_extend(subscription, message)
                     .await
-                    .map_err(ClientError::from)?;
-                self.sessions
-                    .get_mut(message.topic())
-                    .ok_or_else(|| ClientError::SessionMissing {
-                        topic: message.topic().clone(),
-                    })?
-                    .session
-                    .expiry = expiry;
+                    .map_err(SingleSessionClientError::from)?;
+                self.client_session_mut(message.topic())?.session.expiry = expiry;
             }
             SessionClientEvent::SessionDelete(message) => {
                 self.pairing
                     .respond_session_delete(subscription, message)
                     .await
-                    .map_err(ClientError::from)?;
-                self.sessions.remove(message.topic());
+                    .map_err(SingleSessionClientError::from)?;
+                self.clear_session(message.topic());
             }
             SessionClientEvent::SessionRequest(_)
             | SessionClientEvent::SessionUpdate(_)
@@ -730,26 +789,28 @@ impl Client {
             | SessionClientEvent::RejectedSessionRequest(_) => {}
         }
 
-        Ok(Some(ClientEvent::Session(event)))
+        Ok(Some(SingleSessionClientEvent::Session(event)))
     }
 }
 
-/// Client-level event.
+/// `SingleSessionClient` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientEvent {
+pub enum SingleSessionClientEvent {
     /// A dapp proposed a session on a pairing topic.
-    SessionProposal(Box<ClientSessionProposal>),
+    SessionProposal(Box<SingleSessionProposal>),
     /// Pairing-topic message that is not a session proposal.
     PairingMessage(PairingReceivedMessage),
     /// Message on an acknowledged session topic.
     Session(SessionClientEvent),
+    /// Local session expiry detected before polling relay messages.
+    SessionExpired(SessionExpired),
 }
 
-impl ClientEvent {
+impl SingleSessionClientEvent {
     pub(crate) fn from_pairing_message(message: PairingReceivedMessage) -> Self {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
-                Self::SessionProposal(Box::new(ClientSessionProposal {
+                Self::SessionProposal(Box::new(SingleSessionProposal {
                     pairing_topic: message.topic().clone(),
                     request: (**request).clone(),
                     message,
@@ -766,13 +827,13 @@ impl ClientEvent {
 
 /// Session proposal retained for approval or rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientSessionProposal {
+pub struct SingleSessionProposal {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionProposeParams>,
     message: PairingReceivedMessage,
 }
 
-impl ClientSessionProposal {
+impl SingleSessionProposal {
     /// Pairing topic that received the proposal.
     #[must_use]
     pub const fn pairing_topic(&self) -> &RelayTopic {
@@ -798,10 +859,38 @@ impl ClientSessionProposal {
     }
 }
 
+/// Active session removed after its expiry timestamp passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionExpired {
+    topic: RelayTopic,
+    expiry: u64,
+}
+
+impl SessionExpired {
+    /// Session topic removed from the in-memory runtime.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Expiry timestamp that made the session inactive.
+    #[must_use]
+    pub const fn expiry(&self) -> u64 {
+        self.expiry
+    }
+}
+
 #[derive(Debug, Clone)]
-struct ClientSession {
+struct ActiveSession {
     subscription: SessionSubscription,
     session: Session,
+}
+
+#[derive(Debug, Clone)]
+enum SingleSessionClientState {
+    Idle,
+    Pairing(PairingSubscription),
+    Session(Box<ActiveSession>),
 }
 
 /// Bounded FIFO for runtime events waiting for application polling.
@@ -826,19 +915,17 @@ impl<T> BoundedQueue<T> {
         self.items.pop_front()
     }
 
-    fn ensure_capacity_for(&self, incoming: usize) -> Result<(), ClientError> {
-        let required =
-            self.items
-                .len()
-                .checked_add(incoming)
-                .ok_or(ClientError::EventQueueFull {
-                    capacity: self.capacity,
-                    queued: self.items.len(),
-                    incoming,
-                })?;
+    fn ensure_capacity_for(&self, incoming: usize) -> Result<(), SingleSessionClientError> {
+        let required = self.items.len().checked_add(incoming).ok_or(
+            SingleSessionClientError::EventQueueFull {
+                capacity: self.capacity,
+                queued: self.items.len(),
+                incoming,
+            },
+        )?;
 
         if required > self.capacity {
-            return Err(ClientError::EventQueueFull {
+            return Err(SingleSessionClientError::EventQueueFull {
                 capacity: self.capacity,
                 queued: self.items.len(),
                 incoming,
@@ -853,40 +940,54 @@ impl<T> BoundedQueue<T> {
     }
 }
 
-/// Client runtime error.
+/// `SingleSessionClient` runtime error.
 #[derive(Debug, thiserror::Error)]
-pub enum ClientError {
+pub enum SingleSessionClientError {
     /// Lower-level pairing/session primitive failed.
-    #[error("client pairing primitive failed")]
+    #[error("single-session client pairing primitive failed")]
     Pairing {
         /// Source pairing client error.
         #[source]
         source: PairingClientError,
     },
 
+    /// A pairing topic is already active in the single-session runtime.
+    #[error("single-session client active pairing exists")]
+    ActivePairingExists {
+        /// Active pairing topic.
+        topic: RelayTopic,
+    },
+
+    /// A session topic is already active in the single-session runtime.
+    #[error("single-session client active session exists")]
+    ActiveSessionExists {
+        /// Active session topic.
+        topic: RelayTopic,
+    },
+
     /// Proposal belongs to a pairing topic this runtime no longer tracks.
-    #[error("client pairing subscription missing")]
+    #[error("single-session client pairing subscription missing")]
     PairingSubscriptionMissing {
         /// Pairing topic from the proposal.
         topic: RelayTopic,
     },
 
     /// Session topic is not registered in this runtime.
-    #[error("client session missing")]
+    #[error("single-session client session missing")]
     SessionMissing {
         /// Session topic from the message.
         topic: RelayTopic,
     },
 
     /// The peer did not acknowledge the settlement request.
-    #[error("client session settle response missing")]
+    #[error("single-session client session settle response missing")]
     SessionSettleResponseMissing {
         /// Session topic waiting for settlement acknowledgement.
         topic: RelayTopic,
     },
 
     /// The peer did not answer an update or extend request.
-    #[error("client session lifecycle response missing")]
+    #[error("single-session client session lifecycle response missing")]
     SessionLifecycleResponseMissing {
         /// Session topic waiting for lifecycle acknowledgement.
         topic: RelayTopic,
@@ -895,14 +996,14 @@ pub enum ClientError {
     },
 
     /// The peer rejected an update or extend request.
-    #[error("client session lifecycle rejected")]
+    #[error("single-session client session lifecycle rejected")]
     SessionLifecycleRejected {
         /// JSON-RPC error response received from the peer.
         response: JsonRpcErrorResponse,
     },
 
     /// System clock failed while refreshing session expiry.
-    #[error("client clock failed")]
+    #[error("single-session client clock failed")]
     Clock {
         /// Source system time error.
         #[source]
@@ -910,11 +1011,11 @@ pub enum ClientError {
     },
 
     /// Default session extension exceeded `u64`.
-    #[error("client session expiry overflow")]
+    #[error("single-session client session expiry overflow")]
     SessionExpiryOverflow,
 
-    /// Client event queue cannot retain all pending messages.
-    #[error("client event queue full")]
+    /// `SingleSessionClient` event queue cannot retain all pending messages.
+    #[error("single-session client event queue full")]
     EventQueueFull {
         /// Configured queue capacity.
         capacity: usize,
@@ -925,7 +1026,7 @@ pub enum ClientError {
     },
 
     /// A session-topic message could not be converted to request review data.
-    #[error("client session request review failed")]
+    #[error("single-session client session request review failed")]
     SessionRequestReview {
         /// Source review construction error.
         #[source]
@@ -933,7 +1034,7 @@ pub enum ClientError {
     },
 }
 
-impl From<PairingClientError> for ClientError {
+impl From<PairingClientError> for SingleSessionClientError {
     fn from(source: PairingClientError) -> Self {
         Self::Pairing { source }
     }
@@ -941,50 +1042,52 @@ impl From<PairingClientError> for ClientError {
 
 fn ensure_session_lifecycle_success(
     response: &SessionLifecycleResponseMessage,
-) -> Result<(), ClientError> {
+) -> Result<(), SingleSessionClientError> {
     match response.payload() {
         SessionLifecycleResponsePayload::Success(_) => Ok(()),
         SessionLifecycleResponsePayload::Error(response) => {
-            Err(ClientError::SessionLifecycleRejected {
+            Err(SingleSessionClientError::SessionLifecycleRejected {
                 response: response.clone(),
             })
         }
     }
 }
 
-fn now_unix_seconds() -> Result<u64, ClientError> {
+fn now_unix_seconds() -> Result<u64, SingleSessionClientError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|source| ClientError::Clock { source })
+        .map_err(|source| SingleSessionClientError::Clock { source })
 }
 
-fn session_extended_expiry() -> Result<u64, ClientError> {
+fn session_extended_expiry() -> Result<u64, SingleSessionClientError> {
     now_unix_seconds()?
         .checked_add(DEFAULT_SESSION_EXPIRY_SECONDS)
-        .ok_or(ClientError::SessionExpiryOverflow)
+        .ok_or(SingleSessionClientError::SessionExpiryOverflow)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedQueue, ClientError, DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY};
-    use crate::{ClientConfig, PairingClientConfig};
+    use super::{
+        BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY, SingleSessionClientError,
+    };
+    use crate::{PairingClientConfig, SingleSessionClientConfig};
 
     #[test]
     fn client_config_uses_default_event_queue_capacity() {
         let pairing = PairingClientConfig::new("project", [7; 32], "subject");
-        let config = ClientConfig::new(pairing);
+        let config = SingleSessionClientConfig::new(pairing);
 
         assert_eq!(
             config.max_queued_events(),
-            DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY
+            DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY
         );
     }
 
     #[test]
     fn client_config_sets_event_queue_capacity() {
         let pairing = PairingClientConfig::new("project", [7; 32], "subject");
-        let config = ClientConfig::new(pairing).with_max_queued_events(2);
+        let config = SingleSessionClientConfig::new(pairing).with_max_queued_events(2);
 
         assert_eq!(config.max_queued_events(), 2);
     }
@@ -1000,7 +1103,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ClientError::EventQueueFull {
+            SingleSessionClientError::EventQueueFull {
                 capacity: 2,
                 queued: 1,
                 incoming: 2

@@ -102,6 +102,9 @@ try {
       case "session_extend":
         await startSessionExtend(session.topic);
         break;
+      case "session_event":
+        await startSessionEvent(session.topic);
+        break;
       case "wait_session_update":
         await waitForSessionUpdate(session.topic);
         break;
@@ -315,6 +318,55 @@ async function startSessionExtend(topic: string): Promise<void> {
     sleep(sessionRequestHoldMs).then(() => ({
       outcome: "session_extend_timeout",
       topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+async function startSessionEvent(topic: string): Promise<void> {
+  const chainId = process.env.WC_JS_SESSION_EVENT_CHAIN_ID ?? "eip155:1";
+  const eventName = process.env.WC_JS_SESSION_EVENT_NAME ?? "accountsChanged";
+  const eventData = sessionEventData();
+  const request = signClient.emit({
+    topic,
+    chainId,
+    event: {
+      name: eventName,
+      data: eventData,
+    },
+  });
+  console.error(
+    `js-harness session_event_started=true topic=${topic} chain_id=${chainId} event_name=${eventName} hold_ms=${sessionRequestHoldMs}`,
+  );
+
+  const response = await Promise.race([
+    request.then(
+      () => {
+        console.error("js-harness session_event_sent=true");
+        return {
+          outcome: "session_event_sent",
+          topic,
+          chainId,
+          eventName,
+        };
+      },
+      (error: unknown) => {
+        const message = errorMessage(error);
+        console.error(`js-harness session_event_error=${message}`);
+        return {
+          outcome: "session_event_error",
+          topic,
+          chainId,
+          eventName,
+          message,
+        };
+      },
+    ),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_event_timeout",
+      topic,
+      chainId,
+      eventName,
     })),
   ]);
   await writeResult(response);
@@ -546,6 +598,15 @@ function sessionRequestParams(): unknown {
     process.env.WC_JS_SESSION_REQUEST_ACCOUNT_ADDRESS ??
     "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb";
   return ["0x68656c6c6f", address];
+}
+
+function sessionEventData(): unknown {
+  const dataJson = process.env.WC_JS_SESSION_EVENT_DATA_JSON;
+  if (dataJson) {
+    return JSON.parse(dataJson) as unknown;
+  }
+
+  return ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"];
 }
 
 function errorMessage(error: unknown): string {

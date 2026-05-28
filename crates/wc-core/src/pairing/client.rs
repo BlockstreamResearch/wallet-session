@@ -261,16 +261,18 @@ impl PairingClient {
 
     /// Approves a `wc_sessionPropose` request and publishes the settlement request.
     ///
-    /// The first approval primitive follows the maintained Sign Client order:
-    /// derive the session topic, subscribe to it, publish the proposal success
-    /// response on the pairing topic, then publish `wc_sessionSettle` on the
-    /// derived session topic.
+    /// The first approval primitive derives the session topic, publishes the
+    /// proposal success response on the pairing topic, unsubscribes the pairing
+    /// topic, subscribes the derived session topic, then publishes
+    /// `wc_sessionSettle`.
     ///
-    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L475-L498>
+    /// The unsubscribe-before-session-subscribe order is the single-session
+    /// runtime boundary; relay unsubscribe is the protocol primitive that drops
+    /// the old topic.
     ///
-    /// > const selfPublicKey = await this.client.core.crypto.generateKeyPair();
-    /// > const sessionTopic = await this.client.core.crypto.generateSharedKey(
-    /// > await this.client.core.relayer.subscribe(sessionTopic, {
+    /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#unsubscribe>
+    ///
+    /// > Used when a client unsubscribes a given topic.
     ///
     /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L528-L548>
     ///
@@ -293,15 +295,24 @@ impl PairingClient {
             &responder,
             settle_request_id,
         )?;
-        let session_subscription_id = self
-            .relay
-            .subscribe(approval_messages.session_topic.clone())
-            .await
-            .map_err(|source| PairingClientError::Relay { source })?;
-
         let proposal_response_ack = self
             .relay
             .publish(approval_messages.proposal_response)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+        let pairing_unsubscribed = self
+            .relay
+            .unsubscribe(&subscription.topic, &subscription.subscription_id)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+        if !pairing_unsubscribed {
+            return Err(PairingClientError::PairingUnsubscribeRejected {
+                topic: subscription.topic.clone(),
+            });
+        }
+        let session_subscription_id = self
+            .relay
+            .subscribe(approval_messages.session_topic.clone())
             .await
             .map_err(|source| PairingClientError::Relay { source })?;
         let session_settle_ack = self

@@ -1,4 +1,4 @@
-//! Core `WalletConnect` client behavior.
+//! Core `WalletConnect` single-session client behavior.
 
 mod capabilities;
 mod client;
@@ -10,8 +10,9 @@ pub use capabilities::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
 };
 pub use client::{
-    Client, ClientConfig, ClientError, ClientEvent, ClientSessionProposal,
-    DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY,
+    DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY, SessionExpired, SingleSessionClient,
+    SingleSessionClientConfig, SingleSessionClientError, SingleSessionClientEvent,
+    SingleSessionProposal,
 };
 pub use pairing::{
     ApprovedSession, DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,

@@ -14,13 +14,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
-    ApprovedSession, Client, ClientConfig, ClientEvent, ClientSessionProposal,
-    DEFAULT_SESSION_EXPIRY_SECONDS, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
-    PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
-    SessionClientEvent, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
-    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
-    SessionRequestReview, SessionSettleResponseMessage, SessionSettleResponsePayload,
-    WalletCapabilities, WalletChainCapability,
+    ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PAIRING_PING_RESPONSE_TAG, PairingClient,
+    PairingClientConfig, PairingPayload, PairingReceivedMessage, PairingSubscription,
+    SESSION_REQUEST_RESPONSE_TAG, SessionClientEvent, SessionLifecycleResponseMessage,
+    SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
+    SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
+    SessionSettleResponseMessage, SessionSettleResponsePayload, SingleSessionClient,
+    SingleSessionClientConfig, SingleSessionClientEvent, SingleSessionProposal, WalletCapabilities,
+    WalletChainCapability,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId},
@@ -60,9 +61,9 @@ pub enum ProbeMode {
     CoreJsPairingLifecycle,
     CoreJsSessionRequest,
     CoreJsSessionLifecycle,
-    CoreClientSessionRequest,
-    CoreClientSessionLifecycle,
-    CoreClientDisconnect,
+    CoreSingleSessionClientSessionRequest,
+    CoreSingleSessionClientSessionLifecycle,
+    CoreSingleSessionClientDisconnect,
     PairingUri(String),
 }
 
@@ -85,14 +86,20 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::CoreJsSessionLifecycle => {
             Box::pin(run_core_js_session_lifecycle_probe(&config)).await
         }
-        ProbeMode::CoreClientSessionRequest => {
-            Box::pin(run_core_client_session_request_probe(&config)).await
+        ProbeMode::CoreSingleSessionClientSessionRequest => {
+            Box::pin(run_core_single_session_client_session_request_probe(
+                &config,
+            ))
+            .await
         }
-        ProbeMode::CoreClientSessionLifecycle => {
-            Box::pin(run_core_client_session_lifecycle_probe(&config)).await
+        ProbeMode::CoreSingleSessionClientSessionLifecycle => {
+            Box::pin(run_core_single_session_client_session_lifecycle_probe(
+                &config,
+            ))
+            .await
         }
-        ProbeMode::CoreClientDisconnect => {
-            Box::pin(run_core_client_disconnect_probe(&config)).await
+        ProbeMode::CoreSingleSessionClientDisconnect => {
+            Box::pin(run_core_single_session_client_disconnect_probe(&config)).await
         }
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
@@ -782,45 +789,51 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
     Ok(())
 }
 
-async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Result<()> {
+async fn run_core_single_session_client_session_request_probe(
+    config: &RelayProbeConfig,
+) -> Result<()> {
     let response_mode =
         env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
     let (mut harness, uri) = SessionHarness::start("session_request", &response_mode).await?;
     let mut client_config = PairingClientConfig::new(
         config.project_id.clone(),
         config.subscriber_auth_seed,
-        format!("xtask-core-client-{}", rpc_id()?.as_u64()),
+        format!("xtask-core-single-session-client-{}", rpc_id()?.as_u64()),
     );
     client_config.relay_url.clone_from(&config.relay_url);
     client_config.user_agent.clone_from(&config.user_agent);
     client_config.receive_timeout = pairing_uri_wait_timeout();
 
-    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    let mut client =
+        SingleSessionClient::connect(&SingleSessionClientConfig::new(client_config)).await?;
     println!(
-        "core-client-session-request connected status={}",
+        "core-single-session-client-session-request connected status={}",
         client.status()
     );
     let pairing_topic = client.pair(uri.trim()).await?;
-    println!("core-client-session-request pairing_topic={pairing_topic}");
+    println!("core-single-session-client-session-request pairing_topic={pairing_topic}");
 
-    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-client-session-request proposal_id={} pairing_topic={}",
+        "core-single-session-client-session-request proposal_id={} pairing_topic={}",
         proposal.proposal_id(),
         proposal.pairing_topic()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
     println!(
-        "core-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={}",
+        "core-single-session-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={}",
         session.topic,
         session.acknowledged,
         session.namespaces.len(),
         session.expiry
     );
 
-    let session_message = wait_for_client_session_request_event(&mut client).await?;
-    print_session_message("core-client-session-request live_event", &session_message);
+    let session_message = wait_for_single_session_client_session_request_event(&mut client).await?;
+    print_session_message(
+        "core-single-session-client-session-request live_event",
+        &session_message,
+    );
     let review = client.session_request_review(&session_message)?;
     print_session_request_review(&review);
     validate_session_request_review(&review)?;
@@ -846,7 +859,9 @@ async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Res
             bail!("unknown WC_CORE_SESSION_REQUEST_RESPONSE={other}; expected success or error")
         }
     };
-    println!("core-client-session-request response_ack={response_ack} mode={response_mode}");
+    println!(
+        "core-single-session-client-session-request response_ack={response_ack} mode={response_mode}"
+    );
 
     let expected_outcome = match response_mode.as_str() {
         "success" => "session_request_response",
@@ -854,41 +869,45 @@ async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Res
         _ => unreachable!("validated response mode"),
     };
     let result = harness.expect_result(expected_outcome).await?;
-    println!("core-client-session-request js_result={result}");
+    println!("core-single-session-client-session-request js_result={result}");
     harness.terminate();
 
     Ok(())
 }
 
-async fn run_core_client_disconnect_probe(config: &RelayProbeConfig) -> Result<()> {
+async fn run_core_single_session_client_disconnect_probe(config: &RelayProbeConfig) -> Result<()> {
     let (mut harness, uri) = SessionHarness::start("wait_session_delete", "disconnect").await?;
     let mut client_config = PairingClientConfig::new(
         config.project_id.clone(),
         config.subscriber_auth_seed,
-        format!("xtask-core-client-disconnect-{}", rpc_id()?.as_u64()),
+        format!(
+            "xtask-core-single-session-client-disconnect-{}",
+            rpc_id()?.as_u64()
+        ),
     );
     client_config.relay_url.clone_from(&config.relay_url);
     client_config.user_agent.clone_from(&config.user_agent);
     client_config.receive_timeout = pairing_uri_wait_timeout();
 
-    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    let mut client =
+        SingleSessionClient::connect(&SingleSessionClientConfig::new(client_config)).await?;
     println!(
-        "core-client-disconnect connected status={}",
+        "core-single-session-client-disconnect connected status={}",
         client.status()
     );
     let pairing_topic = client.pair(uri.trim()).await?;
-    println!("core-client-disconnect pairing_topic={pairing_topic}");
+    println!("core-single-session-client-disconnect pairing_topic={pairing_topic}");
 
-    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-client-disconnect proposal_id={} pairing_topic={}",
+        "core-single-session-client-disconnect proposal_id={} pairing_topic={}",
         proposal.proposal_id(),
         proposal.pairing_topic()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
     println!(
-        "core-client-disconnect active_session topic={} acknowledged={} namespaces={} expiry={}",
+        "core-single-session-client-disconnect active_session topic={} acknowledged={} namespaces={} expiry={}",
         session.topic,
         session.acknowledged,
         session.namespaces.len(),
@@ -899,135 +918,151 @@ async fn run_core_client_disconnect_probe(config: &RelayProbeConfig) -> Result<(
         .disconnect(&session.topic, SessionDeleteParams::user_disconnected())
         .await?;
     println!(
-        "core-client-disconnect request id={} method={} request_tag={} publish_ack={} active_sessions={}",
+        "core-single-session-client-disconnect request id={} method={} request_tag={} publish_ack={} active_session={}",
         request.request_id(),
         request.method(),
         request.request_tag(),
         request.publish_ack(),
-        client.active_sessions().len()
+        client.active_session().is_some()
     );
 
     let result = harness.expect_result("session_delete_received").await?;
-    println!("core-client-disconnect js_result={result}");
+    println!("core-single-session-client-disconnect js_result={result}");
     harness.terminate();
 
     Ok(())
 }
 
-async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> Result<()> {
-    let action = CoreClientSessionLifecycleAction::from_env()?;
+async fn run_core_single_session_client_session_lifecycle_probe(
+    config: &RelayProbeConfig,
+) -> Result<()> {
+    let action = CoreSingleSessionClientSessionLifecycleAction::from_env()?;
     let (mut harness, uri) = SessionHarness::start(action.harness_action(), action.label()).await?;
     let mut client_config = PairingClientConfig::new(
         config.project_id.clone(),
         config.subscriber_auth_seed,
-        format!("xtask-core-client-lifecycle-{}", rpc_id()?.as_u64()),
+        format!(
+            "xtask-core-single-session-client-lifecycle-{}",
+            rpc_id()?.as_u64()
+        ),
     );
     client_config.relay_url.clone_from(&config.relay_url);
     client_config.user_agent.clone_from(&config.user_agent);
     client_config.receive_timeout = pairing_uri_wait_timeout();
 
-    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    let mut client =
+        SingleSessionClient::connect(&SingleSessionClientConfig::new(client_config)).await?;
     println!(
-        "core-client-session-lifecycle connected status={}",
+        "core-single-session-client-session-lifecycle connected status={}",
         client.status()
     );
     let pairing_topic = client.pair(uri.trim()).await?;
-    println!("core-client-session-lifecycle pairing_topic={pairing_topic}");
+    println!("core-single-session-client-session-lifecycle pairing_topic={pairing_topic}");
 
-    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-client-session-lifecycle proposal_id={} pairing_topic={}",
+        "core-single-session-client-session-lifecycle proposal_id={} pairing_topic={}",
         proposal.proposal_id(),
         proposal.pairing_topic()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
     println!(
-        "core-client-session-lifecycle active_session topic={} acknowledged={} namespaces={} expiry={}",
+        "core-single-session-client-session-lifecycle active_session topic={} acknowledged={} namespaces={} expiry={}",
         session.topic,
         session.acknowledged,
         session.namespaces.len(),
         session.expiry
     );
 
-    run_core_client_session_lifecycle_action(&mut client, action, &session).await?;
+    run_core_single_session_client_session_lifecycle_action(&mut client, action, &session).await?;
 
     let result = harness.expect_result(action.expected_outcome()).await?;
-    println!("core-client-session-lifecycle js_result={result}");
+    println!("core-single-session-client-session-lifecycle js_result={result}");
     harness.terminate();
 
     Ok(())
 }
 
-async fn run_core_client_session_lifecycle_action(
-    client: &mut Client,
-    action: CoreClientSessionLifecycleAction,
+async fn run_core_single_session_client_session_lifecycle_action(
+    client: &mut SingleSessionClient,
+    action: CoreSingleSessionClientSessionLifecycleAction,
     session: &Session,
 ) -> Result<()> {
     match action {
-        CoreClientSessionLifecycleAction::Ping
-        | CoreClientSessionLifecycleAction::Delete
-        | CoreClientSessionLifecycleAction::IncomingExtend => {
-            let event = wait_for_client_session_lifecycle_event(client, action.label()).await?;
+        CoreSingleSessionClientSessionLifecycleAction::Ping
+        | CoreSingleSessionClientSessionLifecycleAction::Delete
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingExtend
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingEvent => {
+            let event =
+                wait_for_single_session_client_session_lifecycle_event(client, action.label())
+                    .await?;
             if let Some(message) = event.message() {
-                print_session_message("core-client-session-lifecycle live_event", message);
+                print_session_message(
+                    "core-single-session-client-session-lifecycle live_event",
+                    message,
+                );
+                if action == CoreSingleSessionClientSessionLifecycleAction::IncomingEvent {
+                    validate_incoming_session_event(message)?;
+                }
             }
             println!(
-                "core-client-session-lifecycle auto_handled={} active_sessions={}",
+                "core-single-session-client-session-lifecycle handled={} active_session={}",
                 action.label(),
-                client.active_sessions().len()
+                client.active_session().is_some()
             );
             match action {
-                CoreClientSessionLifecycleAction::IncomingExtend => {
+                CoreSingleSessionClientSessionLifecycleAction::IncomingExtend => {
                     let active_expiry = client
-                        .active_sessions()
-                        .first()
+                        .active_session()
                         .map(|session| session.expiry)
                         .context("extended session was not retained")?;
-                    println!("core-client-session-lifecycle active_session_expiry={active_expiry}");
+                    println!("core-single-session-client-session-lifecycle active_session_expiry={active_expiry}");
                 }
-                CoreClientSessionLifecycleAction::Ping
-                | CoreClientSessionLifecycleAction::Delete
-                | CoreClientSessionLifecycleAction::IncomingUpdatePending
-                | CoreClientSessionLifecycleAction::IncomingUpdateApprove
-                | CoreClientSessionLifecycleAction::IncomingUpdateReject
-                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
-                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
-                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject
-                | CoreClientSessionLifecycleAction::Update
-                | CoreClientSessionLifecycleAction::Extend
-                | CoreClientSessionLifecycleAction::Event => {}
+                CoreSingleSessionClientSessionLifecycleAction::Ping
+                | CoreSingleSessionClientSessionLifecycleAction::Delete
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdatePending
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateApprove
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateReject
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject
+                | CoreSingleSessionClientSessionLifecycleAction::IncomingEvent
+                | CoreSingleSessionClientSessionLifecycleAction::Update
+                | CoreSingleSessionClientSessionLifecycleAction::Extend
+                | CoreSingleSessionClientSessionLifecycleAction::Event => {}
             }
         }
-        CoreClientSessionLifecycleAction::IncomingUpdatePending
-        | CoreClientSessionLifecycleAction::IncomingUpdateApprove
-        | CoreClientSessionLifecycleAction::IncomingUpdateReject
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
-            handle_incoming_client_session_update(client, action).await?;
+        CoreSingleSessionClientSessionLifecycleAction::IncomingUpdatePending
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateApprove
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateReject
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
+            handle_incoming_single_session_client_session_update(client, action).await?;
         }
-        CoreClientSessionLifecycleAction::Update => {
+        CoreSingleSessionClientSessionLifecycleAction::Update => {
             let response = client
                 .update_session(&session.topic, &session.namespaces)
                 .await?;
             print_session_lifecycle_response(&response);
         }
-        CoreClientSessionLifecycleAction::Extend => {
+        CoreSingleSessionClientSessionLifecycleAction::Extend => {
             let response = client.extend_session(&session.topic).await?;
             print_session_lifecycle_response(&response);
             let active_expiry = client
-                .active_sessions()
-                .first()
+                .active_session()
                 .map(|session| session.expiry)
                 .context("extended session was not retained")?;
-            println!("core-client-session-lifecycle active_session_expiry={active_expiry}");
+            println!(
+                "core-single-session-client-session-lifecycle active_session_expiry={active_expiry}"
+            );
         }
-        CoreClientSessionLifecycleAction::Event => {
+        CoreSingleSessionClientSessionLifecycleAction::Event => {
             let params = session_event_params()?;
             let request = client.emit_session_event(&session.topic, &params).await?;
             println!(
-                "core-client-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
+                "core-single-session-client-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
                 request.request_id(),
                 request.method(),
                 request.request_tag(),
@@ -1039,35 +1074,41 @@ async fn run_core_client_session_lifecycle_action(
     Ok(())
 }
 
-async fn handle_incoming_client_session_update(
-    client: &mut Client,
-    action: CoreClientSessionLifecycleAction,
+async fn handle_incoming_single_session_client_session_update(
+    client: &mut SingleSessionClient,
+    action: CoreSingleSessionClientSessionLifecycleAction,
 ) -> Result<()> {
-    let event = wait_for_client_session_lifecycle_event(client, action.label()).await?;
+    let event =
+        wait_for_single_session_client_session_lifecycle_event(client, action.label()).await?;
     let message = event
         .message()
         .context("session update event did not carry a message")?;
-    print_session_message("core-client-session-lifecycle live_event", message);
+    print_session_message(
+        "core-single-session-client-session-lifecycle live_event",
+        message,
+    );
     let diff = client.session_update_diff(message)?;
     print_session_update_diff(&diff);
     assert_session_update_diff(action, &diff)?;
 
     match action {
-        CoreClientSessionLifecycleAction::IncomingUpdatePending
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending => {
+        CoreSingleSessionClientSessionLifecycleAction::IncomingUpdatePending
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending => {
             println!(
-                "core-client-session-lifecycle explicit_approval_required=true active_sessions={}",
-                client.active_sessions().len()
+                "core-single-session-client-session-lifecycle explicit_approval_required=true active_session={}",
+                client.active_session().is_some()
             );
         }
-        CoreClientSessionLifecycleAction::IncomingUpdateApprove
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove => {
+        CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateApprove
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove => {
             let response_ack = client.approve_session_update(message).await?;
-            println!("core-client-session-lifecycle update_approval_ack={response_ack}");
+            println!(
+                "core-single-session-client-session-lifecycle update_approval_ack={response_ack}"
+            );
             print_active_session_namespaces(client)?;
         }
-        CoreClientSessionLifecycleAction::IncomingUpdateReject
-        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
+        CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateReject
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
             let response_ack = client
                 .reject_session_update(
                     message,
@@ -1077,15 +1118,18 @@ async fn handle_incoming_client_session_update(
                     ),
                 )
                 .await?;
-            println!("core-client-session-lifecycle update_rejection_ack={response_ack}");
+            println!(
+                "core-single-session-client-session-lifecycle update_rejection_ack={response_ack}"
+            );
             print_active_session_namespaces(client)?;
         }
-        CoreClientSessionLifecycleAction::Ping
-        | CoreClientSessionLifecycleAction::Delete
-        | CoreClientSessionLifecycleAction::IncomingExtend
-        | CoreClientSessionLifecycleAction::Update
-        | CoreClientSessionLifecycleAction::Extend
-        | CoreClientSessionLifecycleAction::Event => {
+        CoreSingleSessionClientSessionLifecycleAction::Ping
+        | CoreSingleSessionClientSessionLifecycleAction::Delete
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingExtend
+        | CoreSingleSessionClientSessionLifecycleAction::IncomingEvent
+        | CoreSingleSessionClientSessionLifecycleAction::Update
+        | CoreSingleSessionClientSessionLifecycleAction::Extend
+        | CoreSingleSessionClientSessionLifecycleAction::Event => {
             unreachable!("validated incoming update action")
         }
     }
@@ -1094,7 +1138,7 @@ async fn handle_incoming_client_session_update(
 }
 
 fn assert_session_update_diff(
-    action: CoreClientSessionLifecycleAction,
+    action: CoreSingleSessionClientSessionLifecycleAction,
     diff: &wc_core::SessionNamespacesDiff,
 ) -> Result<()> {
     let Some((expected_added, expected_removed, expected_empty)) = action.expected_update_diff()
@@ -1114,20 +1158,21 @@ fn assert_session_update_diff(
     Ok(())
 }
 
-fn print_active_session_namespaces(client: &Client) -> Result<()> {
+fn print_active_session_namespaces(client: &SingleSessionClient) -> Result<()> {
     let active_namespaces = client
-        .active_sessions()
-        .first()
+        .active_session()
         .map(|session| session.namespaces.len())
         .context("updated session was not retained")?;
-    println!("core-client-session-lifecycle active_session_namespaces={active_namespaces}");
+    println!(
+        "core-single-session-client-session-lifecycle active_session_namespaces={active_namespaces}"
+    );
 
     Ok(())
 }
 
 fn print_session_update_diff(diff: &wc_core::SessionNamespacesDiff) {
     println!(
-        "core-client-session-lifecycle update_diff added={} removed={} empty={}",
+        "core-single-session-client-session-lifecycle update_diff added={} removed={} empty={}",
         count_permission_changes(diff.added()),
         count_permission_changes(diff.removed()),
         diff.is_empty()
@@ -1144,6 +1189,39 @@ fn count_permission_changes(set: &wc_core::SessionNamespacePermissionSet) -> usi
                 + permissions.events().len()
         })
         .sum()
+}
+
+fn validate_incoming_session_event(message: &SessionReceivedMessage) -> Result<()> {
+    let expected_chain =
+        env::var("WC_JS_SESSION_EVENT_CHAIN_ID").unwrap_or_else(|_| "eip155:1".to_owned());
+    let expected_event =
+        env::var("WC_JS_SESSION_EVENT_NAME").unwrap_or_else(|_| "accountsChanged".to_owned());
+    let SessionPayload::SessionEvent(request) = message.payload() else {
+        bail!("incoming session event action received non-event payload");
+    };
+    if request.params.chain_id.as_str() != expected_chain {
+        bail!(
+            "incoming session event chain mismatch: expected {expected_chain}, got {}",
+            request.params.chain_id
+        );
+    }
+    if request.params.event.name.as_str() != expected_event {
+        bail!(
+            "incoming session event name mismatch: expected {expected_event}, got {}",
+            request.params.event.name
+        );
+    }
+    if let Ok(data_json) = env::var("WC_JS_SESSION_EVENT_DATA_JSON") {
+        let expected_data = parse_json_env(&data_json)?;
+        if request.params.event.data != expected_data {
+            bail!(
+                "incoming session event data mismatch: expected {expected_data}, got {}",
+                request.params.event.data
+            );
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_core_valid_session_request_probe(
@@ -1225,7 +1303,7 @@ enum CoreJsSessionLifecycleAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoreClientSessionLifecycleAction {
+enum CoreSingleSessionClientSessionLifecycleAction {
     Ping,
     Delete,
     IncomingUpdatePending,
@@ -1235,12 +1313,13 @@ enum CoreClientSessionLifecycleAction {
     IncomingUpdateAddPermissionsApprove,
     IncomingUpdateAddPermissionsReject,
     IncomingExtend,
+    IncomingEvent,
     Update,
     Extend,
     Event,
 }
 
-impl CoreClientSessionLifecycleAction {
+impl CoreSingleSessionClientSessionLifecycleAction {
     fn from_env() -> Result<Self> {
         let value =
             env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "update".to_owned());
@@ -1260,12 +1339,13 @@ impl CoreClientSessionLifecycleAction {
                 Ok(Self::IncomingUpdateAddPermissionsReject)
             }
             "incoming-extend" => Ok(Self::IncomingExtend),
+            "incoming-event" => Ok(Self::IncomingEvent),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-update-approve, incoming-update-reject, incoming-update-add-permissions, incoming-update-add-permissions-approve, incoming-update-add-permissions-reject, incoming-extend, update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-update-approve, incoming-update-reject, incoming-update-add-permissions, incoming-update-add-permissions-approve, incoming-update-add-permissions-reject, incoming-extend, incoming-event, update, extend, or event"
                 )
             }
         }
@@ -1283,7 +1363,7 @@ impl CoreClientSessionLifecycleAction {
             | Self::IncomingUpdateAddPermissionsReject
             | Self::Update => "update",
             Self::IncomingExtend | Self::Extend => "extend",
-            Self::Event => "event",
+            Self::IncomingEvent | Self::Event => "event",
         }
     }
 
@@ -1298,6 +1378,7 @@ impl CoreClientSessionLifecycleAction {
             | Self::IncomingUpdateAddPermissionsApprove
             | Self::IncomingUpdateAddPermissionsReject => "session_update_add_permissions",
             Self::IncomingExtend => "session_extend",
+            Self::IncomingEvent => "session_event",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
             Self::Event => "wait_session_event",
@@ -1318,6 +1399,7 @@ impl CoreClientSessionLifecycleAction {
                 "session_update_error"
             }
             Self::IncomingExtend => "session_extend_acknowledged",
+            Self::IncomingEvent => "session_event_sent",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",
             Self::Event => "session_event_received",
@@ -1335,6 +1417,7 @@ impl CoreClientSessionLifecycleAction {
             Self::Ping
             | Self::Delete
             | Self::IncomingExtend
+            | Self::IncomingEvent
             | Self::Update
             | Self::Extend
             | Self::Event => None,
@@ -1580,90 +1663,131 @@ async fn wait_for_valid_session_request_message(
     }
 }
 
-async fn wait_for_client_session_proposal(client: &mut Client) -> Result<ClientSessionProposal> {
+async fn wait_for_single_session_client_proposal(
+    client: &mut SingleSessionClient,
+) -> Result<SingleSessionProposal> {
     loop {
         let event = client
             .next_event()
             .await?
-            .context("no client session proposal event received")?;
+            .context("no single-session client proposal event received")?;
         match event {
-            ClientEvent::SessionProposal(proposal) => return Ok(*proposal),
-            ClientEvent::PairingMessage(message) => {
+            SingleSessionClientEvent::SessionProposal(proposal) => return Ok(*proposal),
+            SingleSessionClientEvent::PairingMessage(message) => {
                 print_core_pairing_payload_metadata(
-                    "core-client-session-request ignored_pairing_message",
+                    "core-single-session-client-session-request ignored_pairing_message",
                     &message,
                 )?;
             }
-            ClientEvent::Session(event) => print_ignored_client_session_event(&event),
+            SingleSessionClientEvent::Session(event) => {
+                print_ignored_single_session_client_event(&event);
+            }
+            SingleSessionClientEvent::SessionExpired(expired) => {
+                print_ignored_single_session_client_expired(&expired);
+            }
         }
     }
 }
 
-async fn wait_for_client_session_request_event(
-    client: &mut Client,
+async fn wait_for_single_session_client_session_request_event(
+    client: &mut SingleSessionClient,
 ) -> Result<SessionReceivedMessage> {
     loop {
         let event = client
             .next_event()
             .await?
-            .context("no client session request event received")?;
+            .context("no single-session client session request event received")?;
         match event {
-            ClientEvent::Session(SessionClientEvent::SessionRequest(message)) => {
+            SingleSessionClientEvent::Session(SessionClientEvent::SessionRequest(message)) => {
                 return Ok(message);
             }
-            ClientEvent::Session(event) => print_ignored_client_session_event(&event),
-            ClientEvent::PairingMessage(message) => {
+            SingleSessionClientEvent::Session(event) => {
+                print_ignored_single_session_client_event(&event);
+            }
+            SingleSessionClientEvent::PairingMessage(message) => {
                 print_core_pairing_payload_metadata(
-                    "core-client-session-request ignored_pairing_message",
+                    "core-single-session-client-session-request ignored_pairing_message",
                     &message,
                 )?;
             }
-            ClientEvent::SessionProposal(proposal) => {
+            SingleSessionClientEvent::SessionProposal(proposal) => {
                 println!(
-                    "core-client-session-request ignored_proposal id={} pairing_topic={}",
+                    "core-single-session-client-session-request ignored_proposal id={} pairing_topic={}",
                     proposal.proposal_id(),
                     proposal.pairing_topic()
                 );
+            }
+            SingleSessionClientEvent::SessionExpired(expired) => {
+                print_ignored_single_session_client_expired(&expired);
             }
         }
     }
 }
 
-async fn wait_for_client_session_lifecycle_event(
-    client: &mut Client,
+async fn wait_for_single_session_client_session_lifecycle_event(
+    client: &mut SingleSessionClient,
     lifecycle_action: &str,
 ) -> Result<SessionClientEvent> {
     loop {
         let event = client
             .next_event()
             .await?
-            .context("no client session lifecycle event received")?;
+            .context("no single-session client session lifecycle event received")?;
         match (lifecycle_action, event) {
-            ("ping", ClientEvent::Session(event @ SessionClientEvent::SessionPing(_)))
-            | ("delete", ClientEvent::Session(event @ SessionClientEvent::SessionDelete(_)))
-            | ("update", ClientEvent::Session(event @ SessionClientEvent::SessionUpdate(_)))
-            | ("extend", ClientEvent::Session(event @ SessionClientEvent::SessionExtend(_))) => {
+            (
+                "ping",
+                SingleSessionClientEvent::Session(event @ SessionClientEvent::SessionPing(_)),
+            )
+            | (
+                "delete",
+                SingleSessionClientEvent::Session(event @ SessionClientEvent::SessionDelete(_)),
+            )
+            | (
+                "update",
+                SingleSessionClientEvent::Session(event @ SessionClientEvent::SessionUpdate(_)),
+            )
+            | (
+                "extend",
+                SingleSessionClientEvent::Session(event @ SessionClientEvent::SessionExtend(_)),
+            )
+            | (
+                "event",
+                SingleSessionClientEvent::Session(event @ SessionClientEvent::SessionEvent(_)),
+            ) => {
                 return Ok(event);
             }
-            (_, ClientEvent::Session(event)) => print_ignored_client_session_event(&event),
-            (_, ClientEvent::PairingMessage(message)) => {
+            (_, SingleSessionClientEvent::Session(event)) => {
+                print_ignored_single_session_client_event(&event);
+            }
+            (_, SingleSessionClientEvent::PairingMessage(message)) => {
                 print_core_pairing_payload_metadata(
-                    "core-client-session-lifecycle ignored_pairing_message",
+                    "core-single-session-client-session-lifecycle ignored_pairing_message",
                     &message,
                 )?;
             }
-            (_, ClientEvent::SessionProposal(proposal)) => {
+            (_, SingleSessionClientEvent::SessionProposal(proposal)) => {
                 println!(
-                    "core-client-session-lifecycle ignored_proposal id={} pairing_topic={}",
+                    "core-single-session-client-session-lifecycle ignored_proposal id={} pairing_topic={}",
                     proposal.proposal_id(),
                     proposal.pairing_topic()
                 );
+            }
+            (_, SingleSessionClientEvent::SessionExpired(expired)) => {
+                print_ignored_single_session_client_expired(&expired);
             }
         }
     }
 }
 
-fn print_ignored_client_session_event(event: &SessionClientEvent) {
+fn print_ignored_single_session_client_expired(expired: &wc_core::SessionExpired) {
+    println!(
+        "ignored_single_session_client_expired topic={} expiry={}",
+        expired.topic(),
+        expired.expiry()
+    );
+}
+
+fn print_ignored_single_session_client_event(event: &SessionClientEvent) {
     if let Some(message) = event.message() {
         print_ignored_session_message(message);
     } else if let Some(rejection) = event.rejection() {
@@ -1844,7 +1968,7 @@ fn print_ignored_session_message(message: &SessionReceivedMessage) {
 
 fn print_session_request_review(review: &SessionRequestReview) {
     println!(
-        "core-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} params={}",
+        "core-single-session-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} params={}",
         review.topic(),
         review.request_id(),
         review.chain_id(),

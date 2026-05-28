@@ -832,10 +832,10 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
         payload: PairingPayload::SessionProposal(Box::new(request)),
     };
 
-    let event = crate::ClientEvent::from_pairing_message(message);
+    let event = crate::SingleSessionClientEvent::from_pairing_message(message);
 
     match event {
-        crate::ClientEvent::SessionProposal(proposal) => {
+        crate::SingleSessionClientEvent::SessionProposal(proposal) => {
             assert_eq!(proposal.proposal_id(), 7);
             assert_eq!(proposal.pairing_topic().as_str(), "11".repeat(32));
             assert_eq!(
@@ -852,12 +852,12 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
 #[test]
 fn client_config_wraps_pairing_config() {
     let pairing = PairingClientConfig::new("project", [7; 32], "subject");
-    let config = crate::ClientConfig::new(pairing.clone());
+    let config = crate::SingleSessionClientConfig::new(pairing.clone());
 
     assert_eq!(config.pairing().project_id, pairing.project_id);
     assert_eq!(
         config.max_queued_events(),
-        crate::DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY
+        crate::DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY
     );
 }
 

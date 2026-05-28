@@ -47,24 +47,44 @@ References:
 
 ## Runtime Model
 
-The core runtime is deliberately foreground-driven:
+The core runtime is foreground-driven:
 
 - one relay connection;
-- one `Client` runtime;
-- `Client::next_event()` as the polling API;
-- in-memory pairings and sessions;
+- one `SingleSessionClient` runtime;
+- one active protocol topic at a time;
+- one active session at a time;
+- `SingleSessionClient::next_event()` as the polling API;
+- in-memory pairing/session state;
 - no background task model yet;
 - no concurrent `next_event()` contract.
 
 Rationale: wallet UX is approval-driven, not throughput-driven. 
 A single foreground event loop makes security-sensitive behavior easier to inspect. 
 It also avoids callback reference cycles, hidden background approval paths, and unclear cancellation semantics.
+The first production target is a single-session client because replacement is a clearer trust boundary than hidden multi-session routing.
+
+The relay protocol can support many subscribed topics over one WebSocket.
+`SingleSessionClient` chooses a narrower runtime:
+
+1. `Idle`;
+2. `Pairing`;
+3. `Session`.
+
+Subscribing a new pairing topic while a session is active must be an explicit replacement flow.
+The caller should tell the user that connecting the new app disconnects the current app, then call a replacement/disconnect operation.
+`SingleSessionClient` must not silently replace an active session or keep multiple approved dapp sessions alive.
+Consumers must not create multiple `SingleSessionClient` instances to regain multi-session behavior.
+One wallet runtime should reuse one client instance; multiple simultaneous instances are a separate multi-session design and require their own state ownership, UX, and threat model.
+
+Rationale: a single active session removes scheduler fairness, cross-topic routing, stale-session, and multi-dapp approval edge cases from the first production surface.
+If future product requirements need multiple simultaneous sessions, that should be introduced as a separate multi-session client/runtime with its own threat model and tests.
 
 Current event model:
 
-- pairing proposals become `ClientEvent::SessionProposal`;
-- non-proposal pairing messages remain visible as `ClientEvent::PairingMessage`;
-- session-topic messages become `ClientEvent::Session`;
+- pairing proposals become `SingleSessionClientEvent::SessionProposal`;
+- non-proposal pairing messages remain visible as `SingleSessionClientEvent::PairingMessage`;
+- session-topic messages become `SingleSessionClientEvent::Session`;
+- an expired active session becomes `SingleSessionClientEvent::SessionExpired` and is removed from the in-memory runtime before another session message is polled;
 - invalid session requests are auto-rejected by the receive path when the rejection is deterministic and does not require user approval.
 - permission-changing session updates are surfaced as events and require an explicit approve/reject API call.
 
@@ -74,13 +94,13 @@ Reference:
 
 ## State Model
 
-The current client stores runtime state in memory only:
+`SingleSessionClient` stores runtime state in memory only:
 
-- pairing subscriptions;
-- active session subscriptions;
-- acknowledged session records;
+- at most one active pairing subscription;
+- at most one active session subscription;
+- at most one acknowledged session record;
 - queued events;
-- symmetric keys associated with active pairings/sessions.
+- symmetric keys associated with the active pairing or session.
 
 No symmetric keys, sessions, or pending approvals are persisted in this phase.
 
@@ -89,7 +109,7 @@ Until restore semantics, key storage, corruption handling, and migration behavio
 If the application closes or crashes, the next run starts fresh.
 
 Messages for unknown or untracked runtime state should be dropped or rejected according to the narrow protocol context. 
-The client should not infer a session from an incoming message when its in-memory state has been lost.
+`SingleSessionClient` should not infer a session from an incoming message when its in-memory state has been lost.
 
 Deferred:
 
@@ -105,7 +125,7 @@ Auto-approval is not allowed.
 The current session proposal approval flow is:
 
 1. receive `wc_sessionPropose`;
-2. expose it as `ClientEvent::SessionProposal`;
+2. expose it as `SingleSessionClientEvent::SessionProposal`;
 3. caller decides whether to approve or reject;
 4. wallet capabilities are used to plan an approved namespace set;
 5. core publishes approval only after the caller supplies approval data.
@@ -123,15 +143,15 @@ Rationale: namespace approval is a wallet security decision. The core can help c
 
 Session updates follow the same rule.
 `wc_sessionUpdate` replaces namespaces, and namespaces contain chains, accounts, methods, and events.
-The runtime must not acknowledge or apply such updates inside `Client::next_event()`.
+The runtime must not acknowledge or apply such updates inside `SingleSessionClient::next_event()`.
 It must expose the update to the caller, then apply it only through an explicit approval primitive.
 
 Current session update flow:
 
 1. receive `wc_sessionUpdate`;
-2. expose it as `ClientEvent::Session(SessionClientEvent::SessionUpdate)`;
+2. expose it as `SingleSessionClientEvent::Session(SessionClientEvent::SessionUpdate)`;
 3. caller compares current and requested namespaces using `SessionNamespacesDiff`;
-4. caller invokes `Client::approve_session_update` or `Client::reject_session_update`;
+4. caller invokes `SingleSessionClient::approve_session_update` or `SingleSessionClient::reject_session_update`;
 5. core mutates stored namespaces only after publishing an approval acknowledgement.
 
 Rationale: a protocol acknowledgement is not the same thing as wallet authorization.
@@ -146,7 +166,7 @@ Reference:
 Session requests follow the same foreground approval model.
 `wc_sessionRequest` asks the wallet to handle a chain-scoped JSON-RPC method.
 The receive path may reject requests that are expired or outside the active namespaces, because the spec requires an immediate protocol error for unauthorized chain or method.
-Valid requests are exposed to the caller through `ClientEvent::Session(SessionClientEvent::SessionRequest)`.
+Valid requests are exposed to the caller through `SingleSessionClientEvent::Session(SessionClientEvent::SessionRequest)`.
 
 Current session request flow:
 
@@ -154,7 +174,7 @@ Current session request flow:
 2. reject deterministically invalid chain, method, or expiry cases;
 3. expose valid requests as session events;
 4. caller extracts `SessionRequestReview` for UI and policy;
-5. caller invokes `Client::respond_session_request_success` or `Client::respond_session_request_error`.
+5. caller invokes `SingleSessionClient::respond_session_request_success` or `SingleSessionClient::respond_session_request_error`.
 
 Rationale: the protocol can decide whether a request is authorized by namespace, but only the wallet/user can decide whether to sign or submit it.
 The review primitive keeps request id, topic, chain, method, params, and expiry available without requiring application code to downcast raw session payloads.
@@ -163,6 +183,18 @@ Reference:
 
 - [Session Request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
 - [Session Request RPC method](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest)
+
+Session expiry is a local runtime lifecycle event.
+`SingleSessionClient` does not run a background expirer, so `SingleSessionClient::next_event()` checks active session expiry before polling relay messages.
+When a session is expired, `SingleSessionClient` removes it from memory and returns `SingleSessionClientEvent::SessionExpired`.
+The caller can update UI and refuse follow-up actions against that topic.
+
+Rationale: an expired session should not remain available for signing or lifecycle operations.
+The maintained Sign Client deletes the stored session and emits `session_expire` from its expirer callback; the proof-of-concept keeps the same transition in the foreground polling path.
+
+Reference:
+
+- [Maintained Sign Client expirer handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2714-L2727)
 
 ## Security Posture
 

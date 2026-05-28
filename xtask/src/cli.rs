@@ -55,7 +55,7 @@ struct RelayProbeArgs {
     core_session: CoreRelaySessionProbeArgs,
 
     #[command(flatten)]
-    core_client_session: CoreRelayClientSessionProbeArgs,
+    core_single_session_client: CoreRelaySingleSessionClientProbeArgs,
 
     #[arg(long, value_name = "URI")]
     pairing_uri: Option<String>,
@@ -89,12 +89,15 @@ struct CoreRelaySessionProbeArgs {
 }
 
 #[derive(Debug, Args)]
-struct CoreRelayClientSessionProbeArgs {
+struct CoreRelaySingleSessionClientProbeArgs {
     #[arg(long)]
-    core_client_session_request: bool,
+    core_single_session_client_session_request: bool,
 
     #[arg(long)]
-    core_client_session_lifecycle: bool,
+    core_single_session_client_session_lifecycle: bool,
+
+    #[arg(long)]
+    core_single_session_client_disconnect: bool,
 }
 
 #[derive(Debug, Args)]
@@ -145,8 +148,18 @@ impl RelayProbeArgs {
             + usize::from(self.core_pairing.core_js_pairing_lifecycle)
             + usize::from(self.core_session.core_js_session_request)
             + usize::from(self.core_session.core_js_session_lifecycle)
-            + usize::from(self.core_client_session.core_client_session_request)
-            + usize::from(self.core_client_session.core_client_session_lifecycle)
+            + usize::from(
+                self.core_single_session_client
+                    .core_single_session_client_session_request,
+            )
+            + usize::from(
+                self.core_single_session_client
+                    .core_single_session_client_session_lifecycle,
+            )
+            + usize::from(
+                self.core_single_session_client
+                    .core_single_session_client_disconnect,
+            )
             + usize::from(self.pairing_uri.is_some());
         if selected_count > 1 {
             bail!("choose only one relay probe mode");
@@ -179,11 +192,23 @@ impl RelayProbeArgs {
         if self.core_session.core_js_session_lifecycle {
             return Ok(relay::ProbeMode::CoreJsSessionLifecycle);
         }
-        if self.core_client_session.core_client_session_request {
-            return Ok(relay::ProbeMode::CoreClientSessionRequest);
+        if self
+            .core_single_session_client
+            .core_single_session_client_session_request
+        {
+            return Ok(relay::ProbeMode::CoreSingleSessionClientSessionRequest);
         }
-        if self.core_client_session.core_client_session_lifecycle {
-            return Ok(relay::ProbeMode::CoreClientSessionLifecycle);
+        if self
+            .core_single_session_client
+            .core_single_session_client_session_lifecycle
+        {
+            return Ok(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle);
+        }
+        if self
+            .core_single_session_client
+            .core_single_session_client_disconnect
+        {
+            return Ok(relay::ProbeMode::CoreSingleSessionClientDisconnect);
         }
         if let Some(uri) = self.pairing_uri {
             return Ok(relay::ProbeMode::PairingUri(uri));
@@ -199,9 +224,15 @@ impl RelayProbeArgs {
             Ok("core-js-pairing-lifecycle") => Ok(relay::ProbeMode::CoreJsPairingLifecycle),
             Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
             Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
-            Ok("core-client-session-request") => Ok(relay::ProbeMode::CoreClientSessionRequest),
-            Ok("core-client-session-lifecycle") => Ok(relay::ProbeMode::CoreClientSessionLifecycle),
-            Ok("core-client-disconnect") => Ok(relay::ProbeMode::CoreClientDisconnect),
+            Ok("core-single-session-client-session-request") => {
+                Ok(relay::ProbeMode::CoreSingleSessionClientSessionRequest)
+            }
+            Ok("core-single-session-client-session-lifecycle") => {
+                Ok(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle)
+            }
+            Ok("core-single-session-client-disconnect") => {
+                Ok(relay::ProbeMode::CoreSingleSessionClientDisconnect)
+            }
             Ok("pairing-uri") => {
                 let uri = env::var("WC_PAIRING_URI")
                     .context("set WC_PAIRING_URI when WC_RELAY_PROBE_MODE=pairing-uri")?;

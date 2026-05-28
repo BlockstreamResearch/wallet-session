@@ -87,6 +87,13 @@ pub enum PairingClientError {
         actual: RelayTopic,
     },
 
+    /// Relay did not acknowledge dropping the previous pairing topic.
+    #[error("pairing unsubscribe was not acknowledged")]
+    PairingUnsubscribeRejected {
+        /// Pairing topic that remains subscribed.
+        topic: RelayTopic,
+    },
+
     /// Relay message envelope decoding, decryption, or JSON parsing failed.
     #[error("pairing message failed")]
     PairingMessage {

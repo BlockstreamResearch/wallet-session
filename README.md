@@ -4,7 +4,7 @@ Rust workspace for the WalletConnect client proof of concept.
 
 ## Crates
 
-- `wc-core`: core WalletConnect client primitives.
+- `wc-core`: core WalletConnect single-session client primitives.
 
 ## Checks
 
