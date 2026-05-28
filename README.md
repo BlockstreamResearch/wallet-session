@@ -20,3 +20,17 @@ cargo rbmt toolchains
 cargo rbmt tools
 just check_all
 ```
+
+## Live Scenarios
+
+Run the default live relay and single-session client suite:
+
+```sh
+REOWN_PROJECT_ID=... cargo run -p xtask --locked -- scenario
+```
+
+List available scenarios:
+
+```sh
+cargo run -p xtask --locked -- scenario --list
+```

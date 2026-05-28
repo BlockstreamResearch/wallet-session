@@ -294,7 +294,27 @@ Source:
 
 ## Live Coverage
 
-Current live harness coverage for the high-level API:
+The standard live suite is:
+
+```sh
+cargo run -p xtask --locked -- scenario
+```
+
+That runs:
+
+- relay matrix;
+- single-session request;
+- single-session lifecycle update;
+- single-session disconnect.
+
+Focused high-level scenarios are also available:
+
+- `cargo run -p xtask --locked -- scenario single-session-request`;
+- `cargo run -p xtask --locked -- scenario single-session-lifecycle`;
+- `cargo run -p xtask --locked -- scenario single-session-disconnect`;
+- `cargo run -p xtask --locked -- scenario single-session-live`.
+
+Underlying probe commands remain available:
 
 - `relay-probe --core-single-session-client-session-request`;
 - `relay-probe --core-single-session-client-session-lifecycle`;

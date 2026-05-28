@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{probe, relay};
+use crate::{probe, relay, scenario};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +32,8 @@ enum Command {
     Pairing(JsonProbeArgs),
     #[command(name = "session-probe")]
     Session(JsonProbeArgs),
+    #[command(name = "scenario")]
+    Scenario(ScenarioArgs),
 }
 
 #[derive(Debug, Args)]
@@ -115,6 +117,15 @@ struct JsonProbeArgs {
     stdin: bool,
 }
 
+#[derive(Debug, Args)]
+struct ScenarioArgs {
+    #[arg(long)]
+    list: bool,
+
+    #[arg(value_enum, default_value_t = scenario::ScenarioName::DefaultLive)]
+    name: scenario::ScenarioName,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonProbeInput {
     Json(String),
@@ -133,6 +144,14 @@ pub fn run() -> Result<()> {
         }
         Command::Session(args) => {
             probe::session::run(args.into_input("WC_SESSION_PROBE_JSON", "WC_SESSION_PROBE_FILE")?)
+        }
+        Command::Scenario(args) => {
+            if args.list {
+                scenario::list();
+                Ok(())
+            } else {
+                run_async(scenario::run(args.name))
+            }
         }
     }
 }
