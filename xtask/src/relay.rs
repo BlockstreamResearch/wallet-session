@@ -948,6 +948,18 @@ async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> R
     );
 
     match action {
+        CoreClientSessionLifecycleAction::Ping | CoreClientSessionLifecycleAction::Delete => {
+            let event =
+                wait_for_client_session_lifecycle_event(&mut client, action.label()).await?;
+            if let Some(message) = event.message() {
+                print_session_message("core-client-session-lifecycle live_event", message);
+            }
+            println!(
+                "core-client-session-lifecycle auto_handled={} active_sessions={}",
+                action.label(),
+                client.active_sessions().len()
+            );
+        }
         CoreClientSessionLifecycleAction::Update => {
             let response = client
                 .update_session(&session.topic, &session.namespaces)
@@ -1062,6 +1074,8 @@ enum CoreJsSessionLifecycleAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CoreClientSessionLifecycleAction {
+    Ping,
+    Delete,
     Update,
     Extend,
     Event,
@@ -1072,12 +1086,14 @@ impl CoreClientSessionLifecycleAction {
         let value =
             env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "update".to_owned());
         match value.as_str() {
+            "ping" => Ok(Self::Ping),
+            "delete" => Ok(Self::Delete),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, update, extend, or event"
                 )
             }
         }
@@ -1085,6 +1101,8 @@ impl CoreClientSessionLifecycleAction {
 
     const fn label(self) -> &'static str {
         match self {
+            Self::Ping => "ping",
+            Self::Delete => "delete",
             Self::Update => "update",
             Self::Extend => "extend",
             Self::Event => "event",
@@ -1093,6 +1111,8 @@ impl CoreClientSessionLifecycleAction {
 
     const fn harness_action(self) -> &'static str {
         match self {
+            Self::Ping => "session_ping",
+            Self::Delete => "session_delete",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
             Self::Event => "wait_session_event",
@@ -1101,6 +1121,8 @@ impl CoreClientSessionLifecycleAction {
 
     const fn expected_outcome(self) -> &'static str {
         match self {
+            Self::Ping => "session_ping_response",
+            Self::Delete => "session_delete_sent",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",
             Self::Event => "session_event_received",
@@ -1366,6 +1388,38 @@ async fn wait_for_client_session_request_event(
             ClientEvent::SessionProposal(proposal) => {
                 println!(
                     "core-client-session-request ignored_proposal id={} pairing_topic={}",
+                    proposal.proposal_id(),
+                    proposal.pairing_topic()
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_client_session_lifecycle_event(
+    client: &mut Client,
+    lifecycle_action: &str,
+) -> Result<SessionClientEvent> {
+    loop {
+        let event = client
+            .next_event()
+            .await?
+            .context("no client session lifecycle event received")?;
+        match (lifecycle_action, event) {
+            ("ping", ClientEvent::Session(event @ SessionClientEvent::SessionPing(_)))
+            | ("delete", ClientEvent::Session(event @ SessionClientEvent::SessionDelete(_))) => {
+                return Ok(event);
+            }
+            (_, ClientEvent::Session(event)) => print_ignored_client_session_event(&event),
+            (_, ClientEvent::PairingMessage(message)) => {
+                print_core_pairing_payload_metadata(
+                    "core-client-session-lifecycle ignored_pairing_message",
+                    &message,
+                )?;
+            }
+            (_, ClientEvent::SessionProposal(proposal)) => {
+                println!(
+                    "core-client-session-lifecycle ignored_proposal id={} pairing_topic={}",
                     proposal.proposal_id(),
                     proposal.pairing_topic()
                 );

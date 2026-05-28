@@ -150,9 +150,10 @@ impl Client {
 
     /// Waits for the next queued, pairing-topic, or session-topic event.
     ///
-    /// Session messages are exposed as `SessionClientEvent`; invalid
-    /// `wc_sessionRequest` payloads are still auto-rejected by the lower-level
-    /// receive path before being returned as `RejectedSessionRequest`.
+    /// Session messages are exposed as `SessionClientEvent`. Invalid
+    /// `wc_sessionRequest` payloads are auto-rejected by the lower-level
+    /// receive path; deterministic `wc_sessionPing` and `wc_sessionDelete`
+    /// side effects are handled before the event is returned.
     ///
     /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/session-events.md#session_request>
     ///
@@ -170,7 +171,9 @@ impl Client {
                 .await
                 .map_err(ClientError::from)?;
             if let Some(event) = event {
-                return Ok(Some(ClientEvent::Session(event)));
+                return self
+                    .handle_session_event(&session.subscription, event)
+                    .await;
             }
         }
 
@@ -294,6 +297,10 @@ impl Client {
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionPing`.
+    ///
+    /// `Client::next_event` already responds to session pings it returns. This
+    /// method is retained for callers that receive a session message through a
+    /// lower-level path.
     pub async fn respond_session_ping(
         &mut self,
         message: &SessionReceivedMessage,
@@ -306,6 +313,10 @@ impl Client {
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionDelete`.
+    ///
+    /// `Client::next_event` already responds to session deletes it returns and
+    /// removes the local session. This method is retained for callers that
+    /// receive a session message through a lower-level path.
     pub async fn respond_session_delete(
         &mut self,
         message: &SessionReceivedMessage,
@@ -521,6 +532,53 @@ impl Client {
         }
 
         Ok(ClientEvent::from_pairing_message(message))
+    }
+
+    /// Applies deterministic session-topic side effects for the polling API.
+    ///
+    /// `wc_sessionPing` has no wallet decision: the peer expects `true`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2401-L2411>
+    ///
+    /// > await this.sendResult<"wc_sessionPing">({
+    /// > id,
+    /// > result: true,
+    ///
+    /// `wc_sessionDelete` is also deterministic for the runtime: acknowledge
+    /// the request and remove local session state.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2442-L2454>
+    ///
+    /// > await this.isValidDisconnect({ topic, reason: payload.params });
+    /// > await this.deleteSession({ topic, id });
+    async fn handle_session_event(
+        &mut self,
+        subscription: &SessionSubscription,
+        event: SessionClientEvent,
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        match &event {
+            SessionClientEvent::SessionPing(message) => {
+                self.pairing
+                    .respond_session_ping(subscription, message)
+                    .await
+                    .map_err(ClientError::from)?;
+            }
+            SessionClientEvent::SessionDelete(message) => {
+                self.pairing
+                    .respond_session_delete(subscription, message)
+                    .await
+                    .map_err(ClientError::from)?;
+                self.sessions.remove(message.topic());
+            }
+            SessionClientEvent::SessionRequest(_)
+            | SessionClientEvent::SessionUpdate(_)
+            | SessionClientEvent::SessionExtend(_)
+            | SessionClientEvent::SessionEvent(_)
+            | SessionClientEvent::Unsupported(_)
+            | SessionClientEvent::RejectedSessionRequest(_) => {}
+        }
+
+        Ok(Some(ClientEvent::Session(event)))
     }
 }
 

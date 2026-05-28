@@ -54,6 +54,9 @@ struct RelayProbeArgs {
     #[command(flatten)]
     core_session: CoreRelaySessionProbeArgs,
 
+    #[command(flatten)]
+    core_client_session: CoreRelayClientSessionProbeArgs,
+
     #[arg(long, value_name = "URI")]
     pairing_uri: Option<String>,
 }
@@ -83,9 +86,15 @@ struct CoreRelaySessionProbeArgs {
 
     #[arg(long)]
     core_js_session_lifecycle: bool,
+}
 
+#[derive(Debug, Args)]
+struct CoreRelayClientSessionProbeArgs {
     #[arg(long)]
     core_client_session_request: bool,
+
+    #[arg(long)]
+    core_client_session_lifecycle: bool,
 }
 
 #[derive(Debug, Args)]
@@ -136,7 +145,8 @@ impl RelayProbeArgs {
             + usize::from(self.core_pairing.core_js_pairing_lifecycle)
             + usize::from(self.core_session.core_js_session_request)
             + usize::from(self.core_session.core_js_session_lifecycle)
-            + usize::from(self.core_session.core_client_session_request)
+            + usize::from(self.core_client_session.core_client_session_request)
+            + usize::from(self.core_client_session.core_client_session_lifecycle)
             + usize::from(self.pairing_uri.is_some());
         if selected_count > 1 {
             bail!("choose only one relay probe mode");
@@ -169,8 +179,11 @@ impl RelayProbeArgs {
         if self.core_session.core_js_session_lifecycle {
             return Ok(relay::ProbeMode::CoreJsSessionLifecycle);
         }
-        if self.core_session.core_client_session_request {
+        if self.core_client_session.core_client_session_request {
             return Ok(relay::ProbeMode::CoreClientSessionRequest);
+        }
+        if self.core_client_session.core_client_session_lifecycle {
+            return Ok(relay::ProbeMode::CoreClientSessionLifecycle);
         }
         if let Some(uri) = self.pairing_uri {
             return Ok(relay::ProbeMode::PairingUri(uri));
