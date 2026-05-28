@@ -17,6 +17,7 @@ use crate::pairing::{
     SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
 };
+use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 
 /// Default number of fetched or internally queued events retained for `next_event`.
@@ -297,6 +298,20 @@ impl Client {
             .respond_session_request_error(&subscription, message, error)
             .await
             .map_err(ClientError::from)
+    }
+
+    /// Extracts wallet-facing review data from a `SessionClientEvent::SessionRequest`.
+    ///
+    /// This helper verifies that the request belongs to an active session held
+    /// by this runtime. It does not send a response and does not apply wallet
+    /// policy by itself.
+    pub fn session_request_review(
+        &self,
+        message: &SessionReceivedMessage,
+    ) -> Result<SessionRequestReview, ClientError> {
+        self.client_session(message.topic())?;
+        SessionRequestReview::from_message(message)
+            .map_err(|source| ClientError::SessionRequestReview { source })
     }
 
     /// Publishes a success response for a `SessionClientEvent::SessionPing`.
@@ -907,6 +922,14 @@ pub enum ClientError {
         queued: usize,
         /// New events that need to be retained.
         incoming: usize,
+    },
+
+    /// A session-topic message could not be converted to request review data.
+    #[error("client session request review failed")]
+    SessionRequestReview {
+        /// Source review construction error.
+        #[source]
+        source: SessionRequestReviewError,
     },
 }
 

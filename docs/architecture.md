@@ -143,6 +143,27 @@ Reference:
 - [Approving a Session Response](https://specs.walletconnect.com/2.0/specs/clients/sign/namespaces#approving-a-session-response)
 - [Updating a Session](https://docs.walletconnect.network/wallet-sdk/web/usage#updating-a-session)
 
+Session requests follow the same foreground approval model.
+`wc_sessionRequest` asks the wallet to handle a chain-scoped JSON-RPC method.
+The receive path may reject requests that are expired or outside the active namespaces, because the spec requires an immediate protocol error for unauthorized chain or method.
+Valid requests are exposed to the caller through `ClientEvent::Session(SessionClientEvent::SessionRequest)`.
+
+Current session request flow:
+
+1. receive `wc_sessionRequest`;
+2. reject deterministically invalid chain, method, or expiry cases;
+3. expose valid requests as session events;
+4. caller extracts `SessionRequestReview` for UI and policy;
+5. caller invokes `Client::respond_session_request_success` or `Client::respond_session_request_error`.
+
+Rationale: the protocol can decide whether a request is authorized by namespace, but only the wallet/user can decide whether to sign or submit it.
+The review primitive keeps request id, topic, chain, method, params, and expiry available without requiring application code to downcast raw session payloads.
+
+Reference:
+
+- [Session Request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
+- [Session Request RPC method](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest)
+
 ## Security Posture
 
 Security should be added alongside feature work when it naturally belongs to the feature. Pure hardening should not run far ahead of behavior, but obvious safety boundaries should be added early.

@@ -19,8 +19,8 @@ use wc_core::{
     PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
     SessionClientEvent, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
-    SessionSettleResponseMessage, SessionSettleResponsePayload, WalletCapabilities,
-    WalletChainCapability,
+    SessionRequestReview, SessionSettleResponseMessage, SessionSettleResponsePayload,
+    WalletCapabilities, WalletChainCapability,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId},
@@ -821,6 +821,9 @@ async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Res
 
     let session_message = wait_for_client_session_request_event(&mut client).await?;
     print_session_message("core-client-session-request live_event", &session_message);
+    let review = client.session_request_review(&session_message)?;
+    print_session_request_review(&review);
+    validate_session_request_review(&review)?;
     let response_ack = match response_mode.as_str() {
         "success" => {
             let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
@@ -1837,6 +1840,55 @@ fn print_ignored_session_message(message: &SessionReceivedMessage) {
         message.tag().unwrap_or_default(),
         message.payload()
     );
+}
+
+fn print_session_request_review(review: &SessionRequestReview) {
+    println!(
+        "core-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} params={}",
+        review.topic(),
+        review.request_id(),
+        review.chain_id(),
+        review.method(),
+        review.expiry_timestamp(),
+        review.params()
+    );
+}
+
+fn validate_session_request_review(review: &SessionRequestReview) -> Result<()> {
+    let expected_chain =
+        env::var("WC_JS_SESSION_REQUEST_CHAIN_ID").unwrap_or_else(|_| "eip155:1".to_owned());
+    let expected_method =
+        env::var("WC_JS_SESSION_REQUEST_METHOD").unwrap_or_else(|_| "personal_sign".to_owned());
+    if review.chain_id().as_str() != expected_chain {
+        bail!(
+            "session request review chain mismatch: expected {expected_chain}, got {}",
+            review.chain_id()
+        );
+    }
+    if review.method().as_str() != expected_method {
+        bail!(
+            "session request review method mismatch: expected {expected_method}, got {}",
+            review.method()
+        );
+    }
+    if let Ok(params_json) = env::var("WC_JS_SESSION_REQUEST_PARAMS_JSON") {
+        let expected_params = parse_json_env(&params_json)?;
+        if review.params() != &expected_params {
+            bail!(
+                "session request review params mismatch: expected {expected_params}, got {}",
+                review.params()
+            );
+        }
+    }
+    if review.is_expired_at(unix_timestamp()) {
+        bail!(
+            "session request review is expired: id={} expiry={:?}",
+            review.request_id(),
+            review.expiry_timestamp()
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_session_request_rejection(

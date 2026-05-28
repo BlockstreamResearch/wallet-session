@@ -3,6 +3,7 @@
 mod capabilities;
 mod client;
 mod pairing;
+mod session_request;
 mod session_update;
 
 pub use capabilities::{
@@ -33,6 +34,7 @@ pub use pairing::{
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
 };
+pub use session_request::{SessionRequestReview, SessionRequestReviewError};
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
     diff_session_namespaces,
