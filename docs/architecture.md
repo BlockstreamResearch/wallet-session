@@ -130,12 +130,13 @@ Current session update flow:
 
 1. receive `wc_sessionUpdate`;
 2. expose it as `ClientEvent::Session(SessionClientEvent::SessionUpdate)`;
-3. caller compares current and requested namespaces and obtains any required user consent;
+3. caller compares current and requested namespaces using `SessionNamespacesDiff`;
 4. caller invokes `Client::approve_session_update` or `Client::reject_session_update`;
 5. core mutates stored namespaces only after publishing an approval acknowledgement.
 
 Rationale: a protocol acknowledgement is not the same thing as wallet authorization.
 The lower-level pairing primitive may build either success or error responses, but the wallet-facing runtime must make the permission boundary obvious.
+The diff primitive keeps the review surface explicit: added chains, accounts, methods, and events can be shown to wallet policy and UI before acknowledgement.
 
 Reference:
 

@@ -1039,6 +1039,8 @@ async fn handle_incoming_client_session_update(
         .message()
         .context("session update event did not carry a message")?;
     print_session_message("core-client-session-lifecycle live_event", message);
+    let diff = client.session_update_diff(message)?;
+    print_session_update_diff(&diff);
 
     match action {
         CoreClientSessionLifecycleAction::IncomingUpdatePending => {
@@ -1087,6 +1089,27 @@ fn print_active_session_namespaces(client: &Client) -> Result<()> {
     println!("core-client-session-lifecycle active_session_namespaces={active_namespaces}");
 
     Ok(())
+}
+
+fn print_session_update_diff(diff: &wc_core::SessionNamespacesDiff) {
+    println!(
+        "core-client-session-lifecycle update_diff added={} removed={} empty={}",
+        count_permission_changes(diff.added()),
+        count_permission_changes(diff.removed()),
+        diff.is_empty()
+    );
+}
+
+fn count_permission_changes(set: &wc_core::SessionNamespacePermissionSet) -> usize {
+    set.namespaces()
+        .values()
+        .map(|permissions| {
+            permissions.chains().len()
+                + permissions.accounts().len()
+                + permissions.methods().len()
+                + permissions.events().len()
+        })
+        .sum()
 }
 
 async fn run_core_valid_session_request_probe(

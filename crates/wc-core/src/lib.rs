@@ -3,6 +3,7 @@
 mod capabilities;
 mod client;
 mod pairing;
+mod session_update;
 
 pub use capabilities::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
@@ -31,4 +32,8 @@ pub use pairing::{
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionMessageOutcome,
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
+};
+pub use session_update::{
+    SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
+    diff_session_namespaces,
 };

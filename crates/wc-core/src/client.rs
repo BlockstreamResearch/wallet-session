@@ -17,6 +17,7 @@ use crate::pairing::{
     SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
 };
+use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 
 /// Default number of fetched or internally queued events retained for `next_event`.
 pub const DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -353,6 +354,27 @@ impl Client {
         Ok(publish_ack)
     }
 
+    /// Describes the permission change requested by a `SessionClientEvent::SessionUpdate`.
+    ///
+    /// This helper does not acknowledge the peer and does not mutate local
+    /// session state.
+    pub fn session_update_diff(
+        &self,
+        message: &SessionReceivedMessage,
+    ) -> Result<SessionNamespacesDiff, ClientError> {
+        let session = self.client_session(message.topic())?;
+        let SessionPayload::SessionUpdate(request) = message.payload() else {
+            return Err(ClientError::Pairing {
+                source: PairingClientError::SessionResponseTargetNotUpdate,
+            });
+        };
+
+        Ok(diff_session_namespaces(
+            &session.session.namespaces,
+            &request.params.namespaces,
+        ))
+    }
+
     /// Rejects a `SessionClientEvent::SessionUpdate` without mutating session permissions.
     ///
     /// Use this when the requested namespace replacement is not allowed by
@@ -576,6 +598,14 @@ impl Client {
         self.sessions
             .get(topic)
             .map(|state| &state.subscription)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })
+    }
+
+    fn client_session(&self, topic: &RelayTopic) -> Result<&ClientSession, ClientError> {
+        self.sessions
+            .get(topic)
             .ok_or_else(|| ClientError::SessionMissing {
                 topic: topic.clone(),
             })
