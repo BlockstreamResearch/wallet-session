@@ -396,6 +396,131 @@ pub enum SessionMessageOutcome {
     Rejected(SessionRequestRejection),
 }
 
+/// Wallet-facing event classified from one session-topic delivery.
+///
+/// The low-level decoder preserves the full JSON-RPC message as
+/// `SessionReceivedMessage`; this event enum adds the first application routing
+/// boundary while keeping the original message available for response helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionClientEvent {
+    /// `wc_sessionRequest` asks the wallet to handle a CAIP-27 request.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > Sends a CAIP-27 request to the peer client.
+    SessionRequest(SessionReceivedMessage),
+    /// `wc_sessionUpdate` replaces session namespaces.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionupdate>
+    ///
+    /// > Updates session namespaces.
+    SessionUpdate(SessionReceivedMessage),
+    /// `wc_sessionExtend` requests session expiry extension.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionextend>
+    ///
+    /// > Extends a session.
+    SessionExtend(SessionReceivedMessage),
+    /// `wc_sessionEvent` delivers a chain-scoped event to the peer.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionevent>
+    ///
+    /// > Emits events to the peer client.
+    SessionEvent(SessionReceivedMessage),
+    /// `wc_sessionPing` checks whether the peer is reachable.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionping>
+    ///
+    /// > Pings a peer client to check if it's online.
+    SessionPing(SessionReceivedMessage),
+    /// `wc_sessionDelete` disconnects the session.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessiondelete>
+    ///
+    /// > Deletes a session.
+    SessionDelete(SessionReceivedMessage),
+    /// Session-topic JSON-RPC payload without a dedicated wallet event yet.
+    Unsupported(SessionReceivedMessage),
+    /// Invalid `wc_sessionRequest` answered automatically with JSON-RPC error.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > The client should immediately reject the request and respond an error
+    /// > if the target session permissions doesn't include the requested method
+    /// > or chain ID.
+    RejectedSessionRequest(SessionRequestRejection),
+}
+
+impl SessionClientEvent {
+    pub(super) fn from_outcome(outcome: SessionMessageOutcome) -> Self {
+        match outcome {
+            SessionMessageOutcome::Received(message) => Self::from_message(message),
+            SessionMessageOutcome::Rejected(rejection) => Self::RejectedSessionRequest(rejection),
+        }
+    }
+
+    /// Classifies a validated session-topic message by parsed Sign method.
+    #[must_use]
+    pub const fn from_message(message: SessionReceivedMessage) -> Self {
+        match message.payload() {
+            SessionPayload::SessionRequest(_) => Self::SessionRequest(message),
+            SessionPayload::SessionUpdate(_) => Self::SessionUpdate(message),
+            SessionPayload::SessionExtend(_) => Self::SessionExtend(message),
+            SessionPayload::SessionEvent(_) => Self::SessionEvent(message),
+            SessionPayload::SessionPing(_) => Self::SessionPing(message),
+            SessionPayload::SessionDelete(_) => Self::SessionDelete(message),
+            SessionPayload::Sign(_) | SessionPayload::Unknown(_) | SessionPayload::Missing => {
+                Self::Unsupported(message)
+            }
+        }
+    }
+
+    /// Relay topic associated with the event.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        match self {
+            Self::SessionRequest(message)
+            | Self::SessionUpdate(message)
+            | Self::SessionExtend(message)
+            | Self::SessionEvent(message)
+            | Self::SessionPing(message)
+            | Self::SessionDelete(message)
+            | Self::Unsupported(message) => message.topic(),
+            Self::RejectedSessionRequest(rejection) => rejection.topic(),
+        }
+    }
+
+    /// Original session-topic message when the event was not auto-rejected.
+    #[must_use]
+    pub const fn message(&self) -> Option<&SessionReceivedMessage> {
+        match self {
+            Self::SessionRequest(message)
+            | Self::SessionUpdate(message)
+            | Self::SessionExtend(message)
+            | Self::SessionEvent(message)
+            | Self::SessionPing(message)
+            | Self::SessionDelete(message)
+            | Self::Unsupported(message) => Some(message),
+            Self::RejectedSessionRequest(_) => None,
+        }
+    }
+
+    /// Auto-rejection details for invalid `wc_sessionRequest` payloads.
+    #[must_use]
+    pub const fn rejection(&self) -> Option<&SessionRequestRejection> {
+        match self {
+            Self::RejectedSessionRequest(rejection) => Some(rejection),
+            Self::SessionRequest(_)
+            | Self::SessionUpdate(_)
+            | Self::SessionExtend(_)
+            | Self::SessionEvent(_)
+            | Self::SessionPing(_)
+            | Self::SessionDelete(_)
+            | Self::Unsupported(_) => None,
+        }
+    }
+}
+
 /// Protocol error response sent for an invalid `wc_sessionRequest`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRequestRejection {

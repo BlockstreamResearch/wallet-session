@@ -18,10 +18,10 @@ pub use client::{PairingClient, PairingClientConfig};
 pub use error::PairingClientError;
 pub use types::{
     ApprovedSession, PairingPayload, PairingReceivedMessage, PairingSubscription,
-    SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
-    SessionMessageOutcome, SessionPayload, SessionProposalApproval, SessionReceivedMessage,
-    SessionRequestRejection, SessionSettleResponseMessage, SessionSettleResponsePayload,
-    SessionSubscription,
+    SessionClientEvent, SessionLifecycleRequest, SessionLifecycleResponseMessage,
+    SessionLifecycleResponsePayload, SessionMessageOutcome, SessionPayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+    SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
 };
 
 /// Default wait time for one live pairing-topic message.

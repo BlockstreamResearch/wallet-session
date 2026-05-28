@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
     PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
-    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionMessageOutcome,
+    SessionClientEvent, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
     SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload,
 };
@@ -795,14 +795,21 @@ async fn wait_for_session_lifecycle_message(
     lifecycle_action: &str,
 ) -> Result<SessionReceivedMessage> {
     loop {
-        let message = client
-            .next_session_message(subscription, session)
+        let event = client
+            .next_session_event(subscription, session)
             .await?
             .context("no session lifecycle message received")?;
-        match (lifecycle_action, message.payload()) {
-            ("ping", SessionPayload::SessionPing(_))
-            | ("delete", SessionPayload::SessionDelete(_)) => return Ok(message),
-            _ => print_ignored_session_message(&message),
+        match (lifecycle_action, event) {
+            ("ping", SessionClientEvent::SessionPing(message))
+            | ("delete", SessionClientEvent::SessionDelete(message)) => return Ok(message),
+            (_, SessionClientEvent::RejectedSessionRequest(rejection)) => {
+                print_ignored_session_request_rejection(&rejection);
+            }
+            (_, event) => {
+                if let Some(message) = event.message() {
+                    print_ignored_session_message(message);
+                }
+            }
         }
     }
 }
@@ -823,14 +830,21 @@ async fn wait_for_valid_session_request_message(
     session: &Session,
 ) -> Result<SessionReceivedMessage> {
     loop {
-        let message = client
-            .next_session_message(subscription, session)
+        let event = client
+            .next_session_event(subscription, session)
             .await?
             .context("no wc_sessionRequest message received")?;
-        if matches!(message.payload(), SessionPayload::SessionRequest(_)) {
-            return Ok(message);
+        match event {
+            SessionClientEvent::SessionRequest(message) => return Ok(message),
+            SessionClientEvent::RejectedSessionRequest(rejection) => {
+                print_ignored_session_request_rejection(&rejection);
+            }
+            event => {
+                if let Some(message) = event.message() {
+                    print_ignored_session_message(message);
+                }
+            }
         }
-        print_ignored_session_message(&message);
     }
 }
 
@@ -970,15 +984,30 @@ async fn wait_for_session_request_rejection(
     session: &Session,
 ) -> Result<SessionRequestRejection> {
     loop {
-        let outcome = client
-            .next_session_message_or_reject(subscription, session)
+        let event = client
+            .next_session_event(subscription, session)
             .await?
             .context("no adversarial wc_sessionRequest message received")?;
-        match outcome {
-            SessionMessageOutcome::Rejected(rejection) => return Ok(rejection),
-            SessionMessageOutcome::Received(message) => print_ignored_session_message(&message),
+        match event {
+            SessionClientEvent::RejectedSessionRequest(rejection) => return Ok(rejection),
+            event => {
+                if let Some(message) = event.message() {
+                    print_ignored_session_message(message);
+                }
+            }
         }
     }
+}
+
+fn print_ignored_session_request_rejection(rejection: &SessionRequestRejection) {
+    println!(
+        "core-js-session-request ignored_session_request_rejection topic={} id={} code={:?} message={} response_ack={}",
+        rejection.topic(),
+        rejection.request_id(),
+        rejection.error().code,
+        rejection.error().message,
+        rejection.response_ack()
+    );
 }
 
 fn print_ignored_session_message(message: &SessionReceivedMessage) {

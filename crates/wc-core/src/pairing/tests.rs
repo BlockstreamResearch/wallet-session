@@ -663,6 +663,97 @@ fn rejects_unauthorized_session_event() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn classifies_session_request_as_client_event() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let message = SessionReceivedMessage {
+        topic: subscription.topic().clone(),
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1108),
+        payload: SessionPayload::SessionRequest(Box::new(session_request(
+            77,
+            "eip155:1",
+            "personal_sign",
+            Some(4_102_444_700),
+        )?)),
+    };
+
+    let event = SessionClientEvent::from_message(message);
+
+    assert_eq!(event.topic(), subscription.topic());
+    assert!(event.rejection().is_none());
+    match event {
+        SessionClientEvent::SessionRequest(message) => {
+            assert_eq!(message.tag(), Some(1108));
+            assert!(matches!(
+                message.payload(),
+                SessionPayload::SessionRequest(_)
+            ));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn classifies_rejected_session_request_as_client_event() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let rejection = SessionRequestRejection {
+        topic: subscription.topic().clone(),
+        request_id: 77,
+        error: JsonRpcError::new(JsonRpcErrorCode::UnauthorizedMethod, "Unsupported method."),
+        response_ack: true,
+    };
+
+    let event =
+        SessionClientEvent::from_outcome(SessionMessageOutcome::Rejected(rejection.clone()));
+
+    assert_eq!(event.topic(), subscription.topic());
+    assert_eq!(event.message(), None);
+    assert_eq!(event.rejection(), Some(&rejection));
+    assert!(matches!(
+        event,
+        SessionClientEvent::RejectedSessionRequest(_)
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn classifies_unparsed_session_payload_as_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let message = SessionReceivedMessage {
+        topic: subscription.topic().clone(),
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1114),
+        payload: SessionPayload::Sign(SignMethod::SessionPing),
+    };
+
+    let event = SessionClientEvent::from_message(message);
+
+    assert_eq!(event.topic(), subscription.topic());
+    assert!(event.rejection().is_none());
+    match event {
+        SessionClientEvent::Unsupported(message) => {
+            assert!(matches!(message.payload(), SessionPayload::Sign(_)));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
 fn rejects_session_message_before_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",

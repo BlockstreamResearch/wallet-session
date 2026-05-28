@@ -35,9 +35,9 @@ use super::{
         session_request_validation_error,
     },
     types::{
-        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionLifecycleRequest,
-        SessionLifecycleResponseMessage, SessionMessageOutcome, SessionPayload,
-        SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionClientEvent,
+        SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionMessageOutcome,
+        SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
         SessionSettleResponseMessage, SessionSubscription,
     },
 };
@@ -649,6 +649,32 @@ impl PairingClient {
                 )))
             }
         }
+    }
+
+    /// Waits for one wallet-facing event on an acknowledged session topic.
+    ///
+    /// Valid decrypted deliveries become `SessionClientEvent` variants.
+    /// Invalid `wc_sessionRequest` payloads are answered with a JSON-RPC error
+    /// and returned as `RejectedSessionRequest`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/session-events.md#session_request>
+    ///
+    /// > Triggered when a session request is received and should be presented
+    /// > to the user for approval or rejection.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > The client should immediately reject the request and respond an error
+    /// > if the target session permissions doesn't include the requested method
+    /// > or chain ID.
+    pub async fn next_session_event(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+    ) -> Result<Option<SessionClientEvent>, PairingClientError> {
+        self.next_session_message_or_reject(subscription, session)
+            .await
+            .map(|outcome| outcome.map(SessionClientEvent::from_outcome))
     }
 
     /// Publishes a success response for a received `wc_sessionRequest`.

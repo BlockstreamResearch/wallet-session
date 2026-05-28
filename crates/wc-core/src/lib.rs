@@ -15,8 +15,8 @@ pub use pairing::{
     SESSION_SETTLE_REQUEST_TTL_SECONDS, SESSION_SETTLE_RESPONSE_TAG,
     SESSION_SETTLE_RESPONSE_TTL_SECONDS, SESSION_UPDATE_REQUEST_TAG,
     SESSION_UPDATE_REQUEST_TTL_SECONDS, SESSION_UPDATE_RESPONSE_TAG,
-    SESSION_UPDATE_RESPONSE_TTL_SECONDS, SessionLifecycleRequest, SessionLifecycleResponseMessage,
-    SessionLifecycleResponsePayload, SessionMessageOutcome, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+    SESSION_UPDATE_RESPONSE_TTL_SECONDS, SessionClientEvent, SessionLifecycleRequest,
+    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionMessageOutcome,
+    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
 };
