@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -20,10 +19,11 @@ use wc_core::{
     PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG, SessionClientEvent,
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
     SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
-    SessionSettleResponseMessage, SessionSettleResponsePayload,
+    SessionSettleResponseMessage, SessionSettleResponsePayload, WalletCapabilities,
+    WalletChainCapability,
 };
 use wc_protocol::{
-    caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
+    caip::{Caip2ChainId, Caip10AccountId},
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
@@ -34,8 +34,7 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{
-        DappMetadata, ProposalNamespace, Session, SessionEvent, SessionEventName,
-        SessionEventParams, SessionNamespace, SessionNamespaces,
+        DappMetadata, Session, SessionEvent, SessionEventName, SessionEventParams, SessionMethod,
     },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
@@ -587,12 +586,7 @@ async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Res
         proposal.proposal_id(),
         proposal.pairing_topic()
     );
-    let namespaces = approved_namespaces_for_probe(proposal.request())?;
-    let approval = SessionProposalApproval::new(
-        namespaces,
-        probe_wallet_metadata(),
-        unix_timestamp() + DEFAULT_SESSION_EXPIRY_SECONDS,
-    );
+    let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
     println!(
         "core-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={}",
@@ -1377,12 +1371,7 @@ async fn run_core_pairing_uri_approve_probe(
         }
     };
 
-    let namespaces = approved_namespaces_for_probe(&proposal)?;
-    let approval = SessionProposalApproval::new(
-        namespaces,
-        probe_wallet_metadata(),
-        unix_timestamp() + DEFAULT_SESSION_EXPIRY_SECONDS,
-    );
+    let approval = approval_for_probe(&proposal)?;
     let approved = client
         .approve_session_proposal(&subscription, &proposal, approval)
         .await?;
@@ -1674,67 +1663,62 @@ fn first_session_proposal_request(
     })
 }
 
-fn approved_namespaces_for_probe(
+fn approval_for_probe(
     proposal: &JsonRpcRequest<SessionProposeParams>,
-) -> Result<SessionNamespaces> {
-    let proposal_namespaces = if proposal.params.optional_namespaces.is_empty() {
-        &proposal.params.required_namespaces
-    } else {
-        &proposal.params.optional_namespaces
-    };
-
-    if proposal_namespaces.is_empty() {
-        bail!("session proposal has no required or optional namespaces");
-    }
-
-    let mut approved = BTreeMap::<NamespaceKey, SessionNamespace>::new();
-    for (key, namespace) in proposal_namespaces {
-        let chains = proposal_namespace_chains(key, namespace)?;
-        let approved_key = NamespaceKey::parse(key.namespace())?;
-        let entry = approved.entry(approved_key).or_insert(SessionNamespace {
-            chains: Some(Vec::new()),
-            accounts: Vec::new(),
-            methods: Vec::new(),
-            events: Vec::new(),
-        });
-
-        for chain in chains {
-            insert_unique(entry.chains.get_or_insert_with(Vec::new), chain.clone());
-            let account = probe_account_for_chain(&chain)?;
-            insert_unique(&mut entry.accounts, account);
-        }
-        for method in &namespace.methods {
-            insert_unique(&mut entry.methods, method.clone());
-        }
-        for event in &namespace.events {
-            insert_unique(&mut entry.events, event.clone());
-        }
-    }
-
-    Ok(approved)
+) -> Result<SessionProposalApproval> {
+    probe_wallet_capabilities()?
+        .plan_session_approval(
+            proposal,
+            probe_wallet_metadata(),
+            unix_timestamp() + DEFAULT_SESSION_EXPIRY_SECONDS,
+        )
+        .map_err(Into::into)
 }
 
-fn proposal_namespace_chains(
-    key: &NamespaceKey,
-    namespace: &ProposalNamespace,
-) -> Result<Vec<Caip2ChainId>> {
-    if let Some(chains) = &namespace.chains {
-        if !chains.is_empty() {
-            return Ok(chains.clone());
-        }
-    }
-
-    if let Some(chain_id) = key.chain_id() {
-        return Ok(vec![chain_id.clone()]);
-    }
-
-    bail!("proposal namespace {key} has no chains")
-}
-
-fn probe_account_for_chain(chain: &Caip2ChainId) -> Result<Caip10AccountId> {
+fn probe_wallet_capabilities() -> Result<WalletCapabilities> {
+    let chains = env_list("WC_APPROVAL_CHAINS", "eip155:1")?
+        .into_iter()
+        .map(Caip2ChainId::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let methods = env_list("WC_APPROVAL_METHODS", "personal_sign,eth_signTypedData_v4")?
+        .into_iter()
+        .map(SessionMethod::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = env_list("WC_APPROVAL_EVENTS", "accountsChanged,chainChanged")?
+        .into_iter()
+        .map(SessionEventName::parse)
+        .collect::<Result<Vec<_>, _>>()?;
     let address = env::var("WC_APPROVAL_ACCOUNT_ADDRESS")
         .unwrap_or_else(|_| "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".to_owned());
-    Caip10AccountId::parse(format!("{chain}:{address}")).map_err(Into::into)
+
+    let mut capabilities = Vec::new();
+    for chain in chains {
+        let account = Caip10AccountId::from_parts(&chain, &address)?;
+        capabilities.push(WalletChainCapability::new(
+            chain,
+            vec![account],
+            methods.clone(),
+            events.clone(),
+        )?);
+    }
+
+    WalletCapabilities::new(capabilities).map_err(Into::into)
+}
+
+fn env_list(name: &str, default: &str) -> Result<Vec<String>> {
+    let value = env::var(name).unwrap_or_else(|_| default.to_owned());
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    if values.is_empty() {
+        bail!("{name} must contain at least one comma-separated value");
+    }
+
+    Ok(values)
 }
 
 fn probe_wallet_metadata() -> DappMetadata {
@@ -1745,15 +1729,6 @@ fn probe_wallet_metadata() -> DappMetadata {
         icons: vec!["https://walletconnect.com/walletconnect-logo.png".to_owned()],
         verify_url: None,
         redirect: None,
-    }
-}
-
-fn insert_unique<T>(items: &mut Vec<T>, value: T)
-where
-    T: Eq,
-{
-    if !items.contains(&value) {
-        items.push(value);
     }
 }
 
