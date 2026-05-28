@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -13,8 +14,12 @@ use crate::util::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
-use wc_core::{PairingClient, PairingClientConfig, PairingPayload, PairingReceivedMessage};
+use wc_core::{
+    ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
+    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
+};
 use wc_protocol::{
+    caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
@@ -24,14 +29,15 @@ use wc_protocol::{
         DEFAULT_RELAY_URL, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
+    session::{DappMetadata, ProposalNamespace, SessionNamespace, SessionNamespaces},
     session::{JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, SessionProposeParams, SignMethod},
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const JS_HARNESS_URI_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const JS_HARNESS_URI_FILE: &str = "target/live-pairing-uri.txt";
-const JS_HARNESS_RESULT_FILE: &str = "target/live-pairing-result.json";
+const JS_HARNESS_URI_FILE_STEM: &str = "live-pairing-uri";
+const JS_HARNESS_RESULT_FILE_STEM: &str = "live-pairing-result";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeMode {
@@ -39,6 +45,7 @@ pub enum ProbeMode {
     Matrix,
     JsProposal,
     CoreJsProposal,
+    CoreJsApproveProposal,
     CoreJsRejectProposal,
     PairingUri(String),
 }
@@ -51,6 +58,7 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::Matrix => run_probe_matrix(&config).await,
         ProbeMode::JsProposal => run_js_proposal_probe(&config).await,
         ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
+        ProbeMode::CoreJsApproveProposal => run_core_js_approve_proposal_probe(&config).await,
         ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
@@ -117,6 +125,12 @@ async fn wait_for_js_pairing_uri(uri_file: &Path, child: &mut Child) -> Result<S
 
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn js_harness_file(workspace_root: &Path, stem: &str, extension: &str) -> PathBuf {
+    workspace_root
+        .join("target")
+        .join(format!("{stem}-{}.{extension}", std::process::id()))
 }
 
 async fn wait_for_js_result(result_file: &Path, child: &mut Child) -> Result<Value> {
@@ -233,7 +247,7 @@ async fn run_basic_probe(config: &RelayProbeConfig) -> Result<()> {
 async fn run_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
     let workspace_root = workspace_root()?;
     let harness_dir = workspace_root.join("tools/js-harness");
-    let uri_file = workspace_root.join(JS_HARNESS_URI_FILE);
+    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
     if let Some(parent) = uri_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -270,7 +284,7 @@ async fn run_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
 async fn run_core_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
     let workspace_root = workspace_root()?;
     let harness_dir = workspace_root.join("tools/js-harness");
-    let uri_file = workspace_root.join(JS_HARNESS_URI_FILE);
+    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
     if let Some(parent) = uri_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -307,8 +321,8 @@ async fn run_core_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
 async fn run_core_js_reject_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
     let workspace_root = workspace_root()?;
     let harness_dir = workspace_root.join("tools/js-harness");
-    let uri_file = workspace_root.join(JS_HARNESS_URI_FILE);
-    let result_file = workspace_root.join(JS_HARNESS_RESULT_FILE);
+    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+    let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
     if let Some(parent) = uri_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -345,6 +359,64 @@ async fn run_core_js_reject_proposal_probe(config: &RelayProbeConfig) -> Result<
         bail!("expected JS approval_error result, got {result}");
     }
     println!("core-js-reject-proposal js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let harness_dir = workspace_root.join("tools/js-harness");
+    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+    let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
+    if let Some(parent) = uri_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(&uri_file);
+    let _ = fs::remove_file(&result_file);
+
+    let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+    println!(
+        "core-js-approve-proposal harness_dir={} uri_file={} result_file={} hold_ms={hold_ms}",
+        harness_dir.display(),
+        uri_file.display(),
+        result_file.display()
+    );
+
+    let child = Command::new("bun")
+        .args(["run", "propose-session"])
+        .current_dir(&harness_dir)
+        .env("WC_JS_URI_FILE", &uri_file)
+        .env("WC_JS_RESULT_FILE", &result_file)
+        .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+        .env_remove("WC_JS_PRINT_URI")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
+    let mut harness = ChildGuard::new(child);
+    let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
+
+    let (mut client, pairing_subscription, approved) =
+        run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
+    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
+    if result.get("outcome").and_then(Value::as_str) != Some("approved") {
+        bail!("expected JS approved result, got {result}");
+    }
+    println!("core-js-approve-proposal js_result={result}");
+
+    let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
+    println!("core-pairing-approve unsubscribe_ack={unsubscribe_result}");
+    println!(
+        "core-pairing-approve session_topic={} session_subscription_id={} responder_public_key={} proposal_response_ack={} session_settle_ack={}",
+        approved.session_topic(),
+        approved.subscription().subscription_id(),
+        approved.responder_public_key(),
+        approved.proposal_response_ack(),
+        approved.session_settle_ack()
+    );
     harness.terminate();
 
     Ok(())
@@ -429,6 +501,86 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
     println!("pairing-uri unsubscribe_ack={unsubscribe_result}");
 
     Ok(())
+}
+
+async fn run_core_pairing_uri_approve_probe(
+    config: &RelayProbeConfig,
+    uri: &str,
+) -> Result<(PairingClient, PairingSubscription, ApprovedSession)> {
+    let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-approve-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    println!(
+        "core-pairing-approve project_id={} relay_url={} topic={} version={} relay_protocol={} sym_key={} expiry={:?} expired_now={}",
+        redact(&config.project_id),
+        config.relay_url,
+        pairing.topic(),
+        pairing.version(),
+        pairing.relay().protocol(),
+        redact(pairing.sym_key().as_str()),
+        pairing.expiry_timestamp(),
+        pairing.is_expired_at(unix_timestamp())
+    );
+
+    let mut client = PairingClient::connect(&client_config).await?;
+    println!("core-pairing-approve connected status={}", client.status());
+
+    let fetched = client.fetch_pairing_messages(&pairing).await?;
+    println!(
+        "core-pairing-approve fetch_messages count={}",
+        fetched.len()
+    );
+    for (index, message) in fetched.iter().enumerate() {
+        print_core_pairing_payload_metadata(
+            &format!("core-pairing-approve fetched index={index}"),
+            message,
+        )?;
+    }
+
+    let subscription = client.subscribe_pairing(&pairing).await?;
+    println!(
+        "core-pairing-approve subscription_id={}",
+        subscription.subscription_id()
+    );
+
+    let proposal = if let Some(proposal) = first_session_proposal_request(&fetched) {
+        proposal
+    } else {
+        match client.next_pairing_message(&subscription).await? {
+            Some(message) => {
+                print_core_pairing_payload_metadata("core-pairing-approve live_message", &message)?;
+                first_session_proposal_request(std::slice::from_ref(&message))
+                    .context("live pairing message was not wc_sessionPropose")?
+            }
+            None => bail!("no wc_sessionPropose message received"),
+        }
+    };
+
+    let namespaces = approved_namespaces_for_probe(&proposal)?;
+    let approval = SessionProposalApproval::new(
+        namespaces,
+        probe_wallet_metadata(),
+        unix_timestamp() + DEFAULT_SESSION_EXPIRY_SECONDS,
+    );
+    let approved = client
+        .approve_session_proposal(&subscription, &proposal, approval)
+        .await?;
+    println!(
+        "core-pairing-approve proposal_id={} session_topic={} proposal_response_ack={} session_settle_ack={}",
+        proposal.id,
+        approved.session_topic(),
+        approved.proposal_response_ack(),
+        approved.session_settle_ack()
+    );
+
+    Ok((client, subscription, approved))
 }
 
 async fn run_core_pairing_uri_reject_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
@@ -559,6 +711,98 @@ fn first_session_proposal_id(messages: &[PairingReceivedMessage]) -> Option<u64>
         PairingPayload::SessionProposal(request) => Some(request.id),
         _ => None,
     })
+}
+
+fn first_session_proposal_request(
+    messages: &[PairingReceivedMessage],
+) -> Option<JsonRpcRequest<SessionProposeParams>> {
+    messages.iter().find_map(|message| match message.payload() {
+        PairingPayload::SessionProposal(request) => Some((**request).clone()),
+        _ => None,
+    })
+}
+
+fn approved_namespaces_for_probe(
+    proposal: &JsonRpcRequest<SessionProposeParams>,
+) -> Result<SessionNamespaces> {
+    let proposal_namespaces = if proposal.params.optional_namespaces.is_empty() {
+        &proposal.params.required_namespaces
+    } else {
+        &proposal.params.optional_namespaces
+    };
+
+    if proposal_namespaces.is_empty() {
+        bail!("session proposal has no required or optional namespaces");
+    }
+
+    let mut approved = BTreeMap::<NamespaceKey, SessionNamespace>::new();
+    for (key, namespace) in proposal_namespaces {
+        let chains = proposal_namespace_chains(key, namespace)?;
+        let approved_key = NamespaceKey::parse(key.namespace())?;
+        let entry = approved.entry(approved_key).or_insert(SessionNamespace {
+            chains: Some(Vec::new()),
+            accounts: Vec::new(),
+            methods: Vec::new(),
+            events: Vec::new(),
+        });
+
+        for chain in chains {
+            insert_unique(entry.chains.get_or_insert_with(Vec::new), chain.clone());
+            let account = probe_account_for_chain(&chain)?;
+            insert_unique(&mut entry.accounts, account);
+        }
+        for method in &namespace.methods {
+            insert_unique(&mut entry.methods, method.clone());
+        }
+        for event in &namespace.events {
+            insert_unique(&mut entry.events, event.clone());
+        }
+    }
+
+    Ok(approved)
+}
+
+fn proposal_namespace_chains(
+    key: &NamespaceKey,
+    namespace: &ProposalNamespace,
+) -> Result<Vec<Caip2ChainId>> {
+    if let Some(chains) = &namespace.chains {
+        if !chains.is_empty() {
+            return Ok(chains.clone());
+        }
+    }
+
+    if let Some(chain_id) = key.chain_id() {
+        return Ok(vec![chain_id.clone()]);
+    }
+
+    bail!("proposal namespace {key} has no chains")
+}
+
+fn probe_account_for_chain(chain: &Caip2ChainId) -> Result<Caip10AccountId> {
+    let address = env::var("WC_APPROVAL_ACCOUNT_ADDRESS")
+        .unwrap_or_else(|_| "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".to_owned());
+    Caip10AccountId::parse(format!("{chain}:{address}")).map_err(Into::into)
+}
+
+fn probe_wallet_metadata() -> DappMetadata {
+    DappMetadata {
+        name: "walletconnect-client-poc Rust wallet".to_owned(),
+        description: "Live WalletConnect approval probe for Rust core".to_owned(),
+        url: "https://github.com/BlockstreamResearch/walletconnect-client-poc".to_owned(),
+        icons: vec!["https://walletconnect.com/walletconnect-logo.png".to_owned()],
+        verify_url: None,
+        redirect: None,
+    }
+}
+
+fn insert_unique<T>(items: &mut Vec<T>, value: T)
+where
+    T: Eq,
+{
+    if !items.contains(&value) {
+        items.push(value);
+    }
 }
 
 fn print_pairing_payload_metadata(

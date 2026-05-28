@@ -1,11 +1,16 @@
 //! Pairing-topic receive behavior.
 
-use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH},
+};
 
 use tokio::time::timeout;
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding, EnvelopeError},
+    key::{X25519KeyPair, X25519KeyPairError, derive_shared_sym_key, derive_topic_from_sym_key},
+    namespaces::{NamespaceValidationError, validate_approved_namespaces},
     pairing::{PairingSymKey, PairingUri, PairingUriError},
     pairing_message::{PairingMessage, PairingMessageError, PairingMessageMethod},
     relay::{
@@ -13,14 +18,39 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{
-        JsonRpcError, JsonRpcRequest, SessionProposeParams, SignMethod,
+        DappMetadata, JsonRpcError, JsonRpcRequest, JsonRpcResponse, RelayProtocolOptions,
+        ScopedProperties, SessionConfig, SessionNamespaces, SessionParticipant, SessionProperties,
+        SessionProposeParams, SessionProposeResult, SessionSettleParams, SignMethod,
         session_propose_error_response,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
 
+static SIGN_RPC_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
+
 /// Default wait time for one live pairing-topic message.
 pub const DEFAULT_PAIRING_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default session lifetime used by the first approval primitive.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/constants/session.ts#L1-L5>
+///
+/// > export const SESSION_EXPIRY = SEVEN_DAYS;
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L482-L486>
+///
+/// > const sessionSettle = {
+/// > relay: { protocol: relayProtocol ?? "irn" },
+/// > namespaces,
+/// > expiry: calcExpiry(SESSION_EXPIRY),
+pub const DEFAULT_SESSION_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Relay tag used for approved `wc_sessionPropose` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L13-L17>
+///
+/// > res: { ttl: FIVE_MINUTES, prompt: false, tag: 1101 }
+pub const SESSION_PROPOSE_RESPONSE_TAG: u64 = 1101;
 
 /// Relay tag used for rejected `wc_sessionPropose` responses.
 ///
@@ -29,12 +59,33 @@ pub const DEFAULT_PAIRING_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// > reject: { ttl: FIVE_MINUTES, prompt: false, tag: 1120 }
 pub const SESSION_PROPOSE_REJECT_TAG: u64 = 1120;
 
+/// Relay tag used for `wc_sessionSettle` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L29-L34>
+///
+/// > req: { ttl: FIVE_MINUTES, prompt: false, tag: 1102 }
+pub const SESSION_SETTLE_REQUEST_TAG: u64 = 1102;
+
+/// Relay retention window for approved `wc_sessionPropose` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L13-L17>
+///
+/// > res: { ttl: FIVE_MINUTES, prompt: false, tag: 1101 }
+pub const SESSION_PROPOSE_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
+
 /// Relay retention window for rejected `wc_sessionPropose` responses.
 ///
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L18-L22>
 ///
 /// > reject: { ttl: FIVE_MINUTES, prompt: false, tag: 1120 }
 pub const SESSION_PROPOSE_REJECT_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay retention window for `wc_sessionSettle` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L29-L34>
+///
+/// > req: { ttl: FIVE_MINUTES, prompt: false, tag: 1102 }
+pub const SESSION_SETTLE_REQUEST_TTL_SECONDS: u64 = 5 * 60;
 
 /// Configuration for a native pairing-topic relay client.
 ///
@@ -243,6 +294,69 @@ impl PairingClient {
             .map_err(|source| PairingClientError::Relay { source })
     }
 
+    /// Approves a `wc_sessionPropose` request and publishes the settlement request.
+    ///
+    /// The first approval primitive follows the maintained Sign Client order:
+    /// derive the session topic, subscribe to it, publish the proposal success
+    /// response on the pairing topic, then publish `wc_sessionSettle` on the
+    /// derived session topic.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L475-L498>
+    ///
+    /// > const selfPublicKey = await this.client.core.crypto.generateKeyPair();
+    /// > const sessionTopic = await this.client.core.crypto.generateSharedKey(
+    /// > await this.client.core.relayer.subscribe(sessionTopic, {
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L528-L548>
+    ///
+    /// > await this.sendApproveSession({
+    /// > sessionTopic,
+    /// > proposal,
+    pub async fn approve_session_proposal(
+        &mut self,
+        subscription: &PairingSubscription,
+        proposal: &JsonRpcRequest<SessionProposeParams>,
+        approval: SessionProposalApproval,
+    ) -> Result<ApprovedSession, PairingClientError> {
+        let responder =
+            X25519KeyPair::generate().map_err(|source| PairingClientError::KeyPair { source })?;
+        let settle_request_id = next_sign_rpc_id()?;
+        let approval_messages = session_proposal_approval_publishes(
+            subscription,
+            proposal,
+            approval,
+            &responder,
+            settle_request_id,
+        )?;
+        let session_subscription_id = self
+            .relay
+            .subscribe(approval_messages.session_topic.clone())
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        let proposal_response_ack = self
+            .relay
+            .publish(approval_messages.proposal_response)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+        let session_settle_ack = self
+            .relay
+            .publish(approval_messages.session_settle)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(ApprovedSession {
+            subscription: SessionSubscription {
+                topic: approval_messages.session_topic,
+                sym_key: approval_messages.session_sym_key,
+                subscription_id: session_subscription_id,
+            },
+            responder_public_key: responder.public_key().clone(),
+            proposal_response_ack,
+            session_settle_ack,
+        })
+    }
+
     /// Publishes a `wc_sessionPropose` JSON-RPC error response.
     ///
     /// This rejects the proposal on the pairing topic. Approval is intentionally
@@ -266,6 +380,116 @@ impl PairingClient {
             .publish(publish)
             .await
             .map_err(|source| PairingClientError::Relay { source })
+    }
+}
+
+/// Application data needed to approve a session proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProposalApproval {
+    /// Relay protocol selected for the session.
+    pub relay: RelayProtocolOptions,
+    /// Approved namespaces with accounts.
+    pub namespaces: SessionNamespaces,
+    /// Wallet metadata sent as the session controller.
+    pub wallet_metadata: DappMetadata,
+    /// Absolute session expiry timestamp in unix seconds.
+    pub expiry: u64,
+    /// Optional string session properties.
+    pub session_properties: Option<SessionProperties>,
+    /// Optional namespace-scoped properties.
+    pub scoped_properties: Option<ScopedProperties>,
+    /// Optional session configuration.
+    pub session_config: Option<SessionConfig>,
+    /// Optional proposal subrequest responses.
+    pub proposal_requests_responses: Option<serde_json::Value>,
+}
+
+impl SessionProposalApproval {
+    /// Builds approval data with the default `irn` relay protocol.
+    #[must_use]
+    pub fn new(namespaces: SessionNamespaces, wallet_metadata: DappMetadata, expiry: u64) -> Self {
+        Self {
+            relay: RelayProtocolOptions {
+                protocol: "irn".to_owned(),
+                data: None,
+            },
+            namespaces,
+            wallet_metadata,
+            expiry,
+            session_properties: None,
+            scoped_properties: None,
+            session_config: None,
+            proposal_requests_responses: None,
+        }
+    }
+}
+
+/// Active relay subscription for one approved session topic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSubscription {
+    topic: RelayTopic,
+    sym_key: PairingSymKey,
+    subscription_id: String,
+}
+
+impl SessionSubscription {
+    /// Session relay topic registered on the connection.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Symmetric key derived for the approved session topic.
+    #[must_use]
+    pub const fn sym_key(&self) -> &PairingSymKey {
+        &self.sym_key
+    }
+
+    /// Subscription ID returned by `irn_subscribe`.
+    #[must_use]
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+}
+
+/// Result of publishing the first session approval messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedSession {
+    subscription: SessionSubscription,
+    responder_public_key: wc_protocol::key::X25519PublicKey,
+    proposal_response_ack: bool,
+    session_settle_ack: bool,
+}
+
+impl ApprovedSession {
+    /// Active relay subscription for the approved session topic.
+    #[must_use]
+    pub const fn subscription(&self) -> &SessionSubscription {
+        &self.subscription
+    }
+
+    /// Derived session topic.
+    #[must_use]
+    pub const fn session_topic(&self) -> &RelayTopic {
+        self.subscription.topic()
+    }
+
+    /// Wallet responder public key sent to the dapp.
+    #[must_use]
+    pub const fn responder_public_key(&self) -> &wc_protocol::key::X25519PublicKey {
+        &self.responder_public_key
+    }
+
+    /// Relay ack for the proposal success response publish.
+    #[must_use]
+    pub const fn proposal_response_ack(&self) -> bool {
+        self.proposal_response_ack
+    }
+
+    /// Relay ack for the `wc_sessionSettle` request publish.
+    #[must_use]
+    pub const fn session_settle_ack(&self) -> bool {
+        self.session_settle_ack
     }
 }
 
@@ -409,6 +633,22 @@ pub enum PairingClientError {
         source: RelayClientError,
     },
 
+    /// Responder X25519 key generation failed.
+    #[error("pairing key generation failed")]
+    KeyPair {
+        /// Source X25519 key-pair error.
+        #[source]
+        source: X25519KeyPairError,
+    },
+
+    /// Approved namespaces do not satisfy the proposal.
+    #[error("pairing namespace validation failed")]
+    Namespace {
+        /// Source namespace validation error.
+        #[source]
+        source: NamespaceValidationError,
+    },
+
     /// No live pairing message arrived before the configured timeout.
     #[error("pairing receive timed out after {timeout:?}")]
     ReceiveTimedOut {
@@ -433,6 +673,15 @@ pub enum PairingClientError {
         source: PairingMessageError,
     },
 
+    /// Proposal params and active subscription disagree on the pairing topic.
+    #[error("session proposal pairing topic does not match active subscription")]
+    ProposalPairingTopicMismatch {
+        /// Topic from the active pairing subscription.
+        expected: RelayTopic,
+        /// Topic duplicated in the session proposal params.
+        actual: RelayTopic,
+    },
+
     /// Outbound pairing message envelope encryption failed.
     #[error("pairing envelope failed")]
     Envelope {
@@ -447,6 +696,13 @@ pub enum PairingClientError {
         /// Source DTO parse error.
         #[source]
         source: serde_json::Error,
+    },
+
+    /// Sign JSON-RPC ID construction failed.
+    #[error("sign rpc id construction failed")]
+    SignRpcId {
+        /// Source numeric overflow or system-clock failure.
+        source: SignRpcIdError,
     },
 }
 
@@ -492,6 +748,31 @@ fn now_unix_seconds() -> Result<u64, PairingClientError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|source| PairingClientError::Clock { source })?
         .as_secs())
+}
+
+/// Returns unix milliseconds for Sign JSON-RPC ID generation.
+fn now_unix_millis() -> Result<u64, SignRpcIdError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| SignRpcIdError::Clock { source })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| SignRpcIdError::Overflow)
+}
+
+/// Builds a Sign JSON-RPC ID using the same timestamp-plus-entropy layout as JS.
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/payload.ts#L12-L18>
+///
+/// > const date = BigInt(Date.now()) * BigInt(1000000);
+fn next_sign_rpc_id() -> Result<u64, PairingClientError> {
+    let entropy = u64::from(SIGN_RPC_ID_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000);
+    now_unix_millis()
+        .map_err(|source| PairingClientError::SignRpcId { source })?
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(entropy))
+        .ok_or(SignRpcIdError::Overflow)
+        .map_err(|source| PairingClientError::SignRpcId { source })
 }
 
 /// Rejects pairing URIs that cannot receive valid proposals anymore.
@@ -560,6 +841,126 @@ where
         .map_err(|source| PairingClientError::PairingPayload { source })
 }
 
+struct SessionProposalApprovalPublishes {
+    session_topic: RelayTopic,
+    session_sym_key: PairingSymKey,
+    proposal_response: IrnPublish,
+    session_settle: IrnPublish,
+}
+
+/// Builds the encrypted relay publish payloads for proposal approval.
+///
+/// The maintained Sign Client formats one JSON-RPC result on the pairing topic
+/// and one `wc_sessionSettle` request on the derived session topic.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1746-L1786>
+///
+/// > const pairingPayload = formatJsonRpcResult(proposal.id, pairingProposalResponse);
+/// > const sessionSettlePayload = formatJsonRpcRequest(
+/// > "wc_sessionSettle",
+fn session_proposal_approval_publishes(
+    subscription: &PairingSubscription,
+    proposal: &JsonRpcRequest<SessionProposeParams>,
+    approval: SessionProposalApproval,
+    responder: &X25519KeyPair,
+    settle_request_id: u64,
+) -> Result<SessionProposalApprovalPublishes, PairingClientError> {
+    validate_session_proposal_approval(subscription, proposal, &approval)?;
+
+    let session_sym_key = derive_shared_sym_key(
+        responder.private_key(),
+        &proposal.params.proposer.public_key,
+    );
+    let session_topic = derive_topic_from_sym_key(&session_sym_key);
+
+    let proposal_response = JsonRpcResponse::new(
+        proposal.id,
+        SessionProposeResult {
+            relay: approval.relay.clone(),
+            responder_public_key: responder.public_key().clone(),
+        },
+    );
+    let proposal_response = encrypted_json_publish(
+        subscription.topic.clone(),
+        &subscription.sym_key,
+        &proposal_response,
+        SESSION_PROPOSE_RESPONSE_TTL_SECONDS,
+        SESSION_PROPOSE_RESPONSE_TAG,
+    )?;
+
+    let session_settle = JsonRpcRequest::new(
+        settle_request_id,
+        SignMethod::SessionSettle,
+        SessionSettleParams {
+            relay: approval.relay,
+            namespaces: approval.namespaces,
+            controller: SessionParticipant {
+                public_key: responder.public_key().clone(),
+                metadata: approval.wallet_metadata,
+            },
+            expiry: approval.expiry,
+            session_properties: approval.session_properties,
+            scoped_properties: approval.scoped_properties,
+            session_config: approval.session_config,
+            special_namespaces: None,
+            proposal_requests_responses: approval.proposal_requests_responses,
+        },
+    );
+    let session_settle = encrypted_json_publish(
+        session_topic.clone(),
+        &session_sym_key,
+        &session_settle,
+        SESSION_SETTLE_REQUEST_TTL_SECONDS,
+        SESSION_SETTLE_REQUEST_TAG,
+    )?;
+
+    Ok(SessionProposalApprovalPublishes {
+        session_topic,
+        session_sym_key,
+        proposal_response,
+        session_settle,
+    })
+}
+
+/// Checks proposal-level invariants before encrypting approval messages.
+fn validate_session_proposal_approval(
+    subscription: &PairingSubscription,
+    proposal: &JsonRpcRequest<SessionProposeParams>,
+    approval: &SessionProposalApproval,
+) -> Result<(), PairingClientError> {
+    if let Some(pairing_topic) = &proposal.params.pairing_topic
+        && pairing_topic != &subscription.topic
+    {
+        return Err(PairingClientError::ProposalPairingTopicMismatch {
+            expected: subscription.topic.clone(),
+            actual: pairing_topic.clone(),
+        });
+    }
+
+    validate_approved_namespaces(&proposal.params.required_namespaces, &approval.namespaces)
+        .map_err(|source| PairingClientError::Namespace { source })
+}
+
+/// Serializes a Sign JSON-RPC payload and encrypts it as a relay publish message.
+fn encrypted_json_publish<T>(
+    topic: RelayTopic,
+    sym_key: &PairingSymKey,
+    payload: &T,
+    ttl: u64,
+    tag: u64,
+) -> Result<IrnPublish, PairingClientError>
+where
+    T: serde::Serialize,
+{
+    let plaintext = serde_json::to_string(payload)
+        .map_err(|source| PairingClientError::PairingPayload { source })?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, sym_key)
+        .map_err(|source| PairingClientError::Envelope { source })?;
+    let message = envelope.encode(EnvelopeEncoding::Base64);
+
+    Ok(IrnPublish::new(topic, message, ttl, tag))
+}
+
 /// Builds the encrypted relay publish payload for proposal rejection.
 ///
 /// This helper keeps outbound encoding deterministic enough for unit tests:
@@ -576,18 +977,29 @@ fn session_proposal_reject_publish(
     error: JsonRpcError,
 ) -> Result<IrnPublish, PairingClientError> {
     let response = session_propose_error_response(proposal_id, error);
-    let plaintext = serde_json::to_string(&response)
-        .map_err(|source| PairingClientError::PairingPayload { source })?;
-    let envelope = Envelope::encrypt_type_0(&plaintext, &subscription.sym_key)
-        .map_err(|source| PairingClientError::Envelope { source })?;
-    let message = envelope.encode(EnvelopeEncoding::Base64);
-
-    Ok(IrnPublish::new(
+    encrypted_json_publish(
         subscription.topic.clone(),
-        message,
+        &subscription.sym_key,
+        &response,
         SESSION_PROPOSE_REJECT_TTL_SECONDS,
         SESSION_PROPOSE_REJECT_TAG,
-    ))
+    )
+}
+
+/// Sign JSON-RPC ID generation failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SignRpcIdError {
+    /// System clock is before the unix epoch.
+    #[error("system clock is before the unix epoch")]
+    Clock {
+        /// Source system time error.
+        #[source]
+        source: SystemTimeError,
+    },
+
+    /// Timestamp-based ID construction exceeded `u64`.
+    #[error("sign rpc id overflow")]
+    Overflow,
 }
 
 #[cfg(test)]
@@ -595,9 +1007,13 @@ mod tests {
     use super::*;
     use wc_protocol::{
         envelope::{Envelope, EnvelopeEncoding},
+        key::{X25519KeyPair, X25519PrivateKey},
         pairing::PairingSymKey,
         relay::IrnSubscriptionData,
-        session::{JsonRpcErrorCode, SessionProposeErrorResponse},
+        session::{
+            DappMetadata, JsonRpcErrorCode, SessionNamespace, SessionProposeErrorResponse,
+            SessionProposeResult, SessionSettleParams,
+        },
     };
 
     const PAIRING_URI: &str = concat!(
@@ -737,6 +1153,82 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn builds_session_proposal_approval_publishes() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        )?;
+        let subscription = PairingSubscription {
+            topic: RelayTopic::from_hex("11".repeat(32))?,
+            sym_key: sym_key.clone(),
+            subscription_id: "sub-1".to_owned(),
+        };
+        let proposal = session_proposal_request()?;
+        let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
+            "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+        )?);
+        let approval = SessionProposalApproval::new(
+            std::collections::BTreeMap::from([(
+                "eip155".parse()?,
+                SessionNamespace {
+                    chains: Some(vec!["eip155:1".parse()?]),
+                    accounts: vec!["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?],
+                    methods: vec!["personal_sign".parse()?],
+                    events: vec!["accountsChanged".parse()?],
+                },
+            )]),
+            wallet_metadata(),
+            4_102_444_800,
+        );
+
+        let publishes =
+            session_proposal_approval_publishes(&subscription, &proposal, approval, &responder, 9)?;
+
+        assert_eq!(publishes.proposal_response.topic, *subscription.topic());
+        assert_eq!(
+            publishes.proposal_response.ttl,
+            SESSION_PROPOSE_RESPONSE_TTL_SECONDS
+        );
+        assert_eq!(
+            publishes.proposal_response.tag,
+            SESSION_PROPOSE_RESPONSE_TAG
+        );
+        assert_eq!(publishes.session_settle.topic, publishes.session_topic);
+        assert_eq!(
+            publishes.session_settle.ttl,
+            SESSION_SETTLE_REQUEST_TTL_SECONDS
+        );
+        assert_eq!(publishes.session_settle.tag, SESSION_SETTLE_REQUEST_TAG);
+
+        let proposal_response = decrypt_publish::<JsonRpcResponse<SessionProposeResult>>(
+            &publishes.proposal_response,
+            &sym_key,
+        )?;
+        assert_eq!(proposal_response.id, proposal.id);
+        assert_eq!(
+            proposal_response.result.responder_public_key,
+            *responder.public_key()
+        );
+
+        let settle_request = decrypt_publish::<JsonRpcRequest<SessionSettleParams>>(
+            &publishes.session_settle,
+            &publishes.session_sym_key,
+        )?;
+        assert_eq!(settle_request.id, 9);
+        assert_eq!(settle_request.method, SignMethod::SessionSettle);
+        assert_eq!(
+            settle_request.params.controller.public_key,
+            *responder.public_key()
+        );
+        assert_eq!(
+            settle_request.params.controller.metadata.name,
+            "Rust Wallet"
+        );
+        assert_eq!(settle_request.params.namespaces["eip155"].accounts.len(), 1);
+
+        Ok(())
+    }
+
     fn encrypted_subscription_data(
         plaintext: &str,
         sym_key: &PairingSymKey,
@@ -748,5 +1240,43 @@ mod tests {
             published_at: 1_700_000_000_000,
             tag: Some(1100),
         })
+    }
+
+    fn session_proposal_request()
+    -> Result<JsonRpcRequest<SessionProposeParams>, Box<dyn std::error::Error>> {
+        let json = concat!(
+            r#"{"id":7,"jsonrpc":"2.0","method":"wc_sessionPropose","params":{"#,
+            r#""id":7,"pairingTopic":"1111111111111111111111111111111111111111111111111111111111111111","#,
+            r#""expiryTimestamp":4102444800,"relays":[{"protocol":"irn"}],"#,
+            r#""proposer":{"publicKey":"80dd64bd6e4c3612ff0f5ccbe9282f1f11ba56ada6a2f9740da063d1ed1f2b20","#,
+            r#""metadata":{"name":"Probe Dapp","description":"Probe","url":"https://example.com","icons":[]}},"#,
+            r#""requiredNamespaces":{"eip155":{"chains":["eip155:1"],"methods":["personal_sign"],"events":["accountsChanged"]}},"#,
+            r#""optionalNamespaces":{}}}"#
+        );
+
+        serde_json::from_str(json).map_err(Into::into)
+    }
+
+    fn wallet_metadata() -> DappMetadata {
+        DappMetadata {
+            name: "Rust Wallet".to_owned(),
+            description: "Rust Wallet".to_owned(),
+            url: "https://example.com/wallet".to_owned(),
+            icons: vec![],
+            verify_url: None,
+            redirect: None,
+        }
+    }
+
+    fn decrypt_publish<T>(
+        publish: &IrnPublish,
+        sym_key: &PairingSymKey,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
+        let plaintext = envelope.decrypt(sym_key)?;
+        serde_json::from_str(&plaintext).map_err(Into::into)
     }
 }

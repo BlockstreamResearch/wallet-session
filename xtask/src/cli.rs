@@ -58,6 +58,9 @@ struct CoreRelayProbeArgs {
     core_js_proposal: bool,
 
     #[arg(long)]
+    core_js_approve_proposal: bool,
+
+    #[arg(long)]
     core_js_reject_proposal: bool,
 }
 
@@ -104,6 +107,7 @@ impl RelayProbeArgs {
             + usize::from(self.matrix)
             + usize::from(self.js_proposal)
             + usize::from(self.core.core_js_proposal)
+            + usize::from(self.core.core_js_approve_proposal)
             + usize::from(self.core.core_js_reject_proposal)
             + usize::from(self.pairing_uri.is_some());
         if selected_count > 1 {
@@ -122,6 +126,9 @@ impl RelayProbeArgs {
         if self.core.core_js_proposal {
             return Ok(relay::ProbeMode::CoreJsProposal);
         }
+        if self.core.core_js_approve_proposal {
+            return Ok(relay::ProbeMode::CoreJsApproveProposal);
+        }
         if self.core.core_js_reject_proposal {
             return Ok(relay::ProbeMode::CoreJsRejectProposal);
         }
@@ -134,6 +141,7 @@ impl RelayProbeArgs {
             Ok("matrix") => Ok(relay::ProbeMode::Matrix),
             Ok("js-proposal") => Ok(relay::ProbeMode::JsProposal),
             Ok("core-js-proposal") => Ok(relay::ProbeMode::CoreJsProposal),
+            Ok("core-js-approve-proposal") => Ok(relay::ProbeMode::CoreJsApproveProposal),
             Ok("core-js-reject-proposal") => Ok(relay::ProbeMode::CoreJsRejectProposal),
             Ok("pairing-uri") => {
                 let uri = env::var("WC_PAIRING_URI")

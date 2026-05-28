@@ -161,10 +161,13 @@ impl fmt::Display for PairingVersion {
 
 /// Symmetric key carried in the pairing URI.
 ///
+/// Debug output is redacted. Use [`Self::as_str`] only where the key must be
+/// encoded into a protocol value or passed to cryptographic code.
+///
 /// <https://github.com/ethereum/ERCs/blob/9b4ffa311293c6f404afc510511b93e1e04011f3/ERCS/erc-1328.md#L40-L46>
 ///
 /// > `symKey` - symmetric key used for encrypting messages over relay
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PairingSymKey(String);
 
@@ -216,6 +219,12 @@ impl PairingSymKey {
         let mut bytes = [0_u8; PAIRING_SYM_KEY_BYTES];
         decode_validated_hex(&self.0, &mut bytes);
         bytes
+    }
+}
+
+impl fmt::Debug for PairingSymKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingSymKey(<redacted>)")
     }
 }
 
@@ -670,5 +679,23 @@ mod tests {
             PairingUri::parse(&uri).expect_err("methods contains empty entry"),
             PairingUriError::EmptyMethod { index: 1 }
         ));
+    }
+
+    #[test]
+    fn debug_redacts_pairing_symmetric_key() {
+        let sym_key = PairingSymKey::from_hex(SYM_KEY).expect("symKey parses");
+        let debug = format!("{sym_key:?}");
+
+        assert_eq!(debug, "PairingSymKey(<redacted>)");
+        assert!(!debug.contains(SYM_KEY));
+    }
+
+    #[test]
+    fn debug_redacts_pairing_uri_symmetric_key() {
+        let pairing = PairingUri::parse(&uri()).expect("pairing URI parses");
+        let debug = format!("{pairing:?}");
+
+        assert!(debug.contains("PairingSymKey(<redacted>)"));
+        assert!(!debug.contains(SYM_KEY));
     }
 }
