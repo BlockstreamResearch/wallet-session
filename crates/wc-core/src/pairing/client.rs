@@ -6,14 +6,16 @@ use wc_protocol::{
     pairing::PairingUri,
     relay::{DEFAULT_RELAY_URL, RelayAuthToken, RelayConnectionUrl, relay_auth_audience},
     session::{
-        JsonRpcError, JsonRpcRequest, Session, SessionNamespaces, SessionProposeParams, SignMethod,
+        JsonRpcError, JsonRpcRequest, Session, SessionEventParams, SessionNamespaces,
+        SessionProposeParams, SignMethod,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig};
 
 use super::{
-    DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_EXTEND_REQUEST_TAG, SESSION_EXTEND_RESPONSE_TAG,
-    SESSION_UPDATE_REQUEST_TAG, SESSION_UPDATE_RESPONSE_TAG,
+    DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_EVENT_REQUEST_TAG, SESSION_EVENT_RESPONSE_TAG,
+    SESSION_EXTEND_REQUEST_TAG, SESSION_EXTEND_RESPONSE_TAG, SESSION_UPDATE_REQUEST_TAG,
+    SESSION_UPDATE_RESPONSE_TAG,
     approval::{
         next_sign_rpc_id, session_proposal_approval_publishes, session_proposal_reject_publish,
     },
@@ -24,8 +26,9 @@ use super::{
     },
     error::PairingClientError,
     session_lifecycle::{
-        session_delete_response_publish, session_extend_request_publish,
-        session_ping_response_publish, session_update_request_publish,
+        session_delete_response_publish, session_event_request_publish,
+        session_extend_request_publish, session_ping_response_publish,
+        session_update_request_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -436,10 +439,58 @@ impl PairingClient {
         })
     }
 
-    /// Waits for the peer response to `wc_sessionUpdate` or `wc_sessionExtend`.
+    /// Publishes a `wc_sessionEvent` request for an acknowledged session.
+    ///
+    /// Current Sign Client traffic emits `session_event` to listeners and only
+    /// sends a JSON-RPC error when validation fails; a success ack is not sent
+    /// by that implementation.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L881-L896>
+    ///
+    /// > method: "wc_sessionEvent",
+    /// > params: { event, chainId },
+    /// > throwOnFailedPublish: true,
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2537-L2539>
+    ///
+    /// > this.isValidEmit({ topic, ...params });
+    /// > this.client.events.emit("session_event", { id, topic, params });
+    pub async fn emit_session_event(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+        params: &SessionEventParams,
+    ) -> Result<SessionLifecycleRequest, PairingClientError> {
+        let request_id = next_sign_rpc_id()?;
+        let publish = session_event_request_publish(
+            subscription,
+            session,
+            params,
+            request_id,
+            now_unix_seconds()?,
+        )?;
+        let publish_ack = self
+            .relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionLifecycleRequest {
+            topic: subscription.topic().clone(),
+            request_id,
+            method: SignMethod::SessionEvent,
+            request_tag: SESSION_EVENT_REQUEST_TAG,
+            response_tag: SESSION_EVENT_RESPONSE_TAG,
+            publish_ack,
+        })
+    }
+
+    /// Waits for the peer response to a session lifecycle request.
     ///
     /// Same-topic deliveries with other tags are skipped with a fixed bound; in
     /// live relay testing the first skipped message can be the request echo.
+    /// Maintained JS Sign Client sends success responses for update and extend,
+    /// but currently does not send one for event.
     ///
     /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
     ///

@@ -5,9 +5,10 @@ use wc_protocol::{
     relay::RelayTopic,
     session::{
         DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, ScopedProperties,
-        Session, SessionAckResponse, SessionConfig, SessionDeleteParams, SessionExtendParams,
-        SessionNamespaces, SessionPingParams, SessionProperties, SessionProposeParams,
-        SessionRequestParams, SessionSettleResponse, SessionUpdateParams, SignMethod,
+        Session, SessionAckResponse, SessionConfig, SessionDeleteParams, SessionEventParams,
+        SessionExtendParams, SessionNamespaces, SessionPingParams, SessionProperties,
+        SessionProposeParams, SessionRequestParams, SessionSettleResponse, SessionUpdateParams,
+        SignMethod,
     },
 };
 
@@ -246,8 +247,8 @@ pub enum SessionSettleResponsePayload {
 
 /// Outbound session lifecycle request published by the core client.
 ///
-/// `wc_sessionUpdate` and `wc_sessionExtend` are sent as Sign JSON-RPC
-/// requests over the acknowledged session topic.
+/// `wc_sessionUpdate`, `wc_sessionExtend`, and `wc_sessionEvent` are sent as
+/// Sign JSON-RPC requests over the acknowledged session topic.
 ///
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L638-L645>
 ///
@@ -259,6 +260,12 @@ pub enum SessionSettleResponsePayload {
 ///
 /// > method: "wc_sessionExtend",
 /// > params: {},
+/// > throwOnFailedPublish: true,
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L888-L895>
+///
+/// > method: "wc_sessionEvent",
+/// > params: { event, chainId },
 /// > throwOnFailedPublish: true,
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLifecycleRequest {
@@ -471,6 +478,8 @@ pub enum SessionPayload {
     SessionUpdate(JsonRpcRequest<SessionUpdateParams>),
     /// `wc_sessionExtend` Sign API request.
     SessionExtend(JsonRpcRequest<SessionExtendParams>),
+    /// `wc_sessionEvent` Sign API request.
+    SessionEvent(JsonRpcRequest<SessionEventParams>),
     /// `wc_sessionPing` Sign API request.
     SessionPing(JsonRpcRequest<SessionPingParams>),
     /// `wc_sessionDelete` Sign API request.

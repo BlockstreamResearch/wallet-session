@@ -1,7 +1,7 @@
 use wc_protocol::{
     dto::pairing::PairingMethod,
     envelope::{Envelope, EnvelopeEncoding},
-    namespaces::{is_chain_authorized, is_method_authorized},
+    namespaces::{is_chain_authorized, is_event_authorized, is_method_authorized},
     pairing::PairingSymKey,
     pairing_message::{PairingMessage, PairingMessageMethod},
     relay::{IrnSubscriptionData, RelayTopic},
@@ -237,6 +237,9 @@ fn parse_session_payload(json: serde_json::Value) -> Result<SessionPayload, Pair
         Some(SignMethod::SessionExtend) => serde_json::from_value(json)
             .map(SessionPayload::SessionExtend)
             .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(SignMethod::SessionEvent) => serde_json::from_value(json)
+            .map(SessionPayload::SessionEvent)
+            .map_err(|source| PairingClientError::SessionPayload { source }),
         Some(SignMethod::SessionPing) => serde_json::from_value(json)
             .map(SessionPayload::SessionPing)
             .map_err(|source| PairingClientError::SessionPayload { source }),
@@ -268,37 +271,58 @@ fn validate_session_payload(
     payload: &SessionPayload,
     now_unix_seconds: u64,
 ) -> Result<(), PairingClientError> {
-    let SessionPayload::SessionRequest(request) = payload else {
-        return Ok(());
-    };
+    match payload {
+        SessionPayload::SessionRequest(request) => {
+            if let Some(expiry_timestamp) = request.params.request.expiry_timestamp
+                && expiry_timestamp <= now_unix_seconds
+            {
+                return Err(PairingClientError::SessionRequestExpired {
+                    expiry_timestamp,
+                    now_unix_seconds,
+                });
+            }
 
-    if let Some(expiry_timestamp) = request.params.request.expiry_timestamp
-        && expiry_timestamp <= now_unix_seconds
-    {
-        return Err(PairingClientError::SessionRequestExpired {
-            expiry_timestamp,
-            now_unix_seconds,
-        });
+            if !is_chain_authorized(&session.namespaces, &request.params.chain_id) {
+                return Err(PairingClientError::SessionUnauthorizedChain {
+                    chain_id: request.params.chain_id.clone(),
+                });
+            }
+
+            if !is_method_authorized(
+                &session.namespaces,
+                &request.params.chain_id,
+                request.params.request.method.as_str(),
+            ) {
+                return Err(PairingClientError::SessionUnauthorizedMethod {
+                    chain_id: request.params.chain_id.clone(),
+                    method: request.params.request.method.clone(),
+                });
+            }
+
+            Ok(())
+        }
+        SessionPayload::SessionEvent(request) => {
+            if !is_chain_authorized(&session.namespaces, &request.params.chain_id) {
+                return Err(PairingClientError::SessionUnauthorizedChain {
+                    chain_id: request.params.chain_id.clone(),
+                });
+            }
+
+            if !is_event_authorized(
+                &session.namespaces,
+                &request.params.chain_id,
+                request.params.event.name.as_str(),
+            ) {
+                return Err(PairingClientError::SessionUnauthorizedEvent {
+                    chain_id: request.params.chain_id.clone(),
+                    event: request.params.event.name.clone(),
+                });
+            }
+
+            Ok(())
+        }
+        _ => Ok(()),
     }
-
-    if !is_chain_authorized(&session.namespaces, &request.params.chain_id) {
-        return Err(PairingClientError::SessionUnauthorizedChain {
-            chain_id: request.params.chain_id.clone(),
-        });
-    }
-
-    if !is_method_authorized(
-        &session.namespaces,
-        &request.params.chain_id,
-        request.params.request.method.as_str(),
-    ) {
-        return Err(PairingClientError::SessionUnauthorizedMethod {
-            chain_id: request.params.chain_id.clone(),
-            method: request.params.request.method.clone(),
-        });
-    }
-
-    Ok(())
 }
 
 /// Parses and correlates the JSON-RPC response to `wc_sessionSettle`.

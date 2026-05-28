@@ -32,7 +32,10 @@ use wc_protocol::{
         DEFAULT_RELAY_URL, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
-    session::{DappMetadata, ProposalNamespace, Session, SessionNamespace, SessionNamespaces},
+    session::{
+        DappMetadata, ProposalNamespace, Session, SessionEvent, SessionEventName,
+        SessionEventParams, SessionNamespace, SessionNamespaces,
+    },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
         SignMethod,
@@ -600,96 +603,187 @@ async fn run_core_valid_session_request_probe(
 }
 
 async fn run_core_js_session_lifecycle_probe(config: &RelayProbeConfig) -> Result<()> {
-    let lifecycle_action =
-        env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "ping".to_owned());
-    let harness_action = match lifecycle_action.as_str() {
-        "ping" => "session_ping",
-        "delete" => "session_delete",
-        "update" => "wait_session_update",
-        "extend" => "wait_session_extend",
-        other => {
-            bail!(
-                "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, update, or extend"
-            )
-        }
-    };
-    let (mut harness, uri) = SessionHarness::start(harness_action, &lifecycle_action).await?;
+    let action = CoreJsSessionLifecycleAction::from_env()?;
+    let (mut harness, uri) = SessionHarness::start(action.harness_action(), action.label()).await?;
 
     let (mut client, pairing_subscription, approved, session) =
         run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
 
-    if matches!(lifecycle_action.as_str(), "update" | "extend") {
-        let request = match lifecycle_action.as_str() {
-            "update" => {
-                client
-                    .update_session(approved.subscription(), &session, &session.namespaces)
-                    .await?
-            }
-            "extend" => {
-                client
-                    .extend_session(approved.subscription(), &session)
-                    .await?
-            }
-            _ => unreachable!("validated lifecycle action"),
-        };
-        println!(
-            "core-js-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
-            request.request_id(),
-            request.method(),
-            request.request_tag(),
-            request.publish_ack()
-        );
-        let response = client
-            .next_session_lifecycle_response(approved.subscription(), &request)
-            .await?
-            .context("no outbound session lifecycle response received")?;
-        print_session_lifecycle_response(&response);
-        if let SessionLifecycleResponsePayload::Error(error) = response.payload() {
-            bail!(
-                "outbound session lifecycle request was rejected: id={} code={:?} message={}",
-                error.id,
-                error.error.code,
-                error.error.message
-            );
-        }
-    } else {
-        let message = wait_for_session_lifecycle_message(
-            &mut client,
-            approved.subscription(),
-            &session,
-            &lifecycle_action,
-        )
+    run_core_js_session_lifecycle_action(&mut client, approved.subscription(), &session, action)
         .await?;
-        print_session_message("core-js-session-lifecycle live_message", &message);
-        let response_ack = match lifecycle_action.as_str() {
-            "ping" => {
-                client
-                    .respond_session_ping(approved.subscription(), &message)
-                    .await?
-            }
-            "delete" => {
-                client
-                    .respond_session_delete(approved.subscription(), &message)
-                    .await?
-            }
-            _ => unreachable!("validated lifecycle action"),
-        };
-        println!("core-js-session-lifecycle response_ack={response_ack} action={lifecycle_action}");
-    }
 
-    let expected_outcome = match lifecycle_action.as_str() {
-        "ping" => "session_ping_response",
-        "delete" => "session_delete_sent",
-        "update" => "session_update_received",
-        "extend" => "session_extend_received",
-        _ => unreachable!("validated lifecycle action"),
-    };
-    let result = harness.expect_result(expected_outcome).await?;
+    let result = harness.expect_result(action.expected_outcome()).await?;
     println!("core-js-session-lifecycle js_result={result}");
 
     let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
     println!("core-js-session-lifecycle pairing_unsubscribe_ack={unsubscribe_result}");
     harness.terminate();
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreJsSessionLifecycleAction {
+    Ping,
+    Delete,
+    Update,
+    Extend,
+    Event,
+}
+
+impl CoreJsSessionLifecycleAction {
+    fn from_env() -> Result<Self> {
+        let value =
+            env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "ping".to_owned());
+        match value.as_str() {
+            "ping" => Ok(Self::Ping),
+            "delete" => Ok(Self::Delete),
+            "update" => Ok(Self::Update),
+            "extend" => Ok(Self::Extend),
+            "event" => Ok(Self::Event),
+            other => {
+                bail!(
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, update, extend, or event"
+                )
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Delete => "delete",
+            Self::Update => "update",
+            Self::Extend => "extend",
+            Self::Event => "event",
+        }
+    }
+
+    const fn harness_action(self) -> &'static str {
+        match self {
+            Self::Ping => "session_ping",
+            Self::Delete => "session_delete",
+            Self::Update => "wait_session_update",
+            Self::Extend => "wait_session_extend",
+            Self::Event => "wait_session_event",
+        }
+    }
+
+    const fn expected_outcome(self) -> &'static str {
+        match self {
+            Self::Ping => "session_ping_response",
+            Self::Delete => "session_delete_sent",
+            Self::Update => "session_update_received",
+            Self::Extend => "session_extend_received",
+            Self::Event => "session_event_received",
+        }
+    }
+}
+
+async fn run_core_js_session_lifecycle_action(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    action: CoreJsSessionLifecycleAction,
+) -> Result<()> {
+    match action {
+        CoreJsSessionLifecycleAction::Ping | CoreJsSessionLifecycleAction::Delete => {
+            respond_to_js_session_lifecycle_message(client, subscription, session, action).await
+        }
+        CoreJsSessionLifecycleAction::Update | CoreJsSessionLifecycleAction::Extend => {
+            publish_js_session_lifecycle_request(client, subscription, session, action).await
+        }
+        CoreJsSessionLifecycleAction::Event => {
+            publish_js_session_event(client, subscription, session).await
+        }
+    }
+}
+
+async fn publish_js_session_lifecycle_request(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    action: CoreJsSessionLifecycleAction,
+) -> Result<()> {
+    let request = match action {
+        CoreJsSessionLifecycleAction::Update => {
+            client
+                .update_session(subscription, session, &session.namespaces)
+                .await?
+        }
+        CoreJsSessionLifecycleAction::Extend => {
+            client.extend_session(subscription, session).await?
+        }
+        _ => unreachable!("validated outbound lifecycle request action"),
+    };
+    println!(
+        "core-js-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
+        request.request_id(),
+        request.method(),
+        request.request_tag(),
+        request.publish_ack()
+    );
+    let response = client
+        .next_session_lifecycle_response(subscription, &request)
+        .await?
+        .context("no outbound session lifecycle response received")?;
+    print_session_lifecycle_response(&response);
+    if let SessionLifecycleResponsePayload::Error(error) = response.payload() {
+        bail!(
+            "outbound session lifecycle request was rejected: id={} code={:?} message={}",
+            error.id,
+            error.error.code,
+            error.error.message
+        );
+    }
+
+    Ok(())
+}
+
+async fn publish_js_session_event(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+) -> Result<()> {
+    let params = session_event_params()?;
+    let request = client
+        .emit_session_event(subscription, session, &params)
+        .await?;
+    println!(
+        "core-js-session-lifecycle request id={} method={} request_tag={} publish_ack={}",
+        request.request_id(),
+        request.method(),
+        request.request_tag(),
+        request.publish_ack()
+    );
+
+    Ok(())
+}
+
+async fn respond_to_js_session_lifecycle_message(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    action: CoreJsSessionLifecycleAction,
+) -> Result<()> {
+    let message =
+        wait_for_session_lifecycle_message(client, subscription, session, action.label()).await?;
+    print_session_message("core-js-session-lifecycle live_message", &message);
+    let response_ack = match action {
+        CoreJsSessionLifecycleAction::Ping => {
+            client.respond_session_ping(subscription, &message).await?
+        }
+        CoreJsSessionLifecycleAction::Delete => {
+            client
+                .respond_session_delete(subscription, &message)
+                .await?
+        }
+        _ => unreachable!("validated inbound lifecycle response action"),
+    };
+    println!(
+        "core-js-session-lifecycle response_ack={response_ack} action={}",
+        action.label()
+    );
 
     Ok(())
 }
@@ -711,6 +805,16 @@ async fn wait_for_session_lifecycle_message(
             _ => print_ignored_session_message(&message),
         }
     }
+}
+
+fn session_event_params() -> Result<SessionEventParams> {
+    Ok(SessionEventParams {
+        event: SessionEvent {
+            name: SessionEventName::parse("accountsChanged")?,
+            data: json!(["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]),
+        },
+        chain_id: "eip155:1".parse()?,
+    })
 }
 
 async fn wait_for_valid_session_request_message(
@@ -1228,6 +1332,15 @@ fn print_session_message(label: &str, message: &SessionReceivedMessage) {
             println!(
                 "{label} session_extend id={} params={:?}",
                 request.id, request.params
+            );
+        }
+        SessionPayload::SessionEvent(request) => {
+            println!(
+                "{label} session_event id={} chain_id={} event_name={} data={}",
+                request.id,
+                request.params.chain_id,
+                request.params.event.name,
+                request.params.event.data
             );
         }
         SessionPayload::SessionPing(request) => {

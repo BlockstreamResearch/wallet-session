@@ -156,6 +156,42 @@ pub const SESSION_EXTEND_REQUEST_TTL_SECONDS: u64 = 24 * 60 * 60;
 /// > res: { ttl: ONE_DAY, prompt: false, tag: 1107 }
 pub const SESSION_EXTEND_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;
 
+/// Relay tag used for `wc_sessionEvent` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L77-L82>
+///
+/// > req: {
+/// > ttl: FIVE_MINUTES,
+/// > tag: 1110,
+pub const SESSION_EVENT_REQUEST_TAG: u64 = 1110;
+
+/// Relay tag used for `wc_sessionEvent` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L83-L87>
+///
+/// > res: {
+/// > ttl: FIVE_MINUTES,
+/// > tag: 1111,
+pub const SESSION_EVENT_RESPONSE_TAG: u64 = 1111;
+
+/// Relay retention window for `wc_sessionEvent` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L77-L82>
+///
+/// > req: {
+/// > ttl: FIVE_MINUTES,
+/// > tag: 1110,
+pub const SESSION_EVENT_REQUEST_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay retention window for `wc_sessionEvent` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L83-L87>
+///
+/// > res: {
+/// > ttl: FIVE_MINUTES,
+/// > tag: 1111,
+pub const SESSION_EVENT_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
+
 /// Relay tag used for `wc_sessionRequest` responses.
 ///
 /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest>

@@ -7,8 +7,9 @@ use super::{
         decode_subscription_data, validate_session_message_payload,
     },
     session_lifecycle::{
-        session_delete_response_publish, session_extend_request_publish,
-        session_ping_response_publish, session_update_request_publish,
+        session_delete_response_publish, session_event_request_publish,
+        session_extend_request_publish, session_ping_response_publish,
+        session_update_request_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -24,10 +25,10 @@ use wc_protocol::{
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
         JsonRpcResponse, RelayProtocolOptions, Session, SessionDeleteParams, SessionDeleteResponse,
-        SessionExtendParams, SessionNamespace, SessionParticipant, SessionPingParams,
-        SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
-        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
-        SessionUpdateParams, SignMethod, session_ack_response,
+        SessionEvent, SessionEventName, SessionEventParams, SessionExtendParams, SessionNamespace,
+        SessionParticipant, SessionPingParams, SessionPingResponse, SessionProposeErrorResponse,
+        SessionProposeParams, SessionProposeResult, SessionRequestParams, SessionSettleParams,
+        SessionTransportType, SessionUpdateParams, SignMethod, session_ack_response,
     },
 };
 
@@ -596,6 +597,72 @@ fn decodes_session_extend() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn decodes_session_event() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = JsonRpcRequest::new(92, SignMethod::SessionEvent, session_event_params()?);
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_EVENT_REQUEST_TAG),
+    )?;
+
+    let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+    assert_eq!(received.tag(), Some(SESSION_EVENT_REQUEST_TAG));
+    match received.payload() {
+        SessionPayload::SessionEvent(request) => {
+            assert_eq!(request.id, 92);
+            assert_eq!(request.params.chain_id.as_str(), "eip155:1");
+            assert_eq!(request.params.event.name.as_str(), "accountsChanged");
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn rejects_unauthorized_session_event() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = JsonRpcRequest::new(
+        92,
+        SignMethod::SessionEvent,
+        SessionEventParams {
+            event: SessionEvent {
+                name: "sessionChanged".parse()?,
+                data: serde_json::json!(null),
+            },
+            chain_id: "eip155:1".parse()?,
+        },
+    );
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_EVENT_REQUEST_TAG),
+    )?;
+
+    assert!(matches!(
+        decode_session_message_data(data, &subscription, &session, 4_000_000_000)
+            .expect_err("unapproved event should fail"),
+        PairingClientError::SessionUnauthorizedEvent { .. }
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn rejects_session_message_before_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",
@@ -981,6 +1048,31 @@ fn builds_session_extend_request_publish() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn builds_session_event_request_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let params = session_event_params()?;
+
+    let publish =
+        session_event_request_publish(&subscription, &session, &params, 102, 4_000_000_000)?;
+    let request: JsonRpcRequest<SessionEventParams> = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_EVENT_REQUEST_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_EVENT_REQUEST_TAG);
+    assert_eq!(request.id, 102);
+    assert_eq!(request.method, SignMethod::SessionEvent);
+    assert_eq!(request.params.chain_id.as_str(), "eip155:1");
+    assert_eq!(request.params.event.name.as_str(), "accountsChanged");
+
+    Ok(())
+}
+
+#[test]
 fn rejects_outbound_session_lifecycle_before_acknowledgement()
 -> Result<(), Box<dyn std::error::Error>> {
     let subscription = session_subscription(PairingSymKey::from_hex(
@@ -1003,6 +1095,41 @@ fn rejects_outbound_session_lifecycle_before_acknowledgement()
         session_extend_request_publish(&subscription, &session, 101, 4_000_000_000)
             .expect_err("pending extend should fail"),
         PairingClientError::SessionNotAcknowledged { .. }
+    ));
+    assert!(matches!(
+        session_event_request_publish(
+            &subscription,
+            &session,
+            &session_event_params()?,
+            102,
+            4_000_000_000,
+        )
+        .expect_err("pending event should fail"),
+        PairingClientError::SessionNotAcknowledged { .. }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn rejects_outbound_unauthorized_session_event() -> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let params = SessionEventParams {
+        event: SessionEvent {
+            name: "sessionChanged".parse()?,
+            data: serde_json::json!(null),
+        },
+        chain_id: "eip155:1".parse()?,
+    };
+
+    assert!(matches!(
+        session_event_request_publish(&subscription, &session, &params, 102, 4_000_000_000)
+            .expect_err("unapproved event should fail"),
+        PairingClientError::SessionUnauthorizedEvent { .. }
     ));
 
     Ok(())
@@ -1344,6 +1471,16 @@ fn session_request(
     );
 
     serde_json::from_str(&json).map_err(Into::into)
+}
+
+fn session_event_params() -> Result<SessionEventParams, Box<dyn std::error::Error>> {
+    Ok(SessionEventParams {
+        event: SessionEvent {
+            name: SessionEventName::parse("accountsChanged")?,
+            data: serde_json::json!(["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]),
+        },
+        chain_id: "eip155:1".parse()?,
+    })
 }
 
 fn wallet_metadata() -> DappMetadata {

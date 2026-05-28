@@ -1,13 +1,15 @@
 use wc_protocol::{
+    namespaces::{is_chain_authorized, is_event_authorized},
     relay::IrnPublish,
     session::{
-        JsonRpcRequest, Session, SessionAckResponse, SessionExtendParams, SessionNamespaces,
-        SessionUpdateParams, SignMethod, session_ack_response,
+        JsonRpcRequest, Session, SessionAckResponse, SessionEventParams, SessionExtendParams,
+        SessionNamespaces, SessionUpdateParams, SignMethod, session_ack_response,
     },
 };
 
 use super::{
-    SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EXTEND_REQUEST_TAG,
+    SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
+    SESSION_EVENT_REQUEST_TTL_SECONDS, SESSION_EXTEND_REQUEST_TAG,
     SESSION_EXTEND_REQUEST_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
     SESSION_PING_RESPONSE_TTL_SECONDS, SESSION_UPDATE_REQUEST_TAG,
     SESSION_UPDATE_REQUEST_TTL_SECONDS,
@@ -80,6 +82,41 @@ pub(super) fn session_extend_request_publish(
         &request,
         SESSION_EXTEND_REQUEST_TTL_SECONDS,
         SESSION_EXTEND_REQUEST_TAG,
+    )
+}
+
+/// Builds an encrypted `wc_sessionEvent` request publish.
+///
+/// The maintained Sign Client emits the event to application listeners after
+/// validating the session topic, chain, and event name.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L881-L896>
+///
+/// > method: "wc_sessionEvent",
+/// > params: { event, chainId },
+/// > throwOnFailedPublish: true,
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2537-L2539>
+///
+/// > this.isValidEmit({ topic, ...params });
+/// > this.client.events.emit("session_event", { id, topic, params });
+pub(super) fn session_event_request_publish(
+    subscription: &SessionSubscription,
+    session: &Session,
+    params: &SessionEventParams,
+    request_id: u64,
+    now_unix_seconds: u64,
+) -> Result<IrnPublish, PairingClientError> {
+    ensure_outbound_session_ready(subscription, session, now_unix_seconds)?;
+    ensure_session_event_authorized(session, params)?;
+    let request = JsonRpcRequest::new(request_id, SignMethod::SessionEvent, params.clone());
+
+    encrypted_json_publish(
+        subscription.topic().clone(),
+        subscription.sym_key(),
+        &request,
+        SESSION_EVENT_REQUEST_TTL_SECONDS,
+        SESSION_EVENT_REQUEST_TAG,
     )
 }
 
@@ -179,6 +216,39 @@ fn ensure_outbound_session_ready(
         return Err(PairingClientError::SessionExpired {
             expiry_timestamp: session.expiry,
             now_unix_seconds,
+        });
+    }
+
+    Ok(())
+}
+
+/// Applies outbound chain/event checks before publishing `wc_sessionEvent`.
+///
+/// This mirrors the maintained Sign Client validation boundary before an
+/// incoming event is emitted to application listeners.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2537-L2539>
+///
+/// > this.isValidEmit({ topic, ...params });
+/// > this.client.events.emit("session_event", { id, topic, params });
+fn ensure_session_event_authorized(
+    session: &Session,
+    params: &SessionEventParams,
+) -> Result<(), PairingClientError> {
+    if !is_chain_authorized(&session.namespaces, &params.chain_id) {
+        return Err(PairingClientError::SessionUnauthorizedChain {
+            chain_id: params.chain_id.clone(),
+        });
+    }
+
+    if !is_event_authorized(
+        &session.namespaces,
+        &params.chain_id,
+        params.event.name.as_str(),
+    ) {
+        return Err(PairingClientError::SessionUnauthorizedEvent {
+            chain_id: params.chain_id.clone(),
+            event: params.event.name.clone(),
         });
     }
 

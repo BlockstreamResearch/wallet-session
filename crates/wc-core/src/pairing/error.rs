@@ -243,6 +243,15 @@ pub enum PairingClientError {
         method: SessionMethod,
     },
 
+    /// Session namespaces do not authorize the event on the chain.
+    #[error("session event is not authorized")]
+    SessionUnauthorizedEvent {
+        /// Event chain ID.
+        chain_id: wc_protocol::caip::Caip2ChainId,
+        /// Event name.
+        event: wc_protocol::session::SessionEventName,
+    },
+
     /// Sign JSON-RPC ID construction failed.
     #[error("sign rpc id construction failed")]
     SignRpcId {

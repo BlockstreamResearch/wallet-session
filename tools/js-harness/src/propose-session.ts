@@ -99,6 +99,9 @@ try {
       case "wait_session_extend":
         await waitForSessionExtend(session.topic);
         break;
+      case "wait_session_event":
+        await waitForSessionEvent(session.topic);
+        break;
       default:
         throw new Error(`unknown WC_JS_AFTER_APPROVAL_ACTION=${afterApprovalAction}`);
     }
@@ -331,12 +334,49 @@ async function waitForSessionExtend(topic: string): Promise<void> {
   await writeResult(response);
 }
 
+async function waitForSessionEvent(topic: string): Promise<void> {
+  console.error(`js-harness wait_session_event_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+  const response = await Promise.race([
+    onceSignClientEvent("session_event", topic).then((event) => {
+      const params = event.params as
+        | {
+            chainId?: string;
+            event?: {
+              name?: string;
+            };
+          }
+        | undefined;
+      console.error(`js-harness session_event_received=${stringifyForLog(event)}`);
+      return {
+        outcome: "session_event_received",
+        topic,
+        id: stringifyId(event.id),
+        chainId: params?.chainId,
+        eventName: params?.event?.name,
+      };
+    }),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_event_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
 function onceSignClientEvent(
-  eventName: "session_update" | "session_extend",
+  eventName: "session_update" | "session_extend" | "session_event",
   topic: string,
-): Promise<{ id: number | bigint; topic: string }> {
+): Promise<{
+  id: number | bigint;
+  topic: string;
+  params?: unknown;
+}> {
   return new Promise((resolve) => {
-    const listener = (event: { id: number | bigint; topic: string }) => {
+    const listener = (event: {
+      id: number | bigint;
+      topic: string;
+      params?: unknown;
+    }) => {
       if (event.topic !== topic) {
         return;
       }
