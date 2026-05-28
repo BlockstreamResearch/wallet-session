@@ -15,10 +15,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
-    ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
-    PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
-    SessionClientEvent, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
-    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+    ApprovedSession, Client, ClientConfig, ClientEvent, ClientSessionProposal,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingPayload,
+    PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG, SessionClientEvent,
+    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload,
 };
 use wc_protocol::{
@@ -58,6 +59,7 @@ pub enum ProbeMode {
     CoreJsRejectProposal,
     CoreJsSessionRequest,
     CoreJsSessionLifecycle,
+    CoreClientSessionRequest,
     PairingUri(String),
 }
 
@@ -76,6 +78,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         }
         ProbeMode::CoreJsSessionLifecycle => {
             Box::pin(run_core_js_session_lifecycle_probe(&config)).await
+        }
+        ProbeMode::CoreClientSessionRequest => {
+            Box::pin(run_core_client_session_request_probe(&config)).await
         }
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
@@ -555,6 +560,86 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
     Ok(())
 }
 
+async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Result<()> {
+    let response_mode =
+        env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
+    let (mut harness, uri) = SessionHarness::start("session_request", &response_mode).await?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-client-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    println!(
+        "core-client-session-request connected status={}",
+        client.status()
+    );
+    let pairing_topic = client.pair(uri.trim()).await?;
+    println!("core-client-session-request pairing_topic={pairing_topic}");
+
+    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    println!(
+        "core-client-session-request proposal_id={} pairing_topic={}",
+        proposal.proposal_id(),
+        proposal.pairing_topic()
+    );
+    let namespaces = approved_namespaces_for_probe(proposal.request())?;
+    let approval = SessionProposalApproval::new(
+        namespaces,
+        probe_wallet_metadata(),
+        unix_timestamp() + DEFAULT_SESSION_EXPIRY_SECONDS,
+    );
+    let session = client.approve_session(&proposal, approval).await?;
+    println!(
+        "core-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={}",
+        session.topic,
+        session.acknowledged,
+        session.namespaces.len(),
+        session.expiry
+    );
+
+    let session_message = wait_for_client_session_request_event(&mut client).await?;
+    print_session_message("core-client-session-request live_event", &session_message);
+    let response_ack = match response_mode.as_str() {
+        "success" => {
+            let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
+                |_| Ok(json!("0xsigned-by-rust-client")),
+                |value| parse_json_env(&value),
+            )?;
+            client
+                .respond_session_request_success(&session_message, result)
+                .await?
+        }
+        "error" => {
+            client
+                .respond_session_request_error(
+                    &session_message,
+                    JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
+                )
+                .await?
+        }
+        other => {
+            bail!("unknown WC_CORE_SESSION_REQUEST_RESPONSE={other}; expected success or error")
+        }
+    };
+    println!("core-client-session-request response_ack={response_ack} mode={response_mode}");
+
+    let expected_outcome = match response_mode.as_str() {
+        "success" => "session_request_response",
+        "error" => "session_request_error",
+        _ => unreachable!("validated response mode"),
+    };
+    let result = harness.expect_result(expected_outcome).await?;
+    println!("core-client-session-request js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
 async fn run_core_valid_session_request_probe(
     client: &mut PairingClient,
     subscription: &wc_core::SessionSubscription,
@@ -845,6 +930,63 @@ async fn wait_for_valid_session_request_message(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_client_session_proposal(client: &mut Client) -> Result<ClientSessionProposal> {
+    loop {
+        let event = client
+            .next_event()
+            .await?
+            .context("no client session proposal event received")?;
+        match event {
+            ClientEvent::SessionProposal(proposal) => return Ok(*proposal),
+            ClientEvent::PairingMessage(message) => {
+                print_core_pairing_payload_metadata(
+                    "core-client-session-request ignored_pairing_message",
+                    &message,
+                )?;
+            }
+            ClientEvent::Session(event) => print_ignored_client_session_event(&event),
+        }
+    }
+}
+
+async fn wait_for_client_session_request_event(
+    client: &mut Client,
+) -> Result<SessionReceivedMessage> {
+    loop {
+        let event = client
+            .next_event()
+            .await?
+            .context("no client session request event received")?;
+        match event {
+            ClientEvent::Session(SessionClientEvent::SessionRequest(message)) => {
+                return Ok(message);
+            }
+            ClientEvent::Session(event) => print_ignored_client_session_event(&event),
+            ClientEvent::PairingMessage(message) => {
+                print_core_pairing_payload_metadata(
+                    "core-client-session-request ignored_pairing_message",
+                    &message,
+                )?;
+            }
+            ClientEvent::SessionProposal(proposal) => {
+                println!(
+                    "core-client-session-request ignored_proposal id={} pairing_topic={}",
+                    proposal.proposal_id(),
+                    proposal.pairing_topic()
+                );
+            }
+        }
+    }
+}
+
+fn print_ignored_client_session_event(event: &SessionClientEvent) {
+    if let Some(message) = event.message() {
+        print_ignored_session_message(message);
+    } else if let Some(rejection) = event.rejection() {
+        print_ignored_session_request_rejection(rejection);
     }
 }
 

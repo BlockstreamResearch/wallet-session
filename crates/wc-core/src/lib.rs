@@ -1,7 +1,9 @@
 //! Core `WalletConnect` client behavior.
 
+mod client;
 mod pairing;
 
+pub use client::{Client, ClientConfig, ClientError, ClientEvent, ClientSessionProposal};
 pub use pairing::{
     ApprovedSession, DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
     PairingClient, PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,

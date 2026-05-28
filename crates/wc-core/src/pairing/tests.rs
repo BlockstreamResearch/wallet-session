@@ -21,6 +21,7 @@ use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, X25519PrivateKey},
     pairing::{PairingSymKey, PairingUri},
+    pairing_message::PairingMessage,
     relay::{IrnPublish, IrnSubscriptionData, RelayTopic},
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
@@ -751,6 +752,51 @@ fn classifies_unparsed_session_payload_as_unsupported() -> Result<(), Box<dyn st
     }
 
     Ok(())
+}
+
+#[test]
+fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::error::Error>> {
+    let request = session_proposal_request()?;
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let plaintext = serde_json::to_string(&request)?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, &sym_key)?;
+    let message = PairingReceivedMessage {
+        topic: RelayTopic::from_hex("11".repeat(32))?,
+        encoded_message_len: envelope.encode(EnvelopeEncoding::Base64).len(),
+        published_at: 1_779_954_250_000,
+        tag: Some(1100),
+        message: PairingMessage::decode_relay_message(
+            &envelope.encode(EnvelopeEncoding::Base64),
+            &sym_key,
+        )?,
+        payload: PairingPayload::SessionProposal(Box::new(request)),
+    };
+
+    let event = crate::ClientEvent::from_pairing_message(message);
+
+    match event {
+        crate::ClientEvent::SessionProposal(proposal) => {
+            assert_eq!(proposal.proposal_id(), 7);
+            assert_eq!(proposal.pairing_topic().as_str(), "11".repeat(32));
+            assert_eq!(
+                proposal.request().params.proposer.metadata.name,
+                "Probe Dapp"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn client_config_wraps_pairing_config() {
+    let pairing = PairingClientConfig::new("project", [7; 32], "subject");
+    let config = crate::ClientConfig::new(pairing.clone());
+
+    assert_eq!(config.pairing().project_id, pairing.project_id);
 }
 
 #[test]

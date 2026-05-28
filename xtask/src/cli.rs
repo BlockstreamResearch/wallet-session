@@ -74,6 +74,9 @@ struct CoreRelaySessionProbeArgs {
 
     #[arg(long)]
     core_js_session_lifecycle: bool,
+
+    #[arg(long)]
+    core_client_session_request: bool,
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +126,7 @@ impl RelayProbeArgs {
             + usize::from(self.core.core_js_reject_proposal)
             + usize::from(self.core_session.core_js_session_request)
             + usize::from(self.core_session.core_js_session_lifecycle)
+            + usize::from(self.core_session.core_client_session_request)
             + usize::from(self.pairing_uri.is_some());
         if selected_count > 1 {
             bail!("choose only one relay probe mode");
@@ -152,6 +156,9 @@ impl RelayProbeArgs {
         if self.core_session.core_js_session_lifecycle {
             return Ok(relay::ProbeMode::CoreJsSessionLifecycle);
         }
+        if self.core_session.core_client_session_request {
+            return Ok(relay::ProbeMode::CoreClientSessionRequest);
+        }
         if let Some(uri) = self.pairing_uri {
             return Ok(relay::ProbeMode::PairingUri(uri));
         }
@@ -165,6 +172,7 @@ impl RelayProbeArgs {
             Ok("core-js-reject-proposal") => Ok(relay::ProbeMode::CoreJsRejectProposal),
             Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
             Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
+            Ok("core-client-session-request") => Ok(relay::ProbeMode::CoreClientSessionRequest),
             Ok("pairing-uri") => {
                 let uri = env::var("WC_PAIRING_URI")
                     .context("set WC_PAIRING_URI when WC_RELAY_PROBE_MODE=pairing-uri")?;
