@@ -6,16 +6,16 @@ use wc_protocol::{
     pairing::PairingUri,
     relay::{DEFAULT_RELAY_URL, RelayAuthToken, RelayConnectionUrl, relay_auth_audience},
     session::{
-        JsonRpcError, JsonRpcRequest, Session, SessionEventParams, SessionNamespaces,
-        SessionProposeParams, SignMethod,
+        JsonRpcError, JsonRpcRequest, Session, SessionDeleteParams, SessionEventParams,
+        SessionNamespaces, SessionProposeParams, SignMethod,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig};
 
 use super::{
-    DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_EVENT_REQUEST_TAG, SESSION_EVENT_RESPONSE_TAG,
-    SESSION_EXTEND_REQUEST_TAG, SESSION_EXTEND_RESPONSE_TAG, SESSION_UPDATE_REQUEST_TAG,
-    SESSION_UPDATE_RESPONSE_TAG,
+    DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_DELETE_REQUEST_TAG, SESSION_DELETE_RESPONSE_TAG,
+    SESSION_EVENT_REQUEST_TAG, SESSION_EVENT_RESPONSE_TAG, SESSION_EXTEND_REQUEST_TAG,
+    SESSION_EXTEND_RESPONSE_TAG, SESSION_UPDATE_REQUEST_TAG, SESSION_UPDATE_RESPONSE_TAG,
     approval::{
         next_sign_rpc_id, session_proposal_approval_publishes, session_proposal_reject_publish,
     },
@@ -26,9 +26,9 @@ use super::{
     },
     error::PairingClientError,
     session_lifecycle::{
-        session_delete_response_publish, session_event_request_publish,
-        session_extend_request_publish, session_ping_response_publish,
-        session_update_request_publish,
+        session_delete_request_publish, session_delete_response_publish,
+        session_event_request_publish, session_extend_request_publish,
+        session_ping_response_publish, session_update_request_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -481,6 +481,47 @@ impl PairingClient {
             method: SignMethod::SessionEvent,
             request_tag: SESSION_EVENT_REQUEST_TAG,
             response_tag: SESSION_EVENT_RESPONSE_TAG,
+            publish_ack,
+        })
+    }
+
+    /// Publishes a `wc_sessionDelete` request for an acknowledged session.
+    ///
+    /// The maintained Sign Client deletes local session state after the relay
+    /// accepts the publish. It does not wait for the peer's JSON-RPC response
+    /// before removing the local session.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L897-L909>
+    ///
+    /// > await this.sendRequest({
+    /// > topic,
+    /// > method: "wc_sessionDelete",
+    pub async fn disconnect_session(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+        reason: SessionDeleteParams,
+    ) -> Result<SessionLifecycleRequest, PairingClientError> {
+        let request_id = next_sign_rpc_id()?;
+        let publish = session_delete_request_publish(
+            subscription,
+            session,
+            reason,
+            request_id,
+            now_unix_seconds()?,
+        )?;
+        let publish_ack = self
+            .relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionLifecycleRequest {
+            topic: subscription.topic().clone(),
+            request_id,
+            method: SignMethod::SessionDelete,
+            request_tag: SESSION_DELETE_REQUEST_TAG,
+            response_tag: SESSION_DELETE_RESPONSE_TAG,
             publish_ack,
         })
     }

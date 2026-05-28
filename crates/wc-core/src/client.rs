@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 
 use wc_protocol::{
     relay::RelayTopic,
-    session::{JsonRpcError, JsonRpcRequest, Session, SessionProposeParams},
+    session::{JsonRpcError, JsonRpcRequest, Session, SessionDeleteParams, SessionProposeParams},
 };
 
 use crate::pairing::{
     PairingClient, PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,
-    PairingSubscription, SessionClientEvent, SessionProposalApproval, SessionReceivedMessage,
-    SessionSubscription,
+    PairingSubscription, SessionClientEvent, SessionLifecycleRequest, SessionProposalApproval,
+    SessionReceivedMessage, SessionSubscription,
 };
 
 /// Runtime client configuration.
@@ -271,6 +271,40 @@ impl Client {
         self.sessions.remove(message.topic());
 
         Ok(ack)
+    }
+
+    /// Publishes `wc_sessionDelete` and removes the acknowledged session locally.
+    ///
+    /// The maintained Sign Client removes local session state after the relay
+    /// accepts the delete request publish.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L897-L909>
+    ///
+    /// > await this.sendRequest({
+    /// > method: "wc_sessionDelete",
+    /// > await this.deleteSession({ topic, emitEvent: false });
+    pub async fn disconnect(
+        &mut self,
+        topic: &RelayTopic,
+        reason: SessionDeleteParams,
+    ) -> Result<SessionLifecycleRequest, ClientError> {
+        let session = self
+            .sessions
+            .get(topic)
+            .ok_or_else(|| ClientError::SessionMissing {
+                topic: topic.clone(),
+            })?
+            .clone();
+        let request = self
+            .pairing
+            .disconnect_session(&session.subscription, &session.session, reason)
+            .await
+            .map_err(ClientError::from)?;
+        if request.publish_ack() {
+            self.sessions.remove(topic);
+        }
+
+        Ok(request)
     }
 
     /// Active sessions currently held by this in-memory runtime.

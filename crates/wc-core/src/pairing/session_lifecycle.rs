@@ -2,13 +2,15 @@ use wc_protocol::{
     namespaces::{is_chain_authorized, is_event_authorized},
     relay::IrnPublish,
     session::{
-        JsonRpcRequest, Session, SessionAckResponse, SessionEventParams, SessionExtendParams,
-        SessionNamespaces, SessionUpdateParams, SignMethod, session_ack_response,
+        JsonRpcRequest, Session, SessionAckResponse, SessionDeleteParams, SessionEventParams,
+        SessionExtendParams, SessionNamespaces, SessionUpdateParams, SignMethod,
+        session_ack_response,
     },
 };
 
 use super::{
-    SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
+    SESSION_DELETE_REQUEST_TAG, SESSION_DELETE_REQUEST_TTL_SECONDS, SESSION_DELETE_RESPONSE_TAG,
+    SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
     SESSION_EVENT_REQUEST_TTL_SECONDS, SESSION_EXTEND_REQUEST_TAG,
     SESSION_EXTEND_REQUEST_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
     SESSION_PING_RESPONSE_TTL_SECONDS, SESSION_UPDATE_REQUEST_TAG,
@@ -117,6 +119,41 @@ pub(super) fn session_event_request_publish(
         &request,
         SESSION_EVENT_REQUEST_TTL_SECONDS,
         SESSION_EVENT_REQUEST_TAG,
+    )
+}
+
+/// Builds an encrypted `wc_sessionDelete` request publish.
+///
+/// The maintained Sign Client validates the topic, publishes
+/// `wc_sessionDelete`, then deletes the local session after the relay publish
+/// acknowledgement.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L897-L909>
+///
+/// > method: "wc_sessionDelete",
+/// > params: getSdkError("USER_DISCONNECTED"),
+/// > throwOnFailedPublish: true,
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L904-L907>
+///
+/// > // await an ack to ensure the relay has received the disconnect request
+/// > await this.sendRequest({
+pub(super) fn session_delete_request_publish(
+    subscription: &SessionSubscription,
+    session: &Session,
+    params: SessionDeleteParams,
+    request_id: u64,
+    now_unix_seconds: u64,
+) -> Result<IrnPublish, PairingClientError> {
+    ensure_outbound_session_ready(subscription, session, now_unix_seconds)?;
+    let request = JsonRpcRequest::new(request_id, SignMethod::SessionDelete, params);
+
+    encrypted_json_publish(
+        subscription.topic().clone(),
+        subscription.sym_key(),
+        &request,
+        SESSION_DELETE_REQUEST_TTL_SECONDS,
+        SESSION_DELETE_REQUEST_TAG,
     )
 }
 

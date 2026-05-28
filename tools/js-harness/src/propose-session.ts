@@ -102,6 +102,9 @@ try {
       case "wait_session_event":
         await waitForSessionEvent(session.topic);
         break;
+      case "wait_session_delete":
+        await waitForSessionDelete(session.topic);
+        break;
       default:
         throw new Error(`unknown WC_JS_AFTER_APPROVAL_ACTION=${afterApprovalAction}`);
     }
@@ -363,8 +366,35 @@ async function waitForSessionEvent(topic: string): Promise<void> {
   await writeResult(response);
 }
 
+async function waitForSessionDelete(topic: string): Promise<void> {
+  console.error(`js-harness wait_session_delete_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+  const response = await Promise.race([
+    onceSignClientEvent("session_delete", topic).then((event) => {
+      const params = event.params as
+        | {
+            code?: number;
+            message?: string;
+          }
+        | undefined;
+      console.error(`js-harness session_delete_received=${stringifyForLog(event)}`);
+      return {
+        outcome: "session_delete_received",
+        topic,
+        id: stringifyId(event.id),
+        code: params?.code,
+        message: params?.message,
+      };
+    }),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_delete_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
 function onceSignClientEvent(
-  eventName: "session_update" | "session_extend" | "session_event",
+  eventName: "session_update" | "session_extend" | "session_event" | "session_delete",
   topic: string,
 ): Promise<{
   id: number | bigint;

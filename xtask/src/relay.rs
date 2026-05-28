@@ -34,7 +34,8 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{
-        DappMetadata, Session, SessionEvent, SessionEventName, SessionEventParams, SessionMethod,
+        DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
+        SessionEventParams, SessionMethod,
     },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
@@ -59,6 +60,7 @@ pub enum ProbeMode {
     CoreJsSessionRequest,
     CoreJsSessionLifecycle,
     CoreClientSessionRequest,
+    CoreClientDisconnect,
     PairingUri(String),
 }
 
@@ -80,6 +82,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         }
         ProbeMode::CoreClientSessionRequest => {
             Box::pin(run_core_client_session_request_probe(&config)).await
+        }
+        ProbeMode::CoreClientDisconnect => {
+            Box::pin(run_core_client_disconnect_probe(&config)).await
         }
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
@@ -629,6 +634,60 @@ async fn run_core_client_session_request_probe(config: &RelayProbeConfig) -> Res
     };
     let result = harness.expect_result(expected_outcome).await?;
     println!("core-client-session-request js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_client_disconnect_probe(config: &RelayProbeConfig) -> Result<()> {
+    let (mut harness, uri) = SessionHarness::start("wait_session_delete", "disconnect").await?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-client-disconnect-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    let mut client = Client::connect(&ClientConfig::new(client_config)).await?;
+    println!(
+        "core-client-disconnect connected status={}",
+        client.status()
+    );
+    let pairing_topic = client.pair(uri.trim()).await?;
+    println!("core-client-disconnect pairing_topic={pairing_topic}");
+
+    let proposal = wait_for_client_session_proposal(&mut client).await?;
+    println!(
+        "core-client-disconnect proposal_id={} pairing_topic={}",
+        proposal.proposal_id(),
+        proposal.pairing_topic()
+    );
+    let approval = approval_for_probe(proposal.request())?;
+    let session = client.approve_session(&proposal, approval).await?;
+    println!(
+        "core-client-disconnect active_session topic={} acknowledged={} namespaces={} expiry={}",
+        session.topic,
+        session.acknowledged,
+        session.namespaces.len(),
+        session.expiry
+    );
+
+    let request = client
+        .disconnect(&session.topic, SessionDeleteParams::user_disconnected())
+        .await?;
+    println!(
+        "core-client-disconnect request id={} method={} request_tag={} publish_ack={} active_sessions={}",
+        request.request_id(),
+        request.method(),
+        request.request_tag(),
+        request.publish_ack(),
+        client.active_sessions().len()
+    );
+
+    let result = harness.expect_result("session_delete_received").await?;
+    println!("core-client-disconnect js_result={result}");
     harness.terminate();
 
     Ok(())

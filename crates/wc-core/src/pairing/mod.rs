@@ -215,6 +215,23 @@ pub const SESSION_REQUEST_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L90-L100>
 ///
 /// > wc_sessionDelete: {
+/// > req: {
+/// > tag: 1112,
+pub const SESSION_DELETE_REQUEST_TAG: u64 = 1112;
+
+/// Relay retention window for `wc_sessionDelete` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L90-L100>
+///
+/// > ttl: ONE_DAY,
+/// > tag: 1112,
+pub const SESSION_DELETE_REQUEST_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay tag used for `wc_sessionDelete` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L90-L100>
+///
+/// > wc_sessionDelete: {
 /// > res: {
 /// > tag: 1113,
 pub const SESSION_DELETE_RESPONSE_TAG: u64 = 1113;

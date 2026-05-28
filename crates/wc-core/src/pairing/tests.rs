@@ -7,9 +7,9 @@ use super::{
         decode_subscription_data, validate_session_message_payload,
     },
     session_lifecycle::{
-        session_delete_response_publish, session_event_request_publish,
-        session_extend_request_publish, session_ping_response_publish,
-        session_update_request_publish,
+        session_delete_request_publish, session_delete_response_publish,
+        session_event_request_publish, session_extend_request_publish,
+        session_ping_response_publish, session_update_request_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -1139,6 +1139,37 @@ fn builds_session_delete_response_publish() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
+fn builds_session_delete_request_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+
+    let publish = session_delete_request_publish(
+        &subscription,
+        &session,
+        SessionDeleteParams::user_disconnected(),
+        103,
+        4_000_000_000,
+    )?;
+    let request: JsonRpcRequest<SessionDeleteParams> = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_DELETE_REQUEST_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_DELETE_REQUEST_TAG);
+    assert_eq!(request.id, 103);
+    assert_eq!(request.method, SignMethod::SessionDelete);
+    assert_eq!(
+        request.params.message,
+        SessionDeleteParams::USER_DISCONNECTED_MESSAGE
+    );
+
+    Ok(())
+}
+
+#[test]
 fn builds_session_update_request_publish() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",
@@ -1242,6 +1273,17 @@ fn rejects_outbound_session_lifecycle_before_acknowledgement()
             4_000_000_000,
         )
         .expect_err("pending event should fail"),
+        PairingClientError::SessionNotAcknowledged { .. }
+    ));
+    assert!(matches!(
+        session_delete_request_publish(
+            &subscription,
+            &session,
+            SessionDeleteParams::user_disconnected(),
+            103,
+            4_000_000_000,
+        )
+        .expect_err("pending delete should fail"),
         PairingClientError::SessionNotAcknowledged { .. }
     ));
 
