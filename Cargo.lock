@@ -1097,10 +1097,12 @@ dependencies = [
 name = "wc-core"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "wc-protocol",
  "wc-transport",
 ]

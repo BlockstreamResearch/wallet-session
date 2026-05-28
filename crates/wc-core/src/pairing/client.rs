@@ -10,7 +10,7 @@ use wc_protocol::{
         SessionNamespaces, SessionProposeParams, SignMethod,
     },
 };
-use wc_transport::{RelayClient, RelayClientConfig};
+use wc_transport::{RelayClient, RelayClientConfig, RelayReconnectConfig};
 
 use super::{
     DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_DELETE_REQUEST_TAG, SESSION_DELETE_RESPONSE_TAG,
@@ -164,6 +164,70 @@ impl PairingClient {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.relay.status()
+    }
+
+    /// Reopens the relay WebSocket with a fresh Relay Auth URL.
+    ///
+    /// This only replaces the socket. Callers must explicitly resubscribe the
+    /// active pairing or session topic afterwards.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/clients/core/relay/relay-client-auth#overview>
+    ///
+    /// > The Relay Client Authentication protocol allows the client to authenticate using a JSON Web Token.
+    pub async fn reconnect(
+        &mut self,
+        config: &PairingClientConfig,
+        reconnect: RelayReconnectConfig,
+    ) -> Result<(), PairingClientError> {
+        let url = relay_connection_url(config, now_unix_seconds()?)?;
+        self.relay
+            .reconnect_with_retry(url.as_str(), reconnect)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Subscribes the reopened relay connection to the existing pairing topic.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
+    ///
+    /// > Used when a client subscribes a given topic.
+    pub async fn resubscribe_pairing(
+        &mut self,
+        subscription: &PairingSubscription,
+    ) -> Result<PairingSubscription, PairingClientError> {
+        let subscription_id = self
+            .relay
+            .subscribe(subscription.topic().clone())
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(PairingSubscription {
+            topic: subscription.topic().clone(),
+            sym_key: subscription.sym_key().clone(),
+            subscription_id,
+        })
+    }
+
+    /// Subscribes the reopened relay connection to the existing session topic.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
+    ///
+    /// > Used when a client subscribes a given topic.
+    pub async fn resubscribe_session(
+        &mut self,
+        subscription: &SessionSubscription,
+    ) -> Result<SessionSubscription, PairingClientError> {
+        let subscription_id = self
+            .relay
+            .subscribe(subscription.topic().clone())
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionSubscription {
+            topic: subscription.topic().clone(),
+            sym_key: subscription.sym_key().clone(),
+            subscription_id,
+        })
     }
 
     /// Fetches retained messages for a parsed pairing URI.

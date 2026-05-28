@@ -40,3 +40,4 @@ pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
     diff_session_namespaces,
 };
+pub use wc_transport::RelayReconnectConfig;

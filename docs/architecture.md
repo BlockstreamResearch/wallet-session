@@ -75,6 +75,7 @@ The caller should tell the user that connecting the new app disconnects the curr
 `SingleSessionClient` must not silently replace an active session or keep multiple approved dapp sessions alive.
 Consumers must not create multiple `SingleSessionClient` instances to regain multi-session behavior.
 One wallet runtime should reuse one client instance; multiple simultaneous instances are a separate multi-session design and require their own state ownership, UX, and threat model.
+Reconnect follows the same boundary: the runtime may reopen the relay socket, but it only resubscribes the single active pairing or session topic.
 
 Rationale: a single active session removes scheduler fairness, cross-topic routing, stale-session, and multi-dapp approval edge cases from the first production surface.
 If future product requirements need multiple simultaneous sessions, that should be introduced as a separate multi-session client/runtime with its own threat model and tests.
@@ -239,7 +240,7 @@ Current responsibilities:
 - expose next message by topic.
 
 Reconnect scope in the current transport layer: `RelayReconnectConfig` retries connection establishment, and `RelayClient::reconnect_with_retry` replaces the socket while clearing local subscription IDs and queued messages.
-Resubscribing after an established connection is lost belongs to the single-session runtime because it depends on the active `Idle`, `Pairing`, or `Session` state.
+The single-session runtime owns resubscription because it depends on the active `Idle`, `Pairing`, or `Session` state and must keep the one-topic boundary.
 
 Rationale: relay transport is a runtime primitive, but relay method DTOs and auth URL construction are protocol primitives. Keeping transport separate avoids mixing WebSocket details into protocol validation.
 

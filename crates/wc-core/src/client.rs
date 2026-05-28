@@ -10,6 +10,7 @@ use wc_protocol::{
         SessionEventParams, SessionNamespaces, SessionProposeParams,
     },
 };
+use wc_transport::RelayReconnectConfig;
 
 use crate::pairing::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingClientError,
@@ -28,6 +29,7 @@ pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
 pub struct SingleSessionClientConfig {
     pairing: PairingClientConfig,
     max_queued_events: usize,
+    reconnect: RelayReconnectConfig,
 }
 
 impl SingleSessionClientConfig {
@@ -37,6 +39,11 @@ impl SingleSessionClientConfig {
         Self {
             pairing,
             max_queued_events: DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
+            reconnect: RelayReconnectConfig::new(
+                wc_transport::DEFAULT_CONNECT_RETRY_ATTEMPTS,
+                wc_transport::DEFAULT_CONNECT_RETRY_INITIAL_DELAY,
+                wc_transport::DEFAULT_CONNECT_RETRY_MAX_DELAY,
+            ),
         }
     }
 
@@ -52,10 +59,23 @@ impl SingleSessionClientConfig {
         self.max_queued_events
     }
 
+    /// Relay reconnect policy used by `SingleSessionClient::reconnect`.
+    #[must_use]
+    pub const fn reconnect(&self) -> &RelayReconnectConfig {
+        &self.reconnect
+    }
+
     /// Sets the event queue bound used for retained relay messages.
     #[must_use]
     pub const fn with_max_queued_events(mut self, max_queued_events: usize) -> Self {
         self.max_queued_events = max_queued_events;
+        self
+    }
+
+    /// Sets the relay reconnect policy.
+    #[must_use]
+    pub const fn with_reconnect(mut self, reconnect: RelayReconnectConfig) -> Self {
+        self.reconnect = reconnect;
         self
     }
 }
@@ -101,6 +121,65 @@ impl SingleSessionClient {
     #[must_use]
     pub const fn status(&self) -> u16 {
         self.pairing.status()
+    }
+
+    /// Reopens the relay connection and resubscribes the one active topic.
+    ///
+    /// `SingleSessionClient` does not restore multiple topics. If the runtime
+    /// is idle, this only refreshes the relay socket. If a pairing or session
+    /// is active, the same topic is subscribed again after the socket is
+    /// reopened.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
+    ///
+    /// > Used when a client subscribes a given topic.
+    pub async fn reconnect(
+        &mut self,
+        config: &SingleSessionClientConfig,
+    ) -> Result<(), SingleSessionClientError> {
+        let previous_state = self.state.clone();
+        self.pairing
+            .reconnect(config.pairing(), config.reconnect().clone())
+            .await
+            .map_err(SingleSessionClientError::from)?;
+
+        match previous_state {
+            SingleSessionClientState::Idle => {
+                self.state = SingleSessionClientState::Idle;
+                Ok(())
+            }
+            SingleSessionClientState::Pairing(subscription) => {
+                match self.pairing.resubscribe_pairing(&subscription).await {
+                    Ok(subscription) => {
+                        self.state = SingleSessionClientState::Pairing(subscription);
+                        Ok(())
+                    }
+                    Err(source) => {
+                        self.state = SingleSessionClientState::Idle;
+                        self.queued_events.clear();
+                        Err(SingleSessionClientError::from(source))
+                    }
+                }
+            }
+            SingleSessionClientState::Session(mut session) => {
+                match self
+                    .pairing
+                    .resubscribe_session(&session.subscription)
+                    .await
+                {
+                    Ok(subscription) => {
+                        session.subscription = subscription;
+                        self.state = SingleSessionClientState::Session(session);
+                        Ok(())
+                    }
+                    Err(source) => {
+                        self.state = SingleSessionClientState::Idle;
+                        self.queued_events.clear();
+                        Err(SingleSessionClientError::from(source))
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribes to a `WalletConnect` pairing URI and queues retained proposals.
@@ -949,6 +1028,10 @@ impl<T> BoundedQueue<T> {
     fn extend_within_capacity(&mut self, events: impl IntoIterator<Item = T>) {
         self.items.extend(events);
     }
+
+    fn clear(&mut self) {
+        self.items.clear();
+    }
 }
 
 /// `SingleSessionClient` runtime error.
@@ -1079,13 +1162,18 @@ fn session_extended_expiry() -> Result<u64, SingleSessionClientError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
     use super::{
         ActiveSession, BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
-        SingleSessionClientConfig, SingleSessionClientError, SingleSessionClientState,
-        take_expired_session_from_state,
+        SingleSessionClient, SingleSessionClientConfig, SingleSessionClientError,
+        SingleSessionClientState, take_expired_session_from_state,
     };
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+    use tokio::time::sleep;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
     use wc_protocol::{
         key::X25519PublicKey,
         pairing::PairingSymKey,
@@ -1095,7 +1183,9 @@ mod tests {
         },
     };
 
-    use crate::{PairingClientConfig, SessionSubscription};
+    use crate::{
+        PairingClientConfig, PairingSubscription, RelayReconnectConfig, SessionSubscription,
+    };
 
     #[test]
     fn client_config_uses_default_event_queue_capacity() {
@@ -1158,6 +1248,117 @@ mod tests {
         assert_eq!(take_expired_session_from_state(&mut state, expiry), None);
     }
 
+    #[tokio::test]
+    async fn reconnect_resubscribes_active_pairing_topic() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x45; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let _first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("resubscribed-pairing"),
+            )
+            .await;
+            sleep(Duration::from_millis(30)).await;
+        });
+
+        let config = reconnect_test_config(address);
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            PairingSymKey::from_bytes([0x46; 32]),
+        ));
+
+        client.reconnect(&config).await.expect("reconnects");
+
+        match &client.state {
+            SingleSessionClientState::Pairing(subscription) => {
+                assert_eq!(subscription.topic(), &topic);
+                assert_eq!(subscription.subscription_id(), "resubscribed-pairing");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        server.await.expect("server task joins");
+    }
+
+    #[tokio::test]
+    async fn reconnect_resubscribes_active_session_topic() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let topic = RelayTopic::from_bytes([0x47; 32]);
+        let server_topic = topic.clone();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.expect("accepts first client");
+            let _first_websocket = accept_async(first_stream)
+                .await
+                .expect("accepts first websocket");
+
+            let (second_stream, _) = listener.accept().await.expect("accepts second client");
+            let mut second_websocket = accept_async(second_stream)
+                .await
+                .expect("accepts second websocket");
+            let subscribe = read_json_frame(&mut second_websocket).await;
+            assert_eq!(subscribe["method"], "irn_subscribe");
+            assert_eq!(subscribe["params"]["topic"], server_topic.as_str());
+            send_result(
+                &mut second_websocket,
+                &subscribe,
+                json!("resubscribed-session"),
+            )
+            .await;
+            sleep(Duration::from_millis(30)).await;
+        });
+
+        let config = reconnect_test_config(address);
+        let mut client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to first relay websocket");
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession {
+            subscription: SessionSubscription::for_test(
+                topic.clone(),
+                PairingSymKey::from_bytes([0x48; 32]),
+            ),
+            session: test_session(topic.clone(), 1_779_999_999),
+        }));
+
+        client.reconnect(&config).await.expect("reconnects");
+
+        match &client.state {
+            SingleSessionClientState::Session(session) => {
+                assert_eq!(session.subscription.topic(), &topic);
+                assert_eq!(
+                    session.subscription.subscription_id(),
+                    "resubscribed-session"
+                );
+                assert_eq!(session.session.topic, topic);
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+
+        server.await.expect("server task joins");
+    }
+
     fn test_session(topic: RelayTopic, expiry: u64) -> Session {
         let public_key = X25519PublicKey::from_bytes([0x66; 32]);
         let metadata = DappMetadata {
@@ -1197,5 +1398,51 @@ mod tests {
             wallet_pay_result: None,
             transport_type: Some(SessionTransportType::Relay),
         }
+    }
+
+    fn reconnect_test_config(address: std::net::SocketAddr) -> SingleSessionClientConfig {
+        let mut pairing = PairingClientConfig::new("project", [7; 32], "subject");
+        pairing.relay_url = format!("ws://{address}");
+        SingleSessionClientConfig::new(pairing).with_reconnect(RelayReconnectConfig::new(
+            NonZeroUsize::new(2).expect("non-zero"),
+            Duration::ZERO,
+            Duration::ZERO,
+        ))
+    }
+
+    async fn read_json_frame(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> Value {
+        let message = websocket
+            .next()
+            .await
+            .expect("peer sends frame")
+            .expect("frame is readable");
+
+        match message {
+            Message::Text(text) => {
+                serde_json::from_str::<Value>(&text).expect("text frame is json")
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    async fn send_result(
+        websocket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        request: &Value,
+        result: Value,
+    ) {
+        websocket
+            .send(Message::Text(
+                json!({
+                    "id": request["id"],
+                    "jsonrpc": "2.0",
+                    "result": result,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("sends result");
     }
 }

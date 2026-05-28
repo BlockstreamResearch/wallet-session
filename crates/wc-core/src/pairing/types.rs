@@ -636,6 +636,16 @@ pub struct PairingSubscription {
 }
 
 impl PairingSubscription {
+    /// Builds a pairing subscription for deterministic core-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(topic: RelayTopic, sym_key: PairingSymKey) -> Self {
+        Self {
+            topic,
+            sym_key,
+            subscription_id: "test-subscription-id".to_owned(),
+        }
+    }
+
     /// Pairing relay topic registered on the connection.
     #[must_use]
     pub const fn topic(&self) -> &RelayTopic {
