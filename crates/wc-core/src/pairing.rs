@@ -19,9 +19,10 @@ use wc_protocol::{
     },
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
-        RelayProtocolOptions, ScopedProperties, SessionConfig, SessionNamespaces,
+        RelayProtocolOptions, ScopedProperties, Session, SessionConfig, SessionNamespaces,
         SessionParticipant, SessionProperties, SessionProposeParams, SessionProposeResult,
-        SessionSettleParams, SessionSettleResponse, SignMethod, session_propose_error_response,
+        SessionSettleParams, SessionSettleResponse, SessionTransportType, SignMethod,
+        session_propose_error_response,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
@@ -370,6 +371,7 @@ impl PairingClient {
             },
             responder_public_key: responder.public_key().clone(),
             session_settle_request_id: settle_request_id,
+            session: approval_messages.session,
             proposal_response_ack,
             session_settle_ack,
         })
@@ -520,6 +522,7 @@ pub struct ApprovedSession {
     subscription: SessionSubscription,
     responder_public_key: wc_protocol::key::X25519PublicKey,
     session_settle_request_id: u64,
+    session: Session,
     proposal_response_ack: bool,
     session_settle_ack: bool,
 }
@@ -547,6 +550,58 @@ impl ApprovedSession {
     #[must_use]
     pub const fn session_settle_request_id(&self) -> u64 {
         self.session_settle_request_id
+    }
+
+    /// Session record before the peer acknowledges `wc_sessionSettle`.
+    #[must_use]
+    pub const fn pending_session(&self) -> &Session {
+        &self.session
+    }
+
+    /// Returns the session record after a successful `wc_sessionSettle` response.
+    ///
+    /// The maintained Sign Client stores the session before publishing approval,
+    /// then flips `acknowledged` after receiving the matching settle response.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L506-L524>
+    ///
+    /// > const session: SessionTypes.Struct = {
+    /// > acknowledged: false,
+    /// > await this.client.session.set(sessionTopic, session);
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2288-L2299>
+    ///
+    /// > await this.client.session.update(topic, { acknowledged: true });
+    pub fn acknowledged_session(
+        &self,
+        response: &SessionSettleResponseMessage,
+    ) -> Result<Session, PairingClientError> {
+        if response.topic() != self.session_topic() {
+            return Err(PairingClientError::UnexpectedTopic {
+                expected: self.session_topic().clone(),
+                actual: response.topic().clone(),
+            });
+        }
+
+        match response.payload() {
+            SessionSettleResponsePayload::Success(response) => {
+                if response.id != self.session_settle_request_id {
+                    return Err(PairingClientError::SessionResponseIdMismatch {
+                        expected: self.session_settle_request_id,
+                        actual: response.id,
+                    });
+                }
+
+                let mut session = self.session.clone();
+                session.acknowledged = true;
+                Ok(session)
+            }
+            SessionSettleResponsePayload::Error(response) => {
+                Err(PairingClientError::SessionSettleRejected {
+                    response: response.clone(),
+                })
+            }
+        }
     }
 
     /// Relay ack for the proposal success response publish.
@@ -861,6 +916,13 @@ pub enum PairingClientError {
     #[error("session settle response payload is unsupported")]
     SessionSettleUnsupportedPayload,
 
+    /// Peer rejected the session settlement request.
+    #[error("session settle rejected")]
+    SessionSettleRejected {
+        /// JSON-RPC error response received on the session topic.
+        response: JsonRpcErrorResponse,
+    },
+
     /// Sign JSON-RPC ID construction failed.
     #[error("sign rpc id construction failed")]
     SignRpcId {
@@ -1080,6 +1142,7 @@ where
 struct SessionProposalApprovalPublishes {
     session_topic: RelayTopic,
     session_sym_key: PairingSymKey,
+    session: Session,
     proposal_response: IrnPublish,
     session_settle: IrnPublish,
 }
@@ -1108,6 +1171,32 @@ fn session_proposal_approval_publishes(
         &proposal.params.proposer.public_key,
     );
     let session_topic = derive_topic_from_sym_key(&session_sym_key);
+    let controller = SessionParticipant {
+        public_key: responder.public_key().clone(),
+        metadata: approval.wallet_metadata.clone(),
+    };
+    let session = Session {
+        topic: session_topic.clone(),
+        pairing_topic: subscription.topic.clone(),
+        relay: approval.relay.clone(),
+        expiry: approval.expiry,
+        acknowledged: false,
+        controller: responder.public_key().clone(),
+        namespaces: approval.namespaces.clone(),
+        required_namespaces: proposal.params.required_namespaces.clone(),
+        optional_namespaces: proposal.params.optional_namespaces.clone(),
+        session_properties: approval.session_properties.clone(),
+        scoped_properties: approval.scoped_properties.clone(),
+        session_config: approval.session_config.clone(),
+        self_participant: controller.clone(),
+        peer: SessionParticipant {
+            public_key: proposal.params.proposer.public_key.clone(),
+            metadata: proposal.params.proposer.metadata.clone(),
+        },
+        authentication: None,
+        wallet_pay_result: None,
+        transport_type: Some(SessionTransportType::Relay),
+    };
 
     let proposal_response = JsonRpcResponse::new(
         proposal.id,
@@ -1130,10 +1219,7 @@ fn session_proposal_approval_publishes(
         SessionSettleParams {
             relay: approval.relay,
             namespaces: approval.namespaces,
-            controller: SessionParticipant {
-                public_key: responder.public_key().clone(),
-                metadata: approval.wallet_metadata,
-            },
+            controller,
             expiry: approval.expiry,
             session_properties: approval.session_properties,
             scoped_properties: approval.scoped_properties,
@@ -1153,6 +1239,7 @@ fn session_proposal_approval_publishes(
     Ok(SessionProposalApprovalPublishes {
         session_topic,
         session_sym_key,
+        session,
         proposal_response,
         session_settle,
     })
@@ -1461,6 +1548,99 @@ mod tests {
             "Rust Wallet"
         );
         assert_eq!(settle_request.params.namespaces["eip155"].accounts.len(), 1);
+        assert_eq!(publishes.session.topic, publishes.session_topic);
+        assert_eq!(publishes.session.pairing_topic, *subscription.topic());
+        assert!(!publishes.session.acknowledged);
+        assert_eq!(publishes.session.controller, *responder.public_key());
+        assert_eq!(
+            publishes.session.self_participant.metadata.name,
+            "Rust Wallet"
+        );
+        assert_eq!(publishes.session.peer.metadata.name, "Probe Dapp");
+        assert_eq!(
+            publishes.session.transport_type,
+            Some(SessionTransportType::Relay)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn acknowledged_session_marks_pending_session_active() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let session_subscription = session_subscription(sym_key)?;
+        let mut pending_session = session_from_subscription(&session_subscription)?;
+        pending_session.acknowledged = false;
+        let approved = ApprovedSession {
+            subscription: session_subscription,
+            responder_public_key: X25519PrivateKey::from_hex(
+                "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+            )?
+            .public_key(),
+            session_settle_request_id: 9,
+            session: pending_session,
+            proposal_response_ack: true,
+            session_settle_ack: true,
+        };
+        let response = SessionSettleResponseMessage {
+            topic: approved.session_topic().clone(),
+            encoded_message_len: 112,
+            published_at: 1_779_955_000_000,
+            tag: Some(SESSION_SETTLE_RESPONSE_TAG),
+            payload: SessionSettleResponsePayload::Success(session_ack_response(9)),
+        };
+
+        let acknowledged = approved.acknowledged_session(&response)?;
+
+        assert!(!approved.pending_session().acknowledged);
+        assert!(acknowledged.acknowledged);
+        assert_eq!(acknowledged.topic, *approved.session_topic());
+        assert_eq!(acknowledged.peer.metadata.name, "Probe Dapp");
+
+        Ok(())
+    }
+
+    #[test]
+    fn acknowledged_session_rejects_settle_error_response() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let session_subscription = session_subscription(sym_key)?;
+        let approved = ApprovedSession {
+            responder_public_key: X25519PrivateKey::from_hex(
+                "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+            )?
+            .public_key(),
+            session_settle_request_id: 9,
+            session: session_from_subscription(&session_subscription)?,
+            subscription: session_subscription,
+            proposal_response_ack: true,
+            session_settle_ack: true,
+        };
+        let response = SessionSettleResponseMessage {
+            topic: approved.session_topic().clone(),
+            encoded_message_len: 112,
+            published_at: 1_779_955_000_000,
+            tag: Some(SESSION_SETTLE_RESPONSE_TAG),
+            payload: SessionSettleResponsePayload::Error(JsonRpcErrorResponse::new(
+                9,
+                JsonRpcError::new(
+                    JsonRpcErrorCode::SessionSettlementFailed,
+                    "settlement failed",
+                ),
+            )),
+        };
+
+        assert!(matches!(
+            approved
+                .acknowledged_session(&response)
+                .expect_err("settle error is rejected"),
+            PairingClientError::SessionSettleRejected { .. }
+        ));
 
         Ok(())
     }
@@ -1595,6 +1775,63 @@ mod tests {
             topic: RelayTopic::from_hex("44".repeat(32))?,
             sym_key,
             subscription_id: "session-sub-1".to_owned(),
+        })
+    }
+
+    fn session_from_subscription(
+        subscription: &SessionSubscription,
+    ) -> Result<Session, Box<dyn std::error::Error>> {
+        let controller = X25519PrivateKey::from_hex(
+            "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+        )?
+        .public_key();
+        let peer = X25519PrivateKey::from_hex(
+            "4afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+        )?
+        .public_key();
+
+        Ok(Session {
+            topic: subscription.topic().clone(),
+            pairing_topic: RelayTopic::from_hex("11".repeat(32))?,
+            relay: RelayProtocolOptions {
+                protocol: "irn".to_owned(),
+                data: None,
+            },
+            expiry: 4_102_444_800,
+            acknowledged: false,
+            controller: controller.clone(),
+            namespaces: std::collections::BTreeMap::from([(
+                "eip155".parse()?,
+                SessionNamespace {
+                    chains: Some(vec!["eip155:1".parse()?]),
+                    accounts: vec!["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?],
+                    methods: vec!["personal_sign".parse()?],
+                    events: vec!["accountsChanged".parse()?],
+                },
+            )]),
+            required_namespaces: std::collections::BTreeMap::new(),
+            optional_namespaces: std::collections::BTreeMap::new(),
+            session_properties: None,
+            scoped_properties: None,
+            session_config: None,
+            self_participant: SessionParticipant {
+                public_key: controller,
+                metadata: wallet_metadata(),
+            },
+            peer: SessionParticipant {
+                public_key: peer,
+                metadata: DappMetadata {
+                    name: "Probe Dapp".to_owned(),
+                    description: "Probe".to_owned(),
+                    url: "https://example.com".to_owned(),
+                    icons: vec![],
+                    verify_url: None,
+                    redirect: None,
+                },
+            },
+            authentication: None,
+            wallet_pay_result: None,
+            transport_type: Some(SessionTransportType::Relay),
         })
     }
 

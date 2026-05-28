@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
     PairingPayload, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
-    SessionSettleResponsePayload,
+    SessionSettleResponseMessage, SessionSettleResponsePayload,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
@@ -581,11 +581,38 @@ async fn run_core_pairing_uri_approve_probe(
         approved.proposal_response_ack(),
         approved.session_settle_ack()
     );
+    receive_and_print_session_settle_response(&mut client, &approved).await?;
 
+    Ok((client, subscription, approved))
+}
+
+async fn receive_and_print_session_settle_response(
+    client: &mut PairingClient,
+    approved: &ApprovedSession,
+) -> Result<()> {
     let settle_response = client
-        .next_session_settle_response(&approved)
+        .next_session_settle_response(approved)
         .await?
         .context("no wc_sessionSettle response received")?;
+    print_session_settle_response(&settle_response);
+    let session = approved.acknowledged_session(&settle_response)?;
+
+    println!(
+        "core-pairing-approve active_session topic={} acknowledged={} controller={} peer_name={} self_name={} namespaces={} expiry={} transport={:?}",
+        session.topic,
+        session.acknowledged,
+        session.controller,
+        session.peer.metadata.name,
+        session.self_participant.metadata.name,
+        session.namespaces.len(),
+        session.expiry,
+        session.transport_type
+    );
+
+    Ok(())
+}
+
+fn print_session_settle_response(settle_response: &SessionSettleResponseMessage) {
     match settle_response.payload() {
         SessionSettleResponsePayload::Success(response) => println!(
             "core-pairing-approve settle_response success=true topic={} id={} tag_present={} tag={} published_at={} message_len={}",
@@ -608,8 +635,6 @@ async fn run_core_pairing_uri_approve_probe(
             settle_response.encoded_message_len()
         ),
     }
-
-    Ok((client, subscription, approved))
 }
 
 async fn run_core_pairing_uri_reject_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
