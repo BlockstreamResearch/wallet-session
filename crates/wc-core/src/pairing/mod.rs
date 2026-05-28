@@ -16,9 +16,10 @@ mod tests;
 pub use client::{PairingClient, PairingClientConfig};
 pub use error::PairingClientError;
 pub use types::{
-    ApprovedSession, PairingPayload, PairingReceivedMessage, PairingSubscription, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionSettleResponseMessage,
-    SessionSettleResponsePayload, SessionSubscription,
+    ApprovedSession, PairingPayload, PairingReceivedMessage, PairingSubscription,
+    SessionMessageOutcome, SessionPayload, SessionProposalApproval, SessionReceivedMessage,
+    SessionRequestRejection, SessionSettleResponseMessage, SessionSettleResponsePayload,
+    SessionSubscription,
 };
 
 /// Default wait time for one live pairing-topic message.

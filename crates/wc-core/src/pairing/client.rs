@@ -15,13 +15,19 @@ use super::{
         next_sign_rpc_id, session_proposal_approval_publishes, session_proposal_reject_publish,
     },
     codec::{
-        decode_session_message_data, decode_session_settle_response_data, decode_subscription_data,
+        decode_session_message_data, decode_session_message_data_unchecked,
+        decode_session_settle_response_data, decode_subscription_data,
+        validate_session_message_payload,
     },
     error::PairingClientError,
-    session_request::{session_request_error_publish, session_request_success_publish},
+    session_request::{
+        session_request_error_publish, session_request_success_publish,
+        session_request_validation_error,
+    },
     types::{
-        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
-        SessionReceivedMessage, SessionSettleResponseMessage, SessionSubscription,
+        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionMessageOutcome,
+        SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+        SessionSettleResponseMessage, SessionSubscription,
     },
 };
 
@@ -380,6 +386,69 @@ impl PairingClient {
             now_unix_seconds()?,
         )
         .map(Some)
+    }
+
+    /// Waits for one session-topic message and responds to invalid requests.
+    ///
+    /// Valid messages are returned for wallet handling. Parsed `wc_sessionRequest`
+    /// messages that fail request-level validation are answered on the session
+    /// topic with a JSON-RPC error and returned as `Rejected`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > The client should immediately reject the request and respond an error
+    /// > if the target session permissions doesn't include the requested method
+    /// > or chain ID.
+    pub async fn next_session_message_or_reject(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+    ) -> Result<Option<SessionMessageOutcome>, PairingClientError> {
+        let Some(subscription_data) = timeout(
+            self.receive_timeout,
+            self.relay.next_message_for_topic(subscription.topic()),
+        )
+        .await
+        .map_err(|_| PairingClientError::ReceiveTimedOut {
+            timeout: self.receive_timeout,
+        })?
+        .map_err(|source| PairingClientError::Relay { source })?
+        else {
+            return Ok(None);
+        };
+
+        let now_unix_seconds = now_unix_seconds()?;
+        let message = decode_session_message_data_unchecked(
+            subscription_data.data,
+            subscription,
+            session,
+            now_unix_seconds,
+        )?;
+
+        match validate_session_message_payload(session, &message, now_unix_seconds) {
+            Ok(()) => Ok(Some(SessionMessageOutcome::Received(message))),
+            Err(error) => {
+                let Some(response_error) = session_request_validation_error(&error) else {
+                    return Err(error);
+                };
+                let SessionPayload::SessionRequest(request) = message.payload() else {
+                    return Err(error);
+                };
+                let request_id = request.id;
+                let response_ack = self
+                    .respond_session_request_error(subscription, &message, response_error.clone())
+                    .await?;
+
+                Ok(Some(SessionMessageOutcome::Rejected(
+                    SessionRequestRejection {
+                        topic: message.topic().clone(),
+                        request_id,
+                        error: response_error,
+                        response_ack,
+                    },
+                )))
+            }
+        }
     }
 
     /// Publishes a success response for a received `wc_sessionRequest`.

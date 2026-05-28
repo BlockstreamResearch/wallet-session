@@ -2,9 +2,14 @@ use super::{
     approval::{session_proposal_approval_publishes, session_proposal_reject_publish},
     client::{relay_connection_url, validate_pairing_not_expired},
     codec::{
-        decode_session_message_data, decode_session_settle_response_data, decode_subscription_data,
+        decode_session_message_data, decode_session_message_data_unchecked,
+        decode_session_settle_response_data, decode_subscription_data,
+        validate_session_message_payload,
     },
-    session_request::{session_request_error_publish, session_request_success_publish},
+    session_request::{
+        session_request_error_publish, session_request_success_publish,
+        session_request_validation_error,
+    },
     *,
 };
 use wc_protocol::{
@@ -577,6 +582,84 @@ fn rejects_unauthorized_session_request_method() -> Result<(), Box<dyn std::erro
         PairingClientError::SessionUnauthorizedMethod { chain_id, method }
             if chain_id.as_str() == "eip155:1" && method.as_str() == "eth_sendTransaction"
     ));
+
+    Ok(())
+}
+
+#[test]
+fn maps_unauthorized_session_request_method_to_error_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = session_request(77, "eip155:1", "eth_sendTransaction", Some(4_102_444_700))?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1108),
+    )?;
+    let received =
+        decode_session_message_data_unchecked(data, &subscription, &session, 4_000_000_000)?;
+    let validation_error = validate_session_message_payload(&session, &received, 4_000_000_000)
+        .expect_err("unauthorized method should fail validation");
+    let response_error = session_request_validation_error(&validation_error)
+        .expect("unauthorized method is respondable");
+    let publish = session_request_error_publish(&subscription, &received, response_error)?;
+    let response: wc_protocol::session::SessionRequestErrorResponse =
+        decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(response.id, 77);
+    assert_eq!(response.error.code, JsonRpcErrorCode::UnauthorizedMethod);
+    assert_eq!(response.error.message, "Unauthorized method.");
+    assert_eq!(
+        response.error.data,
+        Some(serde_json::json!({
+            "chainId": "eip155:1",
+            "method": "eth_sendTransaction",
+        }))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn maps_expired_session_request_to_error_response() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = session_request(77, "eip155:1", "personal_sign", Some(99))?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1108),
+    )?;
+    let received = decode_session_message_data_unchecked(data, &subscription, &session, 100)?;
+    let validation_error = validate_session_message_payload(&session, &received, 100)
+        .expect_err("expired request should fail validation");
+    let response_error = session_request_validation_error(&validation_error)
+        .expect("expired request is respondable");
+    let publish = session_request_error_publish(&subscription, &received, response_error)?;
+    let response: wc_protocol::session::SessionRequestErrorResponse =
+        decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(response.id, 77);
+    assert_eq!(response.error.code, JsonRpcErrorCode::Other(6));
+    assert_eq!(response.error.message, "Expired. session request.");
+    assert_eq!(
+        response.error.data,
+        Some(serde_json::json!({
+            "expiryTimestamp": 99,
+            "nowUnixSeconds": 100,
+        }))
+    );
 
     Ok(())
 }

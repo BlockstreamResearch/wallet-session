@@ -254,6 +254,50 @@ pub struct SessionReceivedMessage {
     pub(super) payload: SessionPayload,
 }
 
+/// Result of reading a session-topic message with invalid-request auto-rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMessageOutcome {
+    /// Message passed local session validation and is ready for wallet handling.
+    Received(SessionReceivedMessage),
+    /// Request was invalid for the active session and was answered with an error.
+    Rejected(SessionRequestRejection),
+}
+
+/// Protocol error response sent for an invalid `wc_sessionRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequestRejection {
+    pub(super) topic: RelayTopic,
+    pub(super) request_id: u64,
+    pub(super) error: wc_protocol::session::JsonRpcError,
+    pub(super) response_ack: bool,
+}
+
+impl SessionRequestRejection {
+    /// Session topic that received the invalid request.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// JSON-RPC request ID copied into the error response.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// JSON-RPC error sent to the peer.
+    #[must_use]
+    pub const fn error(&self) -> &wc_protocol::session::JsonRpcError {
+        &self.error
+    }
+
+    /// Relay acknowledgement for the error response publish.
+    #[must_use]
+    pub const fn response_ack(&self) -> bool {
+        self.response_ack
+    }
+}
+
 impl SessionReceivedMessage {
     /// Relay topic that delivered this message.
     #[must_use]

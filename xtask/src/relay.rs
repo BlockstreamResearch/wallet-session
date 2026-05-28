@@ -16,9 +16,9 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
-    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionSettleResponseMessage,
-    SessionSettleResponsePayload,
+    PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
+    SessionMessageOutcome, SessionPayload, SessionProposalApproval, SessionReceivedMessage,
+    SessionRequestRejection, SessionSettleResponseMessage, SessionSettleResponsePayload,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
@@ -32,7 +32,10 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{DappMetadata, ProposalNamespace, Session, SessionNamespace, SessionNamespaces},
-    session::{JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, SessionProposeParams, SignMethod},
+    session::{
+        JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
+        SignMethod,
+    },
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
@@ -101,6 +104,74 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+struct SessionRequestHarness {
+    result_file: PathBuf,
+    guard: ChildGuard,
+}
+
+impl SessionRequestHarness {
+    async fn start(response_mode: &str, raw_invalid_request: bool) -> Result<(Self, String)> {
+        let workspace_root = workspace_root()?;
+        let harness_dir = workspace_root.join("tools/js-harness");
+        let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+        let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
+        if let Some(parent) = uri_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let _ = fs::remove_file(&uri_file);
+        let _ = fs::remove_file(&result_file);
+
+        let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+        let request_hold_ms =
+            env::var("WC_JS_SESSION_REQUEST_HOLD_MS").unwrap_or_else(|_| hold_ms.clone());
+
+        println!(
+            "core-js-session-request harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} request_hold_ms={request_hold_ms} response_mode={response_mode}",
+            harness_dir.display(),
+            uri_file.display(),
+            result_file.display()
+        );
+
+        let mut command = Command::new("bun");
+        command
+            .args(["run", "propose-session"])
+            .current_dir(&harness_dir)
+            .env("WC_JS_URI_FILE", &uri_file)
+            .env("WC_JS_RESULT_FILE", &result_file)
+            .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+            .env("WC_JS_SESSION_REQUEST_HOLD_MS", &request_hold_ms)
+            .env_remove("WC_JS_PRINT_URI")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        if !raw_invalid_request {
+            command
+                .env("WC_JS_SEND_SESSION_REQUEST", "1")
+                .env("WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE", "1");
+        }
+
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
+        let mut guard = ChildGuard::new(child);
+        let uri = wait_for_js_pairing_uri(&uri_file, guard.child_mut()).await?;
+        Ok((Self { result_file, guard }, uri))
+    }
+
+    async fn expect_result(&mut self, expected_outcome: &str) -> Result<Value> {
+        let result = wait_for_js_result(&self.result_file, self.guard.child_mut()).await?;
+        if result.get("outcome").and_then(Value::as_str) != Some(expected_outcome) {
+            bail!("expected JS {expected_outcome} result, got {result}");
+        }
+        Ok(result)
+    }
+
+    fn terminate(&mut self) {
+        self.guard.terminate();
     }
 }
 
@@ -433,69 +504,69 @@ async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result
 }
 
 async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<()> {
-    let workspace_root = workspace_root()?;
-    let harness_dir = workspace_root.join("tools/js-harness");
-    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
-    let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
-    if let Some(parent) = uri_file.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let _ = fs::remove_file(&uri_file);
-    let _ = fs::remove_file(&result_file);
-
-    let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
-    let request_hold_ms =
-        env::var("WC_JS_SESSION_REQUEST_HOLD_MS").unwrap_or_else(|_| hold_ms.clone());
-    println!(
-        "core-js-session-request harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} request_hold_ms={request_hold_ms}",
-        harness_dir.display(),
-        uri_file.display(),
-        result_file.display()
-    );
-
-    let child = Command::new("bun")
-        .args(["run", "propose-session"])
-        .current_dir(&harness_dir)
-        .env("WC_JS_URI_FILE", &uri_file)
-        .env("WC_JS_RESULT_FILE", &result_file)
-        .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
-        .env("WC_JS_SESSION_REQUEST_HOLD_MS", &request_hold_ms)
-        .env("WC_JS_SEND_SESSION_REQUEST", "1")
-        .env("WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE", "1")
-        .env_remove("WC_JS_PRINT_URI")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
-    let mut harness = ChildGuard::new(child);
-    let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
+    let response_mode =
+        env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
+    let raw_invalid_request = response_mode.starts_with("auto-reject-");
+    let (mut harness, uri) =
+        SessionRequestHarness::start(&response_mode, raw_invalid_request).await?;
 
     let (mut client, pairing_subscription, approved, session) =
         run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
-    let session_message = client
-        .next_session_message(approved.subscription(), &session)
-        .await?
-        .context("no wc_sessionRequest message received")?;
+
+    if raw_invalid_request {
+        run_core_raw_invalid_session_request_probe(
+            config,
+            &mut client,
+            approved.subscription(),
+            &session,
+            &response_mode,
+        )
+        .await?;
+        let result = harness.expect_result("approved").await?;
+        println!("core-js-session-request js_result={result}");
+    } else {
+        run_core_valid_session_request_probe(
+            &mut client,
+            approved.subscription(),
+            &session,
+            &response_mode,
+            &mut harness,
+        )
+        .await?;
+    }
+
+    let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
+    println!("core-js-session-request pairing_unsubscribe_ack={unsubscribe_result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_valid_session_request_probe(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    response_mode: &str,
+    harness: &mut SessionRequestHarness,
+) -> Result<()> {
+    let session_message =
+        wait_for_valid_session_request_message(client, subscription, session).await?;
     print_session_message("core-js-session-request live_message", &session_message);
 
-    let response_mode =
-        env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
-    let response_ack = match response_mode.as_str() {
+    let response_ack = match response_mode {
         "success" => {
             let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
                 |_| Ok(json!("0xsigned-by-rust")),
                 |value| parse_json_env(&value),
             )?;
             client
-                .respond_session_request_success(approved.subscription(), &session_message, result)
+                .respond_session_request_success(subscription, &session_message, result)
                 .await?
         }
         "error" => {
             client
                 .respond_session_request_error(
-                    approved.subscription(),
+                    subscription,
                     &session_message,
                     JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
                 )
@@ -507,27 +578,263 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
     };
     println!("core-js-session-request response_ack={response_ack} mode={response_mode}");
 
-    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
-    match response_mode.as_str() {
-        "success" => {
-            if result.get("outcome").and_then(Value::as_str) != Some("session_request_response") {
-                bail!("expected JS session_request_response result, got {result}");
-            }
-        }
-        "error" => {
-            if result.get("outcome").and_then(Value::as_str) != Some("session_request_error") {
-                bail!("expected JS session_request_error result, got {result}");
-            }
-        }
+    let expected_outcome = match response_mode {
+        "success" => "session_request_response",
+        "error" => "session_request_error",
         _ => unreachable!("validated response mode"),
-    }
+    };
+    let result = harness.expect_result(expected_outcome).await?;
     println!("core-js-session-request js_result={result}");
 
-    let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
-    println!("core-js-session-request pairing_unsubscribe_ack={unsubscribe_result}");
-    harness.terminate();
-
     Ok(())
+}
+
+async fn wait_for_valid_session_request_message(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+) -> Result<SessionReceivedMessage> {
+    loop {
+        let message = client
+            .next_session_message(subscription, session)
+            .await?
+            .context("no wc_sessionRequest message received")?;
+        if matches!(message.payload(), SessionPayload::SessionRequest(_)) {
+            return Ok(message);
+        }
+        print_ignored_session_message(&message);
+    }
+}
+
+async fn run_core_raw_invalid_session_request_probe(
+    config: &RelayProbeConfig,
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    response_mode: &str,
+) -> Result<()> {
+    let mut peer = config.connect("publisher").await?;
+    let subscription_id = peer.subscribe(subscription.topic().clone()).await?;
+    println!("core-js-session-request adversarial_subscription_id={subscription_id}");
+
+    let request = RawInvalidSessionRequest::new(response_mode, subscription)?;
+    publish_raw_invalid_session_request(&mut peer, subscription, &request).await?;
+
+    let rejection = wait_for_session_request_rejection(client, subscription, session).await?;
+    validate_session_request_rejection(&rejection, &request)?;
+
+    let response = read_session_request_error_response(&mut peer, subscription, &request).await?;
+    println!(
+        "core-js-session-request auto_reject id={} code={:?} message={} response_ack={}",
+        response.id,
+        response.error.code,
+        response.error.message,
+        rejection.response_ack()
+    );
+
+    peer.unsubscribe(subscription.topic(), &subscription_id)
+        .await?;
+    Ok(())
+}
+
+struct RawInvalidSessionRequest {
+    chain_id: &'static str,
+    method: &'static str,
+    expiry_timestamp: u64,
+    expected_code: JsonRpcErrorCode,
+    message: String,
+    request_id: u64,
+}
+
+impl RawInvalidSessionRequest {
+    fn new(response_mode: &str, subscription: &wc_core::SessionSubscription) -> Result<Self> {
+        let now = unix_timestamp();
+        let (chain_id, method, expiry_timestamp, expected_code) = match response_mode {
+            "auto-reject-unauthorized-method" => (
+                "eip155:1",
+                "eth_sendTransaction",
+                now + 300,
+                JsonRpcErrorCode::UnauthorizedMethod,
+            ),
+            "auto-reject-unauthorized-chain" => (
+                "eip155:137",
+                "personal_sign",
+                now + 300,
+                JsonRpcErrorCode::UnsupportedChains,
+            ),
+            "auto-reject-expired" => (
+                "eip155:1",
+                "personal_sign",
+                now.saturating_sub(1),
+                JsonRpcErrorCode::Other(6),
+            ),
+            other => bail!("unknown raw invalid request mode: {other}"),
+        };
+
+        let request_id = rpc_id()?.as_u64();
+        let plaintext = serde_json::to_string(&raw_session_request_json(
+            request_id,
+            chain_id,
+            method,
+            expiry_timestamp,
+        ))
+        .context("failed to serialize adversarial session request")?;
+        let envelope = Envelope::encrypt_type_0(&plaintext, subscription.sym_key())
+            .context("failed to encrypt adversarial session request")?;
+
+        Ok(Self {
+            chain_id,
+            method,
+            expiry_timestamp,
+            expected_code,
+            message: envelope.encode(EnvelopeEncoding::Base64),
+            request_id,
+        })
+    }
+}
+
+fn raw_session_request_json(
+    request_id: u64,
+    chain_id: &str,
+    method: &str,
+    expiry_timestamp: u64,
+) -> Value {
+    json!({
+        "id": request_id,
+        "jsonrpc": "2.0",
+        "method": "wc_sessionRequest",
+        "params": {
+            "chainId": chain_id,
+            "request": {
+                "method": method,
+                "params": ["0x68656c6c6f", "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+                "expiryTimestamp": expiry_timestamp,
+            },
+        },
+    })
+}
+
+async fn publish_raw_invalid_session_request(
+    peer: &mut RelaySocket,
+    subscription: &wc_core::SessionSubscription,
+    request: &RawInvalidSessionRequest,
+) -> Result<()> {
+    peer.publish(
+        IrnPublish::new(
+            subscription.topic().clone(),
+            request.message.clone(),
+            5 * 60,
+            1108,
+        )
+        .with_prompt(true),
+    )
+    .await?;
+    println!(
+        "core-js-session-request adversarial_request id={} chain_id={} method={} expiry={} publish_ack=true",
+        request.request_id, request.chain_id, request.method, request.expiry_timestamp
+    );
+    Ok(())
+}
+
+async fn wait_for_session_request_rejection(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+) -> Result<SessionRequestRejection> {
+    loop {
+        let outcome = client
+            .next_session_message_or_reject(subscription, session)
+            .await?
+            .context("no adversarial wc_sessionRequest message received")?;
+        match outcome {
+            SessionMessageOutcome::Rejected(rejection) => return Ok(rejection),
+            SessionMessageOutcome::Received(message) => print_ignored_session_message(&message),
+        }
+    }
+}
+
+fn print_ignored_session_message(message: &SessionReceivedMessage) {
+    println!(
+        "core-js-session-request ignored_session_message tag_present={} tag={} payload={:?}",
+        message.tag().is_some(),
+        message.tag().unwrap_or_default(),
+        message.payload()
+    );
+}
+
+fn validate_session_request_rejection(
+    rejection: &SessionRequestRejection,
+    request: &RawInvalidSessionRequest,
+) -> Result<()> {
+    if rejection.request_id() != request.request_id {
+        bail!(
+            "invalid request response id mismatch: expected {}, got {}",
+            request.request_id,
+            rejection.request_id()
+        );
+    }
+    if rejection.error().code != request.expected_code {
+        bail!(
+            "invalid request error code mismatch: expected {:?}, got {:?}",
+            request.expected_code,
+            rejection.error().code
+        );
+    }
+    if !rejection.response_ack() {
+        bail!("invalid request error response was not acknowledged by relay");
+    }
+    Ok(())
+}
+
+async fn read_session_request_error_response(
+    peer: &mut RelaySocket,
+    subscription: &wc_core::SessionSubscription,
+    request: &RawInvalidSessionRequest,
+) -> Result<JsonRpcErrorResponse> {
+    for _ in 0..4 {
+        let delivery = peer
+            .read_any_subscription_for_topic(subscription.topic(), READ_TIMEOUT)
+            .await?
+            .context("timed out waiting for invalid request error response")?;
+        if delivery.data.message == request.message {
+            println!("core-js-session-request ignored_adversarial_echo=true");
+            continue;
+        }
+        if delivery.data.tag != Some(SESSION_REQUEST_RESPONSE_TAG) {
+            println!(
+                "core-js-session-request ignored_session_delivery tag_present={} tag={}",
+                delivery.data.tag.is_some(),
+                delivery.data.tag.unwrap_or_default()
+            );
+            continue;
+        }
+
+        let envelope = Envelope::decode(&delivery.data.message, EnvelopeEncoding::Base64)
+            .context("failed to decode invalid request error response envelope")?;
+        let plaintext = envelope
+            .decrypt(subscription.sym_key())
+            .context("failed to decrypt invalid request error response")?;
+        let response = serde_json::from_str::<JsonRpcErrorResponse>(&plaintext)
+            .context("invalid request error response was not JSON-RPC error")?;
+        if response.id != request.request_id {
+            bail!(
+                "invalid request error response id mismatch: expected {}, got {}",
+                request.request_id,
+                response.id
+            );
+        }
+        if response.error.code != request.expected_code {
+            bail!(
+                "invalid request response code mismatch: expected {:?}, got {:?}",
+                request.expected_code,
+                response.error.code
+            );
+        }
+
+        return Ok(response);
+    }
+
+    bail!("did not receive invalid request error response with tag {SESSION_REQUEST_RESPONSE_TAG}")
 }
 
 async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {

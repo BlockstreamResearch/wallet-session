@@ -89,6 +89,23 @@ pub(super) fn decode_session_message_data(
     session: &Session,
     now_unix_seconds: u64,
 ) -> Result<SessionReceivedMessage, PairingClientError> {
+    let message =
+        decode_session_message_data_unchecked(data, subscription, session, now_unix_seconds)?;
+    validate_session_message_payload(session, &message, now_unix_seconds)?;
+    Ok(message)
+}
+
+/// Converts one relay delivery record into a session-topic message before
+/// request permission checks.
+///
+/// This is used by the auto-reject path: it needs the JSON-RPC request ID to
+/// respond with an error when the request is unauthorized or expired.
+pub(super) fn decode_session_message_data_unchecked(
+    data: IrnSubscriptionData,
+    subscription: &SessionSubscription,
+    session: &Session,
+    now_unix_seconds: u64,
+) -> Result<SessionReceivedMessage, PairingClientError> {
     let encoded_message_len = data.message.len();
     let topic = data.topic;
     let published_at = data.published_at;
@@ -105,7 +122,6 @@ pub(super) fn decode_session_message_data(
     let json = serde_json::from_str::<serde_json::Value>(&plaintext)
         .map_err(|source| PairingClientError::SessionPayload { source })?;
     let payload = parse_session_payload(json)?;
-    validate_session_payload(session, &payload, now_unix_seconds)?;
 
     Ok(SessionReceivedMessage {
         topic,
@@ -115,6 +131,15 @@ pub(super) fn decode_session_message_data(
         tag,
         payload,
     })
+}
+
+/// Applies session request validation to an already decoded session message.
+pub(super) fn validate_session_message_payload(
+    session: &Session,
+    message: &SessionReceivedMessage,
+    now_unix_seconds: u64,
+) -> Result<(), PairingClientError> {
+    validate_session_payload(session, message.payload(), now_unix_seconds)
 }
 
 /// Checks routing and lifecycle state before decrypting a session message.

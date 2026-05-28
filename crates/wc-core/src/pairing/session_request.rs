@@ -1,8 +1,8 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use wc_protocol::{
     relay::IrnPublish,
     session::{
-        JsonRpcError, SessionRequestParams, session_request_error_response,
+        JsonRpcError, JsonRpcErrorCode, SessionRequestParams, session_request_error_response,
         session_request_success_response,
     },
 };
@@ -65,6 +65,49 @@ pub(super) fn session_request_error_publish(
         SESSION_REQUEST_RESPONSE_TTL_SECONDS,
         SESSION_REQUEST_RESPONSE_TAG,
     )
+}
+
+/// Maps request-level validation failures to JSON-RPC error responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/errors.ts#L32-L72>
+///
+/// > UNAUTHORIZED_METHOD: {
+/// > message: "Unauthorized method.",
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/errors.ts#L120-L127>
+///
+/// > EXPIRED: {
+/// > message: "Expired.",
+pub(super) fn session_request_validation_error(error: &PairingClientError) -> Option<JsonRpcError> {
+    match error {
+        PairingClientError::SessionRequestExpired {
+            expiry_timestamp,
+            now_unix_seconds,
+        } => Some(JsonRpcError::with_data(
+            JsonRpcErrorCode::Other(6),
+            "Expired. session request.",
+            json!({
+                "expiryTimestamp": expiry_timestamp,
+                "nowUnixSeconds": now_unix_seconds,
+            }),
+        )),
+        PairingClientError::SessionUnauthorizedChain { chain_id } => Some(JsonRpcError::with_data(
+            JsonRpcErrorCode::UnsupportedChains,
+            "Unsupported chains.",
+            json!({ "chainId": chain_id.as_str() }),
+        )),
+        PairingClientError::SessionUnauthorizedMethod { chain_id, method } => {
+            Some(JsonRpcError::with_data(
+                JsonRpcErrorCode::UnauthorizedMethod,
+                "Unauthorized method.",
+                json!({
+                    "chainId": chain_id.as_str(),
+                    "method": method.as_str(),
+                }),
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Extracts the typed request and checks that it belongs to the active topic.
