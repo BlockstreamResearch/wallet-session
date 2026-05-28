@@ -5,18 +5,36 @@ use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use tokio::time::timeout;
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
+    envelope::{Envelope, EnvelopeEncoding, EnvelopeError},
     pairing::{PairingSymKey, PairingUri, PairingUriError},
     pairing_message::{PairingMessage, PairingMessageError, PairingMessageMethod},
     relay::{
-        DEFAULT_RELAY_URL, IrnSubscriptionData, RelayAuthError, RelayAuthToken, RelayConnectionUrl,
-        RelayTopic, relay_auth_audience,
+        DEFAULT_RELAY_URL, IrnPublish, IrnSubscriptionData, RelayAuthError, RelayAuthToken,
+        RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
-    session::{JsonRpcRequest, SessionProposeParams, SignMethod},
+    session::{
+        JsonRpcError, JsonRpcRequest, SessionProposeParams, SignMethod,
+        session_propose_error_response,
+    },
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
 
 /// Default wait time for one live pairing-topic message.
 pub const DEFAULT_PAIRING_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Relay tag used for rejected `wc_sessionPropose` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L18-L22>
+///
+/// > reject: { ttl: FIVE_MINUTES, prompt: false, tag: 1120 }
+pub const SESSION_PROPOSE_REJECT_TAG: u64 = 1120;
+
+/// Relay retention window for rejected `wc_sessionPropose` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L18-L22>
+///
+/// > reject: { ttl: FIVE_MINUTES, prompt: false, tag: 1120 }
+pub const SESSION_PROPOSE_REJECT_TTL_SECONDS: u64 = 5 * 60;
 
 /// Configuration for a native pairing-topic relay client.
 ///
@@ -224,6 +242,31 @@ impl PairingClient {
             .await
             .map_err(|source| PairingClientError::Relay { source })
     }
+
+    /// Publishes a `wc_sessionPropose` JSON-RPC error response.
+    ///
+    /// This rejects the proposal on the pairing topic. Approval is intentionally
+    /// separate because it must create a responder key pair and then settle a
+    /// session on the derived session topic.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L593-L599>
+    ///
+    /// > await this.sendError({
+    /// > id,
+    /// > topic: pairingTopic,
+    /// > error: reason,
+    pub async fn reject_session_proposal(
+        &mut self,
+        subscription: &PairingSubscription,
+        proposal_id: u64,
+        error: JsonRpcError,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_proposal_reject_publish(subscription, proposal_id, error)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
 }
 
 /// Active relay subscription for one pairing topic.
@@ -390,6 +433,14 @@ pub enum PairingClientError {
         source: PairingMessageError,
     },
 
+    /// Outbound pairing message envelope encryption failed.
+    #[error("pairing envelope failed")]
+    Envelope {
+        /// Source envelope encryption error.
+        #[source]
+        source: EnvelopeError,
+    },
+
     /// Decrypted JSON did not match the DTO for its classified method.
     #[error("pairing payload DTO failed")]
     PairingPayload {
@@ -509,6 +560,36 @@ where
         .map_err(|source| PairingClientError::PairingPayload { source })
 }
 
+/// Builds the encrypted relay publish payload for proposal rejection.
+///
+/// This helper keeps outbound encoding deterministic enough for unit tests:
+/// tests can decrypt the produced relay message without opening a WebSocket.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1852-L1884>
+///
+/// > const payload = formatJsonRpcError(id, error);
+/// > message = await this.client.core.crypto.encode(topic, payload, {
+/// > this.client.core.relayer.publish(topic, message, opts);
+fn session_proposal_reject_publish(
+    subscription: &PairingSubscription,
+    proposal_id: u64,
+    error: JsonRpcError,
+) -> Result<IrnPublish, PairingClientError> {
+    let response = session_propose_error_response(proposal_id, error);
+    let plaintext = serde_json::to_string(&response)
+        .map_err(|source| PairingClientError::PairingPayload { source })?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, &subscription.sym_key)
+        .map_err(|source| PairingClientError::Envelope { source })?;
+    let message = envelope.encode(EnvelopeEncoding::Base64);
+
+    Ok(IrnPublish::new(
+        subscription.topic.clone(),
+        message,
+        SESSION_PROPOSE_REJECT_TTL_SECONDS,
+        SESSION_PROPOSE_REJECT_TAG,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +597,7 @@ mod tests {
         envelope::{Envelope, EnvelopeEncoding},
         pairing::PairingSymKey,
         relay::IrnSubscriptionData,
+        session::{JsonRpcErrorCode, SessionProposeErrorResponse},
     };
 
     const PAIRING_URI: &str = concat!(
@@ -617,6 +699,40 @@ mod tests {
             .expect_err("known method with malformed params should fail");
 
         assert!(matches!(error, PairingClientError::PairingPayload { .. }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn builds_session_proposal_reject_publish() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        )?;
+        let subscription = PairingSubscription {
+            topic: RelayTopic::from_hex("11".repeat(32))?,
+            sym_key: sym_key.clone(),
+            subscription_id: "sub-1".to_owned(),
+        };
+
+        let publish = session_proposal_reject_publish(
+            &subscription,
+            7,
+            JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+        )?;
+
+        assert_eq!(publish.topic, *subscription.topic());
+        assert_eq!(publish.ttl, SESSION_PROPOSE_REJECT_TTL_SECONDS);
+        assert_eq!(publish.tag, SESSION_PROPOSE_REJECT_TAG);
+        assert_eq!(publish.prompt, None);
+
+        let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
+        let plaintext = envelope.decrypt(&sym_key)?;
+        let response = serde_json::from_str::<SessionProposeErrorResponse>(&plaintext)?;
+
+        assert_eq!(response.id, 7);
+        assert_eq!(response.jsonrpc, "2.0");
+        assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+        assert_eq!(response.error.message, "User rejected.");
 
         Ok(())
     }

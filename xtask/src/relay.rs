@@ -24,13 +24,14 @@ use wc_protocol::{
         DEFAULT_RELAY_URL, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
-    session::{JsonRpcRequest, SessionProposeParams, SignMethod},
+    session::{JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, SessionProposeParams, SignMethod},
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const JS_HARNESS_URI_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const JS_HARNESS_URI_FILE: &str = "target/live-pairing-uri.txt";
+const JS_HARNESS_RESULT_FILE: &str = "target/live-pairing-result.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeMode {
@@ -38,6 +39,7 @@ pub enum ProbeMode {
     Matrix,
     JsProposal,
     CoreJsProposal,
+    CoreJsRejectProposal,
     PairingUri(String),
 }
 
@@ -49,6 +51,7 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::Matrix => run_probe_matrix(&config).await,
         ProbeMode::JsProposal => run_js_proposal_probe(&config).await,
         ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
+        ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
 }
@@ -109,6 +112,36 @@ async fn wait_for_js_pairing_uri(uri_file: &Path, child: &mut Child) -> Result<S
                 "timed out waiting {}s for Bun harness URI file {}",
                 JS_HARNESS_URI_READY_TIMEOUT.as_secs(),
                 uri_file.display()
+            );
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_js_result(result_file: &Path, child: &mut Child) -> Result<Value> {
+    let started_at = Instant::now();
+
+    loop {
+        if let Ok(result) = fs::read_to_string(result_file) {
+            if !result.trim().is_empty() {
+                return serde_json::from_str(&result)
+                    .with_context(|| format!("failed to parse {}", result_file.display()));
+            }
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll Bun harness process")?
+        {
+            bail!("Bun harness exited before writing result: {status}");
+        }
+
+        if started_at.elapsed() >= READ_TIMEOUT {
+            bail!(
+                "timed out waiting {}s for Bun harness result file {}",
+                READ_TIMEOUT.as_secs(),
+                result_file.display()
             );
         }
 
@@ -271,6 +304,52 @@ async fn run_core_js_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
     Ok(())
 }
 
+async fn run_core_js_reject_proposal_probe(config: &RelayProbeConfig) -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let harness_dir = workspace_root.join("tools/js-harness");
+    let uri_file = workspace_root.join(JS_HARNESS_URI_FILE);
+    let result_file = workspace_root.join(JS_HARNESS_RESULT_FILE);
+    if let Some(parent) = uri_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(&uri_file);
+    let _ = fs::remove_file(&result_file);
+
+    let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+    println!(
+        "core-js-reject-proposal harness_dir={} uri_file={} result_file={} hold_ms={hold_ms}",
+        harness_dir.display(),
+        uri_file.display(),
+        result_file.display()
+    );
+
+    let child = Command::new("bun")
+        .args(["run", "propose-session"])
+        .current_dir(&harness_dir)
+        .env("WC_JS_URI_FILE", &uri_file)
+        .env("WC_JS_RESULT_FILE", &result_file)
+        .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+        .env_remove("WC_JS_PRINT_URI")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
+    let mut harness = ChildGuard::new(child);
+    let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
+
+    run_core_pairing_uri_reject_probe(config, uri.trim()).await?;
+    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
+    if result.get("outcome").and_then(Value::as_str) != Some("approval_error") {
+        bail!("expected JS approval_error result, got {result}");
+    }
+    println!("core-js-reject-proposal js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
 async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
     let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
     let now = unix_timestamp();
@@ -352,6 +431,75 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
     Ok(())
 }
 
+async fn run_core_pairing_uri_reject_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
+    let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-reject-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    println!(
+        "core-pairing-reject project_id={} relay_url={} topic={} version={} relay_protocol={} sym_key={} expiry={:?} expired_now={}",
+        redact(&config.project_id),
+        config.relay_url,
+        pairing.topic(),
+        pairing.version(),
+        pairing.relay().protocol(),
+        redact(pairing.sym_key().as_str()),
+        pairing.expiry_timestamp(),
+        pairing.is_expired_at(unix_timestamp())
+    );
+
+    let mut client = PairingClient::connect(&client_config).await?;
+    println!("core-pairing-reject connected status={}", client.status());
+
+    let fetched = client.fetch_pairing_messages(&pairing).await?;
+    println!("core-pairing-reject fetch_messages count={}", fetched.len());
+    for (index, message) in fetched.iter().enumerate() {
+        print_core_pairing_payload_metadata(
+            &format!("core-pairing-reject fetched index={index}"),
+            message,
+        )?;
+    }
+
+    let subscription = client.subscribe_pairing(&pairing).await?;
+    println!(
+        "core-pairing-reject subscription_id={}",
+        subscription.subscription_id()
+    );
+
+    let proposal_id = if let Some(proposal_id) = first_session_proposal_id(&fetched) {
+        proposal_id
+    } else {
+        match client.next_pairing_message(&subscription).await? {
+            Some(message) => {
+                print_core_pairing_payload_metadata("core-pairing-reject live_message", &message)?;
+                first_session_proposal_id(std::slice::from_ref(&message))
+                    .context("live pairing message was not wc_sessionPropose")?
+            }
+            None => bail!("no wc_sessionPropose message received"),
+        }
+    };
+
+    let reject_ack = client
+        .reject_session_proposal(
+            &subscription,
+            proposal_id,
+            JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+        )
+        .await?;
+    println!("core-pairing-reject proposal_id={proposal_id} reject_publish_ack={reject_ack}");
+
+    let unsubscribe_result = client.unsubscribe_pairing(&subscription).await?;
+    println!("core-pairing-reject unsubscribe_ack={unsubscribe_result}");
+
+    Ok(())
+}
+
 async fn run_core_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<()> {
     let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
     let mut client_config = PairingClientConfig::new(
@@ -404,6 +552,13 @@ async fn run_core_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Res
     println!("core-pairing unsubscribe_ack={unsubscribe_result}");
 
     Ok(())
+}
+
+fn first_session_proposal_id(messages: &[PairingReceivedMessage]) -> Option<u64> {
+    messages.iter().find_map(|message| match message.payload() {
+        PairingPayload::SessionProposal(request) => Some(request.id),
+        _ => None,
+    })
 }
 
 fn print_pairing_payload_metadata(

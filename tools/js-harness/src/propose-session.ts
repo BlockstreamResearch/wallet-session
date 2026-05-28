@@ -10,6 +10,7 @@ if (!projectId) {
 const relayUrl = process.env.REOWN_RELAY_URL ?? "wss://relay.walletconnect.com";
 const holdMs = Number.parseInt(process.env.WC_JS_HARNESS_HOLD_MS ?? "120000", 10);
 const uriFile = process.env.WC_JS_URI_FILE;
+const resultFile = process.env.WC_JS_RESULT_FILE;
 const printUri = process.env.WC_JS_PRINT_URI === "1";
 
 if (!uriFile && !printUri) {
@@ -67,12 +68,23 @@ try {
 
   if (session) {
     console.error(`js-harness approved_session_topic=${session.topic}`);
+    await writeResult({
+      outcome: "approved",
+      topic: session.topic,
+    });
   } else {
     console.error("js-harness proposal_timeout=true");
+    await writeResult({
+      outcome: "timeout",
+    });
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`js-harness approval_error=${message}`);
+  await writeResult({
+    outcome: "approval_error",
+    message,
+  });
 } finally {
   if (timeout) {
     clearTimeout(timeout);
@@ -83,4 +95,12 @@ try {
 
 function redactPairingUri(uri: string): string {
   return uri.replace(/([?&]symKey=)[^&]+/, "$1<redacted>");
+}
+
+async function writeResult(result: Record<string, string>): Promise<void> {
+  if (!resultFile) {
+    return;
+  }
+
+  await Bun.write(resultFile, `${JSON.stringify(result)}\n`);
 }
