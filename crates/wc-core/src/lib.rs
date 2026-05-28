@@ -4,5 +4,5 @@ mod pairing;
 
 pub use pairing::{
     DEFAULT_PAIRING_RECEIVE_TIMEOUT, PairingClient, PairingClientConfig, PairingClientError,
-    PairingReceivedMessage, PairingSubscription,
+    PairingPayload, PairingReceivedMessage, PairingSubscription,
 };

@@ -13,7 +13,7 @@ use crate::util::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
-use wc_core::{PairingClient, PairingClientConfig, PairingReceivedMessage};
+use wc_core::{PairingClient, PairingClientConfig, PairingPayload, PairingReceivedMessage};
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding},
@@ -480,20 +480,29 @@ fn print_core_pairing_payload_metadata(
         params_keys(payload.json())
     );
 
-    match payload.method() {
-        PairingMessageMethod::Sign(SignMethod::SessionPropose) => {
-            print_session_proposal_summary(label, payload.json().clone())?;
+    match received.payload() {
+        PairingPayload::SessionProposal(request) => {
+            print_session_proposal_request_summary(label, request);
         }
-        PairingMessageMethod::Sign(method) => {
+        PairingPayload::Sign(method) => {
             println!("{label} sign_request method={method}");
         }
-        PairingMessageMethod::Pairing(method) => {
-            print_pairing_payload_summary(label, *method, payload.json().clone())?;
+        PairingPayload::PairingPing(request) => {
+            println!(
+                "{label} pairing_request method={} id={} params=empty",
+                request.method, request.id
+            );
         }
-        PairingMessageMethod::Unknown(method) => {
+        PairingPayload::PairingDelete(request) => {
+            println!(
+                "{label} pairing_request method={} id={} code={} message={}",
+                request.method, request.id, request.params.code, request.params.message
+            );
+        }
+        PairingPayload::Unknown(method) => {
             println!("{label} unknown_request method={method}");
         }
-        PairingMessageMethod::Missing => {
+        PairingPayload::Missing => {
             println!("{label} missing_method=true");
         }
     }
@@ -543,7 +552,16 @@ fn print_pairing_payload_summary(label: &str, method: PairingMethod, json: Value
 fn print_session_proposal_summary(label: &str, json: Value) -> Result<()> {
     let request = serde_json::from_value::<JsonRpcRequest<SessionProposeParams>>(json)
         .with_context(|| format!("{label} failed to parse wc_sessionPropose DTO"))?;
-    let proposal = request.params;
+    print_session_proposal_request_summary(label, &request);
+
+    Ok(())
+}
+
+fn print_session_proposal_request_summary(
+    label: &str,
+    request: &JsonRpcRequest<SessionProposeParams>,
+) {
+    let proposal = &request.params;
     let expiry = proposal
         .effective_expiry_timestamp()
         .map_or_else(|| "<none>".to_owned(), |expiry| expiry.to_string());
@@ -570,8 +588,6 @@ fn print_session_proposal_summary(label: &str, json: Value) -> Result<()> {
         proposal.proposer.metadata.url,
         proposal.proposer.metadata.icons.len()
     );
-
-    Ok(())
 }
 
 fn json_id(json: &Value) -> String {

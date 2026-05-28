@@ -4,12 +4,14 @@ use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use tokio::time::timeout;
 use wc_protocol::{
+    dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     pairing::{PairingSymKey, PairingUri, PairingUriError},
-    pairing_message::{PairingMessage, PairingMessageError},
+    pairing_message::{PairingMessage, PairingMessageError, PairingMessageMethod},
     relay::{
         DEFAULT_RELAY_URL, IrnSubscriptionData, RelayAuthError, RelayAuthToken, RelayConnectionUrl,
         RelayTopic, relay_auth_audience,
     },
+    session::{JsonRpcRequest, SessionProposeParams, SignMethod},
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
 
@@ -254,6 +256,7 @@ pub struct PairingReceivedMessage {
     published_at: u64,
     tag: Option<u64>,
     message: PairingMessage,
+    payload: PairingPayload,
 }
 
 impl PairingReceivedMessage {
@@ -286,6 +289,37 @@ impl PairingReceivedMessage {
     pub const fn message(&self) -> &PairingMessage {
         &self.message
     }
+
+    /// Typed payload parsed from the decrypted pairing-topic JSON.
+    #[must_use]
+    pub const fn payload(&self) -> &PairingPayload {
+        &self.payload
+    }
+}
+
+/// Typed pairing-topic payload.
+///
+/// `wc_sessionPropose` is the first Sign API message expected after the wallet
+/// subscribes to a pairing topic from a URI.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionpropose>
+///
+/// > Used to propose a session through topic A. Requires a success response
+/// > with associated data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingPayload {
+    /// `wc_sessionPropose` Sign API request.
+    SessionProposal(Box<JsonRpcRequest<SessionProposeParams>>),
+    /// `wc_pairingPing` Pairing API request.
+    PairingPing(PairingJsonRpcRequest<PairingPingParams>),
+    /// `wc_pairingDelete` Pairing API request.
+    PairingDelete(PairingJsonRpcRequest<PairingDeleteParams>),
+    /// Known Sign API method whose DTO is not parsed at the pairing layer yet.
+    Sign(SignMethod),
+    /// JSON-RPC method name is present but not implemented by current DTOs.
+    Unknown(String),
+    /// JSON has no string `method` field.
+    Missing,
 }
 
 /// Pairing receive failure.
@@ -354,6 +388,14 @@ pub enum PairingClientError {
         /// Source pairing message error.
         #[source]
         source: PairingMessageError,
+    },
+
+    /// Decrypted JSON did not match the DTO for its classified method.
+    #[error("pairing payload DTO failed")]
+    PairingPayload {
+        /// Source DTO parse error.
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -429,6 +471,7 @@ fn decode_subscription_data(
     let encoded_message_len = data.message.len();
     let message = PairingMessage::decode_relay_message(&data.message, sym_key)
         .map_err(|source| PairingClientError::PairingMessage { source })?;
+    let payload = parse_pairing_payload(&message)?;
 
     Ok(PairingReceivedMessage {
         topic: data.topic,
@@ -436,7 +479,34 @@ fn decode_subscription_data(
         published_at: data.published_at,
         tag: data.tag,
         message,
+        payload,
     })
+}
+
+/// Parses the classified decrypted JSON into the DTO used by that method.
+fn parse_pairing_payload(message: &PairingMessage) -> Result<PairingPayload, PairingClientError> {
+    match message.method() {
+        PairingMessageMethod::Sign(SignMethod::SessionPropose) => parse_json_rpc(message)
+            .map(|request| PairingPayload::SessionProposal(Box::new(request))),
+        PairingMessageMethod::Sign(method) => Ok(PairingPayload::Sign(*method)),
+        PairingMessageMethod::Pairing(PairingMethod::Ping) => {
+            parse_json_rpc(message).map(PairingPayload::PairingPing)
+        }
+        PairingMessageMethod::Pairing(PairingMethod::Delete) => {
+            parse_json_rpc(message).map(PairingPayload::PairingDelete)
+        }
+        PairingMessageMethod::Unknown(method) => Ok(PairingPayload::Unknown(method.clone())),
+        PairingMessageMethod::Missing => Ok(PairingPayload::Missing),
+    }
+}
+
+/// Clones the already parsed JSON into a method-specific DTO.
+fn parse_json_rpc<T>(message: &PairingMessage) -> Result<T, PairingClientError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(message.json().clone())
+        .map_err(|source| PairingClientError::PairingPayload { source })
 }
 
 #[cfg(test)]
@@ -489,7 +559,7 @@ mod tests {
         let sym_key = PairingSymKey::from_hex(
             "2222222222222222222222222222222222222222222222222222222222222222",
         )?;
-        let plaintext = r#"{"id":1,"jsonrpc":"2.0","method":"wc_sessionPropose","params":{}}"#;
+        let plaintext = r#"{"id":1,"jsonrpc":"2.0","method":"wc_pairingPing","params":{}}"#;
         let envelope = Envelope::encrypt_type_0(plaintext, &sym_key)?;
         let data = IrnSubscriptionData {
             topic: RelayTopic::from_hex("11".repeat(32))?,
@@ -504,7 +574,63 @@ mod tests {
         assert_eq!(received.published_at(), 1_700_000_000_000);
         assert_eq!(received.tag(), Some(1100));
         assert_eq!(received.message().plaintext(), plaintext);
+        assert!(matches!(received.payload(), PairingPayload::PairingPing(_)));
 
         Ok(())
+    }
+
+    #[test]
+    fn parses_session_proposal_payload() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        )?;
+        let plaintext = concat!(
+            r#"{"id":1,"jsonrpc":"2.0","method":"wc_sessionPropose","params":{"#,
+            r#""id":1,"pairingTopic":"1111111111111111111111111111111111111111111111111111111111111111","#,
+            r#""expiryTimestamp":4102444800,"relays":[{"protocol":"irn"}],"#,
+            r#""proposer":{"publicKey":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","#,
+            r#""metadata":{"name":"Probe Dapp","description":"Probe","url":"https://example.com","icons":[]}},"#,
+            r#""requiredNamespaces":{},"optionalNamespaces":{}}}"#
+        );
+        let data = encrypted_subscription_data(plaintext, &sym_key)?;
+
+        let received = decode_subscription_data(data, &sym_key)?;
+
+        let PairingPayload::SessionProposal(request) = received.payload() else {
+            panic!("expected typed session proposal");
+        };
+        assert_eq!(request.id, 1);
+        assert_eq!(request.params.proposer.metadata.name, "Probe Dapp");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_known_payload() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+        )?;
+        let plaintext = r#"{"id":1,"jsonrpc":"2.0","method":"wc_sessionPropose","params":{}}"#;
+        let data = encrypted_subscription_data(plaintext, &sym_key)?;
+
+        let error = decode_subscription_data(data, &sym_key)
+            .expect_err("known method with malformed params should fail");
+
+        assert!(matches!(error, PairingClientError::PairingPayload { .. }));
+
+        Ok(())
+    }
+
+    fn encrypted_subscription_data(
+        plaintext: &str,
+        sym_key: &PairingSymKey,
+    ) -> Result<IrnSubscriptionData, Box<dyn std::error::Error>> {
+        let envelope = Envelope::encrypt_type_0(plaintext, sym_key)?;
+        Ok(IrnSubscriptionData {
+            topic: RelayTopic::from_hex("11".repeat(32))?,
+            message: envelope.encode(EnvelopeEncoding::Base64),
+            published_at: 1_700_000_000_000,
+            tag: Some(1100),
+        })
     }
 }
