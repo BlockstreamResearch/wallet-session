@@ -212,6 +212,7 @@ Current security defaults:
 - incoming WebSocket frame size limit;
 - request timeouts;
 - bounded relay connect retry/backoff;
+- closed relay connections are surfaced as explicit runtime errors;
 - strict JSON-RPC response ID matching;
 - subscribed-topic routing;
 - cleanup after failed subscribe/unsubscribe;
@@ -234,9 +235,10 @@ Current responsibilities:
 - acknowledge `irn_subscription` pushes;
 - queue subscribed-topic messages within bounds;
 - retry opening a relay WebSocket with bounded exponential backoff;
+- reopen a relay WebSocket and clear stale local topic routing;
 - expose next message by topic.
 
-Reconnect scope in the first slice: `RelayReconnectConfig` retries connection establishment only.
+Reconnect scope in the current transport layer: `RelayReconnectConfig` retries connection establishment, and `RelayClient::reconnect_with_retry` replaces the socket while clearing local subscription IDs and queued messages.
 Resubscribing after an established connection is lost belongs to the single-session runtime because it depends on the active `Idle`, `Pairing`, or `Session` state.
 
 Rationale: relay transport is a runtime primitive, but relay method DTOs and auth URL construction are protocol primitives. Keeping transport separate avoids mixing WebSocket details into protocol validation.

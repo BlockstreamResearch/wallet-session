@@ -6,7 +6,13 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async,
+    tungstenite::{
+        Message,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    },
+};
 use wc_protocol::relay::{IrnPublish, IrnUnsubscribe, RelayTopic};
 use wc_transport::{
     RelayClient, RelayClientConfig, RelayClientError, RelayReconnectConfig, TransportError,
@@ -245,6 +251,125 @@ async fn relay_client_reports_exhausted_connection_retries() {
         } => assert_eq!(actual, attempts),
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn relay_client_next_message_reports_connection_close_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+        websocket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "server restart".into(),
+            })))
+            .await
+            .expect("sends close frame");
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+
+    let Err(error) = client.next_message().await else {
+        panic!("closed connection should be reported");
+    };
+
+    match error {
+        RelayClientError::ConnectionClosed { close: Some(close) } => {
+            assert_eq!(close.code, Some(1001));
+            assert_eq!(close.reason, "server restart");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_reconnect_clears_stale_topic_routing() {
+    let first_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds first local websocket listener");
+    let first_address = first_listener.local_addr().expect("first listener address");
+    let topic = RelayTopic::from_bytes([0x24; 32]);
+    let first_server = tokio::spawn(async move {
+        let (stream, _) = first_listener.accept().await.expect("accepts first client");
+        let mut websocket = accept_async(stream).await.expect("accepts first websocket");
+        let subscribe = read_json_frame(&mut websocket).await;
+        assert_eq!(subscribe["method"], "irn_subscribe");
+        send_result(&mut websocket, &subscribe, json!("old-subscription-id")).await;
+        sleep(Duration::from_millis(120)).await;
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{first_address}"))
+        .await
+        .expect("connects to first websocket");
+    assert_eq!(
+        client
+            .subscribe(topic.clone())
+            .await
+            .expect("subscribes on first connection"),
+        "old-subscription-id"
+    );
+
+    let second_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds second local websocket listener");
+    let second_address = second_listener
+        .local_addr()
+        .expect("second listener address");
+    let stale_topic = topic.clone();
+    let second_server = tokio::spawn(async move {
+        let (stream, _) = second_listener
+            .accept()
+            .await
+            .expect("accepts second client");
+        let mut websocket = accept_async(stream)
+            .await
+            .expect("accepts second websocket");
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9024, &stale_topic)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends stale-topic push");
+        let ack = read_json_frame(&mut websocket).await;
+        assert_eq!(ack["id"], 9024);
+        assert_eq!(ack["result"], true);
+    });
+
+    client
+        .reconnect_with_retry(
+            &format!("ws://{second_address}"),
+            RelayReconnectConfig::new(
+                NonZeroUsize::new(2).expect("non-zero"),
+                Duration::ZERO,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("reconnects to second websocket");
+
+    let Err(error) = client.next_message().await else {
+        panic!("stale topic should not be routed after reconnect");
+    };
+    match error {
+        RelayClientError::UnexpectedSubscriptionTopic { topic: actual } => {
+            assert_eq!(actual, topic);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    first_server.await.expect("first server task joins");
+    second_server.await.expect("second server task joins");
 }
 
 #[tokio::test]

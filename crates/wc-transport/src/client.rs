@@ -18,7 +18,7 @@ use wc_protocol::relay::{
 };
 
 use crate::{
-    DEFAULT_MAX_INCOMING_FRAME_BYTES, NativeRelayTransport, NativeRelayTransportConfig,
+    DEFAULT_MAX_INCOMING_FRAME_BYTES, NativeRelayTransport, NativeRelayTransportConfig, RelayClose,
     TransportError,
 };
 
@@ -208,6 +208,25 @@ impl RelayClient {
         })
     }
 
+    /// Reopens the relay WebSocket using the existing client limits.
+    ///
+    /// The authenticated URL should be freshly built by the caller. Local
+    /// routing is cleared because the new socket has not run `irn_subscribe`
+    /// for any topic yet; the single-session runtime decides whether its active
+    /// pairing/session topic should be subscribed again.
+    pub async fn reconnect_with_retry(
+        &mut self,
+        url: &str,
+        reconnect: RelayReconnectConfig,
+    ) -> Result<(), RelayClientError> {
+        let replacement = Self::connect_with_retry(url, self.config.clone(), reconnect).await?;
+        self.transport = replacement.transport;
+        self.status = replacement.status;
+        self.subscriptions.clear();
+        self.queued_messages.clear();
+        Ok(())
+    }
+
     /// HTTP status returned during the WebSocket upgrade.
     #[must_use]
     pub const fn status(&self) -> u16 {
@@ -374,9 +393,7 @@ impl RelayClient {
             return Ok(Some(message));
         }
 
-        let Some(value) = self.transport.next_json().await? else {
-            return Ok(None);
-        };
+        let value = self.next_json().await?;
 
         if is_subscription(&value) {
             let message = self.ack_subscription(value).await?;
@@ -404,9 +421,7 @@ impl RelayClient {
         }
 
         loop {
-            let Some(value) = self.transport.next_json().await? else {
-                return Ok(None);
-            };
+            let value = self.next_json().await?;
 
             if is_subscription(&value) {
                 let message = self.ack_subscription(value).await?;
@@ -468,14 +483,11 @@ impl RelayClient {
         let mut pushes_while_waiting = 0_usize;
 
         loop {
-            let Some(value) = timeout_at(deadline, self.transport.next_json())
-                .await
-                .map_err(|_| RelayClientError::RequestTimedOut {
+            let value = timeout_at(deadline, self.next_json()).await.map_err(|_| {
+                RelayClientError::RequestTimedOut {
                     timeout: self.config.request_timeout,
-                })??
-            else {
-                return Err(RelayClientError::StreamEnded);
-            };
+                }
+            })??;
 
             if is_subscription(&value) {
                 if pushes_while_waiting >= self.config.max_pushes_while_waiting {
@@ -499,6 +511,25 @@ impl RelayClient {
                 .map_err(|source| RelayClientError::Json { source })?;
 
             return response.into_result().map_err(Into::into);
+        }
+    }
+
+    /// Reads one JSON frame and maps WebSocket closure into a runtime signal.
+    ///
+    /// `NativeRelayTransport` keeps close-frame metadata close to the socket.
+    /// The relay client promotes that state so the caller can reconnect or
+    /// terminate without treating a closed connection as an absent message.
+    async fn next_json(&mut self) -> Result<Value, RelayClientError> {
+        match self.transport.next_json().await {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(RelayClientError::ConnectionClosed { close: None }),
+            Err(TransportError::Closed(close)) => {
+                Err(RelayClientError::ConnectionClosed { close: Some(close) })
+            }
+            Err(TransportError::StreamEnded) => {
+                Err(RelayClientError::ConnectionClosed { close: None })
+            }
+            Err(source) => Err(RelayClientError::Transport { source }),
         }
     }
 
@@ -608,9 +639,15 @@ pub enum RelayClientError {
         source: RelayRpcIdError,
     },
 
-    /// The WebSocket stream ended while a relay response was expected.
-    #[error("relay stream ended while waiting for response")]
-    StreamEnded,
+    /// The established relay WebSocket closed.
+    #[error("relay connection closed")]
+    ConnectionClosed {
+        /// Close frame metadata when the peer sent a WebSocket close frame.
+        ///
+        /// The close reason is peer-controlled text and should not be shown as
+        /// trusted protocol data.
+        close: Option<RelayClose>,
+    },
 
     /// The relay did not send the matching JSON-RPC response before the deadline.
     #[error("relay request timed out after {timeout:?}")]

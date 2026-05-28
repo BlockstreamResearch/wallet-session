@@ -270,6 +270,14 @@ impl RelayConnection {
 }
 
 /// Relay close metadata extracted from a WebSocket close frame.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.5>
+///
+/// > If The WebSocket Connection is Closed and no Close control frame was received by the endpoint, The WebSocket Connection Close Code is considered to be 1006.
+///
+/// <https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.6>
+///
+/// > the interpretation of said data being left to the endpoints and not defined by this protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayClose {
     /// WebSocket close code when the peer sent one.
