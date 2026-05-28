@@ -211,6 +211,89 @@ async fn relay_client_next_message_acknowledges_subscription_push() {
 }
 
 #[tokio::test]
+async fn relay_client_next_message_for_topic_preserves_other_topics() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local websocket listener");
+    let address = listener.local_addr().expect("listener address");
+    let topic_a = RelayTopic::from_bytes([0x34; 32]);
+    let topic_b = RelayTopic::from_bytes([0x35; 32]);
+    let server_topic_a = topic_a.clone();
+    let server_topic_b = topic_b.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accepts client");
+        let mut websocket = accept_async(stream).await.expect("accepts websocket");
+
+        let subscribe_a = read_json_frame(&mut websocket).await;
+        assert_eq!(subscribe_a["method"], "irn_subscribe");
+        send_result(&mut websocket, &subscribe_a, json!("sub-a")).await;
+
+        let subscribe_b = read_json_frame(&mut websocket).await;
+        assert_eq!(subscribe_b["method"], "irn_subscribe");
+        send_result(&mut websocket, &subscribe_b, json!("sub-b")).await;
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9100, &server_topic_b)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends topic b push first");
+        let ack_b = read_json_frame(&mut websocket).await;
+        assert_eq!(ack_b["id"], 9100);
+        assert_eq!(ack_b["result"], true);
+
+        websocket
+            .send(Message::Text(
+                subscription_push_json(9101, &server_topic_a)
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("sends topic a push second");
+        let ack_a = read_json_frame(&mut websocket).await;
+        assert_eq!(ack_a["id"], 9101);
+        assert_eq!(ack_a["result"], true);
+    });
+
+    let mut client = RelayClient::connect(&format!("ws://{address}"))
+        .await
+        .expect("connects to local websocket");
+    assert_eq!(
+        client
+            .subscribe(topic_a.clone())
+            .await
+            .expect("subscribes topic a"),
+        "sub-a"
+    );
+    assert_eq!(
+        client
+            .subscribe(topic_b.clone())
+            .await
+            .expect("subscribes topic b"),
+        "sub-b"
+    );
+
+    let topic_a_message = client
+        .next_message_for_topic(&topic_a)
+        .await
+        .expect("reads topic a")
+        .expect("topic a message is present");
+    assert_eq!(topic_a_message.data.topic, topic_a);
+
+    let queued_topic_b_message = client
+        .next_message()
+        .await
+        .expect("reads queued topic b")
+        .expect("topic b message is queued");
+    assert_eq!(queued_topic_b_message.data.topic, topic_b);
+
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
 async fn relay_client_queues_subscription_push_while_waiting_for_response() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

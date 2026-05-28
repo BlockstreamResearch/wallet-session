@@ -287,6 +287,42 @@ impl RelayClient {
         Err(RelayClientError::UnexpectedMessage { value })
     }
 
+    /// Reads the next acknowledged relay push for one active topic.
+    ///
+    /// Pushes for other active topics are acknowledged and kept in the local
+    /// queue for later routing.
+    pub async fn next_message_for_topic(
+        &mut self,
+        topic: &RelayTopic,
+    ) -> Result<Option<IrnSubscription>, RelayClientError> {
+        if let Some(index) = self
+            .queued_messages
+            .iter()
+            .position(|message| &message.data.topic == topic)
+        {
+            return Ok(self.queued_messages.remove(index));
+        }
+
+        loop {
+            let Some(value) = self.transport.next_json().await? else {
+                return Ok(None);
+            };
+
+            if is_subscription(&value) {
+                let message = self.ack_subscription(value).await?;
+                self.ensure_expected_subscription_topic(&message, &[])?;
+                if &message.data.topic == topic {
+                    return Ok(Some(message));
+                }
+
+                self.queue_message(message)?;
+                continue;
+            }
+
+            return Err(RelayClientError::UnexpectedMessage { value });
+        }
+    }
+
     async fn request<T, R>(&mut self, params: T) -> Result<R, RelayClientError>
     where
         T: RelayRequest + Send + Serialize + Sync,

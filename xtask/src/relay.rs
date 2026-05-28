@@ -17,6 +17,7 @@ use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
     PairingPayload, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
+    SessionSettleResponsePayload,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
@@ -573,12 +574,40 @@ async fn run_core_pairing_uri_approve_probe(
         .approve_session_proposal(&subscription, &proposal, approval)
         .await?;
     println!(
-        "core-pairing-approve proposal_id={} session_topic={} proposal_response_ack={} session_settle_ack={}",
+        "core-pairing-approve proposal_id={} session_topic={} settle_request_id={} proposal_response_ack={} session_settle_ack={}",
         proposal.id,
         approved.session_topic(),
+        approved.session_settle_request_id(),
         approved.proposal_response_ack(),
         approved.session_settle_ack()
     );
+
+    let settle_response = client
+        .next_session_settle_response(&approved)
+        .await?
+        .context("no wc_sessionSettle response received")?;
+    match settle_response.payload() {
+        SessionSettleResponsePayload::Success(response) => println!(
+            "core-pairing-approve settle_response success=true topic={} id={} tag_present={} tag={} published_at={} message_len={}",
+            settle_response.topic(),
+            response.id,
+            settle_response.tag().is_some(),
+            settle_response.tag().unwrap_or_default(),
+            settle_response.published_at(),
+            settle_response.encoded_message_len()
+        ),
+        SessionSettleResponsePayload::Error(response) => println!(
+            "core-pairing-approve settle_response success=false topic={} id={} error_code={:?} error_message={} tag_present={} tag={} published_at={} message_len={}",
+            settle_response.topic(),
+            response.id,
+            response.error.code,
+            response.error.message,
+            settle_response.tag().is_some(),
+            settle_response.tag().unwrap_or_default(),
+            settle_response.published_at(),
+            settle_response.encoded_message_len()
+        ),
+    }
 
     Ok((client, subscription, approved))
 }

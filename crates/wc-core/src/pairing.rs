@@ -18,10 +18,10 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{
-        DappMetadata, JsonRpcError, JsonRpcRequest, JsonRpcResponse, RelayProtocolOptions,
-        ScopedProperties, SessionConfig, SessionNamespaces, SessionParticipant, SessionProperties,
-        SessionProposeParams, SessionProposeResult, SessionSettleParams, SignMethod,
-        session_propose_error_response,
+        DappMetadata, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+        RelayProtocolOptions, ScopedProperties, SessionConfig, SessionNamespaces,
+        SessionParticipant, SessionProperties, SessionProposeParams, SessionProposeResult,
+        SessionSettleParams, SessionSettleResponse, SignMethod, session_propose_error_response,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
@@ -66,6 +66,15 @@ pub const SESSION_PROPOSE_REJECT_TAG: u64 = 1120;
 /// > req: { ttl: FIVE_MINUTES, prompt: false, tag: 1102 }
 pub const SESSION_SETTLE_REQUEST_TAG: u64 = 1102;
 
+/// Relay tag used for `wc_sessionSettle` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionsettle>
+///
+/// > // Success result
+/// > true
+/// > Tag     | 1103
+pub const SESSION_SETTLE_RESPONSE_TAG: u64 = 1103;
+
 /// Relay retention window for approved `wc_sessionPropose` responses.
 ///
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L13-L17>
@@ -86,6 +95,14 @@ pub const SESSION_PROPOSE_REJECT_TTL_SECONDS: u64 = 5 * 60;
 ///
 /// > req: { ttl: FIVE_MINUTES, prompt: false, tag: 1102 }
 pub const SESSION_SETTLE_REQUEST_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay retention window for `wc_sessionSettle` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionsettle>
+///
+/// > TTL     | 300
+/// > Tag     | 1103
+pub const SESSION_SETTLE_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
 
 /// Configuration for a native pairing-topic relay client.
 ///
@@ -352,9 +369,54 @@ impl PairingClient {
                 subscription_id: session_subscription_id,
             },
             responder_public_key: responder.public_key().clone(),
+            session_settle_request_id: settle_request_id,
             proposal_response_ack,
             session_settle_ack,
         })
+    }
+
+    /// Waits for the peer response to the `wc_sessionSettle` request.
+    ///
+    /// The peer handles `wc_sessionSettle` on the derived session topic and
+    /// responds with JSON-RPC `result: true` or a JSON-RPC error on the same
+    /// topic.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2269-L2274>
+    ///
+    /// > await this.sendResult<"wc_sessionSettle">({
+    /// > id: payload.id,
+    /// > topic,
+    /// > result: true,
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2278-L2283>
+    ///
+    /// > await this.sendError({
+    /// > id,
+    /// > topic,
+    /// > error: err,
+    pub async fn next_session_settle_response(
+        &mut self,
+        approved: &ApprovedSession,
+    ) -> Result<Option<SessionSettleResponseMessage>, PairingClientError> {
+        let Some(subscription_data) = timeout(
+            self.receive_timeout,
+            self.relay.next_message_for_topic(approved.session_topic()),
+        )
+        .await
+        .map_err(|_| PairingClientError::ReceiveTimedOut {
+            timeout: self.receive_timeout,
+        })?
+        .map_err(|source| PairingClientError::Relay { source })?
+        else {
+            return Ok(None);
+        };
+
+        decode_session_settle_response_data(
+            subscription_data.data,
+            approved.subscription(),
+            approved.session_settle_request_id,
+        )
+        .map(Some)
     }
 
     /// Publishes a `wc_sessionPropose` JSON-RPC error response.
@@ -457,6 +519,7 @@ impl SessionSubscription {
 pub struct ApprovedSession {
     subscription: SessionSubscription,
     responder_public_key: wc_protocol::key::X25519PublicKey,
+    session_settle_request_id: u64,
     proposal_response_ack: bool,
     session_settle_ack: bool,
 }
@@ -480,6 +543,12 @@ impl ApprovedSession {
         &self.responder_public_key
     }
 
+    /// JSON-RPC id used for the `wc_sessionSettle` request.
+    #[must_use]
+    pub const fn session_settle_request_id(&self) -> u64 {
+        self.session_settle_request_id
+    }
+
     /// Relay ack for the proposal success response publish.
     #[must_use]
     pub const fn proposal_response_ack(&self) -> bool {
@@ -491,6 +560,67 @@ impl ApprovedSession {
     pub const fn session_settle_ack(&self) -> bool {
         self.session_settle_ack
     }
+}
+
+/// Peer response to the `wc_sessionSettle` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettleResponseMessage {
+    topic: RelayTopic,
+    encoded_message_len: usize,
+    published_at: u64,
+    tag: Option<u64>,
+    payload: SessionSettleResponsePayload,
+}
+
+impl SessionSettleResponseMessage {
+    /// Relay topic that delivered this response.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Length of the encrypted relay message string before decoding.
+    #[must_use]
+    pub const fn encoded_message_len(&self) -> usize {
+        self.encoded_message_len
+    }
+
+    /// Relay server publish timestamp in milliseconds.
+    #[must_use]
+    pub const fn published_at(&self) -> u64 {
+        self.published_at
+    }
+
+    /// Optional `WalletConnect` relay tag.
+    #[must_use]
+    pub const fn tag(&self) -> Option<u64> {
+        self.tag
+    }
+
+    /// Parsed JSON-RPC settle response.
+    #[must_use]
+    pub const fn payload(&self) -> &SessionSettleResponsePayload {
+        &self.payload
+    }
+}
+
+/// Typed `wc_sessionSettle` response payload.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionsettle>
+///
+/// > // Success result
+/// > true
+///
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/format.ts#L28-L45>
+///
+/// > result,
+/// > error: formatErrorMessage(error, data),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSettleResponsePayload {
+    /// Peer accepted the session settlement request.
+    Success(SessionSettleResponse),
+    /// Peer rejected the session settlement request.
+    Error(JsonRpcErrorResponse),
 }
 
 /// Active relay subscription for one pairing topic.
@@ -659,7 +789,7 @@ pub enum PairingClientError {
     /// Relay returned a message for a different topic than this subscription.
     #[error("pairing received unexpected topic")]
     UnexpectedTopic {
-        /// Topic from the active pairing subscription.
+        /// Topic from the active subscription.
         expected: RelayTopic,
         /// Topic delivered by the relay.
         actual: RelayTopic,
@@ -698,10 +828,44 @@ pub enum PairingClientError {
         source: serde_json::Error,
     },
 
+    /// Session-topic envelope decoding, decryption, or plaintext handling failed.
+    #[error("session envelope failed")]
+    SessionEnvelope {
+        /// Source envelope failure.
+        #[source]
+        source: EnvelopeError,
+    },
+
+    /// Session-topic decrypted JSON did not match the expected DTO.
+    #[error("session payload DTO failed")]
+    SessionPayload {
+        /// Source DTO parse error.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Session response payload did not carry a numeric JSON-RPC id.
+    #[error("session response is missing a numeric id")]
+    SessionResponseMissingId,
+
+    /// Session response id did not match the pending request id.
+    #[error("session response id does not match the pending request")]
+    SessionResponseIdMismatch {
+        /// JSON-RPC id from the pending request.
+        expected: u64,
+        /// JSON-RPC id from the received response.
+        actual: u64,
+    },
+
+    /// Session settle response was neither a JSON-RPC result nor error.
+    #[error("session settle response payload is unsupported")]
+    SessionSettleUnsupportedPayload,
+
     /// Sign JSON-RPC ID construction failed.
     #[error("sign rpc id construction failed")]
     SignRpcId {
         /// Source numeric overflow or system-clock failure.
+        #[source]
         source: SignRpcIdError,
     },
 }
@@ -762,14 +926,15 @@ fn now_unix_millis() -> Result<u64, SignRpcIdError> {
 
 /// Builds a Sign JSON-RPC ID using the same timestamp-plus-entropy layout as JS.
 ///
-/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/payload.ts#L12-L18>
+/// <https://github.com/WalletConnect/walletconnect-utils/blob/705f0a894606ca3fb0a750a38dff7bfacf3592b4/jsonrpc/utils/src/format.ts#L5-L8>
 ///
-/// > const date = BigInt(Date.now()) * BigInt(1000000);
+/// > const date = Date.now() * Math.pow(10, entropy);
+/// > const extra = Math.floor(Math.random() * Math.pow(10, entropy));
 fn next_sign_rpc_id() -> Result<u64, PairingClientError> {
-    let entropy = u64::from(SIGN_RPC_ID_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000);
+    let entropy = u64::from(SIGN_RPC_ID_COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000);
     now_unix_millis()
         .map_err(|source| PairingClientError::SignRpcId { source })?
-        .checked_mul(1_000_000)
+        .checked_mul(1_000)
         .and_then(|value| value.checked_add(entropy))
         .ok_or(SignRpcIdError::Overflow)
         .map_err(|source| PairingClientError::SignRpcId { source })
@@ -813,6 +978,77 @@ fn decode_subscription_data(
         message,
         payload,
     })
+}
+
+/// Converts one relay delivery record into a typed `wc_sessionSettle` response.
+fn decode_session_settle_response_data(
+    data: IrnSubscriptionData,
+    subscription: &SessionSubscription,
+    expected_id: u64,
+) -> Result<SessionSettleResponseMessage, PairingClientError> {
+    let encoded_message_len = data.message.len();
+
+    if data.topic != subscription.topic {
+        return Err(PairingClientError::UnexpectedTopic {
+            expected: subscription.topic.clone(),
+            actual: data.topic,
+        });
+    }
+
+    let envelope = Envelope::decode(&data.message, EnvelopeEncoding::Base64)
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let plaintext = envelope
+        .decrypt(&subscription.sym_key)
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let json = serde_json::from_str::<serde_json::Value>(&plaintext)
+        .map_err(|source| PairingClientError::SessionPayload { source })?;
+    let payload = parse_session_settle_response_payload(json, expected_id)?;
+
+    Ok(SessionSettleResponseMessage {
+        topic: subscription.topic.clone(),
+        encoded_message_len,
+        published_at: data.published_at,
+        tag: data.tag,
+        payload,
+    })
+}
+
+/// Parses and correlates the JSON-RPC response to `wc_sessionSettle`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2288-L2299>
+///
+/// > const { id } = payload;
+/// > if (isJsonRpcResult(payload)) {
+/// > } else if (isJsonRpcError(payload)) {
+fn parse_session_settle_response_payload(
+    json: serde_json::Value,
+    expected_id: u64,
+) -> Result<SessionSettleResponsePayload, PairingClientError> {
+    let actual_id = json
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(PairingClientError::SessionResponseMissingId)?;
+
+    if actual_id != expected_id {
+        return Err(PairingClientError::SessionResponseIdMismatch {
+            expected: expected_id,
+            actual: actual_id,
+        });
+    }
+
+    if json.get("result").is_some() {
+        return serde_json::from_value::<SessionSettleResponse>(json)
+            .map(SessionSettleResponsePayload::Success)
+            .map_err(|source| PairingClientError::SessionPayload { source });
+    }
+
+    if json.get("error").is_some() {
+        return serde_json::from_value::<JsonRpcErrorResponse>(json)
+            .map(SessionSettleResponsePayload::Error)
+            .map_err(|source| PairingClientError::SessionPayload { source });
+    }
+
+    Err(PairingClientError::SessionSettleUnsupportedPayload)
 }
 
 /// Parses the classified decrypted JSON into the DTO used by that method.
@@ -1012,7 +1248,7 @@ mod tests {
         relay::IrnSubscriptionData,
         session::{
             DappMetadata, JsonRpcErrorCode, SessionNamespace, SessionProposeErrorResponse,
-            SessionProposeResult, SessionSettleParams,
+            SessionProposeResult, SessionSettleParams, session_ack_response,
         },
     };
 
@@ -1229,6 +1465,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn decodes_session_settle_success_response() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let response = session_ack_response(9);
+        let data = encrypted_subscription_data_for_topic(
+            &response,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(SESSION_SETTLE_RESPONSE_TAG),
+        )?;
+
+        let received = decode_session_settle_response_data(data, &subscription, 9)?;
+
+        assert_eq!(received.topic(), subscription.topic());
+        assert_eq!(received.tag(), Some(SESSION_SETTLE_RESPONSE_TAG));
+        assert!(matches!(
+            received.payload(),
+            SessionSettleResponsePayload::Success(response) if response.id == 9
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_session_settle_error_response() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let response = JsonRpcErrorResponse::new(
+            9,
+            JsonRpcError::new(
+                JsonRpcErrorCode::SessionSettlementFailed,
+                "settlement failed",
+            ),
+        );
+        let data = encrypted_subscription_data_for_topic(
+            &response,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(SESSION_SETTLE_RESPONSE_TAG),
+        )?;
+
+        let received = decode_session_settle_response_data(data, &subscription, 9)?;
+
+        match received.payload() {
+            SessionSettleResponsePayload::Error(response) => {
+                assert_eq!(response.id, 9);
+                assert_eq!(
+                    response.error.code,
+                    JsonRpcErrorCode::SessionSettlementFailed
+                );
+            }
+            SessionSettleResponsePayload::Success(response) => {
+                panic!("unexpected success payload: {response:?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_session_settle_response_with_wrong_id() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let response = session_ack_response(10);
+        let data = encrypted_subscription_data_for_topic(
+            &response,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(SESSION_SETTLE_RESPONSE_TAG),
+        )?;
+
+        assert!(matches!(
+            decode_session_settle_response_data(data, &subscription, 9)
+                .expect_err("wrong response id is rejected"),
+            PairingClientError::SessionResponseIdMismatch {
+                expected: 9,
+                actual: 10
+            }
+        ));
+
+        Ok(())
+    }
+
     fn encrypted_subscription_data(
         plaintext: &str,
         sym_key: &PairingSymKey,
@@ -1239,6 +1565,36 @@ mod tests {
             message: envelope.encode(EnvelopeEncoding::Base64),
             published_at: 1_700_000_000_000,
             tag: Some(1100),
+        })
+    }
+
+    fn encrypted_subscription_data_for_topic<T>(
+        payload: &T,
+        sym_key: &PairingSymKey,
+        topic: RelayTopic,
+        tag: Option<u64>,
+    ) -> Result<IrnSubscriptionData, Box<dyn std::error::Error>>
+    where
+        T: serde::Serialize,
+    {
+        let plaintext = serde_json::to_string(payload)?;
+        let envelope = Envelope::encrypt_type_0(&plaintext, sym_key)?;
+
+        Ok(IrnSubscriptionData {
+            topic,
+            message: envelope.encode(EnvelopeEncoding::Base64),
+            published_at: 1_779_954_250_000,
+            tag,
+        })
+    }
+
+    fn session_subscription(
+        sym_key: PairingSymKey,
+    ) -> Result<SessionSubscription, Box<dyn std::error::Error>> {
+        Ok(SessionSubscription {
+            topic: RelayTopic::from_hex("44".repeat(32))?,
+            sym_key,
+            subscription_id: "session-sub-1".to_owned(),
         })
     }
 
