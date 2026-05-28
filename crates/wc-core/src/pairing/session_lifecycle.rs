@@ -2,9 +2,9 @@ use wc_protocol::{
     namespaces::{is_chain_authorized, is_event_authorized},
     relay::IrnPublish,
     session::{
-        JsonRpcRequest, Session, SessionAckResponse, SessionDeleteParams, SessionEventParams,
-        SessionExtendParams, SessionNamespaces, SessionUpdateParams, SignMethod,
-        session_ack_response,
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, Session, SessionAckResponse,
+        SessionDeleteParams, SessionEventParams, SessionExtendParams, SessionNamespaces,
+        SessionUpdateParams, SignMethod, session_ack_response,
     },
 };
 
@@ -227,6 +227,32 @@ pub(super) fn session_update_response_publish(
     let response = session_ack_response(session_update_request_id(subscription, message)?);
     session_ack_publish(
         subscription,
+        &response,
+        SESSION_UPDATE_RESPONSE_TTL_SECONDS,
+        SESSION_UPDATE_RESPONSE_TAG,
+    )
+}
+
+/// Builds an encrypted `wc_sessionUpdate` error publish.
+///
+/// A namespace update changes session permissions, so higher layers can reject
+/// it instead of sending the `result: true` acknowledgement.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2327-L2333>
+///
+/// > } catch (e) {
+/// > MemoryStore.delete(memoryKey);
+/// > await this.sendError({
+pub(super) fn session_update_error_publish(
+    subscription: &SessionSubscription,
+    message: &SessionReceivedMessage,
+    error: JsonRpcError,
+) -> Result<IrnPublish, PairingClientError> {
+    let response =
+        JsonRpcErrorResponse::new(session_update_request_id(subscription, message)?, error);
+    encrypted_json_publish(
+        subscription.topic().clone(),
+        subscription.sym_key(),
         &response,
         SESSION_UPDATE_RESPONSE_TTL_SECONDS,
         SESSION_UPDATE_RESPONSE_TAG,

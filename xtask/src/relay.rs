@@ -964,7 +964,6 @@ async fn run_core_client_session_lifecycle_action(
     match action {
         CoreClientSessionLifecycleAction::Ping
         | CoreClientSessionLifecycleAction::Delete
-        | CoreClientSessionLifecycleAction::IncomingUpdate
         | CoreClientSessionLifecycleAction::IncomingExtend => {
             let event = wait_for_client_session_lifecycle_event(client, action.label()).await?;
             if let Some(message) = event.message() {
@@ -976,16 +975,6 @@ async fn run_core_client_session_lifecycle_action(
                 client.active_sessions().len()
             );
             match action {
-                CoreClientSessionLifecycleAction::IncomingUpdate => {
-                    let active_namespaces = client
-                        .active_sessions()
-                        .first()
-                        .map(|session| session.namespaces.len())
-                        .context("updated session was not retained")?;
-                    println!(
-                        "core-client-session-lifecycle active_session_namespaces={active_namespaces}"
-                    );
-                }
                 CoreClientSessionLifecycleAction::IncomingExtend => {
                     let active_expiry = client
                         .active_sessions()
@@ -996,10 +985,18 @@ async fn run_core_client_session_lifecycle_action(
                 }
                 CoreClientSessionLifecycleAction::Ping
                 | CoreClientSessionLifecycleAction::Delete
+                | CoreClientSessionLifecycleAction::IncomingUpdatePending
+                | CoreClientSessionLifecycleAction::IncomingUpdateApprove
+                | CoreClientSessionLifecycleAction::IncomingUpdateReject
                 | CoreClientSessionLifecycleAction::Update
                 | CoreClientSessionLifecycleAction::Extend
                 | CoreClientSessionLifecycleAction::Event => {}
             }
+        }
+        CoreClientSessionLifecycleAction::IncomingUpdatePending
+        | CoreClientSessionLifecycleAction::IncomingUpdateApprove
+        | CoreClientSessionLifecycleAction::IncomingUpdateReject => {
+            handle_incoming_client_session_update(client, action).await?;
         }
         CoreClientSessionLifecycleAction::Update => {
             let response = client
@@ -1029,6 +1026,65 @@ async fn run_core_client_session_lifecycle_action(
             );
         }
     }
+
+    Ok(())
+}
+
+async fn handle_incoming_client_session_update(
+    client: &mut Client,
+    action: CoreClientSessionLifecycleAction,
+) -> Result<()> {
+    let event = wait_for_client_session_lifecycle_event(client, action.label()).await?;
+    let message = event
+        .message()
+        .context("session update event did not carry a message")?;
+    print_session_message("core-client-session-lifecycle live_event", message);
+
+    match action {
+        CoreClientSessionLifecycleAction::IncomingUpdatePending => {
+            println!(
+                "core-client-session-lifecycle explicit_approval_required=true active_sessions={}",
+                client.active_sessions().len()
+            );
+        }
+        CoreClientSessionLifecycleAction::IncomingUpdateApprove => {
+            let response_ack = client.approve_session_update(message).await?;
+            println!("core-client-session-lifecycle update_approval_ack={response_ack}");
+            print_active_session_namespaces(client)?;
+        }
+        CoreClientSessionLifecycleAction::IncomingUpdateReject => {
+            let response_ack = client
+                .reject_session_update(
+                    message,
+                    JsonRpcError::new(
+                        JsonRpcErrorCode::UserRejected,
+                        "User rejected session update.",
+                    ),
+                )
+                .await?;
+            println!("core-client-session-lifecycle update_rejection_ack={response_ack}");
+            print_active_session_namespaces(client)?;
+        }
+        CoreClientSessionLifecycleAction::Ping
+        | CoreClientSessionLifecycleAction::Delete
+        | CoreClientSessionLifecycleAction::IncomingExtend
+        | CoreClientSessionLifecycleAction::Update
+        | CoreClientSessionLifecycleAction::Extend
+        | CoreClientSessionLifecycleAction::Event => {
+            unreachable!("validated incoming update action")
+        }
+    }
+
+    Ok(())
+}
+
+fn print_active_session_namespaces(client: &Client) -> Result<()> {
+    let active_namespaces = client
+        .active_sessions()
+        .first()
+        .map(|session| session.namespaces.len())
+        .context("updated session was not retained")?;
+    println!("core-client-session-lifecycle active_session_namespaces={active_namespaces}");
 
     Ok(())
 }
@@ -1115,7 +1171,9 @@ enum CoreJsSessionLifecycleAction {
 enum CoreClientSessionLifecycleAction {
     Ping,
     Delete,
-    IncomingUpdate,
+    IncomingUpdatePending,
+    IncomingUpdateApprove,
+    IncomingUpdateReject,
     IncomingExtend,
     Update,
     Extend,
@@ -1129,14 +1187,16 @@ impl CoreClientSessionLifecycleAction {
         match value.as_str() {
             "ping" => Ok(Self::Ping),
             "delete" => Ok(Self::Delete),
-            "incoming-update" => Ok(Self::IncomingUpdate),
+            "incoming-update" | "incoming-update-pending" => Ok(Self::IncomingUpdatePending),
+            "incoming-update-approve" => Ok(Self::IncomingUpdateApprove),
+            "incoming-update-reject" => Ok(Self::IncomingUpdateReject),
             "incoming-extend" => Ok(Self::IncomingExtend),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-extend, update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-update-approve, incoming-update-reject, incoming-extend, update, extend, or event"
                 )
             }
         }
@@ -1146,7 +1206,10 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "ping",
             Self::Delete => "delete",
-            Self::IncomingUpdate | Self::Update => "update",
+            Self::IncomingUpdatePending
+            | Self::IncomingUpdateApprove
+            | Self::IncomingUpdateReject
+            | Self::Update => "update",
             Self::IncomingExtend | Self::Extend => "extend",
             Self::Event => "event",
         }
@@ -1156,7 +1219,9 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping",
             Self::Delete => "session_delete",
-            Self::IncomingUpdate => "session_update",
+            Self::IncomingUpdatePending
+            | Self::IncomingUpdateApprove
+            | Self::IncomingUpdateReject => "session_update",
             Self::IncomingExtend => "session_extend",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
@@ -1168,7 +1233,9 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping_response",
             Self::Delete => "session_delete_sent",
-            Self::IncomingUpdate => "session_update_acknowledged",
+            Self::IncomingUpdatePending => "session_update_timeout",
+            Self::IncomingUpdateApprove => "session_update_acknowledged",
+            Self::IncomingUpdateReject => "session_update_error",
             Self::IncomingExtend => "session_extend_acknowledged",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",

@@ -13,6 +13,7 @@ The repository builds a Rust WalletConnect client from small, live-tested primit
 The current priority is protocol behavior over broad surface area:
 
 - parse and validate protocol data close to the specification;
+- build security-sensitive primitives correctly from the beginning;
 - use real relay traffic whenever practical;
 - keep wallet decisions explicit and reviewable;
 - keep the runtime model obvious;
@@ -65,6 +66,7 @@ Current event model:
 - non-proposal pairing messages remain visible as `ClientEvent::PairingMessage`;
 - session-topic messages become `ClientEvent::Session`;
 - invalid session requests are auto-rejected by the receive path when the rejection is deterministic and does not require user approval.
+- permission-changing session updates are surfaced as events and require an explicit approve/reject API call.
 
 Reference:
 
@@ -100,7 +102,7 @@ Deferred:
 
 Auto-approval is not allowed.
 
-The current approval flow is:
+The current session proposal approval flow is:
 
 1. receive `wc_sessionPropose`;
 2. expose it as `ClientEvent::SessionProposal`;
@@ -119,9 +121,26 @@ Policy:
 
 Rationale: namespace approval is a wallet security decision. The core can help calculate a safe approval shape, but the caller still owns user consent.
 
+Session updates follow the same rule.
+`wc_sessionUpdate` replaces namespaces, and namespaces contain chains, accounts, methods, and events.
+The runtime must not acknowledge or apply such updates inside `Client::next_event()`.
+It must expose the update to the caller, then apply it only through an explicit approval primitive.
+
+Current session update flow:
+
+1. receive `wc_sessionUpdate`;
+2. expose it as `ClientEvent::Session(SessionClientEvent::SessionUpdate)`;
+3. caller compares current and requested namespaces and obtains any required user consent;
+4. caller invokes `Client::approve_session_update` or `Client::reject_session_update`;
+5. core mutates stored namespaces only after publishing an approval acknowledgement.
+
+Rationale: a protocol acknowledgement is not the same thing as wallet authorization.
+The lower-level pairing primitive may build either success or error responses, but the wallet-facing runtime must make the permission boundary obvious.
+
 Reference:
 
 - [Approving a Session Response](https://specs.walletconnect.com/2.0/specs/clients/sign/namespaces#approving-a-session-response)
+- [Updating a Session](https://docs.walletconnect.network/wallet-sdk/web/usage#updating-a-session)
 
 ## Security Posture
 
@@ -131,6 +150,7 @@ Current security defaults:
 
 - no auto-approval;
 - explicit user/caller approval path;
+- explicit permission-change primitives before protocol acknowledgements;
 - in-memory state only;
 - one connection;
 - bounded relay push handling;

@@ -154,6 +154,8 @@ impl Client {
     /// `wc_sessionRequest` payloads are auto-rejected by the lower-level
     /// receive path; deterministic `wc_sessionPing` and `wc_sessionDelete`
     /// side effects are handled before the event is returned.
+    /// `wc_sessionUpdate` is returned without acknowledgement because it
+    /// replaces session permissions.
     ///
     /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/session-events.md#session_request>
     ///
@@ -312,18 +314,57 @@ impl Client {
             .map_err(ClientError::from)
     }
 
-    /// Publishes a success response for a `SessionClientEvent::SessionUpdate`.
+    /// Approves a `SessionClientEvent::SessionUpdate`.
     ///
-    /// `Client::next_event` already responds to session updates it returns and
-    /// stores the replacement namespaces. This method is retained for callers
-    /// that receive a session message through a lower-level path.
-    pub async fn respond_session_update(
+    /// Session updates replace the active namespace set, so the polling API
+    /// surfaces them first. The caller should approve only after applying wallet
+    /// policy and user consent.
+    ///
+    /// <https://docs.walletconnect.network/wallet-sdk/web/usage#updating-a-session>
+    ///
+    /// > include new accounts or chains or methods in an existing session
+    pub async fn approve_session_update(
         &mut self,
         message: &SessionReceivedMessage,
     ) -> Result<bool, ClientError> {
         let subscription = self.session_subscription(message.topic())?.clone();
-        self.pairing
+        let SessionPayload::SessionUpdate(request) = message.payload() else {
+            return Err(ClientError::Pairing {
+                source: PairingClientError::SessionResponseTargetNotUpdate,
+            });
+        };
+        let namespaces = request.params.namespaces.clone();
+        let publish_ack = self
+            .pairing
             .respond_session_update(&subscription, message)
+            .await
+            .map_err(ClientError::from)?;
+
+        if publish_ack {
+            self.sessions
+                .get_mut(message.topic())
+                .ok_or_else(|| ClientError::SessionMissing {
+                    topic: message.topic().clone(),
+                })?
+                .session
+                .namespaces = namespaces;
+        }
+
+        Ok(publish_ack)
+    }
+
+    /// Rejects a `SessionClientEvent::SessionUpdate` without mutating session permissions.
+    ///
+    /// Use this when the requested namespace replacement is not allowed by
+    /// wallet policy or by user choice.
+    pub async fn reject_session_update(
+        &mut self,
+        message: &SessionReceivedMessage,
+        error: JsonRpcError,
+    ) -> Result<bool, ClientError> {
+        let subscription = self.session_subscription(message.topic())?.clone();
+        self.pairing
+            .reject_session_update(&subscription, message, error)
             .await
             .map_err(ClientError::from)
     }
@@ -582,14 +623,13 @@ impl Client {
     /// > await this.isValidDisconnect({ topic, reason: payload.params });
     /// > await this.deleteSession({ topic, id });
     ///
-    /// `wc_sessionUpdate` carries replacement namespaces and is acknowledged
-    /// with `true` after validation in the maintained Sign Client.
+    /// `wc_sessionUpdate` carries replacement namespaces. The high-level client
+    /// returns it to the caller instead of acknowledging it here, because
+    /// namespace replacement is a wallet permission decision.
     ///
     /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
     ///
     /// > await this.client.session.update(topic, { namespaces: params.namespaces });
-    /// > await this.sendResult<"wc_sessionUpdate">({
-    /// > result: true,
     ///
     /// `wc_sessionExtend` refreshes session expiry and acknowledges with
     /// `true`.
@@ -610,23 +650,6 @@ impl Client {
                     .respond_session_ping(subscription, message)
                     .await
                     .map_err(ClientError::from)?;
-            }
-            SessionClientEvent::SessionUpdate(message) => {
-                let SessionPayload::SessionUpdate(request) = message.payload() else {
-                    return Ok(Some(ClientEvent::Session(event)));
-                };
-                let namespaces = request.params.namespaces.clone();
-                self.pairing
-                    .respond_session_update(subscription, message)
-                    .await
-                    .map_err(ClientError::from)?;
-                self.sessions
-                    .get_mut(message.topic())
-                    .ok_or_else(|| ClientError::SessionMissing {
-                        topic: message.topic().clone(),
-                    })?
-                    .session
-                    .namespaces = namespaces;
             }
             SessionClientEvent::SessionExtend(message) => {
                 let expiry = match message.payload() {
@@ -656,6 +679,7 @@ impl Client {
                 self.sessions.remove(message.topic());
             }
             SessionClientEvent::SessionRequest(_)
+            | SessionClientEvent::SessionUpdate(_)
             | SessionClientEvent::SessionEvent(_)
             | SessionClientEvent::Unsupported(_)
             | SessionClientEvent::RejectedSessionRequest(_) => {}
