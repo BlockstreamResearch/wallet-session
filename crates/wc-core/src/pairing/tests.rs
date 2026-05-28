@@ -797,6 +797,10 @@ fn client_config_wraps_pairing_config() {
     let config = crate::ClientConfig::new(pairing.clone());
 
     assert_eq!(config.pairing().project_id, pairing.project_id);
+    assert_eq!(
+        config.max_queued_events(),
+        crate::DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY
+    );
 }
 
 #[test]

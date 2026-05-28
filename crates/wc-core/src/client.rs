@@ -18,23 +18,43 @@ use crate::pairing::{
     SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
 };
 
+/// Default number of fetched or internally queued events retained for `next_event`.
+pub const DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
+
 /// Runtime client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pairing: PairingClientConfig,
+    max_queued_events: usize,
 }
 
 impl ClientConfig {
     /// Builds a client configuration from the native pairing relay config.
     #[must_use]
     pub const fn new(pairing: PairingClientConfig) -> Self {
-        Self { pairing }
+        Self {
+            pairing,
+            max_queued_events: DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY,
+        }
     }
 
     /// Native pairing relay configuration used by the first runtime client.
     #[must_use]
     pub const fn pairing(&self) -> &PairingClientConfig {
         &self.pairing
+    }
+
+    /// Maximum number of events retained before `next_event` is polled.
+    #[must_use]
+    pub const fn max_queued_events(&self) -> usize {
+        self.max_queued_events
+    }
+
+    /// Sets the event queue bound used for retained relay messages.
+    #[must_use]
+    pub const fn with_max_queued_events(mut self, max_queued_events: usize) -> Self {
+        self.max_queued_events = max_queued_events;
+        self
     }
 }
 
@@ -53,7 +73,7 @@ pub struct Client {
     pairing: PairingClient,
     pairings: BTreeMap<RelayTopic, PairingSubscription>,
     sessions: BTreeMap<RelayTopic, ClientSession>,
-    queued_events: VecDeque<ClientEvent>,
+    queued_events: BoundedQueue<ClientEvent>,
 }
 
 impl Client {
@@ -67,7 +87,7 @@ impl Client {
             pairing,
             pairings: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            queued_events: VecDeque::new(),
+            queued_events: BoundedQueue::new(config.max_queued_events()),
         })
     }
 
@@ -100,6 +120,13 @@ impl Client {
             .fetch_pairing_messages(&pairing_uri)
             .await
             .map_err(ClientError::from)?;
+        let fetched_events = fetched
+            .into_iter()
+            .map(ClientEvent::from_pairing_message)
+            .collect::<Vec<_>>();
+        self.queued_events
+            .ensure_capacity_for(fetched_events.len())?;
+
         let subscription = self
             .pairing
             .subscribe_pairing(&pairing_uri)
@@ -108,9 +135,7 @@ impl Client {
         let topic = subscription.topic().clone();
 
         self.pairings.insert(topic.clone(), subscription);
-        self.queued_events
-            .extend(fetched.into_iter().map(ClientEvent::from_pairing_message));
-
+        self.queued_events.extend_within_capacity(fetched_events);
         Ok(topic)
     }
 
@@ -529,6 +554,55 @@ struct ClientSession {
     session: Session,
 }
 
+/// Bounded FIFO for runtime events waiting for application polling.
+///
+/// Wallet events can require explicit user approval, so overflow is rejected
+/// before state mutation instead of dropping older proposals or requests.
+#[derive(Debug, Clone)]
+struct BoundedQueue<T> {
+    capacity: usize,
+    items: VecDeque<T>,
+}
+
+impl<T> BoundedQueue<T> {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            items: VecDeque::new(),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<T> {
+        self.items.pop_front()
+    }
+
+    fn ensure_capacity_for(&self, incoming: usize) -> Result<(), ClientError> {
+        let required =
+            self.items
+                .len()
+                .checked_add(incoming)
+                .ok_or(ClientError::EventQueueFull {
+                    capacity: self.capacity,
+                    queued: self.items.len(),
+                    incoming,
+                })?;
+
+        if required > self.capacity {
+            return Err(ClientError::EventQueueFull {
+                capacity: self.capacity,
+                queued: self.items.len(),
+                incoming,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn extend_within_capacity(&mut self, events: impl IntoIterator<Item = T>) {
+        self.items.extend(events);
+    }
+}
+
 /// Client runtime error.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -588,6 +662,17 @@ pub enum ClientError {
     /// Default session extension exceeded `u64`.
     #[error("client session expiry overflow")]
     SessionExpiryOverflow,
+
+    /// Client event queue cannot retain all pending messages.
+    #[error("client event queue full")]
+    EventQueueFull {
+        /// Configured queue capacity.
+        capacity: usize,
+        /// Events already retained.
+        queued: usize,
+        /// New events that need to be retained.
+        incoming: usize,
+    },
 }
 
 impl From<PairingClientError> for ClientError {
@@ -614,4 +699,50 @@ fn now_unix_seconds() -> Result<u64, ClientError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|source| ClientError::Clock { source })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BoundedQueue, ClientError, DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY};
+    use crate::{ClientConfig, PairingClientConfig};
+
+    #[test]
+    fn client_config_uses_default_event_queue_capacity() {
+        let pairing = PairingClientConfig::new("project", [7; 32], "subject");
+        let config = ClientConfig::new(pairing);
+
+        assert_eq!(
+            config.max_queued_events(),
+            DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY
+        );
+    }
+
+    #[test]
+    fn client_config_sets_event_queue_capacity() {
+        let pairing = PairingClientConfig::new("project", [7; 32], "subject");
+        let config = ClientConfig::new(pairing).with_max_queued_events(2);
+
+        assert_eq!(config.max_queued_events(), 2);
+    }
+
+    #[test]
+    fn bounded_queue_rejects_overflow_without_mutating() {
+        let mut queue = BoundedQueue::new(2);
+        queue.extend_within_capacity([1]);
+
+        let error = queue
+            .ensure_capacity_for(2)
+            .expect_err("queue should reject overflow");
+
+        assert!(matches!(
+            error,
+            ClientError::EventQueueFull {
+                capacity: 2,
+                queued: 1,
+                incoming: 2
+            }
+        ));
+        assert_eq!(queue.pop_front(), Some(1));
+        assert_eq!(queue.pop_front(), None);
+    }
 }

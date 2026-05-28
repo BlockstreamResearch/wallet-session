@@ -7,7 +7,10 @@ mod pairing;
 pub use capabilities::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
 };
-pub use client::{Client, ClientConfig, ClientError, ClientEvent, ClientSessionProposal};
+pub use client::{
+    Client, ClientConfig, ClientError, ClientEvent, ClientSessionProposal,
+    DEFAULT_CLIENT_EVENT_QUEUE_CAPACITY,
+};
 pub use pairing::{
     ApprovedSession, DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
     PairingClient, PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,
