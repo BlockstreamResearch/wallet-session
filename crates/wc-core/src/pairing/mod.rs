@@ -7,6 +7,7 @@ mod client;
 mod codec;
 mod error;
 mod publish;
+mod session_lifecycle;
 mod session_request;
 mod types;
 
@@ -115,3 +116,37 @@ pub const SESSION_REQUEST_RESPONSE_TAG: u64 = 1109;
 /// > TTL     | 300
 /// > Tag     | 1109
 pub const SESSION_REQUEST_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay tag used for `wc_sessionDelete` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L90-L100>
+///
+/// > wc_sessionDelete: {
+/// > res: {
+/// > tag: 1113,
+pub const SESSION_DELETE_RESPONSE_TAG: u64 = 1113;
+
+/// Relay retention window for `wc_sessionDelete` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L90-L100>
+///
+/// > ttl: ONE_DAY,
+/// > tag: 1113,
+pub const SESSION_DELETE_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay tag used for `wc_sessionPing` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L102-L112>
+///
+/// > wc_sessionPing: {
+/// > res: {
+/// > tag: 1115,
+pub const SESSION_PING_RESPONSE_TAG: u64 = 1115;
+
+/// Relay retention window for `wc_sessionPing` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L102-L112>
+///
+/// > ttl: ONE_DAY,
+/// > tag: 1115,
+pub const SESSION_PING_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;

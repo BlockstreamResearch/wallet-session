@@ -195,6 +195,12 @@ fn parse_session_payload(json: serde_json::Value) -> Result<SessionPayload, Pair
         Some(SignMethod::SessionRequest) => serde_json::from_value(json)
             .map(|request| SessionPayload::SessionRequest(Box::new(request)))
             .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(SignMethod::SessionPing) => serde_json::from_value(json)
+            .map(SessionPayload::SessionPing)
+            .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(SignMethod::SessionDelete) => serde_json::from_value(json)
+            .map(SessionPayload::SessionDelete)
+            .map_err(|source| PairingClientError::SessionPayload { source }),
         Some(method) => Ok(SessionPayload::Sign(method)),
         None => Ok(SessionPayload::Unknown(method.to_owned())),
     }

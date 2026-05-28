@@ -17,6 +17,8 @@ const uriFile = process.env.WC_JS_URI_FILE;
 const resultFile = process.env.WC_JS_RESULT_FILE;
 const printUri = process.env.WC_JS_PRINT_URI === "1";
 const sendSessionRequest = process.env.WC_JS_SEND_SESSION_REQUEST === "1";
+const afterApprovalAction =
+  process.env.WC_JS_AFTER_APPROVAL_ACTION ?? (sendSessionRequest ? "session_request" : "approved");
 const waitForSessionRequestResponse =
   process.env.WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE === "1";
 
@@ -75,13 +77,24 @@ try {
 
   if (session) {
     console.error(`js-harness approved_session_topic=${session.topic}`);
-    if (sendSessionRequest) {
-      await startSessionRequest(session.topic);
-    } else {
-      await writeResult({
-        outcome: "approved",
-        topic: session.topic,
-      });
+    switch (afterApprovalAction) {
+      case "approved":
+        await writeResult({
+          outcome: "approved",
+          topic: session.topic,
+        });
+        break;
+      case "session_request":
+        await startSessionRequest(session.topic);
+        break;
+      case "session_ping":
+        await startSessionPing(session.topic);
+        break;
+      case "session_delete":
+        await startSessionDelete(session.topic);
+        break;
+      default:
+        throw new Error(`unknown WC_JS_AFTER_APPROVAL_ACTION=${afterApprovalAction}`);
     }
   } else {
     console.error("js-harness proposal_timeout=true");
@@ -108,12 +121,82 @@ function redactPairingUri(uri: string): string {
   return uri.replace(/([?&]symKey=)[^&]+/, "$1<redacted>");
 }
 
-async function writeResult(result: Record<string, string>): Promise<void> {
+async function writeResult(result: Record<string, unknown>): Promise<void> {
   if (!resultFile) {
     return;
   }
 
   await Bun.write(resultFile, `${JSON.stringify(result)}\n`);
+}
+
+async function startSessionPing(topic: string): Promise<void> {
+  const request = signClient.ping({ topic });
+  console.error(`js-harness session_ping_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+
+  const response = await Promise.race([
+    request.then(
+      () => {
+        console.error("js-harness session_ping_response=true");
+        return {
+          outcome: "session_ping_response",
+          topic,
+        };
+      },
+      (error) => {
+        const message = errorMessage(error);
+        console.error(`js-harness session_ping_error=${message}`);
+        return {
+          outcome: "session_ping_error",
+          topic,
+          message,
+        };
+      },
+    ),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_ping_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+async function startSessionDelete(topic: string): Promise<void> {
+  const reason = {
+    code: Number.parseInt(process.env.WC_JS_SESSION_DELETE_REASON_CODE ?? "6000", 10),
+    message: process.env.WC_JS_SESSION_DELETE_REASON_MESSAGE ?? "User disconnected.",
+  };
+  const request = signClient.disconnect({ topic, reason });
+  console.error(
+    `js-harness session_delete_started=true topic=${topic} code=${reason.code} message=${JSON.stringify(reason.message)}`,
+  );
+
+  const response = await Promise.race([
+    request.then(
+      () => {
+        console.error("js-harness session_delete_sent=true");
+        return {
+          outcome: "session_delete_sent",
+          topic,
+          code: reason.code,
+          message: reason.message,
+        };
+      },
+      (error) => {
+        const message = errorMessage(error);
+        console.error(`js-harness session_delete_error=${message}`);
+        return {
+          outcome: "session_delete_error",
+          topic,
+          message,
+        };
+      },
+    ),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_delete_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
 }
 
 async function startSessionRequest(topic: string): Promise<void> {

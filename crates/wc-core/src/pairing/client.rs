@@ -20,6 +20,7 @@ use super::{
         validate_session_message_payload,
     },
     error::PairingClientError,
+    session_lifecycle::{session_delete_response_publish, session_ping_response_publish},
     session_request::{
         session_request_error_publish, session_request_success_publish,
         session_request_validation_error,
@@ -491,6 +492,53 @@ impl PairingClient {
         error: JsonRpcError,
     ) -> Result<bool, PairingClientError> {
         let publish = session_request_error_publish(subscription, message, error)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a success response for a received `wc_sessionPing`.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionping>
+    ///
+    /// > // Success result
+    /// > true
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2401-L2411>
+    ///
+    /// > await this.sendResult<"wc_sessionPing">({
+    /// > id,
+    /// > topic,
+    pub async fn respond_session_ping(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_ping_response_publish(subscription, message)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a success response for a received `wc_sessionDelete`.
+    ///
+    /// <https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessiondelete>
+    ///
+    /// > // Success result
+    /// > true
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2442-L2454>
+    ///
+    /// > await this.isValidDisconnect({ topic, reason: payload.params });
+    /// > await this.deleteSession({ topic, id });
+    pub async fn respond_session_delete(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_delete_response_publish(subscription, message)?;
         self.relay
             .publish(publish)
             .await

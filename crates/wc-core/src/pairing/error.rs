@@ -161,9 +161,17 @@ pub enum PairingClientError {
     #[error("session settle response payload is unsupported")]
     SessionSettleUnsupportedPayload,
 
-    /// A session request response was built from a non-request session message.
+    /// A `wc_sessionRequest` response was built from a different session message.
     #[error("session response target is not a session request")]
     SessionResponseTargetNotRequest,
+
+    /// A `wc_sessionPing` response was built from a different session message.
+    #[error("session response target is not a session ping")]
+    SessionResponseTargetNotPing,
+
+    /// A `wc_sessionDelete` response was built from a different session message.
+    #[error("session response target is not a session delete")]
+    SessionResponseTargetNotDelete,
 
     /// Peer rejected the session settlement request.
     #[error("session settle rejected")]

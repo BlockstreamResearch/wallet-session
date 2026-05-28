@@ -5,8 +5,9 @@ use wc_protocol::{
     relay::RelayTopic,
     session::{
         DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, ScopedProperties,
-        Session, SessionConfig, SessionNamespaces, SessionProperties, SessionProposeParams,
-        SessionRequestParams, SessionSettleResponse, SignMethod,
+        Session, SessionConfig, SessionDeleteParams, SessionNamespaces, SessionPingParams,
+        SessionProperties, SessionProposeParams, SessionRequestParams, SessionSettleResponse,
+        SignMethod,
     },
 };
 
@@ -341,6 +342,10 @@ impl SessionReceivedMessage {
 pub enum SessionPayload {
     /// `wc_sessionRequest` Sign API request.
     SessionRequest(Box<JsonRpcRequest<SessionRequestParams>>),
+    /// `wc_sessionPing` Sign API request.
+    SessionPing(JsonRpcRequest<SessionPingParams>),
+    /// `wc_sessionDelete` Sign API request.
+    SessionDelete(JsonRpcRequest<SessionDeleteParams>),
     /// Known Sign API method whose DTO is not parsed at this layer yet.
     Sign(SignMethod),
     /// JSON-RPC method name is present but not implemented by current DTOs.

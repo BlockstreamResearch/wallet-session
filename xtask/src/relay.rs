@@ -53,6 +53,7 @@ pub enum ProbeMode {
     CoreJsApproveProposal,
     CoreJsRejectProposal,
     CoreJsSessionRequest,
+    CoreJsSessionLifecycle,
     PairingUri(String),
 }
 
@@ -68,6 +69,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
         ProbeMode::CoreJsSessionRequest => {
             Box::pin(run_core_js_session_request_probe(&config)).await
+        }
+        ProbeMode::CoreJsSessionLifecycle => {
+            Box::pin(run_core_js_session_lifecycle_probe(&config)).await
         }
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
@@ -107,13 +111,13 @@ impl Drop for ChildGuard {
     }
 }
 
-struct SessionRequestHarness {
+struct SessionHarness {
     result_file: PathBuf,
     guard: ChildGuard,
 }
 
-impl SessionRequestHarness {
-    async fn start(response_mode: &str, raw_invalid_request: bool) -> Result<(Self, String)> {
+impl SessionHarness {
+    async fn start(action: &str, label: &str) -> Result<(Self, String)> {
         let workspace_root = workspace_root()?;
         let harness_dir = workspace_root.join("tools/js-harness");
         let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
@@ -130,7 +134,7 @@ impl SessionRequestHarness {
             env::var("WC_JS_SESSION_REQUEST_HOLD_MS").unwrap_or_else(|_| hold_ms.clone());
 
         println!(
-            "core-js-session-request harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} request_hold_ms={request_hold_ms} response_mode={response_mode}",
+            "core-js-session harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} request_hold_ms={request_hold_ms} action={action} label={label}",
             harness_dir.display(),
             uri_file.display(),
             result_file.display()
@@ -144,11 +148,12 @@ impl SessionRequestHarness {
             .env("WC_JS_RESULT_FILE", &result_file)
             .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
             .env("WC_JS_SESSION_REQUEST_HOLD_MS", &request_hold_ms)
+            .env("WC_JS_AFTER_APPROVAL_ACTION", action)
             .env_remove("WC_JS_PRINT_URI")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        if !raw_invalid_request {
+        if action == "session_request" {
             command
                 .env("WC_JS_SEND_SESSION_REQUEST", "1")
                 .env("WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE", "1");
@@ -507,8 +512,12 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
     let response_mode =
         env::var("WC_CORE_SESSION_REQUEST_RESPONSE").unwrap_or_else(|_| "success".to_owned());
     let raw_invalid_request = response_mode.starts_with("auto-reject-");
-    let (mut harness, uri) =
-        SessionRequestHarness::start(&response_mode, raw_invalid_request).await?;
+    let action = if raw_invalid_request {
+        "approved"
+    } else {
+        "session_request"
+    };
+    let (mut harness, uri) = SessionHarness::start(action, &response_mode).await?;
 
     let (mut client, pairing_subscription, approved, session) =
         run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
@@ -547,7 +556,7 @@ async fn run_core_valid_session_request_probe(
     subscription: &wc_core::SessionSubscription,
     session: &Session,
     response_mode: &str,
-    harness: &mut SessionRequestHarness,
+    harness: &mut SessionHarness,
 ) -> Result<()> {
     let session_message =
         wait_for_valid_session_request_message(client, subscription, session).await?;
@@ -587,6 +596,75 @@ async fn run_core_valid_session_request_probe(
     println!("core-js-session-request js_result={result}");
 
     Ok(())
+}
+
+async fn run_core_js_session_lifecycle_probe(config: &RelayProbeConfig) -> Result<()> {
+    let lifecycle_action =
+        env::var("WC_CORE_SESSION_LIFECYCLE_ACTION").unwrap_or_else(|_| "ping".to_owned());
+    let harness_action = match lifecycle_action.as_str() {
+        "ping" => "session_ping",
+        "delete" => "session_delete",
+        other => bail!("unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping or delete"),
+    };
+    let (mut harness, uri) = SessionHarness::start(harness_action, &lifecycle_action).await?;
+
+    let (mut client, pairing_subscription, approved, session) =
+        run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
+    let message = wait_for_session_lifecycle_message(
+        &mut client,
+        approved.subscription(),
+        &session,
+        &lifecycle_action,
+    )
+    .await?;
+    print_session_message("core-js-session-lifecycle live_message", &message);
+    let response_ack = match lifecycle_action.as_str() {
+        "ping" => {
+            client
+                .respond_session_ping(approved.subscription(), &message)
+                .await?
+        }
+        "delete" => {
+            client
+                .respond_session_delete(approved.subscription(), &message)
+                .await?
+        }
+        _ => unreachable!("validated lifecycle action"),
+    };
+    println!("core-js-session-lifecycle response_ack={response_ack} action={lifecycle_action}");
+
+    let expected_outcome = match lifecycle_action.as_str() {
+        "ping" => "session_ping_response",
+        "delete" => "session_delete_sent",
+        _ => unreachable!("validated lifecycle action"),
+    };
+    let result = harness.expect_result(expected_outcome).await?;
+    println!("core-js-session-lifecycle js_result={result}");
+
+    let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
+    println!("core-js-session-lifecycle pairing_unsubscribe_ack={unsubscribe_result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn wait_for_session_lifecycle_message(
+    client: &mut PairingClient,
+    subscription: &wc_core::SessionSubscription,
+    session: &Session,
+    lifecycle_action: &str,
+) -> Result<SessionReceivedMessage> {
+    loop {
+        let message = client
+            .next_session_message(subscription, session)
+            .await?
+            .context("no session lifecycle message received")?;
+        match (lifecycle_action, message.payload()) {
+            ("ping", SessionPayload::SessionPing(_))
+            | ("delete", SessionPayload::SessionDelete(_)) => return Ok(message),
+            _ => print_ignored_session_message(&message),
+        }
+    }
 }
 
 async fn wait_for_valid_session_request_message(
@@ -1070,6 +1148,15 @@ fn print_session_message(label: &str, message: &SessionReceivedMessage) {
             request.params.request.method,
             request.params.request.params
         ),
+        SessionPayload::SessionPing(request) => {
+            println!("{label} session_ping id={} params=empty", request.id);
+        }
+        SessionPayload::SessionDelete(request) => {
+            println!(
+                "{label} session_delete id={} code={} message={}",
+                request.id, request.params.code, request.params.message
+            );
+        }
         SessionPayload::Sign(method) => {
             println!("{label} sign_request method={method}");
         }
