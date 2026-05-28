@@ -25,6 +25,7 @@ use super::{
         decode_subscription_data, validate_session_message_payload,
     },
     error::PairingClientError,
+    pairing_lifecycle::pairing_ping_response_publish,
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -805,6 +806,24 @@ impl PairingClient {
         message: &SessionReceivedMessage,
     ) -> Result<bool, PairingClientError> {
         let publish = session_delete_response_publish(subscription, message)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a success response for a received `wc_pairingPing`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/pairing.ts#L377-L385>
+    ///
+    /// > await this.sendResult<"wc_pairingPing">(id, topic, true);
+    /// > this.events.emit(PAIRING_EVENTS.ping, { id, topic });
+    pub async fn respond_pairing_ping(
+        &mut self,
+        subscription: &PairingSubscription,
+        message: &PairingReceivedMessage,
+    ) -> Result<bool, PairingClientError> {
+        let publish = pairing_ping_response_publish(subscription, message)?;
         self.relay
             .publish(publish)
             .await

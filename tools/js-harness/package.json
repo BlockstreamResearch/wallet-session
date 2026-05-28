@@ -9,6 +9,7 @@
     "check": "bun run check:supply-chain && bun run check:types",
     "check:supply-chain": "bun run src/check-supply-chain.ts",
     "check:types": "tsc --noEmit",
+    "pairing-lifecycle": "bun run src/pairing-lifecycle.ts",
     "propose-session": "bun run src/propose-session.ts"
   },
   "trustedDependencies": [],

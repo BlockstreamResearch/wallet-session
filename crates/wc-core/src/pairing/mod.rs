@@ -6,6 +6,7 @@ mod approval;
 mod client;
 mod codec;
 mod error;
+mod pairing_lifecycle;
 mod publish;
 mod session_lifecycle;
 mod session_request;
@@ -26,6 +27,24 @@ pub use types::{
 
 /// Default wait time for one live pairing-topic message.
 pub const DEFAULT_PAIRING_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Relay tag used for `wc_pairingPing` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/constants/pairing.ts#L29-L39>
+///
+/// > wc_pairingPing: {
+/// > res: {
+/// > tag: 1003,
+pub const PAIRING_PING_RESPONSE_TAG: u64 = 1003;
+
+/// Relay retention window for `wc_pairingPing` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/constants/pairing.ts#L29-L39>
+///
+/// > res: {
+/// > ttl: THIRTY_SECONDS,
+/// > prompt: false,
+pub const PAIRING_PING_RESPONSE_TTL_SECONDS: u64 = 30;
 
 /// Default session lifetime used by the first approval primitive.
 ///

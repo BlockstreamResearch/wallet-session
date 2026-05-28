@@ -632,6 +632,12 @@ impl PairingSubscription {
         &self.topic
     }
 
+    /// Symmetric key from the pairing URI.
+    #[must_use]
+    pub const fn sym_key(&self) -> &PairingSymKey {
+        &self.sym_key
+    }
+
     /// Subscription ID returned by `irn_subscribe`.
     #[must_use]
     pub fn subscription_id(&self) -> &str {

@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, Client, ClientConfig, ClientEvent, ClientSessionProposal,
-    DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingPayload,
-    PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG, SessionClientEvent,
-    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
+    PairingPayload, PairingReceivedMessage, PairingSubscription, SESSION_REQUEST_RESPONSE_TAG,
+    SessionClientEvent, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
+    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
     SessionSettleResponseMessage, SessionSettleResponsePayload, WalletCapabilities,
     WalletChainCapability,
 };
@@ -57,6 +57,7 @@ pub enum ProbeMode {
     CoreJsProposal,
     CoreJsApproveProposal,
     CoreJsRejectProposal,
+    CoreJsPairingLifecycle,
     CoreJsSessionRequest,
     CoreJsSessionLifecycle,
     CoreClientSessionRequest,
@@ -75,6 +76,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
         ProbeMode::CoreJsApproveProposal => run_core_js_approve_proposal_probe(&config).await,
         ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
+        ProbeMode::CoreJsPairingLifecycle => {
+            Box::pin(run_core_js_pairing_lifecycle_probe(&config)).await
+        }
         ProbeMode::CoreJsSessionRequest => {
             Box::pin(run_core_js_session_request_probe(&config)).await
         }
@@ -131,6 +135,68 @@ impl Drop for ChildGuard {
 struct SessionHarness {
     result_file: PathBuf,
     guard: ChildGuard,
+}
+
+struct PairingHarness {
+    result_file: PathBuf,
+    guard: ChildGuard,
+}
+
+impl PairingHarness {
+    async fn start(action: &str, label: &str) -> Result<(Self, String)> {
+        let workspace_root = workspace_root()?;
+        let harness_dir = workspace_root.join("tools/js-harness");
+        let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+        let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
+        if let Some(parent) = uri_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let _ = fs::remove_file(&uri_file);
+        let _ = fs::remove_file(&result_file);
+
+        let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "30000".to_owned());
+
+        println!(
+            "core-js-pairing-lifecycle harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} action={action} label={label}",
+            harness_dir.display(),
+            uri_file.display(),
+            result_file.display()
+        );
+
+        let child = Command::new("bun")
+            .args(["run", "pairing-lifecycle"])
+            .current_dir(&harness_dir)
+            .env("WC_JS_URI_FILE", &uri_file)
+            .env("WC_JS_RESULT_FILE", &result_file)
+            .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+            .env("WC_JS_PAIRING_ACTION", action)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start pairing Bun harness in {}",
+                    harness_dir.display()
+                )
+            })?;
+        let mut guard = ChildGuard::new(child);
+        let uri = wait_for_js_pairing_uri(&uri_file, guard.child_mut()).await?;
+        Ok((Self { result_file, guard }, uri))
+    }
+
+    async fn expect_result(&mut self, expected_outcome: &str) -> Result<Value> {
+        let result = wait_for_js_result(&self.result_file, self.guard.child_mut()).await?;
+        if result.get("outcome").and_then(Value::as_str) != Some(expected_outcome) {
+            bail!("expected JS {expected_outcome} result, got {result}");
+        }
+        Ok(result)
+    }
+
+    fn terminate(&mut self) {
+        self.guard.terminate();
+    }
 }
 
 impl SessionHarness {
@@ -523,6 +589,154 @@ async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result
     harness.terminate();
 
     Ok(())
+}
+
+async fn run_core_js_pairing_lifecycle_probe(config: &RelayProbeConfig) -> Result<()> {
+    let action = PairingLifecycleAction::from_env()?;
+    let (mut harness, uri) = PairingHarness::start(action.js_action(), action.label()).await?;
+    let (mut client, subscription, message) =
+        receive_core_js_pairing_lifecycle_message(config, uri.trim(), action).await?;
+
+    match action {
+        PairingLifecycleAction::Ping => {
+            let ack = client.respond_pairing_ping(&subscription, &message).await?;
+            println!(
+                "core-js-pairing-lifecycle pairing_ping_response_ack={ack} response_tag={PAIRING_PING_RESPONSE_TAG}"
+            );
+            let result = harness.expect_result(action.expected_result()).await?;
+            println!("core-js-pairing-lifecycle js_result={result}");
+            let unsubscribe_result = client.unsubscribe_pairing(&subscription).await?;
+            println!("core-js-pairing-lifecycle unsubscribe_ack={unsubscribe_result}");
+        }
+        PairingLifecycleAction::Delete => {
+            let unsubscribe_result = client.unsubscribe_pairing(&subscription).await?;
+            println!(
+                "core-js-pairing-lifecycle delete_cleanup_unsubscribe_ack={unsubscribe_result}"
+            );
+            let result = harness.expect_result(action.expected_result()).await?;
+            println!("core-js-pairing-lifecycle js_result={result}");
+        }
+    }
+
+    harness.terminate();
+    Ok(())
+}
+
+async fn receive_core_js_pairing_lifecycle_message(
+    config: &RelayProbeConfig,
+    uri: &str,
+    action: PairingLifecycleAction,
+) -> Result<(PairingClient, PairingSubscription, PairingReceivedMessage)> {
+    let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!("xtask-core-pairing-{}", rpc_id()?.as_u64()),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    println!(
+        "core-js-pairing-lifecycle project_id={} relay_url={} topic={} version={} relay_protocol={} sym_key={} expiry={:?} expired_now={} action={}",
+        redact(&config.project_id),
+        config.relay_url,
+        pairing.topic(),
+        pairing.version(),
+        pairing.relay().protocol(),
+        redact(pairing.sym_key().as_str()),
+        pairing.expiry_timestamp(),
+        pairing.is_expired_at(unix_timestamp()),
+        action.label()
+    );
+
+    let mut client = PairingClient::connect(&client_config).await?;
+    println!(
+        "core-js-pairing-lifecycle connected status={}",
+        client.status()
+    );
+
+    let fetched = client.fetch_pairing_messages(&pairing).await?;
+    println!(
+        "core-js-pairing-lifecycle fetch_messages count={}",
+        fetched.len()
+    );
+    let subscription = client.subscribe_pairing(&pairing).await?;
+    println!(
+        "core-js-pairing-lifecycle subscription_id={}",
+        subscription.subscription_id()
+    );
+
+    for (index, message) in fetched.into_iter().enumerate() {
+        print_core_pairing_payload_metadata(
+            &format!("core-js-pairing-lifecycle fetched index={index}"),
+            &message,
+        )?;
+        if action.matches(&message) {
+            return Ok((client, subscription, message));
+        }
+    }
+
+    loop {
+        let message = client
+            .next_pairing_message(&subscription)
+            .await?
+            .context("no pairing lifecycle message received")?;
+        print_core_pairing_payload_metadata("core-js-pairing-lifecycle live_message", &message)?;
+        if action.matches(&message) {
+            return Ok((client, subscription, message));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingLifecycleAction {
+    Ping,
+    Delete,
+}
+
+impl PairingLifecycleAction {
+    fn from_env() -> Result<Self> {
+        match env::var("WC_CORE_PAIRING_LIFECYCLE_ACTION")
+            .unwrap_or_else(|_| "ping".to_owned())
+            .as_str()
+        {
+            "ping" => Ok(Self::Ping),
+            "delete" => Ok(Self::Delete),
+            other => {
+                bail!("unknown WC_CORE_PAIRING_LIFECYCLE_ACTION={other}; expected ping or delete")
+            }
+        }
+    }
+
+    const fn js_action(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Delete => "delete",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Delete => "delete",
+        }
+    }
+
+    const fn expected_result(self) -> &'static str {
+        match self {
+            Self::Ping => "pairing_ping_response",
+            Self::Delete => "pairing_delete_sent",
+        }
+    }
+
+    const fn matches(self, message: &PairingReceivedMessage) -> bool {
+        matches!(
+            (self, message.payload()),
+            (Self::Ping, PairingPayload::PairingPing(_))
+                | (Self::Delete, PairingPayload::PairingDelete(_))
+        )
+    }
 }
 
 async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<()> {

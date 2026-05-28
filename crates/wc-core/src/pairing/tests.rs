@@ -6,6 +6,7 @@ use super::{
         decode_session_message_data_unchecked, decode_session_settle_response_data,
         decode_subscription_data, validate_session_message_payload,
     },
+    pairing_lifecycle::pairing_ping_response_publish,
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -18,6 +19,9 @@ use super::{
     *,
 };
 use wc_protocol::{
+    dto::pairing::{
+        PairingJsonRpcRequest, PairingJsonRpcResponse, PairingMethod, PairingPingParams,
+    },
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, X25519PrivateKey},
     pairing::{PairingSymKey, PairingUri},
@@ -90,6 +94,57 @@ fn decodes_subscription_data_with_pairing_key() -> Result<(), Box<dyn std::error
     assert_eq!(received.tag(), Some(1100));
     assert_eq!(received.message().plaintext(), plaintext);
     assert!(matches!(received.payload(), PairingPayload::PairingPing(_)));
+
+    Ok(())
+}
+
+#[test]
+fn builds_pairing_ping_response_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(sym_key.clone())?;
+    let request = PairingJsonRpcRequest::new(77, PairingMethod::Ping, PairingPingParams::default());
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1002),
+    )?;
+    let received = decode_subscription_data(data, &sym_key)?;
+
+    let publish = pairing_ping_response_publish(&subscription, &received)?;
+    let response: PairingJsonRpcResponse<bool> = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, PAIRING_PING_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, PAIRING_PING_RESPONSE_TAG);
+    assert_eq!(response.id, 77);
+    assert!(response.result);
+
+    Ok(())
+}
+
+#[test]
+fn pairing_ping_response_rejects_non_ping_message() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(sym_key.clone())?;
+    let proposal = session_proposal_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &proposal,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1100),
+    )?;
+    let received = decode_subscription_data(data, &sym_key)?;
+
+    assert!(matches!(
+        pairing_ping_response_publish(&subscription, &received)
+            .expect_err("session proposal is not a pairing ping"),
+        PairingClientError::PairingResponseTargetNotPing
+    ));
 
     Ok(())
 }
@@ -1543,6 +1598,16 @@ where
         message: envelope.encode(EnvelopeEncoding::Base64),
         published_at: 1_779_954_250_000,
         tag,
+    })
+}
+
+fn pairing_subscription(
+    sym_key: PairingSymKey,
+) -> Result<PairingSubscription, Box<dyn std::error::Error>> {
+    Ok(PairingSubscription {
+        topic: RelayTopic::from_hex("11".repeat(32))?,
+        sym_key,
+        subscription_id: "pairing-sub-1".to_owned(),
     })
 }
 

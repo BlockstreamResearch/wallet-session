@@ -49,6 +49,9 @@ struct RelayProbeArgs {
     core: CoreRelayProbeArgs,
 
     #[command(flatten)]
+    core_pairing: CoreRelayPairingProbeArgs,
+
+    #[command(flatten)]
     core_session: CoreRelaySessionProbeArgs,
 
     #[arg(long, value_name = "URI")]
@@ -65,6 +68,12 @@ struct CoreRelayProbeArgs {
 
     #[arg(long)]
     core_js_reject_proposal: bool,
+}
+
+#[derive(Debug, Args)]
+struct CoreRelayPairingProbeArgs {
+    #[arg(long)]
+    core_js_pairing_lifecycle: bool,
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +133,7 @@ impl RelayProbeArgs {
             + usize::from(self.core.core_js_proposal)
             + usize::from(self.core.core_js_approve_proposal)
             + usize::from(self.core.core_js_reject_proposal)
+            + usize::from(self.core_pairing.core_js_pairing_lifecycle)
             + usize::from(self.core_session.core_js_session_request)
             + usize::from(self.core_session.core_js_session_lifecycle)
             + usize::from(self.core_session.core_client_session_request)
@@ -150,6 +160,9 @@ impl RelayProbeArgs {
         if self.core.core_js_reject_proposal {
             return Ok(relay::ProbeMode::CoreJsRejectProposal);
         }
+        if self.core_pairing.core_js_pairing_lifecycle {
+            return Ok(relay::ProbeMode::CoreJsPairingLifecycle);
+        }
         if self.core_session.core_js_session_request {
             return Ok(relay::ProbeMode::CoreJsSessionRequest);
         }
@@ -170,6 +183,7 @@ impl RelayProbeArgs {
             Ok("core-js-proposal") => Ok(relay::ProbeMode::CoreJsProposal),
             Ok("core-js-approve-proposal") => Ok(relay::ProbeMode::CoreJsApproveProposal),
             Ok("core-js-reject-proposal") => Ok(relay::ProbeMode::CoreJsRejectProposal),
+            Ok("core-js-pairing-lifecycle") => Ok(relay::ProbeMode::CoreJsPairingLifecycle),
             Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
             Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
             Ok("core-client-session-request") => Ok(relay::ProbeMode::CoreClientSessionRequest),

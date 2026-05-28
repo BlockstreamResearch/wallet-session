@@ -120,12 +120,7 @@ impl Client {
             .fetch_pairing_messages(&pairing_uri)
             .await
             .map_err(ClientError::from)?;
-        let fetched_events = fetched
-            .into_iter()
-            .map(ClientEvent::from_pairing_message)
-            .collect::<Vec<_>>();
-        self.queued_events
-            .ensure_capacity_for(fetched_events.len())?;
+        self.queued_events.ensure_capacity_for(fetched.len())?;
 
         let subscription = self
             .pairing
@@ -133,8 +128,22 @@ impl Client {
             .await
             .map_err(ClientError::from)?;
         let topic = subscription.topic().clone();
+        let mut fetched_events = Vec::with_capacity(fetched.len());
+        let mut pairing_deleted = false;
 
-        self.pairings.insert(topic.clone(), subscription);
+        for message in fetched {
+            pairing_deleted |= matches!(message.payload(), PairingPayload::PairingDelete(_));
+            fetched_events.push(self.handle_pairing_message(&subscription, message).await?);
+        }
+
+        if pairing_deleted {
+            self.pairing
+                .unsubscribe_pairing(&subscription)
+                .await
+                .map_err(ClientError::from)?;
+        } else {
+            self.pairings.insert(topic.clone(), subscription);
+        }
         self.queued_events.extend_within_capacity(fetched_events);
         Ok(topic)
     }
@@ -171,7 +180,14 @@ impl Client {
                 .next_pairing_message(&subscription)
                 .await
                 .map_err(ClientError::from)?;
-            return Ok(message.map(ClientEvent::from_pairing_message));
+            if let Some(message) = message {
+                return self
+                    .handle_pairing_message(&subscription, message)
+                    .await
+                    .map(Some);
+            }
+
+            return Ok(None);
         }
 
         Ok(None)
@@ -481,6 +497,30 @@ impl Client {
             .ok_or_else(|| ClientError::SessionMissing {
                 topic: topic.clone(),
             })
+    }
+
+    async fn handle_pairing_message(
+        &mut self,
+        subscription: &PairingSubscription,
+        message: PairingReceivedMessage,
+    ) -> Result<ClientEvent, ClientError> {
+        match message.payload() {
+            PairingPayload::PairingPing(_) => {
+                self.pairing
+                    .respond_pairing_ping(subscription, &message)
+                    .await
+                    .map_err(ClientError::from)?;
+            }
+            PairingPayload::PairingDelete(_) => {
+                self.pairings.remove(message.topic());
+            }
+            PairingPayload::SessionProposal(_)
+            | PairingPayload::Sign(_)
+            | PairingPayload::Unknown(_)
+            | PairingPayload::Missing => {}
+        }
+
+        Ok(ClientEvent::from_pairing_message(message))
     }
 }
 

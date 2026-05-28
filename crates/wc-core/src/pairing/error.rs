@@ -186,6 +186,10 @@ pub enum PairingClientError {
     #[error("session response target is not a session delete")]
     SessionResponseTargetNotDelete,
 
+    /// A `wc_pairingPing` response was built from a different pairing message.
+    #[error("pairing response target is not a pairing ping")]
+    PairingResponseTargetNotPing,
+
     /// Peer rejected the session settlement request.
     #[error("session settle rejected")]
     SessionSettleRejected {

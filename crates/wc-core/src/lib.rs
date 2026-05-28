@@ -13,7 +13,8 @@ pub use client::{
 };
 pub use pairing::{
     ApprovedSession, DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
-    PairingClient, PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,
+    PAIRING_PING_RESPONSE_TAG, PAIRING_PING_RESPONSE_TTL_SECONDS, PairingClient,
+    PairingClientConfig, PairingClientError, PairingPayload, PairingReceivedMessage,
     PairingSubscription, SESSION_DELETE_REQUEST_TAG, SESSION_DELETE_REQUEST_TTL_SECONDS,
     SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
     SESSION_EVENT_REQUEST_TTL_SECONDS, SESSION_EVENT_RESPONSE_TAG,
