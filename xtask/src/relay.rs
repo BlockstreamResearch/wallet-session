@@ -71,12 +71,16 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
     let config = RelayProbeConfig::from_env()?;
 
     match mode {
-        ProbeMode::Basic => run_basic_probe(&config).await,
-        ProbeMode::Matrix => run_probe_matrix(&config).await,
-        ProbeMode::JsProposal => run_js_proposal_probe(&config).await,
-        ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
-        ProbeMode::CoreJsApproveProposal => run_core_js_approve_proposal_probe(&config).await,
-        ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
+        ProbeMode::Basic => Box::pin(run_basic_probe(&config)).await,
+        ProbeMode::Matrix => Box::pin(run_probe_matrix(&config)).await,
+        ProbeMode::JsProposal => Box::pin(run_js_proposal_probe(&config)).await,
+        ProbeMode::CoreJsProposal => Box::pin(run_core_js_proposal_probe(&config)).await,
+        ProbeMode::CoreJsApproveProposal => {
+            Box::pin(run_core_js_approve_proposal_probe(&config)).await
+        }
+        ProbeMode::CoreJsRejectProposal => {
+            Box::pin(run_core_js_reject_proposal_probe(&config)).await
+        }
         ProbeMode::CoreJsPairingLifecycle => {
             Box::pin(run_core_js_pairing_lifecycle_probe(&config)).await
         }
@@ -101,7 +105,7 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::CoreSingleSessionClientDisconnect => {
             Box::pin(run_core_single_session_client_disconnect_probe(&config)).await
         }
-        ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
+        ProbeMode::PairingUri(uri) => Box::pin(run_pairing_uri_probe(&config, &uri)).await,
     }
 }
 

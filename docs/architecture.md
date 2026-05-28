@@ -211,6 +211,7 @@ Current security defaults:
 - bounded queued relay messages;
 - incoming WebSocket frame size limit;
 - request timeouts;
+- bounded relay connect retry/backoff;
 - strict JSON-RPC response ID matching;
 - subscribed-topic routing;
 - cleanup after failed subscribe/unsubscribe;
@@ -232,7 +233,11 @@ Current responsibilities:
 - route responses by request ID;
 - acknowledge `irn_subscription` pushes;
 - queue subscribed-topic messages within bounds;
+- retry opening a relay WebSocket with bounded exponential backoff;
 - expose next message by topic.
+
+Reconnect scope in the first slice: `RelayReconnectConfig` retries connection establishment only.
+Resubscribing after an established connection is lost belongs to the single-session runtime because it depends on the active `Idle`, `Pairing`, or `Session` state.
 
 Rationale: relay transport is a runtime primitive, but relay method DTOs and auth URL construction are protocol primitives. Keeping transport separate avoids mixing WebSocket details into protocol validation.
 
@@ -276,7 +281,7 @@ Rationale: live tests confirm deployed WalletConnect behavior. Local tests cover
 
 These are intentionally not finalized:
 
-- reconnect/backoff policy beyond current relay request timeouts;
+- resubscribe behavior after an established relay connection is lost;
 - durable storage and restore;
 - persisted symmetric key handling;
 - queue capacity as public API;

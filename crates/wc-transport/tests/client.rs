@@ -1,6 +1,6 @@
 //! Local WebSocket tests for the relay client behavior layer.
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -8,7 +8,9 @@ use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use wc_protocol::relay::{IrnPublish, IrnUnsubscribe, RelayTopic};
-use wc_transport::{RelayClient, RelayClientConfig, RelayClientError, TransportError};
+use wc_transport::{
+    RelayClient, RelayClientConfig, RelayClientError, RelayReconnectConfig, TransportError,
+};
 
 #[tokio::test]
 async fn relay_client_subscribe_returns_subscription_id() {
@@ -156,6 +158,93 @@ async fn relay_client_applies_incoming_frame_limit() {
     }
 
     server.await.expect("server task joins");
+}
+
+#[test]
+fn relay_reconnect_config_uses_capped_exponential_delay() {
+    let config = RelayReconnectConfig::new(
+        NonZeroUsize::new(5).expect("non-zero"),
+        Duration::from_millis(10),
+        Duration::from_millis(25),
+    );
+
+    assert_eq!(
+        config.delay_after_failure(NonZeroUsize::new(1).expect("non-zero")),
+        Some(Duration::from_millis(10))
+    );
+    assert_eq!(
+        config.delay_after_failure(NonZeroUsize::new(2).expect("non-zero")),
+        Some(Duration::from_millis(20))
+    );
+    assert_eq!(
+        config.delay_after_failure(NonZeroUsize::new(3).expect("non-zero")),
+        Some(Duration::from_millis(25))
+    );
+    assert_eq!(
+        config.delay_after_failure(NonZeroUsize::new(5).expect("non-zero")),
+        None
+    );
+}
+
+#[tokio::test]
+async fn relay_client_retries_opening_connection_until_server_is_available() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local address");
+    let address = listener.local_addr().expect("listener address");
+    drop(listener);
+
+    let server = tokio::spawn(async move {
+        sleep(Duration::from_millis(25)).await;
+        let listener = TcpListener::bind(address)
+            .await
+            .expect("binds delayed local websocket listener");
+        let (stream, _) = listener.accept().await.expect("accepts retrying client");
+        let _websocket = accept_async(stream).await.expect("accepts websocket");
+    });
+
+    let client = RelayClient::connect_with_retry(
+        &format!("ws://{address}"),
+        RelayClientConfig::default(),
+        RelayReconnectConfig::new(
+            NonZeroUsize::new(20).expect("non-zero"),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ),
+    )
+    .await
+    .expect("connects after retry");
+
+    assert_eq!(client.status(), 101);
+    server.await.expect("server task joins");
+}
+
+#[tokio::test]
+async fn relay_client_reports_exhausted_connection_retries() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds local address");
+    let address = listener.local_addr().expect("listener address");
+    drop(listener);
+    let attempts = NonZeroUsize::new(2).expect("non-zero");
+
+    let Err(error) = RelayClient::connect_with_retry(
+        &format!("ws://{address}"),
+        RelayClientConfig::default(),
+        RelayReconnectConfig::new(attempts, Duration::ZERO, Duration::ZERO),
+    )
+    .await
+    else {
+        panic!("connection attempts should be exhausted");
+    };
+
+    match error {
+        RelayClientError::ConnectRetryExhausted {
+            attempts: actual,
+            source: TransportError::Connect { .. },
+        } => assert_eq!(actual, attempts),
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -64,6 +64,16 @@ pub struct SessionSubscription {
 }
 
 impl SessionSubscription {
+    /// Builds a session subscription for deterministic core-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(topic: RelayTopic, sym_key: PairingSymKey) -> Self {
+        Self {
+            topic,
+            sym_key,
+            subscription_id: "test-subscription-id".to_owned(),
+        }
+    }
+
     /// Session relay topic registered on the connection.
     #[must_use]
     pub const fn topic(&self) -> &RelayTopic {

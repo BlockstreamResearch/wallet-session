@@ -672,18 +672,11 @@ impl SingleSessionClient {
     }
 
     fn take_expired_session(&mut self) -> Result<Option<SessionExpired>, SingleSessionClientError> {
-        let SingleSessionClientState::Session(state) = &self.state else {
-            return Ok(None);
-        };
-        if !state.session.is_expired_at(now_unix_seconds()?) {
-            return Ok(None);
-        }
-
-        let topic = state.session.topic.clone();
-        let expiry = state.session.expiry;
-        self.state = SingleSessionClientState::Idle;
-
-        Ok(Some(SessionExpired { topic, expiry }))
+        let now_unix_seconds = now_unix_seconds()?;
+        Ok(take_expired_session_from_state(
+            &mut self.state,
+            now_unix_seconds,
+        ))
     }
 
     async fn handle_pairing_message(
@@ -791,6 +784,24 @@ impl SingleSessionClient {
 
         Ok(Some(SingleSessionClientEvent::Session(event)))
     }
+}
+
+fn take_expired_session_from_state(
+    state: &mut SingleSessionClientState,
+    now_unix_seconds: u64,
+) -> Option<SessionExpired> {
+    let SingleSessionClientState::Session(active_session) = state else {
+        return None;
+    };
+    if !active_session.session.is_expired_at(now_unix_seconds) {
+        return None;
+    }
+
+    let topic = active_session.session.topic.clone();
+    let expiry = active_session.session.expiry;
+    *state = SingleSessionClientState::Idle;
+
+    Some(SessionExpired { topic, expiry })
 }
 
 /// `SingleSessionClient` event.
@@ -1068,10 +1079,23 @@ fn session_extended_expiry() -> Result<u64, SingleSessionClientError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY, SingleSessionClientError,
+        ActiveSession, BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
+        SingleSessionClientConfig, SingleSessionClientError, SingleSessionClientState,
+        take_expired_session_from_state,
     };
-    use crate::{PairingClientConfig, SingleSessionClientConfig};
+    use wc_protocol::{
+        key::X25519PublicKey,
+        pairing::PairingSymKey,
+        relay::RelayTopic,
+        session::{
+            DappMetadata, RelayProtocolOptions, Session, SessionParticipant, SessionTransportType,
+        },
+    };
+
+    use crate::{PairingClientConfig, SessionSubscription};
 
     #[test]
     fn client_config_uses_default_event_queue_capacity() {
@@ -1111,5 +1135,67 @@ mod tests {
         ));
         assert_eq!(queue.pop_front(), Some(1));
         assert_eq!(queue.pop_front(), None);
+    }
+
+    #[test]
+    fn expired_session_event_is_taken_once_and_clears_session() {
+        let topic = RelayTopic::from_bytes([0x44; 32]);
+        let expiry = 1;
+        let mut state = SingleSessionClientState::Session(Box::new(ActiveSession {
+            subscription: SessionSubscription::for_test(
+                topic.clone(),
+                PairingSymKey::from_bytes([0x55; 32]),
+            ),
+            session: test_session(topic.clone(), expiry),
+        }));
+
+        let expired = take_expired_session_from_state(&mut state, expiry)
+            .expect("expired session event is emitted");
+
+        assert_eq!(expired.topic(), &topic);
+        assert_eq!(expired.expiry(), expiry);
+        assert!(matches!(state, SingleSessionClientState::Idle));
+        assert_eq!(take_expired_session_from_state(&mut state, expiry), None);
+    }
+
+    fn test_session(topic: RelayTopic, expiry: u64) -> Session {
+        let public_key = X25519PublicKey::from_bytes([0x66; 32]);
+        let metadata = DappMetadata {
+            name: "Test".to_owned(),
+            description: "Test".to_owned(),
+            url: "https://example.com".to_owned(),
+            icons: Vec::new(),
+            verify_url: None,
+            redirect: None,
+        };
+
+        Session {
+            topic,
+            pairing_topic: RelayTopic::from_bytes([0x77; 32]),
+            relay: RelayProtocolOptions {
+                protocol: "irn".to_owned(),
+                data: None,
+            },
+            expiry,
+            acknowledged: true,
+            controller: public_key.clone(),
+            namespaces: BTreeMap::new(),
+            required_namespaces: BTreeMap::new(),
+            optional_namespaces: BTreeMap::new(),
+            session_properties: None,
+            scoped_properties: None,
+            session_config: None,
+            self_participant: SessionParticipant {
+                public_key: public_key.clone(),
+                metadata: metadata.clone(),
+            },
+            peer: SessionParticipant {
+                public_key,
+                metadata,
+            },
+            authentication: None,
+            wallet_pay_result: None,
+            transport_type: Some(SessionTransportType::Relay),
+        }
     }
 }

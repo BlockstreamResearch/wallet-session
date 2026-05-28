@@ -2,13 +2,14 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    num::NonZeroUsize,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep, timeout_at};
 use wc_protocol::relay::{
     IrnBatchFetchMessages, IrnBatchFetchMessagesResponse, IrnBatchSubscribe, IrnBatchUnsubscribe,
     IrnFetchMessages, IrnFetchMessagesResponse, IrnPublish, IrnSubscribe, IrnSubscription,
@@ -31,6 +32,73 @@ pub const DEFAULT_MAX_QUEUED_MESSAGES: usize = 1024;
 
 /// Default number of relay pushes processed while one response is pending.
 pub const DEFAULT_MAX_PUSHES_WHILE_WAITING: usize = 1024;
+
+/// Default number of WebSocket open attempts for `RelayClient::connect_with_retry`.
+pub const DEFAULT_CONNECT_RETRY_ATTEMPTS: NonZeroUsize = NonZeroUsize::new(3).expect("non-zero");
+
+/// Default delay before the first retrying connection attempt.
+pub const DEFAULT_CONNECT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
+
+/// Default upper bound for retry connection delays.
+pub const DEFAULT_CONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+/// Bounded exponential retry policy for opening a relay WebSocket.
+///
+/// This policy only covers connection establishment. Restoring subscriptions
+/// after an established connection is lost is a separate runtime decision
+/// because resubscribe behavior must respect the active pairing/session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayReconnectConfig {
+    /// Total connection attempts, including the first immediate attempt.
+    pub max_attempts: NonZeroUsize,
+    /// Delay after the first failed attempt.
+    pub initial_delay: Duration,
+    /// Maximum retry delay after exponential growth.
+    pub max_delay: Duration,
+}
+
+impl RelayReconnectConfig {
+    /// Builds a reconnect policy from explicit attempt and delay bounds.
+    #[must_use]
+    pub const fn new(
+        max_attempts: NonZeroUsize,
+        initial_delay: Duration,
+        max_delay: Duration,
+    ) -> Self {
+        Self {
+            max_attempts,
+            initial_delay,
+            max_delay,
+        }
+    }
+
+    /// Delay to wait after a failed one-based attempt number.
+    ///
+    /// Returns `None` when no later attempt is allowed by `max_attempts`.
+    #[must_use]
+    pub fn delay_after_failure(&self, failed_attempt: NonZeroUsize) -> Option<Duration> {
+        if failed_attempt >= self.max_attempts {
+            return None;
+        }
+
+        let mut delay = self.initial_delay.min(self.max_delay);
+        for _ in 1..failed_attempt.get() {
+            delay = delay.saturating_mul(2).min(self.max_delay);
+        }
+
+        Some(delay)
+    }
+}
+
+impl Default for RelayReconnectConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_CONNECT_RETRY_ATTEMPTS,
+            initial_delay: DEFAULT_CONNECT_RETRY_INITIAL_DELAY,
+            max_delay: DEFAULT_CONNECT_RETRY_MAX_DELAY,
+        }
+    }
+}
 
 /// Runtime limits for the single-connection relay client.
 ///
@@ -92,6 +160,38 @@ impl RelayClient {
         url: &str,
         config: RelayClientConfig,
     ) -> Result<Self, RelayClientError> {
+        Self::connect_once(url, config).await.map_err(Into::into)
+    }
+
+    /// Opens a relay WebSocket connection using bounded retry/backoff.
+    ///
+    /// The first attempt is immediate. Later attempts sleep according to
+    /// `RelayReconnectConfig::delay_after_failure`.
+    pub async fn connect_with_retry(
+        url: &str,
+        config: RelayClientConfig,
+        reconnect: RelayReconnectConfig,
+    ) -> Result<Self, RelayClientError> {
+        for attempt in 1..=reconnect.max_attempts.get() {
+            match Self::connect_once(url, config.clone()).await {
+                Ok(client) => return Ok(client),
+                Err(source) => {
+                    let failed_attempt = NonZeroUsize::new(attempt).expect("range starts at one");
+                    let Some(delay) = reconnect.delay_after_failure(failed_attempt) else {
+                        return Err(RelayClientError::ConnectRetryExhausted {
+                            attempts: reconnect.max_attempts,
+                            source,
+                        });
+                    };
+                    sleep(delay).await;
+                }
+            }
+        }
+
+        unreachable!("non-zero max_attempts always enters the loop")
+    }
+
+    async fn connect_once(url: &str, config: RelayClientConfig) -> Result<Self, TransportError> {
         let connection = NativeRelayTransport::connect_with_config(
             url,
             NativeRelayTransportConfig {
@@ -517,6 +617,16 @@ pub enum RelayClientError {
     RequestTimedOut {
         /// Configured request timeout.
         timeout: Duration,
+    },
+
+    /// The relay WebSocket could not be opened after all configured attempts.
+    #[error("relay connect retry exhausted after {attempts} attempts")]
+    ConnectRetryExhausted {
+        /// Number of connection attempts made.
+        attempts: NonZeroUsize,
+        /// Last connection error.
+        #[source]
+        source: TransportError,
     },
 
     /// Too many relay pushes arrived while one JSON-RPC response was pending.

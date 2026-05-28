@@ -15,8 +15,10 @@
 mod client;
 
 pub use client::{
-    DEFAULT_MAX_PUSHES_WHILE_WAITING, DEFAULT_MAX_QUEUED_MESSAGES, DEFAULT_REQUEST_TIMEOUT,
-    RelayClient, RelayClientConfig, RelayClientError,
+    DEFAULT_CONNECT_RETRY_ATTEMPTS, DEFAULT_CONNECT_RETRY_INITIAL_DELAY,
+    DEFAULT_CONNECT_RETRY_MAX_DELAY, DEFAULT_MAX_PUSHES_WHILE_WAITING, DEFAULT_MAX_QUEUED_MESSAGES,
+    DEFAULT_REQUEST_TIMEOUT, RelayClient, RelayClientConfig, RelayClientError,
+    RelayReconnectConfig,
 };
 
 use std::{fmt, string::FromUtf8Error};
