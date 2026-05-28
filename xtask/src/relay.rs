@@ -947,10 +947,26 @@ async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> R
         session.expiry
     );
 
+    run_core_client_session_lifecycle_action(&mut client, action, &session).await?;
+
+    let result = harness.expect_result(action.expected_outcome()).await?;
+    println!("core-client-session-lifecycle js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_client_session_lifecycle_action(
+    client: &mut Client,
+    action: CoreClientSessionLifecycleAction,
+    session: &Session,
+) -> Result<()> {
     match action {
-        CoreClientSessionLifecycleAction::Ping | CoreClientSessionLifecycleAction::Delete => {
-            let event =
-                wait_for_client_session_lifecycle_event(&mut client, action.label()).await?;
+        CoreClientSessionLifecycleAction::Ping
+        | CoreClientSessionLifecycleAction::Delete
+        | CoreClientSessionLifecycleAction::IncomingUpdate
+        | CoreClientSessionLifecycleAction::IncomingExtend => {
+            let event = wait_for_client_session_lifecycle_event(client, action.label()).await?;
             if let Some(message) = event.message() {
                 print_session_message("core-client-session-lifecycle live_event", message);
             }
@@ -959,6 +975,31 @@ async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> R
                 action.label(),
                 client.active_sessions().len()
             );
+            match action {
+                CoreClientSessionLifecycleAction::IncomingUpdate => {
+                    let active_namespaces = client
+                        .active_sessions()
+                        .first()
+                        .map(|session| session.namespaces.len())
+                        .context("updated session was not retained")?;
+                    println!(
+                        "core-client-session-lifecycle active_session_namespaces={active_namespaces}"
+                    );
+                }
+                CoreClientSessionLifecycleAction::IncomingExtend => {
+                    let active_expiry = client
+                        .active_sessions()
+                        .first()
+                        .map(|session| session.expiry)
+                        .context("extended session was not retained")?;
+                    println!("core-client-session-lifecycle active_session_expiry={active_expiry}");
+                }
+                CoreClientSessionLifecycleAction::Ping
+                | CoreClientSessionLifecycleAction::Delete
+                | CoreClientSessionLifecycleAction::Update
+                | CoreClientSessionLifecycleAction::Extend
+                | CoreClientSessionLifecycleAction::Event => {}
+            }
         }
         CoreClientSessionLifecycleAction::Update => {
             let response = client
@@ -988,10 +1029,6 @@ async fn run_core_client_session_lifecycle_probe(config: &RelayProbeConfig) -> R
             );
         }
     }
-
-    let result = harness.expect_result(action.expected_outcome()).await?;
-    println!("core-client-session-lifecycle js_result={result}");
-    harness.terminate();
 
     Ok(())
 }
@@ -1067,6 +1104,8 @@ async fn run_core_js_session_lifecycle_probe(config: &RelayProbeConfig) -> Resul
 enum CoreJsSessionLifecycleAction {
     Ping,
     Delete,
+    IncomingUpdate,
+    IncomingExtend,
     Update,
     Extend,
     Event,
@@ -1076,6 +1115,8 @@ enum CoreJsSessionLifecycleAction {
 enum CoreClientSessionLifecycleAction {
     Ping,
     Delete,
+    IncomingUpdate,
+    IncomingExtend,
     Update,
     Extend,
     Event,
@@ -1088,12 +1129,14 @@ impl CoreClientSessionLifecycleAction {
         match value.as_str() {
             "ping" => Ok(Self::Ping),
             "delete" => Ok(Self::Delete),
+            "incoming-update" => Ok(Self::IncomingUpdate),
+            "incoming-extend" => Ok(Self::IncomingExtend),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-extend, update, extend, or event"
                 )
             }
         }
@@ -1103,8 +1146,8 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "ping",
             Self::Delete => "delete",
-            Self::Update => "update",
-            Self::Extend => "extend",
+            Self::IncomingUpdate | Self::Update => "update",
+            Self::IncomingExtend | Self::Extend => "extend",
             Self::Event => "event",
         }
     }
@@ -1113,6 +1156,8 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping",
             Self::Delete => "session_delete",
+            Self::IncomingUpdate => "session_update",
+            Self::IncomingExtend => "session_extend",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
             Self::Event => "wait_session_event",
@@ -1123,6 +1168,8 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping_response",
             Self::Delete => "session_delete_sent",
+            Self::IncomingUpdate => "session_update_acknowledged",
+            Self::IncomingExtend => "session_extend_acknowledged",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",
             Self::Event => "session_event_received",
@@ -1137,12 +1184,14 @@ impl CoreJsSessionLifecycleAction {
         match value.as_str() {
             "ping" => Ok(Self::Ping),
             "delete" => Ok(Self::Delete),
+            "incoming-update" => Ok(Self::IncomingUpdate),
+            "incoming-extend" => Ok(Self::IncomingExtend),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-extend, update, extend, or event"
                 )
             }
         }
@@ -1152,8 +1201,8 @@ impl CoreJsSessionLifecycleAction {
         match self {
             Self::Ping => "ping",
             Self::Delete => "delete",
-            Self::Update => "update",
-            Self::Extend => "extend",
+            Self::IncomingUpdate | Self::Update => "update",
+            Self::IncomingExtend | Self::Extend => "extend",
             Self::Event => "event",
         }
     }
@@ -1162,6 +1211,8 @@ impl CoreJsSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping",
             Self::Delete => "session_delete",
+            Self::IncomingUpdate => "session_update",
+            Self::IncomingExtend => "session_extend",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
             Self::Event => "wait_session_event",
@@ -1172,6 +1223,8 @@ impl CoreJsSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping_response",
             Self::Delete => "session_delete_sent",
+            Self::IncomingUpdate => "session_update_acknowledged",
+            Self::IncomingExtend => "session_extend_acknowledged",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",
             Self::Event => "session_event_received",
@@ -1186,7 +1239,10 @@ async fn run_core_js_session_lifecycle_action(
     action: CoreJsSessionLifecycleAction,
 ) -> Result<()> {
     match action {
-        CoreJsSessionLifecycleAction::Ping | CoreJsSessionLifecycleAction::Delete => {
+        CoreJsSessionLifecycleAction::Ping
+        | CoreJsSessionLifecycleAction::Delete
+        | CoreJsSessionLifecycleAction::IncomingUpdate
+        | CoreJsSessionLifecycleAction::IncomingExtend => {
             respond_to_js_session_lifecycle_message(client, subscription, session, action).await
         }
         CoreJsSessionLifecycleAction::Update | CoreJsSessionLifecycleAction::Extend => {
@@ -1277,6 +1333,16 @@ async fn respond_to_js_session_lifecycle_message(
                 .respond_session_delete(subscription, &message)
                 .await?
         }
+        CoreJsSessionLifecycleAction::IncomingUpdate => {
+            client
+                .respond_session_update(subscription, &message)
+                .await?
+        }
+        CoreJsSessionLifecycleAction::IncomingExtend => {
+            client
+                .respond_session_extend(subscription, &message)
+                .await?
+        }
         _ => unreachable!("validated inbound lifecycle response action"),
     };
     println!(
@@ -1300,7 +1366,9 @@ async fn wait_for_session_lifecycle_message(
             .context("no session lifecycle message received")?;
         match (lifecycle_action, event) {
             ("ping", SessionClientEvent::SessionPing(message))
-            | ("delete", SessionClientEvent::SessionDelete(message)) => return Ok(message),
+            | ("delete", SessionClientEvent::SessionDelete(message))
+            | ("update", SessionClientEvent::SessionUpdate(message))
+            | ("extend", SessionClientEvent::SessionExtend(message)) => return Ok(message),
             (_, SessionClientEvent::RejectedSessionRequest(rejection)) => {
                 print_ignored_session_request_rejection(&rejection);
             }
@@ -1407,7 +1475,9 @@ async fn wait_for_client_session_lifecycle_event(
             .context("no client session lifecycle event received")?;
         match (lifecycle_action, event) {
             ("ping", ClientEvent::Session(event @ SessionClientEvent::SessionPing(_)))
-            | ("delete", ClientEvent::Session(event @ SessionClientEvent::SessionDelete(_))) => {
+            | ("delete", ClientEvent::Session(event @ SessionClientEvent::SessionDelete(_)))
+            | ("update", ClientEvent::Session(event @ SessionClientEvent::SessionUpdate(_)))
+            | ("extend", ClientEvent::Session(event @ SessionClientEvent::SessionExtend(_))) => {
                 return Ok(event);
             }
             (_, ClientEvent::Session(event)) => print_ignored_client_session_event(&event),

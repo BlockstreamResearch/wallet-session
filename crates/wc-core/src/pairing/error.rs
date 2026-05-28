@@ -182,6 +182,14 @@ pub enum PairingClientError {
     #[error("session response target is not a session ping")]
     SessionResponseTargetNotPing,
 
+    /// A `wc_sessionUpdate` response was built from a different session message.
+    #[error("session response target is not a session update")]
+    SessionResponseTargetNotUpdate,
+
+    /// A `wc_sessionExtend` response was built from a different session message.
+    #[error("session response target is not a session extend")]
+    SessionResponseTargetNotExtend,
+
     /// A `wc_sessionDelete` response was built from a different session message.
     #[error("session response target is not a session delete")]
     SessionResponseTargetNotDelete,

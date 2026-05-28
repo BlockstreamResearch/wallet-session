@@ -12,9 +12,11 @@ use super::{
     SESSION_DELETE_REQUEST_TAG, SESSION_DELETE_REQUEST_TTL_SECONDS, SESSION_DELETE_RESPONSE_TAG,
     SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
     SESSION_EVENT_REQUEST_TTL_SECONDS, SESSION_EXTEND_REQUEST_TAG,
-    SESSION_EXTEND_REQUEST_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
+    SESSION_EXTEND_REQUEST_TTL_SECONDS, SESSION_EXTEND_RESPONSE_TAG,
+    SESSION_EXTEND_RESPONSE_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
     SESSION_PING_RESPONSE_TTL_SECONDS, SESSION_UPDATE_REQUEST_TAG,
-    SESSION_UPDATE_REQUEST_TTL_SECONDS,
+    SESSION_UPDATE_REQUEST_TTL_SECONDS, SESSION_UPDATE_RESPONSE_TAG,
+    SESSION_UPDATE_RESPONSE_TTL_SECONDS,
     error::PairingClientError,
     publish::encrypted_json_publish,
     types::{SessionPayload, SessionReceivedMessage, SessionSubscription},
@@ -211,6 +213,46 @@ pub(super) fn session_delete_response_publish(
     )
 }
 
+/// Builds an encrypted `wc_sessionUpdate` acknowledgement publish.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
+///
+/// > await this.sendResult<"wc_sessionUpdate">({
+/// > id,
+/// > result: true,
+pub(super) fn session_update_response_publish(
+    subscription: &SessionSubscription,
+    message: &SessionReceivedMessage,
+) -> Result<IrnPublish, PairingClientError> {
+    let response = session_ack_response(session_update_request_id(subscription, message)?);
+    session_ack_publish(
+        subscription,
+        &response,
+        SESSION_UPDATE_RESPONSE_TTL_SECONDS,
+        SESSION_UPDATE_RESPONSE_TAG,
+    )
+}
+
+/// Builds an encrypted `wc_sessionExtend` acknowledgement publish.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2363-L2375>
+///
+/// > await this.sendResult<"wc_sessionExtend">({
+/// > id,
+/// > result: true,
+pub(super) fn session_extend_response_publish(
+    subscription: &SessionSubscription,
+    message: &SessionReceivedMessage,
+) -> Result<IrnPublish, PairingClientError> {
+    let response = session_extend_request_id(subscription, message).map(session_ack_response)?;
+    session_ack_publish(
+        subscription,
+        &response,
+        SESSION_EXTEND_RESPONSE_TTL_SECONDS,
+        SESSION_EXTEND_RESPONSE_TAG,
+    )
+}
+
 fn session_ack_publish(
     subscription: &SessionSubscription,
     response: &SessionAckResponse,
@@ -299,6 +341,30 @@ fn session_ping_request_id(
     ensure_session_topic(subscription, message)?;
     let SessionPayload::SessionPing(request) = message.payload() else {
         return Err(PairingClientError::SessionResponseTargetNotPing);
+    };
+
+    Ok(request.id)
+}
+
+fn session_update_request_id(
+    subscription: &SessionSubscription,
+    message: &SessionReceivedMessage,
+) -> Result<u64, PairingClientError> {
+    ensure_session_topic(subscription, message)?;
+    let SessionPayload::SessionUpdate(request) = message.payload() else {
+        return Err(PairingClientError::SessionResponseTargetNotUpdate);
+    };
+
+    Ok(request.id)
+}
+
+fn session_extend_request_id(
+    subscription: &SessionSubscription,
+    message: &SessionReceivedMessage,
+) -> Result<u64, PairingClientError> {
+    ensure_session_topic(subscription, message)?;
+    let SessionPayload::SessionExtend(request) = message.payload() else {
+        return Err(PairingClientError::SessionResponseTargetNotExtend);
     };
 
     Ok(request.id)

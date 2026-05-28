@@ -15,7 +15,7 @@ use crate::pairing::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig, PairingClientError,
     PairingPayload, PairingReceivedMessage, PairingSubscription, SessionClientEvent,
     SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
+    SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionSubscription,
 };
 
 /// Default number of fetched or internally queued events retained for `next_event`.
@@ -312,6 +312,38 @@ impl Client {
             .map_err(ClientError::from)
     }
 
+    /// Publishes a success response for a `SessionClientEvent::SessionUpdate`.
+    ///
+    /// `Client::next_event` already responds to session updates it returns and
+    /// stores the replacement namespaces. This method is retained for callers
+    /// that receive a session message through a lower-level path.
+    pub async fn respond_session_update(
+        &mut self,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, ClientError> {
+        let subscription = self.session_subscription(message.topic())?.clone();
+        self.pairing
+            .respond_session_update(&subscription, message)
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Publishes a success response for a `SessionClientEvent::SessionExtend`.
+    ///
+    /// `Client::next_event` already responds to session extends it returns and
+    /// refreshes local expiry. This method is retained for callers that receive
+    /// a session message through a lower-level path.
+    pub async fn respond_session_extend(
+        &mut self,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, ClientError> {
+        let subscription = self.session_subscription(message.topic())?.clone();
+        self.pairing
+            .respond_session_extend(&subscription, message)
+            .await
+            .map_err(ClientError::from)
+    }
+
     /// Publishes a success response for a `SessionClientEvent::SessionDelete`.
     ///
     /// `Client::next_event` already responds to session deletes it returns and
@@ -416,9 +448,7 @@ impl Client {
             })?;
 
         ensure_session_lifecycle_success(&response)?;
-        let new_expiry = now_unix_seconds()?
-            .checked_add(DEFAULT_SESSION_EXPIRY_SECONDS)
-            .ok_or(ClientError::SessionExpiryOverflow)?;
+        let new_expiry = session_extended_expiry()?;
         self.sessions
             .get_mut(topic)
             .ok_or_else(|| ClientError::SessionMissing {
@@ -551,6 +581,24 @@ impl Client {
     ///
     /// > await this.isValidDisconnect({ topic, reason: payload.params });
     /// > await this.deleteSession({ topic, id });
+    ///
+    /// `wc_sessionUpdate` carries replacement namespaces and is acknowledged
+    /// with `true` after validation in the maintained Sign Client.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
+    ///
+    /// > await this.client.session.update(topic, { namespaces: params.namespaces });
+    /// > await this.sendResult<"wc_sessionUpdate">({
+    /// > result: true,
+    ///
+    /// `wc_sessionExtend` refreshes session expiry and acknowledges with
+    /// `true`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2363-L2375>
+    ///
+    /// > await this.setExpiry(topic, calcExpiry(SESSION_EXPIRY));
+    /// > await this.sendResult<"wc_sessionExtend">({
+    /// > result: true,
     async fn handle_session_event(
         &mut self,
         subscription: &SessionSubscription,
@@ -563,6 +611,43 @@ impl Client {
                     .await
                     .map_err(ClientError::from)?;
             }
+            SessionClientEvent::SessionUpdate(message) => {
+                let SessionPayload::SessionUpdate(request) = message.payload() else {
+                    return Ok(Some(ClientEvent::Session(event)));
+                };
+                let namespaces = request.params.namespaces.clone();
+                self.pairing
+                    .respond_session_update(subscription, message)
+                    .await
+                    .map_err(ClientError::from)?;
+                self.sessions
+                    .get_mut(message.topic())
+                    .ok_or_else(|| ClientError::SessionMissing {
+                        topic: message.topic().clone(),
+                    })?
+                    .session
+                    .namespaces = namespaces;
+            }
+            SessionClientEvent::SessionExtend(message) => {
+                let expiry = match message.payload() {
+                    SessionPayload::SessionExtend(request) => request
+                        .params
+                        .expiry
+                        .map_or_else(session_extended_expiry, Ok)?,
+                    _ => return Ok(Some(ClientEvent::Session(event))),
+                };
+                self.pairing
+                    .respond_session_extend(subscription, message)
+                    .await
+                    .map_err(ClientError::from)?;
+                self.sessions
+                    .get_mut(message.topic())
+                    .ok_or_else(|| ClientError::SessionMissing {
+                        topic: message.topic().clone(),
+                    })?
+                    .session
+                    .expiry = expiry;
+            }
             SessionClientEvent::SessionDelete(message) => {
                 self.pairing
                     .respond_session_delete(subscription, message)
@@ -571,8 +656,6 @@ impl Client {
                 self.sessions.remove(message.topic());
             }
             SessionClientEvent::SessionRequest(_)
-            | SessionClientEvent::SessionUpdate(_)
-            | SessionClientEvent::SessionExtend(_)
             | SessionClientEvent::SessionEvent(_)
             | SessionClientEvent::Unsupported(_)
             | SessionClientEvent::RejectedSessionRequest(_) => {}
@@ -797,6 +880,12 @@ fn now_unix_seconds() -> Result<u64, ClientError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|source| ClientError::Clock { source })
+}
+
+fn session_extended_expiry() -> Result<u64, ClientError> {
+    now_unix_seconds()?
+        .checked_add(DEFAULT_SESSION_EXPIRY_SECONDS)
+        .ok_or(ClientError::SessionExpiryOverflow)
 }
 
 #[cfg(test)]

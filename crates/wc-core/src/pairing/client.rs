@@ -29,7 +29,8 @@ use super::{
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
-        session_ping_response_publish, session_update_request_publish,
+        session_extend_response_publish, session_ping_response_publish,
+        session_update_request_publish, session_update_response_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -783,6 +784,46 @@ impl PairingClient {
         message: &SessionReceivedMessage,
     ) -> Result<bool, PairingClientError> {
         let publish = session_ping_response_publish(subscription, message)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a success response for a received `wc_sessionUpdate`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
+    ///
+    /// > await this.sendResult<"wc_sessionUpdate">({
+    /// > id,
+    /// > topic,
+    /// > result: true,
+    pub async fn respond_session_update(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_update_response_publish(subscription, message)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a success response for a received `wc_sessionExtend`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2363-L2375>
+    ///
+    /// > await this.sendResult<"wc_sessionExtend">({
+    /// > id,
+    /// > topic,
+    /// > result: true,
+    pub async fn respond_session_extend(
+        &mut self,
+        subscription: &SessionSubscription,
+        message: &SessionReceivedMessage,
+    ) -> Result<bool, PairingClientError> {
+        let publish = session_extend_response_publish(subscription, message)?;
         self.relay
             .publish(publish)
             .await

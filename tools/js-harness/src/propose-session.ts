@@ -93,6 +93,12 @@ try {
       case "session_delete":
         await startSessionDelete(session.topic);
         break;
+      case "session_update":
+        await startSessionUpdate(session.topic, session.namespaces);
+        break;
+      case "session_extend":
+        await startSessionExtend(session.topic);
+        break;
       case "wait_session_update":
         await waitForSessionUpdate(session.topic);
         break;
@@ -205,6 +211,71 @@ async function startSessionDelete(topic: string): Promise<void> {
     ),
     sleep(sessionRequestHoldMs).then(() => ({
       outcome: "session_delete_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+async function startSessionUpdate(
+  topic: string,
+  namespaces: Parameters<typeof signClient.update>[0]["namespaces"],
+): Promise<void> {
+  const request = await signClient.update({ topic, namespaces });
+  console.error(`js-harness session_update_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+
+  const response = await Promise.race([
+    request.acknowledged().then(
+      () => {
+        console.error("js-harness session_update_acknowledged=true");
+        return {
+          outcome: "session_update_acknowledged",
+          topic,
+        };
+      },
+      (error: unknown) => {
+        const message = errorMessage(error);
+        console.error(`js-harness session_update_error=${message}`);
+        return {
+          outcome: "session_update_error",
+          topic,
+          message,
+        };
+      },
+    ),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_update_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+async function startSessionExtend(topic: string): Promise<void> {
+  const request = await signClient.extend({ topic });
+  console.error(`js-harness session_extend_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+
+  const response = await Promise.race([
+    request.acknowledged().then(
+      () => {
+        console.error("js-harness session_extend_acknowledged=true");
+        return {
+          outcome: "session_extend_acknowledged",
+          topic,
+        };
+      },
+      (error: unknown) => {
+        const message = errorMessage(error);
+        console.error(`js-harness session_extend_error=${message}`);
+        return {
+          outcome: "session_extend_error",
+          topic,
+          message,
+        };
+      },
+    ),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_extend_timeout",
       topic,
     })),
   ]);

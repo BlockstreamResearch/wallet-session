@@ -10,7 +10,8 @@ use super::{
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
-        session_ping_response_publish, session_update_request_publish,
+        session_extend_response_publish, session_ping_response_publish,
+        session_update_request_publish, session_update_response_publish,
     },
     session_request::{
         session_request_error_publish, session_request_success_publish,
@@ -30,10 +31,11 @@ use wc_protocol::{
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
         JsonRpcResponse, RelayProtocolOptions, Session, SessionDeleteParams, SessionDeleteResponse,
-        SessionEvent, SessionEventName, SessionEventParams, SessionExtendParams, SessionNamespace,
-        SessionParticipant, SessionPingParams, SessionPingResponse, SessionProposeErrorResponse,
-        SessionProposeParams, SessionProposeResult, SessionRequestParams, SessionSettleParams,
-        SessionTransportType, SessionUpdateParams, SignMethod, session_ack_response,
+        SessionEvent, SessionEventName, SessionEventParams, SessionExtendParams,
+        SessionExtendResponse, SessionNamespace, SessionParticipant, SessionPingParams,
+        SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
+        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
+        SessionUpdateParams, SessionUpdateResponse, SignMethod, session_ack_response,
     },
 };
 
@@ -1161,6 +1163,71 @@ fn builds_session_ping_response_publish() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(publish.ttl, SESSION_PING_RESPONSE_TTL_SECONDS);
     assert_eq!(publish.tag, SESSION_PING_RESPONSE_TAG);
     assert_eq!(response.id, 88);
+    assert_eq!(response.result, wc_protocol::session::SessionAck);
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_update_response_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let session = session_from_subscription(&subscription)?;
+    let received = SessionReceivedMessage {
+        topic: subscription.topic().clone(),
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1104),
+        payload: SessionPayload::SessionUpdate(JsonRpcRequest::new(
+            90,
+            SignMethod::SessionUpdate,
+            SessionUpdateParams {
+                namespaces: session.namespaces,
+            },
+        )),
+    };
+
+    let publish = session_update_response_publish(&subscription, &received)?;
+    let response: SessionUpdateResponse = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_UPDATE_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_UPDATE_RESPONSE_TAG);
+    assert_eq!(response.id, 90);
+    assert_eq!(response.result, wc_protocol::session::SessionAck);
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_extend_response_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let received = SessionReceivedMessage {
+        topic: subscription.topic().clone(),
+        encoded_message_len: 1,
+        plaintext_len: 1,
+        published_at: 1_779_954_250_000,
+        tag: Some(1106),
+        payload: SessionPayload::SessionExtend(JsonRpcRequest::new(
+            91,
+            SignMethod::SessionExtend,
+            SessionExtendParams::default(),
+        )),
+    };
+
+    let publish = session_extend_response_publish(&subscription, &received)?;
+    let response: SessionExtendResponse = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_EXTEND_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_EXTEND_RESPONSE_TAG);
+    assert_eq!(response.id, 91);
     assert_eq!(response.result, wc_protocol::session::SessionAck);
 
     Ok(())
