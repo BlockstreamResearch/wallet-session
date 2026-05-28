@@ -8,6 +8,7 @@ pub use pairing::{
     PairingSubscription, SESSION_PROPOSE_REJECT_TAG, SESSION_PROPOSE_REJECT_TTL_SECONDS,
     SESSION_PROPOSE_RESPONSE_TAG, SESSION_PROPOSE_RESPONSE_TTL_SECONDS, SESSION_SETTLE_REQUEST_TAG,
     SESSION_SETTLE_REQUEST_TTL_SECONDS, SESSION_SETTLE_RESPONSE_TAG,
-    SESSION_SETTLE_RESPONSE_TTL_SECONDS, SessionProposalApproval, SessionSettleResponseMessage,
-    SessionSettleResponsePayload, SessionSubscription,
+    SESSION_SETTLE_RESPONSE_TTL_SECONDS, SessionPayload, SessionProposalApproval,
+    SessionReceivedMessage, SessionSettleResponseMessage, SessionSettleResponsePayload,
+    SessionSubscription,
 };

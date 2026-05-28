@@ -10,7 +10,10 @@ use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding, EnvelopeError},
     key::{X25519KeyPair, X25519KeyPairError, derive_shared_sym_key, derive_topic_from_sym_key},
-    namespaces::{NamespaceValidationError, validate_approved_namespaces},
+    namespaces::{
+        NamespaceValidationError, is_chain_authorized, is_method_authorized,
+        validate_approved_namespaces,
+    },
     pairing::{PairingSymKey, PairingUri, PairingUriError},
     pairing_message::{PairingMessage, PairingMessageError, PairingMessageMethod},
     relay::{
@@ -19,10 +22,10 @@ use wc_protocol::{
     },
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
-        RelayProtocolOptions, ScopedProperties, Session, SessionConfig, SessionNamespaces,
-        SessionParticipant, SessionProperties, SessionProposeParams, SessionProposeResult,
-        SessionSettleParams, SessionSettleResponse, SessionTransportType, SignMethod,
-        session_propose_error_response,
+        RelayProtocolOptions, ScopedProperties, Session, SessionConfig, SessionMethod,
+        SessionNamespaces, SessionParticipant, SessionProperties, SessionProposeParams,
+        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionSettleResponse,
+        SessionTransportType, SignMethod, session_propose_error_response,
     },
 };
 use wc_transport::{RelayClient, RelayClientConfig, RelayClientError};
@@ -421,6 +424,47 @@ impl PairingClient {
         .map(Some)
     }
 
+    /// Waits for one live message on an acknowledged session topic.
+    ///
+    /// Parses `wc_sessionRequest` when that method arrives; other session
+    /// methods are classified by name until their behavior is implemented.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > Sends a CAIP-27 request to the peer client.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+    ///
+    /// > The client should immediately reject the request and respond an error
+    /// > if the target session permissions doesn't include the requested method
+    /// > or chain ID.
+    pub async fn next_session_message(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+    ) -> Result<Option<SessionReceivedMessage>, PairingClientError> {
+        let Some(subscription_data) = timeout(
+            self.receive_timeout,
+            self.relay.next_message_for_topic(subscription.topic()),
+        )
+        .await
+        .map_err(|_| PairingClientError::ReceiveTimedOut {
+            timeout: self.receive_timeout,
+        })?
+        .map_err(|source| PairingClientError::Relay { source })?
+        else {
+            return Ok(None);
+        };
+
+        decode_session_message_data(
+            subscription_data.data,
+            subscription,
+            session,
+            now_unix_seconds()?,
+        )
+        .map(Some)
+    }
+
     /// Publishes a `wc_sessionPropose` JSON-RPC error response.
     ///
     /// This rejects the proposal on the pairing topic. Approval is intentionally
@@ -678,6 +722,68 @@ pub enum SessionSettleResponsePayload {
     Error(JsonRpcErrorResponse),
 }
 
+/// Decrypted session-topic message plus relay delivery metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReceivedMessage {
+    topic: RelayTopic,
+    encoded_message_len: usize,
+    plaintext_len: usize,
+    published_at: u64,
+    tag: Option<u64>,
+    payload: SessionPayload,
+}
+
+impl SessionReceivedMessage {
+    /// Relay topic that delivered this message.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Length of the encrypted relay message string before decoding.
+    #[must_use]
+    pub const fn encoded_message_len(&self) -> usize {
+        self.encoded_message_len
+    }
+
+    /// Length of the decrypted JSON string.
+    #[must_use]
+    pub const fn plaintext_len(&self) -> usize {
+        self.plaintext_len
+    }
+
+    /// Relay server publish timestamp in milliseconds.
+    #[must_use]
+    pub const fn published_at(&self) -> u64 {
+        self.published_at
+    }
+
+    /// Optional `WalletConnect` relay tag.
+    #[must_use]
+    pub const fn tag(&self) -> Option<u64> {
+        self.tag
+    }
+
+    /// Parsed session-topic JSON-RPC payload.
+    #[must_use]
+    pub const fn payload(&self) -> &SessionPayload {
+        &self.payload
+    }
+}
+
+/// Typed session-topic payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPayload {
+    /// `wc_sessionRequest` Sign API request.
+    SessionRequest(Box<JsonRpcRequest<SessionRequestParams>>),
+    /// Known Sign API method whose DTO is not parsed at this layer yet.
+    Sign(SignMethod),
+    /// JSON-RPC method name is present but not implemented by current DTOs.
+    Unknown(String),
+    /// JSON has no string `method` field.
+    Missing,
+}
+
 /// Active relay subscription for one pairing topic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingSubscription {
@@ -923,6 +1029,56 @@ pub enum PairingClientError {
         response: JsonRpcErrorResponse,
     },
 
+    /// Active session record and relay subscription use different topics.
+    #[error("session topic does not match active subscription")]
+    SessionSubscriptionTopicMismatch {
+        /// Topic from the active session record.
+        session_topic: RelayTopic,
+        /// Topic registered on the relay connection.
+        subscription_topic: RelayTopic,
+    },
+
+    /// Session messages are ignored until the settle request is acknowledged.
+    #[error("session is not acknowledged")]
+    SessionNotAcknowledged {
+        /// Session topic that is still pending acknowledgement.
+        topic: RelayTopic,
+    },
+
+    /// Session expired before the received message was processed.
+    #[error("session expired")]
+    SessionExpired {
+        /// Session expiry timestamp.
+        expiry_timestamp: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
+    },
+
+    /// Session request expired before the wallet processed it.
+    #[error("session request expired")]
+    SessionRequestExpired {
+        /// Request expiry timestamp.
+        expiry_timestamp: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
+    },
+
+    /// Session namespaces do not authorize the requested chain.
+    #[error("session request chain is not authorized")]
+    SessionUnauthorizedChain {
+        /// Requested chain ID.
+        chain_id: wc_protocol::caip::Caip2ChainId,
+    },
+
+    /// Session namespaces do not authorize the requested method on the chain.
+    #[error("session request method is not authorized")]
+    SessionUnauthorizedMethod {
+        /// Requested chain ID.
+        chain_id: wc_protocol::caip::Caip2ChainId,
+        /// Requested method.
+        method: SessionMethod,
+    },
+
     /// Sign JSON-RPC ID construction failed.
     #[error("sign rpc id construction failed")]
     SignRpcId {
@@ -1073,6 +1229,162 @@ fn decode_session_settle_response_data(
         tag: data.tag,
         payload,
     })
+}
+
+/// Converts one relay delivery record into a typed session-topic message.
+///
+/// Session messages are encrypted with the symmetric key derived during
+/// proposal approval. Topic and session-state checks happen before the payload
+/// is exposed to higher layers.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2456-L2461>
+///
+/// > const { topic, payload, attestation, encryptedId, transportType } = args;
+/// > const { id, params } = payload;
+/// > await this.isValidRequest({ topic, ...params });
+fn decode_session_message_data(
+    data: IrnSubscriptionData,
+    subscription: &SessionSubscription,
+    session: &Session,
+    now_unix_seconds: u64,
+) -> Result<SessionReceivedMessage, PairingClientError> {
+    let encoded_message_len = data.message.len();
+    let topic = data.topic;
+    let published_at = data.published_at;
+    let tag = data.tag;
+
+    validate_session_message_route(&topic, subscription, session, now_unix_seconds)?;
+
+    let envelope = Envelope::decode(&data.message, EnvelopeEncoding::Base64)
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let plaintext = envelope
+        .decrypt(subscription.sym_key())
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let plaintext_len = plaintext.len();
+    let json = serde_json::from_str::<serde_json::Value>(&plaintext)
+        .map_err(|source| PairingClientError::SessionPayload { source })?;
+    let payload = parse_session_payload(json)?;
+    validate_session_payload(session, &payload, now_unix_seconds)?;
+
+    Ok(SessionReceivedMessage {
+        topic,
+        encoded_message_len,
+        plaintext_len,
+        published_at,
+        tag,
+        payload,
+    })
+}
+
+/// Checks routing and lifecycle state before decrypting a session message.
+fn validate_session_message_route(
+    message_topic: &RelayTopic,
+    subscription: &SessionSubscription,
+    session: &Session,
+    now_unix_seconds: u64,
+) -> Result<(), PairingClientError> {
+    if message_topic != subscription.topic() {
+        return Err(PairingClientError::UnexpectedTopic {
+            expected: subscription.topic().clone(),
+            actual: message_topic.clone(),
+        });
+    }
+
+    if &session.topic != subscription.topic() {
+        return Err(PairingClientError::SessionSubscriptionTopicMismatch {
+            session_topic: session.topic.clone(),
+            subscription_topic: subscription.topic().clone(),
+        });
+    }
+
+    if !session.acknowledged {
+        return Err(PairingClientError::SessionNotAcknowledged {
+            topic: session.topic.clone(),
+        });
+    }
+
+    if session.is_expired_at(now_unix_seconds) {
+        return Err(PairingClientError::SessionExpired {
+            expiry_timestamp: session.expiry,
+            now_unix_seconds,
+        });
+    }
+
+    Ok(())
+}
+
+/// Parses the classified decrypted JSON into the DTO used by that method.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2013-L2029>
+///
+/// > switch (reqMethod) {
+/// > case "wc_sessionRequest":
+/// > return await this.onSessionRequest({
+fn parse_session_payload(json: serde_json::Value) -> Result<SessionPayload, PairingClientError> {
+    let Some(method) = json.get("method").and_then(serde_json::Value::as_str) else {
+        return Ok(SessionPayload::Missing);
+    };
+
+    match SignMethod::from_wire(method) {
+        Some(SignMethod::SessionRequest) => serde_json::from_value(json)
+            .map(|request| SessionPayload::SessionRequest(Box::new(request)))
+            .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(method) => Ok(SessionPayload::Sign(method)),
+        None => Ok(SessionPayload::Unknown(method.to_owned())),
+    }
+}
+
+/// Applies session-permission checks to parsed session requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionrequest>
+///
+/// > The client should immediately reject the request and respond an error if
+/// > the target session permissions doesn't include the requested method or
+/// > chain ID.
+///
+/// The maintained Sign Client performs the same chain and method checks when
+/// receiving a session request.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L3138-L3154>
+///
+/// > if (!isValidNamespacesChainId(namespaces, chainId)) {
+/// > if (!isValidNamespacesRequest(namespaces, chainId, request.method)) {
+fn validate_session_payload(
+    session: &Session,
+    payload: &SessionPayload,
+    now_unix_seconds: u64,
+) -> Result<(), PairingClientError> {
+    let SessionPayload::SessionRequest(request) = payload else {
+        return Ok(());
+    };
+
+    if let Some(expiry_timestamp) = request.params.request.expiry_timestamp
+        && expiry_timestamp <= now_unix_seconds
+    {
+        return Err(PairingClientError::SessionRequestExpired {
+            expiry_timestamp,
+            now_unix_seconds,
+        });
+    }
+
+    if !is_chain_authorized(&session.namespaces, &request.params.chain_id) {
+        return Err(PairingClientError::SessionUnauthorizedChain {
+            chain_id: request.params.chain_id.clone(),
+        });
+    }
+
+    if !is_method_authorized(
+        &session.namespaces,
+        &request.params.chain_id,
+        request.params.request.method.as_str(),
+    ) {
+        return Err(PairingClientError::SessionUnauthorizedMethod {
+            chain_id: request.params.chain_id.clone(),
+            method: request.params.request.method.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Parses and correlates the JSON-RPC response to `wc_sessionSettle`.
@@ -1735,6 +2047,172 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn decodes_authorized_session_request() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let mut session = session_from_subscription(&subscription)?;
+        session.acknowledged = true;
+        let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+        assert_eq!(received.topic(), subscription.topic());
+        assert_eq!(received.tag(), Some(1108));
+        assert!(received.plaintext_len() > 0);
+        match received.payload() {
+            SessionPayload::SessionRequest(request) => {
+                assert_eq!(request.id, 77);
+                assert_eq!(request.params.chain_id.as_str(), "eip155:1");
+                assert_eq!(request.params.request.method.as_str(), "personal_sign");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_session_message_before_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let session = session_from_subscription(&subscription)?;
+        let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        assert!(matches!(
+            decode_session_message_data(data, &subscription, &session, 4_000_000_000)
+                .expect_err("pending session should not receive requests"),
+            PairingClientError::SessionNotAcknowledged { .. }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_expired_session_message() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let mut session = session_from_subscription(&subscription)?;
+        session.acknowledged = true;
+        session.expiry = 99;
+        let request = session_request(77, "eip155:1", "personal_sign", Some(4_102_444_700))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        assert!(matches!(
+            decode_session_message_data(data, &subscription, &session, 100)
+                .expect_err("expired session should reject messages"),
+            PairingClientError::SessionExpired {
+                expiry_timestamp: 99,
+                now_unix_seconds: 100
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_expired_session_request() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let mut session = session_from_subscription(&subscription)?;
+        session.acknowledged = true;
+        let request = session_request(77, "eip155:1", "personal_sign", Some(99))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        assert!(matches!(
+            decode_session_message_data(data, &subscription, &session, 100)
+                .expect_err("expired request should be rejected"),
+            PairingClientError::SessionRequestExpired {
+                expiry_timestamp: 99,
+                now_unix_seconds: 100
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unauthorized_session_request_chain() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let mut session = session_from_subscription(&subscription)?;
+        session.acknowledged = true;
+        let request = session_request(77, "eip155:137", "personal_sign", Some(4_102_444_700))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        assert!(matches!(
+            decode_session_message_data(data, &subscription, &session, 4_000_000_000)
+                .expect_err("unauthorized chain should be rejected"),
+            PairingClientError::SessionUnauthorizedChain { chain_id }
+                if chain_id.as_str() == "eip155:137"
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unauthorized_session_request_method() -> Result<(), Box<dyn std::error::Error>> {
+        let sym_key = PairingSymKey::from_hex(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+        )?;
+        let subscription = session_subscription(sym_key.clone())?;
+        let mut session = session_from_subscription(&subscription)?;
+        session.acknowledged = true;
+        let request = session_request(77, "eip155:1", "eth_sendTransaction", Some(4_102_444_700))?;
+        let data = encrypted_subscription_data_for_topic(
+            &request,
+            &sym_key,
+            subscription.topic().clone(),
+            Some(1108),
+        )?;
+
+        assert!(matches!(
+            decode_session_message_data(data, &subscription, &session, 4_000_000_000)
+                .expect_err("unauthorized method should be rejected"),
+            PairingClientError::SessionUnauthorizedMethod { chain_id, method }
+                if chain_id.as_str() == "eip155:1" && method.as_str() == "eth_sendTransaction"
+        ));
+
+        Ok(())
+    }
+
     fn encrypted_subscription_data(
         plaintext: &str,
         sym_key: &PairingSymKey,
@@ -1848,6 +2326,34 @@ mod tests {
         );
 
         serde_json::from_str(json).map_err(Into::into)
+    }
+
+    fn session_request(
+        id: u64,
+        chain_id: &str,
+        method: &str,
+        expiry_timestamp: Option<u64>,
+    ) -> Result<JsonRpcRequest<SessionRequestParams>, Box<dyn std::error::Error>> {
+        let expiry = expiry_timestamp.map_or_else(String::new, |expiry| {
+            format!(r#","expiryTimestamp":{expiry}"#)
+        });
+        let json = format!(
+            r#"{{
+                "id": {id},
+                "jsonrpc": "2.0",
+                "method": "wc_sessionRequest",
+                "params": {{
+                    "chainId": "{chain_id}",
+                    "request": {{
+                        "method": "{method}",
+                        "params": ["0x68656c6c6f", "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]
+                        {expiry}
+                    }}
+                }}
+            }}"#
+        );
+
+        serde_json::from_str(&json).map_err(Into::into)
     }
 
     fn wallet_metadata() -> DappMetadata {

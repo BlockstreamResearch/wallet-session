@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
     ApprovedSession, DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig,
-    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionProposalApproval,
-    SessionSettleResponseMessage, SessionSettleResponsePayload,
+    PairingPayload, PairingReceivedMessage, PairingSubscription, SessionPayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionSettleResponseMessage,
+    SessionSettleResponsePayload,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
@@ -30,7 +31,7 @@ use wc_protocol::{
         DEFAULT_RELAY_URL, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
-    session::{DappMetadata, ProposalNamespace, SessionNamespace, SessionNamespaces},
+    session::{DappMetadata, ProposalNamespace, Session, SessionNamespace, SessionNamespaces},
     session::{JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, SessionProposeParams, SignMethod},
 };
 
@@ -48,6 +49,7 @@ pub enum ProbeMode {
     CoreJsProposal,
     CoreJsApproveProposal,
     CoreJsRejectProposal,
+    CoreJsSessionRequest,
     PairingUri(String),
 }
 
@@ -61,6 +63,9 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         ProbeMode::CoreJsProposal => run_core_js_proposal_probe(&config).await,
         ProbeMode::CoreJsApproveProposal => run_core_js_approve_proposal_probe(&config).await,
         ProbeMode::CoreJsRejectProposal => run_core_js_reject_proposal_probe(&config).await,
+        ProbeMode::CoreJsSessionRequest => {
+            Box::pin(run_core_js_session_request_probe(&config)).await
+        }
         ProbeMode::PairingUri(uri) => run_pairing_uri_probe(&config, &uri).await,
     }
 }
@@ -400,7 +405,7 @@ async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result
     let mut harness = ChildGuard::new(child);
     let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
 
-    let (mut client, pairing_subscription, approved) =
+    let (mut client, pairing_subscription, approved, _session) =
         run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
     let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
     if result.get("outcome").and_then(Value::as_str) != Some("approved") {
@@ -418,6 +423,66 @@ async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result
         approved.proposal_response_ack(),
         approved.session_settle_ack()
     );
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<()> {
+    let workspace_root = workspace_root()?;
+    let harness_dir = workspace_root.join("tools/js-harness");
+    let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+    let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
+    if let Some(parent) = uri_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(&uri_file);
+    let _ = fs::remove_file(&result_file);
+
+    let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+    let request_hold_ms =
+        env::var("WC_JS_SESSION_REQUEST_HOLD_MS").unwrap_or_else(|_| hold_ms.clone());
+    println!(
+        "core-js-session-request harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} request_hold_ms={request_hold_ms}",
+        harness_dir.display(),
+        uri_file.display(),
+        result_file.display()
+    );
+
+    let child = Command::new("bun")
+        .args(["run", "propose-session"])
+        .current_dir(&harness_dir)
+        .env("WC_JS_URI_FILE", &uri_file)
+        .env("WC_JS_RESULT_FILE", &result_file)
+        .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+        .env("WC_JS_SESSION_REQUEST_HOLD_MS", &request_hold_ms)
+        .env("WC_JS_SEND_SESSION_REQUEST", "1")
+        .env_remove("WC_JS_PRINT_URI")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start Bun harness in {}", harness_dir.display()))?;
+    let mut harness = ChildGuard::new(child);
+    let uri = wait_for_js_pairing_uri(&uri_file, harness.child_mut()).await?;
+
+    let (mut client, pairing_subscription, approved, session) =
+        run_core_pairing_uri_approve_probe(config, uri.trim()).await?;
+    let result = wait_for_js_result(&result_file, harness.child_mut()).await?;
+    if result.get("outcome").and_then(Value::as_str) != Some("session_request_started") {
+        bail!("expected JS session_request_started result, got {result}");
+    }
+    println!("core-js-session-request js_result={result}");
+
+    let session_message = client
+        .next_session_message(approved.subscription(), &session)
+        .await?
+        .context("no wc_sessionRequest message received")?;
+    print_session_message("core-js-session-request live_message", &session_message);
+
+    let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
+    println!("core-js-session-request pairing_unsubscribe_ack={unsubscribe_result}");
     harness.terminate();
 
     Ok(())
@@ -507,7 +572,7 @@ async fn run_pairing_uri_probe(config: &RelayProbeConfig, uri: &str) -> Result<(
 async fn run_core_pairing_uri_approve_probe(
     config: &RelayProbeConfig,
     uri: &str,
-) -> Result<(PairingClient, PairingSubscription, ApprovedSession)> {
+) -> Result<(PairingClient, PairingSubscription, ApprovedSession, Session)> {
     let pairing = PairingUri::parse(uri).context("failed to parse pairing URI")?;
     let mut client_config = PairingClientConfig::new(
         config.project_id.clone(),
@@ -581,15 +646,15 @@ async fn run_core_pairing_uri_approve_probe(
         approved.proposal_response_ack(),
         approved.session_settle_ack()
     );
-    receive_and_print_session_settle_response(&mut client, &approved).await?;
+    let session = receive_and_print_session_settle_response(&mut client, &approved).await?;
 
-    Ok((client, subscription, approved))
+    Ok((client, subscription, approved, session))
 }
 
 async fn receive_and_print_session_settle_response(
     client: &mut PairingClient,
     approved: &ApprovedSession,
-) -> Result<()> {
+) -> Result<Session> {
     let settle_response = client
         .next_session_settle_response(approved)
         .await?
@@ -609,7 +674,7 @@ async fn receive_and_print_session_settle_response(
         session.transport_type
     );
 
-    Ok(())
+    Ok(session)
 }
 
 fn print_session_settle_response(settle_response: &SessionSettleResponseMessage) {
@@ -634,6 +699,37 @@ fn print_session_settle_response(settle_response: &SessionSettleResponseMessage)
             settle_response.published_at(),
             settle_response.encoded_message_len()
         ),
+    }
+}
+
+fn print_session_message(label: &str, message: &SessionReceivedMessage) {
+    println!(
+        "{label} topic={} message_len={} decrypted_len={} tag_present={} tag={} published_at={}",
+        message.topic(),
+        message.encoded_message_len(),
+        message.plaintext_len(),
+        message.tag().is_some(),
+        message.tag().unwrap_or_default(),
+        message.published_at()
+    );
+
+    match message.payload() {
+        SessionPayload::SessionRequest(request) => println!(
+            "{label} session_request id={} chain_id={} method={} params={}",
+            request.id,
+            request.params.chain_id,
+            request.params.request.method,
+            request.params.request.params
+        ),
+        SessionPayload::Sign(method) => {
+            println!("{label} sign_request method={method}");
+        }
+        SessionPayload::Unknown(method) => {
+            println!("{label} unknown_request method={method}");
+        }
+        SessionPayload::Missing => {
+            println!("{label} missing_method=true");
+        }
     }
 }
 
