@@ -5,9 +5,9 @@ use wc_protocol::{
     relay::RelayTopic,
     session::{
         DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, ScopedProperties,
-        Session, SessionConfig, SessionDeleteParams, SessionNamespaces, SessionPingParams,
-        SessionProperties, SessionProposeParams, SessionRequestParams, SessionSettleResponse,
-        SignMethod,
+        Session, SessionAckResponse, SessionConfig, SessionDeleteParams, SessionExtendParams,
+        SessionNamespaces, SessionPingParams, SessionProperties, SessionProposeParams,
+        SessionRequestParams, SessionSettleResponse, SessionUpdateParams, SignMethod,
     },
 };
 
@@ -244,6 +244,131 @@ pub enum SessionSettleResponsePayload {
     Error(JsonRpcErrorResponse),
 }
 
+/// Outbound session lifecycle request published by the core client.
+///
+/// `wc_sessionUpdate` and `wc_sessionExtend` are sent as Sign JSON-RPC
+/// requests over the acknowledged session topic.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L638-L645>
+///
+/// > method: "wc_sessionUpdate",
+/// > params: { namespaces },
+/// > throwOnFailedPublish: true,
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L678-L685>
+///
+/// > method: "wc_sessionExtend",
+/// > params: {},
+/// > throwOnFailedPublish: true,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLifecycleRequest {
+    pub(super) topic: RelayTopic,
+    pub(super) request_id: u64,
+    pub(super) method: SignMethod,
+    pub(super) request_tag: u64,
+    pub(super) response_tag: u64,
+    pub(super) publish_ack: bool,
+}
+
+impl SessionLifecycleRequest {
+    /// Session topic used for the encrypted request.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Sign JSON-RPC request ID to match against the peer response.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Sign RPC method sent to the peer.
+    #[must_use]
+    pub const fn method(&self) -> SignMethod {
+        self.method
+    }
+
+    /// Relay tag used on the request publish.
+    #[must_use]
+    pub const fn request_tag(&self) -> u64 {
+        self.request_tag
+    }
+
+    /// Relay tag expected on the peer response.
+    #[must_use]
+    pub const fn response_tag(&self) -> u64 {
+        self.response_tag
+    }
+
+    /// Relay acknowledgement for the request publish.
+    #[must_use]
+    pub const fn publish_ack(&self) -> bool {
+        self.publish_ack
+    }
+}
+
+/// Peer response to a session lifecycle request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLifecycleResponseMessage {
+    pub(super) topic: RelayTopic,
+    pub(super) encoded_message_len: usize,
+    pub(super) published_at: u64,
+    pub(super) tag: Option<u64>,
+    pub(super) payload: SessionLifecycleResponsePayload,
+}
+
+impl SessionLifecycleResponseMessage {
+    /// Relay topic that delivered this response.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// Length of the encrypted relay message string before decoding.
+    #[must_use]
+    pub const fn encoded_message_len(&self) -> usize {
+        self.encoded_message_len
+    }
+
+    /// Relay server publish timestamp in milliseconds.
+    #[must_use]
+    pub const fn published_at(&self) -> u64 {
+        self.published_at
+    }
+
+    /// Optional `WalletConnect` relay tag.
+    #[must_use]
+    pub const fn tag(&self) -> Option<u64> {
+        self.tag
+    }
+
+    /// Parsed JSON-RPC response payload.
+    #[must_use]
+    pub const fn payload(&self) -> &SessionLifecycleResponsePayload {
+        &self.payload
+    }
+}
+
+/// Typed response payload for `wc_sessionUpdate` and `wc_sessionExtend`.
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionupdate>
+///
+/// > // Success result
+/// > true
+///
+/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionextend>
+///
+/// > // Success result
+/// > true
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLifecycleResponsePayload {
+    /// Peer accepted the lifecycle request.
+    Success(SessionAckResponse),
+    /// Peer rejected the lifecycle request.
+    Error(JsonRpcErrorResponse),
+}
+
 /// Decrypted session-topic message plus relay delivery metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionReceivedMessage {
@@ -342,6 +467,10 @@ impl SessionReceivedMessage {
 pub enum SessionPayload {
     /// `wc_sessionRequest` Sign API request.
     SessionRequest(Box<JsonRpcRequest<SessionRequestParams>>),
+    /// `wc_sessionUpdate` Sign API request.
+    SessionUpdate(JsonRpcRequest<SessionUpdateParams>),
+    /// `wc_sessionExtend` Sign API request.
+    SessionExtend(JsonRpcRequest<SessionExtendParams>),
     /// `wc_sessionPing` Sign API request.
     SessionPing(JsonRpcRequest<SessionPingParams>),
     /// `wc_sessionDelete` Sign API request.

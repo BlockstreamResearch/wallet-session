@@ -161,6 +161,19 @@ pub enum PairingClientError {
     #[error("session settle response payload is unsupported")]
     SessionSettleUnsupportedPayload,
 
+    /// Session lifecycle response was neither a JSON-RPC result nor error.
+    #[error("session lifecycle response payload is unsupported")]
+    SessionLifecycleUnsupportedPayload,
+
+    /// Matching lifecycle response was not found in the bounded receive window.
+    #[error("session lifecycle response was not received")]
+    SessionLifecycleResponseNotReceived {
+        /// Relay tag expected on the peer response.
+        expected_tag: u64,
+        /// Number of same-topic deliveries inspected before failing.
+        inspected: usize,
+    },
+
     /// A `wc_sessionRequest` response was built from a different session message.
     #[error("session response target is not a session request")]
     SessionResponseTargetNotRequest,

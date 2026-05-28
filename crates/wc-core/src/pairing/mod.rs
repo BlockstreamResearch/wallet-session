@@ -18,6 +18,7 @@ pub use client::{PairingClient, PairingClientConfig};
 pub use error::PairingClientError;
 pub use types::{
     ApprovedSession, PairingPayload, PairingReceivedMessage, PairingSubscription,
+    SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionLifecycleResponsePayload,
     SessionMessageOutcome, SessionPayload, SessionProposalApproval, SessionReceivedMessage,
     SessionRequestRejection, SessionSettleResponseMessage, SessionSettleResponsePayload,
     SessionSubscription,
@@ -98,6 +99,62 @@ pub const SESSION_SETTLE_REQUEST_TTL_SECONDS: u64 = 5 * 60;
 /// > TTL     | 300
 /// > Tag     | 1103
 pub const SESSION_SETTLE_RESPONSE_TTL_SECONDS: u64 = 5 * 60;
+
+/// Relay tag used for `wc_sessionUpdate` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L41-L46>
+///
+/// > req: { ttl: ONE_DAY, prompt: false, tag: 1104 }
+pub const SESSION_UPDATE_REQUEST_TAG: u64 = 1104;
+
+/// Relay tag used for `wc_sessionUpdate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L47-L51>
+///
+/// > res: { ttl: ONE_DAY, prompt: false, tag: 1105 }
+pub const SESSION_UPDATE_RESPONSE_TAG: u64 = 1105;
+
+/// Relay retention window for `wc_sessionUpdate` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L41-L46>
+///
+/// > req: { ttl: ONE_DAY, prompt: false, tag: 1104 }
+pub const SESSION_UPDATE_REQUEST_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay retention window for `wc_sessionUpdate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L47-L51>
+///
+/// > res: { ttl: ONE_DAY, prompt: false, tag: 1105 }
+pub const SESSION_UPDATE_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay tag used for `wc_sessionExtend` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L53-L58>
+///
+/// > req: { ttl: ONE_DAY, prompt: false, tag: 1106 }
+pub const SESSION_EXTEND_REQUEST_TAG: u64 = 1106;
+
+/// Relay tag used for `wc_sessionExtend` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L59-L63>
+///
+/// > res: { ttl: ONE_DAY, prompt: false, tag: 1107 }
+pub const SESSION_EXTEND_RESPONSE_TAG: u64 = 1107;
+
+/// Relay retention window for `wc_sessionExtend` requests.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L53-L58>
+///
+/// > req: { ttl: ONE_DAY, prompt: false, tag: 1106 }
+pub const SESSION_EXTEND_REQUEST_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay retention window for `wc_sessionExtend` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L59-L63>
+///
+/// > res: { ttl: ONE_DAY, prompt: false, tag: 1107 }
+pub const SESSION_EXTEND_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 /// Relay tag used for `wc_sessionRequest` responses.
 ///

@@ -5,13 +5,16 @@ use wc_protocol::{
     pairing::PairingSymKey,
     pairing_message::{PairingMessage, PairingMessageMethod},
     relay::{IrnSubscriptionData, RelayTopic},
-    session::{JsonRpcErrorResponse, Session, SessionSettleResponse, SignMethod},
+    session::{
+        JsonRpcErrorResponse, Session, SessionAckResponse, SessionSettleResponse, SignMethod,
+    },
 };
 
 use super::{
     error::PairingClientError,
     types::{
-        PairingPayload, PairingReceivedMessage, SessionPayload, SessionReceivedMessage,
+        PairingPayload, PairingReceivedMessage, SessionLifecycleResponseMessage,
+        SessionLifecycleResponsePayload, SessionPayload, SessionReceivedMessage,
         SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
     },
 };
@@ -64,6 +67,39 @@ pub(super) fn decode_session_settle_response_data(
     let payload = parse_session_settle_response_payload(json, expected_id)?;
 
     Ok(SessionSettleResponseMessage {
+        topic: subscription.topic.clone(),
+        encoded_message_len,
+        published_at: data.published_at,
+        tag: data.tag,
+        payload,
+    })
+}
+
+/// Converts one relay delivery record into a lifecycle acknowledgement response.
+pub(super) fn decode_session_lifecycle_response_data(
+    data: IrnSubscriptionData,
+    subscription: &SessionSubscription,
+    expected_id: u64,
+) -> Result<SessionLifecycleResponseMessage, PairingClientError> {
+    let encoded_message_len = data.message.len();
+
+    if data.topic != subscription.topic {
+        return Err(PairingClientError::UnexpectedTopic {
+            expected: subscription.topic.clone(),
+            actual: data.topic,
+        });
+    }
+
+    let envelope = Envelope::decode(&data.message, EnvelopeEncoding::Base64)
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let plaintext = envelope
+        .decrypt(&subscription.sym_key)
+        .map_err(|source| PairingClientError::SessionEnvelope { source })?;
+    let json = serde_json::from_str::<serde_json::Value>(&plaintext)
+        .map_err(|source| PairingClientError::SessionPayload { source })?;
+    let payload = parse_session_lifecycle_response_payload(json, expected_id)?;
+
+    Ok(SessionLifecycleResponseMessage {
         topic: subscription.topic.clone(),
         encoded_message_len,
         published_at: data.published_at,
@@ -195,6 +231,12 @@ fn parse_session_payload(json: serde_json::Value) -> Result<SessionPayload, Pair
         Some(SignMethod::SessionRequest) => serde_json::from_value(json)
             .map(|request| SessionPayload::SessionRequest(Box::new(request)))
             .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(SignMethod::SessionUpdate) => serde_json::from_value(json)
+            .map(SessionPayload::SessionUpdate)
+            .map_err(|source| PairingClientError::SessionPayload { source }),
+        Some(SignMethod::SessionExtend) => serde_json::from_value(json)
+            .map(SessionPayload::SessionExtend)
+            .map_err(|source| PairingClientError::SessionPayload { source }),
         Some(SignMethod::SessionPing) => serde_json::from_value(json)
             .map(SessionPayload::SessionPing)
             .map_err(|source| PairingClientError::SessionPayload { source }),
@@ -295,6 +337,46 @@ fn parse_session_settle_response_payload(
     }
 
     Err(PairingClientError::SessionSettleUnsupportedPayload)
+}
+
+fn parse_session_lifecycle_response_payload(
+    json: serde_json::Value,
+    expected_id: u64,
+) -> Result<SessionLifecycleResponsePayload, PairingClientError> {
+    validate_response_id(&json, expected_id)?;
+
+    if json.get("result").is_some() {
+        return serde_json::from_value::<SessionAckResponse>(json)
+            .map(SessionLifecycleResponsePayload::Success)
+            .map_err(|source| PairingClientError::SessionPayload { source });
+    }
+
+    if json.get("error").is_some() {
+        return serde_json::from_value::<JsonRpcErrorResponse>(json)
+            .map(SessionLifecycleResponsePayload::Error)
+            .map_err(|source| PairingClientError::SessionPayload { source });
+    }
+
+    Err(PairingClientError::SessionLifecycleUnsupportedPayload)
+}
+
+fn validate_response_id(
+    json: &serde_json::Value,
+    expected_id: u64,
+) -> Result<(), PairingClientError> {
+    let actual_id = json
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(PairingClientError::SessionResponseMissingId)?;
+
+    if actual_id != expected_id {
+        return Err(PairingClientError::SessionResponseIdMismatch {
+            expected: expected_id,
+            actual: actual_id,
+        });
+    }
+
+    Ok(())
 }
 
 /// Parses the classified decrypted JSON into the DTO used by that method.

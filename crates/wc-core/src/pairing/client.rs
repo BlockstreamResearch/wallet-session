@@ -5,32 +5,46 @@ use wc_protocol::{
     key::X25519KeyPair,
     pairing::PairingUri,
     relay::{DEFAULT_RELAY_URL, RelayAuthToken, RelayConnectionUrl, relay_auth_audience},
-    session::{JsonRpcError, JsonRpcRequest, Session, SessionProposeParams},
+    session::{
+        JsonRpcError, JsonRpcRequest, Session, SessionNamespaces, SessionProposeParams, SignMethod,
+    },
 };
 use wc_transport::{RelayClient, RelayClientConfig};
 
 use super::{
-    DEFAULT_PAIRING_RECEIVE_TIMEOUT,
+    DEFAULT_PAIRING_RECEIVE_TIMEOUT, SESSION_EXTEND_REQUEST_TAG, SESSION_EXTEND_RESPONSE_TAG,
+    SESSION_UPDATE_REQUEST_TAG, SESSION_UPDATE_RESPONSE_TAG,
     approval::{
         next_sign_rpc_id, session_proposal_approval_publishes, session_proposal_reject_publish,
     },
     codec::{
-        decode_session_message_data, decode_session_message_data_unchecked,
-        decode_session_settle_response_data, decode_subscription_data,
-        validate_session_message_payload,
+        decode_session_lifecycle_response_data, decode_session_message_data,
+        decode_session_message_data_unchecked, decode_session_settle_response_data,
+        decode_subscription_data, validate_session_message_payload,
     },
     error::PairingClientError,
-    session_lifecycle::{session_delete_response_publish, session_ping_response_publish},
+    session_lifecycle::{
+        session_delete_response_publish, session_extend_request_publish,
+        session_ping_response_publish, session_update_request_publish,
+    },
     session_request::{
         session_request_error_publish, session_request_success_publish,
         session_request_validation_error,
     },
     types::{
-        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionMessageOutcome,
-        SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionLifecycleRequest,
+        SessionLifecycleResponseMessage, SessionMessageOutcome, SessionPayload,
+        SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
         SessionSettleResponseMessage, SessionSubscription,
     },
 };
+
+/// Bounded same-topic deliveries inspected while waiting for a lifecycle ack.
+///
+/// A relay may deliver the locally published request back to the active
+/// subscription before the peer response arrives. The bound keeps that skip path
+/// finite while still accepting the common request-echo then response sequence.
+const MAX_SESSION_LIFECYCLE_RESPONSE_DELIVERIES: usize = 4;
 
 /// Configuration for a native pairing-topic relay client.
 ///
@@ -346,6 +360,140 @@ impl PairingClient {
             approved.session_settle_request_id,
         )
         .map(Some)
+    }
+
+    /// Publishes a `wc_sessionUpdate` request for an acknowledged session.
+    ///
+    /// The wallet/controller sends replacement namespaces to the peer and waits
+    /// for a separate JSON-RPC acknowledgement.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L638-L650>
+    ///
+    /// > method: "wc_sessionUpdate",
+    /// > params: { namespaces },
+    /// > await this.client.session.update(topic, { namespaces });
+    pub async fn update_session(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+        namespaces: &SessionNamespaces,
+    ) -> Result<SessionLifecycleRequest, PairingClientError> {
+        let request_id = next_sign_rpc_id()?;
+        let publish = session_update_request_publish(
+            subscription,
+            session,
+            namespaces,
+            request_id,
+            now_unix_seconds()?,
+        )?;
+        let publish_ack = self
+            .relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionLifecycleRequest {
+            topic: subscription.topic().clone(),
+            request_id,
+            method: SignMethod::SessionUpdate,
+            request_tag: SESSION_UPDATE_REQUEST_TAG,
+            response_tag: SESSION_UPDATE_RESPONSE_TAG,
+            publish_ack,
+        })
+    }
+
+    /// Publishes a `wc_sessionExtend` request for an acknowledged session.
+    ///
+    /// Current Sign Client traffic sends `{}` as params and expects
+    /// `result: true` on the same session topic.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L678-L685>
+    ///
+    /// > method: "wc_sessionExtend",
+    /// > params: {},
+    /// > expiry: calcExpiry(SESSION_EXPIRY),
+    pub async fn extend_session(
+        &mut self,
+        subscription: &SessionSubscription,
+        session: &Session,
+    ) -> Result<SessionLifecycleRequest, PairingClientError> {
+        let request_id = next_sign_rpc_id()?;
+        let publish =
+            session_extend_request_publish(subscription, session, request_id, now_unix_seconds()?)?;
+        let publish_ack = self
+            .relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionLifecycleRequest {
+            topic: subscription.topic().clone(),
+            request_id,
+            method: SignMethod::SessionExtend,
+            request_tag: SESSION_EXTEND_REQUEST_TAG,
+            response_tag: SESSION_EXTEND_RESPONSE_TAG,
+            publish_ack,
+        })
+    }
+
+    /// Waits for the peer response to `wc_sessionUpdate` or `wc_sessionExtend`.
+    ///
+    /// Same-topic deliveries with other tags are skipped with a fixed bound; in
+    /// live relay testing the first skipped message can be the request echo.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2302-L2327>
+    ///
+    /// > await this.sendResult<"wc_sessionUpdate">({
+    /// > id,
+    /// > result: true,
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2363-L2375>
+    ///
+    /// > await this.sendResult<"wc_sessionExtend">({
+    /// > id,
+    /// > result: true,
+    pub async fn next_session_lifecycle_response(
+        &mut self,
+        subscription: &SessionSubscription,
+        request: &SessionLifecycleRequest,
+    ) -> Result<Option<SessionLifecycleResponseMessage>, PairingClientError> {
+        if request.topic() != subscription.topic() {
+            return Err(PairingClientError::UnexpectedTopic {
+                expected: subscription.topic().clone(),
+                actual: request.topic().clone(),
+            });
+        }
+
+        for _ in 0..MAX_SESSION_LIFECYCLE_RESPONSE_DELIVERIES {
+            let Some(subscription_data) = timeout(
+                self.receive_timeout,
+                self.relay.next_message_for_topic(subscription.topic()),
+            )
+            .await
+            .map_err(|_| PairingClientError::ReceiveTimedOut {
+                timeout: self.receive_timeout,
+            })?
+            .map_err(|source| PairingClientError::Relay { source })?
+            else {
+                return Ok(None);
+            };
+
+            if subscription_data.data.tag != Some(request.response_tag()) {
+                continue;
+            }
+
+            return decode_session_lifecycle_response_data(
+                subscription_data.data,
+                subscription,
+                request.request_id(),
+            )
+            .map(Some);
+        }
+
+        Err(PairingClientError::SessionLifecycleResponseNotReceived {
+            expected_tag: request.response_tag(),
+            inspected: MAX_SESSION_LIFECYCLE_RESPONSE_DELIVERIES,
+        })
     }
 
     /// Waits for one live message on an acknowledged session topic.

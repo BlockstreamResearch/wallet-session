@@ -1,15 +1,87 @@
 use wc_protocol::{
     relay::IrnPublish,
-    session::{SessionAckResponse, session_ack_response},
+    session::{
+        JsonRpcRequest, Session, SessionAckResponse, SessionExtendParams, SessionNamespaces,
+        SessionUpdateParams, SignMethod, session_ack_response,
+    },
 };
 
 use super::{
-    SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
-    SESSION_PING_RESPONSE_TTL_SECONDS,
+    SESSION_DELETE_RESPONSE_TAG, SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EXTEND_REQUEST_TAG,
+    SESSION_EXTEND_REQUEST_TTL_SECONDS, SESSION_PING_RESPONSE_TAG,
+    SESSION_PING_RESPONSE_TTL_SECONDS, SESSION_UPDATE_REQUEST_TAG,
+    SESSION_UPDATE_REQUEST_TTL_SECONDS,
     error::PairingClientError,
     publish::encrypted_json_publish,
     types::{SessionPayload, SessionReceivedMessage, SessionSubscription},
 };
+
+/// Builds an encrypted `wc_sessionUpdate` request publish.
+///
+/// The maintained Sign Client sends the replacement namespace map in the request
+/// params before applying the same namespace update locally.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L638-L650>
+///
+/// > method: "wc_sessionUpdate",
+/// > params: { namespaces },
+/// > await this.client.session.update(topic, { namespaces });
+pub(super) fn session_update_request_publish(
+    subscription: &SessionSubscription,
+    session: &Session,
+    namespaces: &SessionNamespaces,
+    request_id: u64,
+    now_unix_seconds: u64,
+) -> Result<IrnPublish, PairingClientError> {
+    ensure_outbound_session_ready(subscription, session, now_unix_seconds)?;
+    let request = JsonRpcRequest::new(
+        request_id,
+        SignMethod::SessionUpdate,
+        SessionUpdateParams {
+            namespaces: namespaces.clone(),
+        },
+    );
+
+    encrypted_json_publish(
+        subscription.topic().clone(),
+        subscription.sym_key(),
+        &request,
+        SESSION_UPDATE_REQUEST_TTL_SECONDS,
+        SESSION_UPDATE_REQUEST_TAG,
+    )
+}
+
+/// Builds an encrypted `wc_sessionExtend` request publish.
+///
+/// Current Sign Client traffic sends empty params and extends local expiry from
+/// session state rather than carrying `expiry` in the request body.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L678-L685>
+///
+/// > await this.setExpiry(topic, calcExpiry(SESSION_EXPIRY));
+/// > method: "wc_sessionExtend",
+/// > params: {},
+pub(super) fn session_extend_request_publish(
+    subscription: &SessionSubscription,
+    session: &Session,
+    request_id: u64,
+    now_unix_seconds: u64,
+) -> Result<IrnPublish, PairingClientError> {
+    ensure_outbound_session_ready(subscription, session, now_unix_seconds)?;
+    let request = JsonRpcRequest::new(
+        request_id,
+        SignMethod::SessionExtend,
+        SessionExtendParams::default(),
+    );
+
+    encrypted_json_publish(
+        subscription.topic().clone(),
+        subscription.sym_key(),
+        &request,
+        SESSION_EXTEND_REQUEST_TTL_SECONDS,
+        SESSION_EXTEND_REQUEST_TAG,
+    )
+}
 
 /// Builds an encrypted `wc_sessionPing` acknowledgement publish.
 ///
@@ -78,6 +150,39 @@ fn session_ack_publish(
         ttl,
         tag,
     )
+}
+
+/// Checks the session record before publishing controller-side lifecycle requests.
+///
+/// This mirrors the same topic/acknowledged/expiry guard used before decoding
+/// inbound session-topic messages, but runs before encryption so invalid local
+/// state cannot produce relay traffic.
+fn ensure_outbound_session_ready(
+    subscription: &SessionSubscription,
+    session: &Session,
+    now_unix_seconds: u64,
+) -> Result<(), PairingClientError> {
+    if &session.topic != subscription.topic() {
+        return Err(PairingClientError::SessionSubscriptionTopicMismatch {
+            session_topic: session.topic.clone(),
+            subscription_topic: subscription.topic().clone(),
+        });
+    }
+
+    if !session.acknowledged {
+        return Err(PairingClientError::SessionNotAcknowledged {
+            topic: session.topic.clone(),
+        });
+    }
+
+    if session.is_expired_at(now_unix_seconds) {
+        return Err(PairingClientError::SessionExpired {
+            expiry_timestamp: session.expiry,
+            now_unix_seconds,
+        });
+    }
+
+    Ok(())
 }
 
 fn session_ping_request_id(

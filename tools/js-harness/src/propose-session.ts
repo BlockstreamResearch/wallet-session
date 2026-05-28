@@ -93,6 +93,12 @@ try {
       case "session_delete":
         await startSessionDelete(session.topic);
         break;
+      case "wait_session_update":
+        await waitForSessionUpdate(session.topic);
+        break;
+      case "wait_session_extend":
+        await waitForSessionExtend(session.topic);
+        break;
       default:
         throw new Error(`unknown WC_JS_AFTER_APPROVAL_ACTION=${afterApprovalAction}`);
     }
@@ -285,6 +291,70 @@ async function startSessionRequest(topic: string): Promise<void> {
     method,
   });
   await sleep(sessionRequestHoldMs);
+}
+
+async function waitForSessionUpdate(topic: string): Promise<void> {
+  console.error(`js-harness wait_session_update_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+  const response = await Promise.race([
+    onceSignClientEvent("session_update", topic).then((event) => {
+      console.error(`js-harness session_update_received=${stringifyForLog(event)}`);
+      return {
+        outcome: "session_update_received",
+        topic,
+        id: stringifyId(event.id),
+      };
+    }),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_update_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+async function waitForSessionExtend(topic: string): Promise<void> {
+  console.error(`js-harness wait_session_extend_started=true topic=${topic} hold_ms=${sessionRequestHoldMs}`);
+  const response = await Promise.race([
+    onceSignClientEvent("session_extend", topic).then((event) => {
+      console.error(`js-harness session_extend_received=${stringifyForLog(event)}`);
+      return {
+        outcome: "session_extend_received",
+        topic,
+        id: stringifyId(event.id),
+      };
+    }),
+    sleep(sessionRequestHoldMs).then(() => ({
+      outcome: "session_extend_timeout",
+      topic,
+    })),
+  ]);
+  await writeResult(response);
+}
+
+function onceSignClientEvent(
+  eventName: "session_update" | "session_extend",
+  topic: string,
+): Promise<{ id: number | bigint; topic: string }> {
+  return new Promise((resolve) => {
+    const listener = (event: { id: number | bigint; topic: string }) => {
+      if (event.topic !== topic) {
+        return;
+      }
+      signClient.off(eventName, listener);
+      resolve(event);
+    };
+    signClient.on(eventName, listener);
+  });
+}
+
+function stringifyId(id: number | bigint): string {
+  return typeof id === "bigint" ? id.toString() : String(id);
+}
+
+function stringifyForLog(value: unknown): string {
+  return JSON.stringify(value, (_key, item) =>
+    typeof item === "bigint" ? item.toString() : item,
+  );
 }
 
 function sessionRequestParams(): unknown {

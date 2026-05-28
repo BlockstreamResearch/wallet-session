@@ -2,11 +2,14 @@ use super::{
     approval::{session_proposal_approval_publishes, session_proposal_reject_publish},
     client::{relay_connection_url, validate_pairing_not_expired},
     codec::{
-        decode_session_message_data, decode_session_message_data_unchecked,
-        decode_session_settle_response_data, decode_subscription_data,
-        validate_session_message_payload,
+        decode_session_lifecycle_response_data, decode_session_message_data,
+        decode_session_message_data_unchecked, decode_session_settle_response_data,
+        decode_subscription_data, validate_session_message_payload,
     },
-    session_lifecycle::{session_delete_response_publish, session_ping_response_publish},
+    session_lifecycle::{
+        session_delete_response_publish, session_extend_request_publish,
+        session_ping_response_publish, session_update_request_publish,
+    },
     session_request::{
         session_request_error_publish, session_request_success_publish,
         session_request_validation_error,
@@ -21,10 +24,10 @@ use wc_protocol::{
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
         JsonRpcResponse, RelayProtocolOptions, Session, SessionDeleteParams, SessionDeleteResponse,
-        SessionNamespace, SessionParticipant, SessionPingParams, SessionPingResponse,
-        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult,
-        SessionRequestParams, SessionSettleParams, SessionTransportType, SignMethod,
-        session_ack_response,
+        SessionExtendParams, SessionNamespace, SessionParticipant, SessionPingParams,
+        SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
+        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
+        SessionUpdateParams, SignMethod, session_ack_response,
     },
 };
 
@@ -523,6 +526,76 @@ fn decodes_session_delete() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn decodes_session_update() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = JsonRpcRequest::new(
+        90,
+        SignMethod::SessionUpdate,
+        SessionUpdateParams {
+            namespaces: session.namespaces.clone(),
+        },
+    );
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_UPDATE_REQUEST_TAG),
+    )?;
+
+    let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+    assert_eq!(received.tag(), Some(SESSION_UPDATE_REQUEST_TAG));
+    match received.payload() {
+        SessionPayload::SessionUpdate(request) => {
+            assert_eq!(request.id, 90);
+            assert_eq!(request.params.namespaces, session.namespaces);
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn decodes_session_extend() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let request = JsonRpcRequest::new(
+        91,
+        SignMethod::SessionExtend,
+        SessionExtendParams::default(),
+    );
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_EXTEND_REQUEST_TAG),
+    )?;
+
+    let received = decode_session_message_data(data, &subscription, &session, 4_000_000_000)?;
+
+    assert_eq!(received.tag(), Some(SESSION_EXTEND_REQUEST_TAG));
+    match received.payload() {
+        SessionPayload::SessionExtend(request) => {
+            assert_eq!(request.id, 91);
+            assert_eq!(request.params, SessionExtendParams::default());
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
 fn rejects_session_message_before_acknowledgement() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",
@@ -857,6 +930,169 @@ fn builds_session_delete_response_publish() -> Result<(), Box<dyn std::error::Er
     assert_eq!(publish.tag, SESSION_DELETE_RESPONSE_TAG);
     assert_eq!(response.id, 89);
     assert_eq!(response.result, wc_protocol::session::SessionAck);
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_update_request_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let namespaces = session.namespaces.clone();
+
+    let publish =
+        session_update_request_publish(&subscription, &session, &namespaces, 100, 4_000_000_000)?;
+    let request: JsonRpcRequest<SessionUpdateParams> = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_UPDATE_REQUEST_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_UPDATE_REQUEST_TAG);
+    assert_eq!(request.id, 100);
+    assert_eq!(request.method, SignMethod::SessionUpdate);
+    assert_eq!(request.params.namespaces, namespaces);
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_extend_request_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+
+    let publish = session_extend_request_publish(&subscription, &session, 101, 4_000_000_000)?;
+    let request: JsonRpcRequest<SessionExtendParams> = decrypt_publish(&publish, &sym_key)?;
+
+    assert_eq!(publish.topic, *subscription.topic());
+    assert_eq!(publish.ttl, SESSION_EXTEND_REQUEST_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_EXTEND_REQUEST_TAG);
+    assert_eq!(request.id, 101);
+    assert_eq!(request.method, SignMethod::SessionExtend);
+    assert_eq!(request.params, SessionExtendParams::default());
+
+    Ok(())
+}
+
+#[test]
+fn rejects_outbound_session_lifecycle_before_acknowledgement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let subscription = session_subscription(PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?)?;
+    let session = session_from_subscription(&subscription)?;
+
+    assert!(matches!(
+        session_update_request_publish(
+            &subscription,
+            &session,
+            &session.namespaces,
+            100,
+            4_000_000_000,
+        )
+        .expect_err("pending update should fail"),
+        PairingClientError::SessionNotAcknowledged { .. }
+    ));
+    assert!(matches!(
+        session_extend_request_publish(&subscription, &session, 101, 4_000_000_000)
+            .expect_err("pending extend should fail"),
+        PairingClientError::SessionNotAcknowledged { .. }
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn decodes_session_lifecycle_success_response() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let response = session_ack_response(100);
+    let data = encrypted_subscription_data_for_topic(
+        &response,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_UPDATE_RESPONSE_TAG),
+    )?;
+
+    let received = decode_session_lifecycle_response_data(data, &subscription, 100)?;
+
+    assert_eq!(received.tag(), Some(SESSION_UPDATE_RESPONSE_TAG));
+    match received.payload() {
+        SessionLifecycleResponsePayload::Success(response) => {
+            assert_eq!(response.id, 100);
+            assert_eq!(response.result, wc_protocol::session::SessionAck);
+        }
+        other @ SessionLifecycleResponsePayload::Error(_) => {
+            panic!("unexpected payload: {other:?}")
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn decodes_session_lifecycle_error_response() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let response = JsonRpcErrorResponse::new(
+        101,
+        JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected."),
+    );
+    let data = encrypted_subscription_data_for_topic(
+        &response,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_EXTEND_RESPONSE_TAG),
+    )?;
+
+    let received = decode_session_lifecycle_response_data(data, &subscription, 101)?;
+
+    assert_eq!(received.tag(), Some(SESSION_EXTEND_RESPONSE_TAG));
+    match received.payload() {
+        SessionLifecycleResponsePayload::Error(response) => {
+            assert_eq!(response.id, 101);
+            assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+        }
+        other @ SessionLifecycleResponsePayload::Success(_) => {
+            panic!("unexpected payload: {other:?}")
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn rejects_session_lifecycle_response_with_wrong_id() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let response = session_ack_response(102);
+    let data = encrypted_subscription_data_for_topic(
+        &response,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(SESSION_UPDATE_RESPONSE_TAG),
+    )?;
+
+    assert!(matches!(
+        decode_session_lifecycle_response_data(data, &subscription, 100)
+            .expect_err("wrong response id should fail"),
+        PairingClientError::SessionResponseIdMismatch {
+            expected: 100,
+            actual: 102
+        }
+    ));
 
     Ok(())
 }
