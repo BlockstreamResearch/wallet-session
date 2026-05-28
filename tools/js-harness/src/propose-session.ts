@@ -96,6 +96,9 @@ try {
       case "session_update":
         await startSessionUpdate(session.topic, session.namespaces);
         break;
+      case "session_update_add_permissions":
+        await startSessionUpdate(session.topic, sessionUpdateAddPermissions(session.namespaces));
+        break;
       case "session_extend":
         await startSessionExtend(session.topic);
         break;
@@ -249,6 +252,41 @@ async function startSessionUpdate(
     })),
   ]);
   await writeResult(response);
+}
+
+function sessionUpdateAddPermissions(
+  namespaces: Parameters<typeof signClient.update>[0]["namespaces"],
+): Parameters<typeof signClient.update>[0]["namespaces"] {
+  const next = cloneNamespaces(namespaces);
+  const eip155 = next.eip155 ?? {
+    chains: [],
+    accounts: [],
+    methods: [],
+    events: [],
+  };
+
+  eip155.chains = addUnique(eip155.chains ?? [], "eip155:137");
+  eip155.accounts = addUnique(
+    eip155.accounts,
+    "eip155:137:0x3333333333333333333333333333333333333333",
+  );
+  eip155.methods = addUnique(eip155.methods, "eth_sendTransaction");
+  eip155.events = addUnique(eip155.events, "sessionChanged");
+  next.eip155 = eip155;
+
+  return next;
+}
+
+function cloneNamespaces(
+  namespaces: Parameters<typeof signClient.update>[0]["namespaces"],
+): Parameters<typeof signClient.update>[0]["namespaces"] {
+  return JSON.parse(JSON.stringify(namespaces)) as Parameters<
+    typeof signClient.update
+  >[0]["namespaces"];
+}
+
+function addUnique<T>(values: T[], value: T): T[] {
+  return values.includes(value) ? values : [...values, value];
 }
 
 async function startSessionExtend(topic: string): Promise<void> {

@@ -988,6 +988,9 @@ async fn run_core_client_session_lifecycle_action(
                 | CoreClientSessionLifecycleAction::IncomingUpdatePending
                 | CoreClientSessionLifecycleAction::IncomingUpdateApprove
                 | CoreClientSessionLifecycleAction::IncomingUpdateReject
+                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
+                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
+                | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject
                 | CoreClientSessionLifecycleAction::Update
                 | CoreClientSessionLifecycleAction::Extend
                 | CoreClientSessionLifecycleAction::Event => {}
@@ -995,7 +998,10 @@ async fn run_core_client_session_lifecycle_action(
         }
         CoreClientSessionLifecycleAction::IncomingUpdatePending
         | CoreClientSessionLifecycleAction::IncomingUpdateApprove
-        | CoreClientSessionLifecycleAction::IncomingUpdateReject => {
+        | CoreClientSessionLifecycleAction::IncomingUpdateReject
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
             handle_incoming_client_session_update(client, action).await?;
         }
         CoreClientSessionLifecycleAction::Update => {
@@ -1041,20 +1047,24 @@ async fn handle_incoming_client_session_update(
     print_session_message("core-client-session-lifecycle live_event", message);
     let diff = client.session_update_diff(message)?;
     print_session_update_diff(&diff);
+    assert_session_update_diff(action, &diff)?;
 
     match action {
-        CoreClientSessionLifecycleAction::IncomingUpdatePending => {
+        CoreClientSessionLifecycleAction::IncomingUpdatePending
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsPending => {
             println!(
                 "core-client-session-lifecycle explicit_approval_required=true active_sessions={}",
                 client.active_sessions().len()
             );
         }
-        CoreClientSessionLifecycleAction::IncomingUpdateApprove => {
+        CoreClientSessionLifecycleAction::IncomingUpdateApprove
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove => {
             let response_ack = client.approve_session_update(message).await?;
             println!("core-client-session-lifecycle update_approval_ack={response_ack}");
             print_active_session_namespaces(client)?;
         }
-        CoreClientSessionLifecycleAction::IncomingUpdateReject => {
+        CoreClientSessionLifecycleAction::IncomingUpdateReject
+        | CoreClientSessionLifecycleAction::IncomingUpdateAddPermissionsReject => {
             let response_ack = client
                 .reject_session_update(
                     message,
@@ -1075,6 +1085,27 @@ async fn handle_incoming_client_session_update(
         | CoreClientSessionLifecycleAction::Event => {
             unreachable!("validated incoming update action")
         }
+    }
+
+    Ok(())
+}
+
+fn assert_session_update_diff(
+    action: CoreClientSessionLifecycleAction,
+    diff: &wc_core::SessionNamespacesDiff,
+) -> Result<()> {
+    let Some((expected_added, expected_removed, expected_empty)) = action.expected_update_diff()
+    else {
+        return Ok(());
+    };
+    let added = count_permission_changes(diff.added());
+    let removed = count_permission_changes(diff.removed());
+    let empty = diff.is_empty();
+    if (added, removed, empty) != (expected_added, expected_removed, expected_empty) {
+        bail!(
+            "unexpected session update diff for action {}: expected added={expected_added} removed={expected_removed} empty={expected_empty}, got added={added} removed={removed} empty={empty}",
+            action.label()
+        );
     }
 
     Ok(())
@@ -1197,6 +1228,9 @@ enum CoreClientSessionLifecycleAction {
     IncomingUpdatePending,
     IncomingUpdateApprove,
     IncomingUpdateReject,
+    IncomingUpdateAddPermissionsPending,
+    IncomingUpdateAddPermissionsApprove,
+    IncomingUpdateAddPermissionsReject,
     IncomingExtend,
     Update,
     Extend,
@@ -1213,13 +1247,22 @@ impl CoreClientSessionLifecycleAction {
             "incoming-update" | "incoming-update-pending" => Ok(Self::IncomingUpdatePending),
             "incoming-update-approve" => Ok(Self::IncomingUpdateApprove),
             "incoming-update-reject" => Ok(Self::IncomingUpdateReject),
+            "incoming-update-add-permissions" | "incoming-update-add-permissions-pending" => {
+                Ok(Self::IncomingUpdateAddPermissionsPending)
+            }
+            "incoming-update-add-permissions-approve" => {
+                Ok(Self::IncomingUpdateAddPermissionsApprove)
+            }
+            "incoming-update-add-permissions-reject" => {
+                Ok(Self::IncomingUpdateAddPermissionsReject)
+            }
             "incoming-extend" => Ok(Self::IncomingExtend),
             "update" => Ok(Self::Update),
             "extend" => Ok(Self::Extend),
             "event" => Ok(Self::Event),
             other => {
                 bail!(
-                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-update-approve, incoming-update-reject, incoming-extend, update, extend, or event"
+                    "unknown WC_CORE_SESSION_LIFECYCLE_ACTION={other}; expected ping, delete, incoming-update, incoming-update-approve, incoming-update-reject, incoming-update-add-permissions, incoming-update-add-permissions-approve, incoming-update-add-permissions-reject, incoming-extend, update, extend, or event"
                 )
             }
         }
@@ -1232,6 +1275,9 @@ impl CoreClientSessionLifecycleAction {
             Self::IncomingUpdatePending
             | Self::IncomingUpdateApprove
             | Self::IncomingUpdateReject
+            | Self::IncomingUpdateAddPermissionsPending
+            | Self::IncomingUpdateAddPermissionsApprove
+            | Self::IncomingUpdateAddPermissionsReject
             | Self::Update => "update",
             Self::IncomingExtend | Self::Extend => "extend",
             Self::Event => "event",
@@ -1245,6 +1291,9 @@ impl CoreClientSessionLifecycleAction {
             Self::IncomingUpdatePending
             | Self::IncomingUpdateApprove
             | Self::IncomingUpdateReject => "session_update",
+            Self::IncomingUpdateAddPermissionsPending
+            | Self::IncomingUpdateAddPermissionsApprove
+            | Self::IncomingUpdateAddPermissionsReject => "session_update_add_permissions",
             Self::IncomingExtend => "session_extend",
             Self::Update => "wait_session_update",
             Self::Extend => "wait_session_extend",
@@ -1256,13 +1305,36 @@ impl CoreClientSessionLifecycleAction {
         match self {
             Self::Ping => "session_ping_response",
             Self::Delete => "session_delete_sent",
-            Self::IncomingUpdatePending => "session_update_timeout",
-            Self::IncomingUpdateApprove => "session_update_acknowledged",
-            Self::IncomingUpdateReject => "session_update_error",
+            Self::IncomingUpdatePending | Self::IncomingUpdateAddPermissionsPending => {
+                "session_update_timeout"
+            }
+            Self::IncomingUpdateApprove | Self::IncomingUpdateAddPermissionsApprove => {
+                "session_update_acknowledged"
+            }
+            Self::IncomingUpdateReject | Self::IncomingUpdateAddPermissionsReject => {
+                "session_update_error"
+            }
             Self::IncomingExtend => "session_extend_acknowledged",
             Self::Update => "session_update_received",
             Self::Extend => "session_extend_received",
             Self::Event => "session_event_received",
+        }
+    }
+
+    const fn expected_update_diff(self) -> Option<(usize, usize, bool)> {
+        match self {
+            Self::IncomingUpdatePending
+            | Self::IncomingUpdateApprove
+            | Self::IncomingUpdateReject => Some((0, 0, true)),
+            Self::IncomingUpdateAddPermissionsPending
+            | Self::IncomingUpdateAddPermissionsApprove
+            | Self::IncomingUpdateAddPermissionsReject => Some((4, 0, false)),
+            Self::Ping
+            | Self::Delete
+            | Self::IncomingExtend
+            | Self::Update
+            | Self::Extend
+            | Self::Event => None,
         }
     }
 }
