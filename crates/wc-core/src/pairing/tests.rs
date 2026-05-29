@@ -38,13 +38,14 @@ use wc_protocol::{
     session::{
         AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
         CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
-        JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, RelayProtocolOptions, Session,
-        SessionAuthenticateParams, SessionAuthenticateResult, SessionDeleteParams,
-        SessionDeleteResponse, SessionEvent, SessionEventName, SessionEventParams,
-        SessionExtendParams, SessionExtendResponse, SessionNamespace, SessionParticipant,
-        SessionPingParams, SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
-        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
-        SessionUpdateParams, SessionUpdateResponse, SignMethod, session_ack_response,
+        JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, ProposalRequestsResponses,
+        RelayProtocolOptions, Session, SessionAuthenticateParams, SessionAuthenticateResult,
+        SessionDeleteParams, SessionDeleteResponse, SessionEvent, SessionEventName,
+        SessionEventParams, SessionExtendParams, SessionExtendResponse, SessionNamespace,
+        SessionParticipant, SessionPingParams, SessionPingResponse, SessionProposeErrorResponse,
+        SessionProposeParams, SessionProposeResult, SessionRequestParams, SessionSettleParams,
+        SessionTransportType, SessionUpdateParams, SessionUpdateResponse, SignMethod,
+        session_ack_response,
     },
 };
 
@@ -373,19 +374,16 @@ fn builds_session_proposal_approval_publishes() -> Result<(), Box<dyn std::error
     let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
         "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
     )?);
-    let approval = SessionProposalApproval::new(
-        std::collections::BTreeMap::from([(
-            "eip155".parse()?,
-            SessionNamespace {
-                chains: Some(vec!["eip155:1".parse()?]),
-                accounts: vec!["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?],
-                methods: vec!["personal_sign".parse()?],
-                events: vec!["accountsChanged".parse()?],
-            },
-        )]),
+    let mut approval = SessionProposalApproval::new(
+        approved_eip155_namespaces()?,
         wallet_metadata(),
         4_102_444_800,
     );
+    let cacao = auth_cacao()?;
+    approval.proposal_requests_responses = Some(ProposalRequestsResponses {
+        authentication: Some(vec![cacao.clone()]),
+        wallet_pay: Some(vec![serde_json::json!({"id": "payment-1"})]),
+    });
 
     let publishes =
         session_proposal_approval_publishes(&subscription, &proposal, approval, &responder, 9)?;
@@ -443,6 +441,25 @@ fn builds_session_proposal_approval_publishes() -> Result<(), Box<dyn std::error
     assert_eq!(
         publishes.session.transport_type,
         Some(SessionTransportType::Relay)
+    );
+    assert_eq!(publishes.session.authentication, Some(vec![cacao]));
+    assert_eq!(
+        publishes
+            .session
+            .wallet_pay_result
+            .as_ref()
+            .and_then(|results| results.first())
+            .and_then(|result| result.get("id"))
+            .and_then(serde_json::Value::as_str),
+        Some("payment-1")
+    );
+    assert!(
+        settle_request
+            .params
+            .proposal_requests_responses
+            .as_ref()
+            .and_then(|responses| responses.authentication.as_ref())
+            .is_some_and(|authentication| authentication.len() == 1)
     );
 
     Ok(())
@@ -2056,6 +2073,19 @@ fn wallet_metadata() -> DappMetadata {
         verify_url: None,
         redirect: None,
     }
+}
+
+fn approved_eip155_namespaces()
+-> Result<wc_protocol::session::SessionNamespaces, Box<dyn std::error::Error>> {
+    Ok(std::collections::BTreeMap::from([(
+        "eip155".parse()?,
+        SessionNamespace {
+            chains: Some(vec!["eip155:1".parse()?]),
+            accounts: vec!["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?],
+            methods: vec!["personal_sign".parse()?],
+            events: vec!["accountsChanged".parse()?],
+        },
+    )]))
 }
 
 fn auth_cacao() -> Result<Cacao, Box<dyn std::error::Error>> {

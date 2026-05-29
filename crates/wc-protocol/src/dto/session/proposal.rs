@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    SessionEventName, SessionMethod,
+    AuthPayload, Cacao, CacaoSignatureType, SessionEventName, SessionMethod,
     rpc::{JsonRpcError, JsonRpcErrorResponse},
 };
 use crate::{
@@ -325,10 +325,125 @@ pub struct DappRedirect {
 /// > walletPay?: EngineTypes.WalletPayParams;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposalRequests {
-    /// Authentication subrequests are preserved as JSON until modeled.
+    /// Authentication subrequests requested before session approval.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/proposal.ts#L41-L44>
+    ///
+    /// > requests?: {
+    /// > authentication?: AuthTypes.AuthenticateParams[];
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authentication: Option<Vec<Value>>,
+    pub authentication: Option<Vec<ProposalAuthRequest>>,
     /// `WalletPay` subrequest is preserved as JSON until modeled.
     #[serde(rename = "walletPay", default, skip_serializing_if = "Option::is_none")]
     pub wallet_pay: Option<Value>,
+}
+
+/// Authentication subrequest embedded in `wc_sessionPropose`.
+///
+/// The maintained Sign Client maps public `connect({ authentication })` input
+/// into this flat protocol object.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L302-L333>
+///
+/// > requests: {
+/// > authentication: authentication?.map((auth) => {
+/// > const protocolParams: AuthTypes.AuthenticateParams = {
+/// > domain,
+/// > chains,
+/// > nonce,
+///
+/// The extra `signatureTypes` field is part of the auth subrequest type, but
+/// not part of `authPayload` sent by `wc_sessionAuthenticate`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L176-L191>
+///
+/// > interface AuthenticateParams {
+/// > domain: string;
+/// > chains: string[];
+/// > signatureTypes?: Record<string, string[]>;
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::session::{CacaoSignatureType, ProposalAuthRequest};
+///
+/// let json = r#"{
+///   "type": "caip122",
+///   "chains": ["eip155:1"],
+///   "aud": "https://example.com/login",
+///   "domain": "example.com",
+///   "version": "1",
+///   "nonce": "proposal-auth-nonce-001",
+///   "iat": "2026-05-29T11:43:58.877Z",
+///   "statement": "Sign in to Example",
+///   "resources": ["https://example.com/resource/1"],
+///   "signatureTypes": {"eip155:1": ["eip191"]}
+/// }"#;
+///
+/// let request = serde_json::from_str::<ProposalAuthRequest>(json)?;
+/// assert_eq!(request.auth_payload.domain, "example.com");
+/// let chain = "eip155:1".parse()?;
+/// assert_eq!(
+///     request.signature_types_for_chain(&chain),
+///     Some([CacaoSignatureType::Eip191].as_slice()),
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalAuthRequest {
+    /// CAIP-122/CACAO payload that the wallet may sign before approval.
+    #[serde(flatten)]
+    pub auth_payload: AuthPayload,
+    /// Signature types accepted by the dapp, keyed by CAIP-2 chain ID.
+    #[serde(
+        rename = "signatureTypes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub signature_types: Option<ProposalAuthSignatureTypes>,
+}
+
+impl ProposalAuthRequest {
+    /// Returns requested signature types for one CAIP-2 chain.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L188-L190>
+    ///
+    /// > resources?: string[];
+    /// > signatureTypes?: Record<string, string[]>;
+    #[must_use]
+    pub fn signature_types_for_chain(&self, chain: &Caip2ChainId) -> Option<&[CacaoSignatureType]> {
+        self.signature_types
+            .as_ref()
+            .and_then(|signature_types| signature_types.get(chain).map(Vec::as_slice))
+    }
+}
+
+/// Proposal authentication signature-type preferences keyed by CAIP-2 chain ID.
+pub type ProposalAuthSignatureTypes = BTreeMap<Caip2ChainId, Vec<CacaoSignatureType>>;
+
+/// Responses to proposal subrequests included in `wc_sessionSettle`.
+///
+/// Current TypeScript clients pass this object through approval into
+/// `wc_sessionSettle`, then copy its values into stored session fields.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/engine.ts#L108-L121>
+///
+/// > type ProposalRequestsResponses = {
+/// > authentication?: AuthTypes.Cacao[];
+/// > walletPay?: WalletPayResult[];
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L482-L491>
+///
+/// > const sessionSettle = {
+/// > relay: { protocol: relayProtocol ?? "irn" },
+/// > namespaces,
+/// > proposalRequestsResponses,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalRequestsResponses {
+    /// CACAO responses signed for proposal authentication subrequests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<Vec<Cacao>>,
+    /// `WalletPay` results are preserved as JSON until modeled.
+    #[serde(rename = "walletPay", default, skip_serializing_if = "Option::is_none")]
+    pub wallet_pay: Option<Vec<Value>>,
 }

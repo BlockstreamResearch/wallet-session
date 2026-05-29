@@ -5,11 +5,12 @@ use wc_protocol::{
     pairing_message::PairingMessage,
     relay::RelayTopic,
     session::{
-        DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, ScopedProperties,
-        Session, SessionAckResponse, SessionAuthenticateParams, SessionConfig, SessionDeleteParams,
-        SessionEventParams, SessionExtendParams, SessionNamespaces, SessionPingParams,
-        SessionProperties, SessionProposeParams, SessionRequestParams, SessionSettleResponse,
-        SessionUpdateParams, SignMethod,
+        DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, ProposalRequestsResponses,
+        RelayProtocolOptions, ScopedProperties, Session, SessionAckResponse,
+        SessionAuthenticateParams, SessionConfig, SessionDeleteParams, SessionEventParams,
+        SessionExtendParams, SessionNamespaces, SessionPingParams, SessionProperties,
+        SessionProposeParams, SessionRequestParams, SessionSettleResponse, SessionUpdateParams,
+        SignMethod,
     },
 };
 
@@ -33,7 +34,7 @@ pub struct SessionProposalApproval {
     /// Optional session configuration.
     pub session_config: Option<SessionConfig>,
     /// Optional proposal subrequest responses.
-    pub proposal_requests_responses: Option<serde_json::Value>,
+    pub proposal_requests_responses: Option<ProposalRequestsResponses>,
 }
 
 impl SessionProposalApproval {

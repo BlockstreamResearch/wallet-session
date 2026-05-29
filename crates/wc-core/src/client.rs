@@ -7,9 +7,10 @@ use std::{
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, Session,
-        SessionAuthenticateParams, SessionDeleteParams, SessionEventParams, SessionNamespaces,
-        SessionParticipant, SessionProposeParams, SessionTransportType,
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, ProposalAuthRequest,
+        RelayProtocolOptions, Session, SessionAuthenticateParams, SessionDeleteParams,
+        SessionEventParams, SessionNamespaces, SessionParticipant, SessionProposeParams,
+        SessionTransportType,
     },
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
@@ -1275,6 +1276,23 @@ impl SingleSessionProposal {
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest<SessionProposeParams> {
         &self.request
+    }
+
+    /// Authentication subrequests embedded in this proposal.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L302-L333>
+    ///
+    /// > requests: {
+    /// > authentication: authentication?.map((auth) => {
+    /// > const protocolParams: AuthTypes.AuthenticateParams = {
+    #[must_use]
+    pub fn authentication_requests(&self) -> &[ProposalAuthRequest] {
+        self.request
+            .params
+            .requests
+            .as_ref()
+            .and_then(|requests| requests.authentication.as_deref())
+            .unwrap_or(&[])
     }
 
     /// Original decrypted pairing-topic message.

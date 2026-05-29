@@ -88,6 +88,7 @@ pub(super) fn session_proposal_approval_publishes(
         public_key: responder.public_key().clone(),
         metadata: approval.wallet_metadata.clone(),
     };
+    let proposal_requests_responses = approval.proposal_requests_responses.clone();
     let session = Session {
         topic: session_topic.clone(),
         pairing_topic: subscription.topic.clone(),
@@ -106,8 +107,12 @@ pub(super) fn session_proposal_approval_publishes(
             public_key: proposal.params.proposer.public_key.clone(),
             metadata: proposal.params.proposer.metadata.clone(),
         },
-        authentication: None,
-        wallet_pay_result: None,
+        authentication: proposal_requests_responses
+            .as_ref()
+            .and_then(|responses| responses.authentication.clone()),
+        wallet_pay_result: proposal_requests_responses
+            .as_ref()
+            .and_then(|responses| responses.wallet_pay.clone()),
         transport_type: Some(SessionTransportType::Relay),
     };
 

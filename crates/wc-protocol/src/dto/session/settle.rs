@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::{
-    RelayProtocolOptions, ScopedProperties, SessionConfig, SessionEventName, SessionMethod,
-    SessionNamespaces, SessionParticipant, SessionProperties,
+    ProposalRequestsResponses, RelayProtocolOptions, ScopedProperties, SessionConfig,
+    SessionEventName, SessionMethod, SessionNamespaces, SessionParticipant, SessionProperties,
 };
 
 /// Decrypted `wc_sessionSettle` params.
@@ -105,13 +104,20 @@ pub struct SessionSettleParams {
         skip_serializing_if = "Option::is_none"
     )]
     pub special_namespaces: Option<SpecialNamespaces>,
-    /// Experimental proposal subrequest responses from the JavaScript client.
+    /// Proposal subrequest responses copied from approval.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L482-L491>
+    ///
+    /// > const sessionSettle = {
+    /// > relay: { protocol: relayProtocol ?? "irn" },
+    /// > namespaces,
+    /// > proposalRequestsResponses,
     #[serde(
         rename = "proposalRequestsResponses",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub proposal_requests_responses: Option<Value>,
+    pub proposal_requests_responses: Option<ProposalRequestsResponses>,
 }
 
 impl SessionSettleParams {

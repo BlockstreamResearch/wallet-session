@@ -4,8 +4,8 @@ use serde_json::json;
 
 use super::{account, account_strings, chain, chain_strings, event_name, method, public_key};
 use wc_protocol::session::{
-    DappMetadata, JsonRpcRequest, RelayProtocolOptions, SessionConfig, SessionNamespace,
-    SessionParticipant, SessionSettleParams, SignMethod, SpecialNamespace,
+    DappMetadata, JsonRpcRequest, ProposalRequestsResponses, RelayProtocolOptions, SessionConfig,
+    SessionNamespace, SessionParticipant, SessionSettleParams, SignMethod, SpecialNamespace,
 };
 
 const LIVE_SESSION_SETTLE_JSON: &str = r#"{
@@ -131,10 +131,10 @@ fn serializes_current_optional_fields() {
                     events: vec![],
                 },
             )])),
-            proposal_requests_responses: Some(json!({
-                "authentication": [],
-                "walletPay": []
-            })),
+            proposal_requests_responses: Some(ProposalRequestsResponses {
+                authentication: Some(vec![]),
+                wallet_pay: Some(vec![]),
+            }),
         },
     );
 

@@ -6,10 +6,10 @@ use super::{chain_strings, public_key};
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
-        JsonRpcResponse, ProposalNamespaces, ProposalRequests, Proposer, RelayProtocolOptions,
-        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult, SignMethod,
-        session_propose_error_response,
+        CacaoSignatureType, DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse,
+        JsonRpcRequest, JsonRpcResponse, ProposalAuthRequest, ProposalNamespaces, ProposalRequests,
+        Proposer, RelayProtocolOptions, SessionProposeErrorResponse, SessionProposeParams,
+        SessionProposeResult, SignMethod, session_propose_error_response,
     },
 };
 
@@ -181,6 +181,51 @@ const LIVE_SESSION_PROPOSE_STRING_ERROR_JSON: &str = r#"{
   }
 }"#;
 
+const LIVE_SESSION_PROPOSE_WITH_AUTHENTICATION_JSON: &str = r#"{
+  "id": 1780055038877815,
+  "jsonrpc": "2.0",
+  "method": "wc_sessionPropose",
+  "params": {
+    "expiryTimestamp": 1780055338,
+    "id": 1780055038877815,
+    "optionalNamespaces": {
+      "eip155": {
+        "chains": ["eip155:1"],
+        "events": ["accountsChanged"],
+        "methods": ["personal_sign"]
+      }
+    },
+    "pairingTopic": "f57feb3b2105286aa72028d51090dc86d6c4caeb10c4342e21ed3f045d53713a",
+    "proposer": {
+      "metadata": {
+        "description": "Live proposal auth subrequest generator for Rust probes",
+        "icons": ["https://walletconnect.com/walletconnect-logo.png"],
+        "name": "walletconnect-client-poc JS auth proposal harness",
+        "url": "https://github.com/BlockstreamResearch/walletconnect-client-poc"
+      },
+      "publicKey": "19baf2b76e92b5aeaa438520fbcaf78f5045e2d1a63d779d025f9d0502b47966"
+    },
+    "relays": [{"protocol": "irn"}],
+    "requests": {
+      "authentication": [
+        {
+          "aud": "https://example.com/login",
+          "chains": ["eip155:1"],
+          "domain": "example.com",
+          "iat": "2026-05-29T11:43:58.877Z",
+          "nonce": "proposal-auth-nonce-001",
+          "resources": ["https://example.com/resource/1"],
+          "signatureTypes": {"eip155:1": ["eip191"]},
+          "statement": "Sign in to Example",
+          "type": "caip122",
+          "version": "1"
+        }
+      ]
+    },
+    "requiredNamespaces": {}
+  }
+}"#;
+
 #[test]
 fn deserializes_spec_event_shape() {
     let request =
@@ -320,7 +365,19 @@ fn serializes_current_type_names() {
             attestation: Some("attestation-jwt".to_owned()),
             encrypted_id: Some("encrypted-id".to_owned()),
             requests: Some(ProposalRequests {
-                authentication: Some(vec![json!({"chains": ["eip155:1"]})]),
+                authentication: Some(vec![
+                    serde_json::from_value::<ProposalAuthRequest>(json!({
+                        "type": "caip122",
+                        "chains": ["eip155:1"],
+                        "aud": "https://example.com/login",
+                        "domain": "example.com",
+                        "version": "1",
+                        "nonce": "proposal-auth-nonce-001",
+                        "iat": "2026-05-29T11:43:58.877Z",
+                        "signatureTypes": {"eip155:1": ["eip191"]}
+                    }))
+                    .expect("auth request parses"),
+                ]),
                 wallet_pay: Some(json!({"version": "1"})),
             }),
         },
@@ -346,6 +403,41 @@ fn serializes_current_type_names() {
         Some("encrypted-id")
     );
     assert!(value["params"].get("expiry").is_none());
+}
+
+#[test]
+fn deserializes_live_proposal_authentication_subrequest_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = serde_json::from_str::<JsonRpcRequest<SessionProposeParams>>(
+        LIVE_SESSION_PROPOSE_WITH_AUTHENTICATION_JSON,
+    )?;
+
+    let auth_requests = request
+        .params
+        .requests
+        .as_ref()
+        .and_then(|requests| requests.authentication.as_ref())
+        .expect("authentication requests");
+    let auth = &auth_requests[0];
+    let chain: wc_protocol::caip::Caip2ChainId = "eip155:1".parse()?;
+
+    assert_eq!(auth.auth_payload.kind.as_str(), "caip122");
+    assert_eq!(auth.auth_payload.domain, "example.com");
+    assert_eq!(auth.auth_payload.aud, "https://example.com/login");
+    assert_eq!(auth.auth_payload.nonce, "proposal-auth-nonce-001");
+    assert_eq!(auth.auth_payload.chains, vec![chain.clone()]);
+    assert_eq!(
+        auth.signature_types_for_chain(&chain),
+        Some([CacaoSignatureType::Eip191].as_slice())
+    );
+
+    let value = serde_json::to_value(&request)?;
+    assert_eq!(
+        value["params"]["requests"]["authentication"][0]["signatureTypes"]["eip155:1"],
+        json!(["eip191"])
+    );
+
+    Ok(())
 }
 
 #[test]
