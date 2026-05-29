@@ -133,6 +133,18 @@ struct VerifyProbeArgs {
     #[arg(long, value_name = "HASH")]
     hash: Option<String>,
 
+    #[arg(long)]
+    public_key: bool,
+
+    #[arg(long, value_name = "JWT")]
+    attestation_jwt: Option<String>,
+
+    #[arg(long, value_name = "ID")]
+    encrypted_id: Option<String>,
+
+    #[arg(long, value_name = "SECONDS")]
+    now_unix_seconds: Option<u64>,
+
     #[arg(long, value_name = "URL")]
     metadata_url: Option<String>,
 
@@ -184,6 +196,10 @@ impl From<VerifyProbeArgs> for probe::verify::VerifyProbeArgs {
     fn from(args: VerifyProbeArgs) -> Self {
         Self {
             hash: args.hash,
+            public_key: args.public_key,
+            attestation_jwt: args.attestation_jwt,
+            encrypted_id: args.encrypted_id,
+            now_unix_seconds: args.now_unix_seconds,
             metadata_url: args.metadata_url,
             verify_url: args.verify_url,
         }
