@@ -442,6 +442,8 @@ pub struct SessionReceivedMessage {
     pub(super) encoded_message_len: usize,
     pub(super) plaintext_len: usize,
     pub(super) verify_attestation_hash: VerifyAttestationHash,
+    pub(super) verify_attestation_jwt: Option<String>,
+    pub(super) verify_encrypted_id: Option<String>,
     pub(super) published_at: u64,
     pub(super) tag: Option<u64>,
     pub(super) payload: SessionPayload,
@@ -651,6 +653,22 @@ impl SessionReceivedMessage {
         &self.verify_attestation_hash
     }
 
+    /// Relay-carried Verify v3 JWT and encrypted identifier, when both exist.
+    ///
+    /// The pair is kept together because the JWT is accepted only when its
+    /// payload `id` equals the relay-provided `encryptedId`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L123>
+    ///
+    /// > const { attestationId, hash, encryptedId } = params;
+    /// > if (decoded.payload.id !== encryptedId) return;
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.verify_attestation_jwt
+            .as_deref()
+            .zip(self.verify_encrypted_id.as_deref())
+    }
+
     /// Relay server publish timestamp in milliseconds.
     #[must_use]
     pub const fn published_at(&self) -> u64 {
@@ -738,6 +756,8 @@ pub struct PairingReceivedMessage {
     pub(super) encoded_message_len: usize,
     pub(super) published_at: u64,
     pub(super) tag: Option<u64>,
+    pub(super) verify_attestation_jwt: Option<String>,
+    pub(super) verify_encrypted_id: Option<String>,
     pub(super) message: PairingMessage,
     pub(super) payload: PairingPayload,
 }
@@ -765,6 +785,22 @@ impl PairingReceivedMessage {
     #[must_use]
     pub const fn tag(&self) -> Option<u64> {
         self.tag
+    }
+
+    /// Relay-carried Verify v3 JWT and encrypted identifier, when both exist.
+    ///
+    /// Session proposals may also carry these fields in params, but the relay
+    /// event path provides them beside the encrypted payload.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2128-L2133>
+    ///
+    /// > attestationId: attestation,
+    /// > encryptedId,
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.verify_attestation_jwt
+            .as_deref()
+            .zip(self.verify_encrypted_id.as_deref())
     }
 
     /// Decrypted and classified pairing-topic payload.

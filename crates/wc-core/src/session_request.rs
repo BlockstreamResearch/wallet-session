@@ -72,6 +72,8 @@ pub struct SessionRequestReview {
     published_at: u64,
     verify_context: VerifyContext,
     verify_attestation_hash: Option<VerifyAttestationHash>,
+    verify_attestation_jwt: Option<String>,
+    verify_encrypted_id: Option<String>,
 }
 
 impl SessionRequestReview {
@@ -111,6 +113,12 @@ impl SessionRequestReview {
             request,
             verify_context,
             Some(message.verify_attestation_hash().clone()),
+            message
+                .verify_jwt_attestation()
+                .map(|(jwt, _encrypted_id)| jwt.to_owned()),
+            message
+                .verify_jwt_attestation()
+                .map(|(_jwt, encrypted_id)| encrypted_id.to_owned()),
         )
     }
 
@@ -125,6 +133,8 @@ impl SessionRequestReview {
             published_at,
             request,
             VerifyContext::unknown("", DEFAULT_VERIFY_URL),
+            None,
+            None,
             None,
         )
     }
@@ -142,6 +152,8 @@ impl SessionRequestReview {
             request,
             verify_context,
             None,
+            None,
+            None,
         )
     }
 
@@ -151,6 +163,8 @@ impl SessionRequestReview {
         request: &JsonRpcRequest<SessionRequestParams>,
         verify_context: VerifyContext,
         verify_attestation_hash: Option<VerifyAttestationHash>,
+        verify_attestation_jwt: Option<String>,
+        verify_encrypted_id: Option<String>,
     ) -> Result<Self, SessionRequestReviewError> {
         if request.method != SignMethod::SessionRequest {
             return Err(SessionRequestReviewError::MethodMismatch {
@@ -168,6 +182,8 @@ impl SessionRequestReview {
             published_at,
             verify_context,
             verify_attestation_hash,
+            verify_attestation_jwt,
+            verify_encrypted_id,
         })
     }
 
@@ -233,6 +249,22 @@ impl SessionRequestReview {
         self.verify_attestation_hash.as_ref()
     }
 
+    /// Relay-carried Verify v3 JWT and encrypted identifier, when retained.
+    ///
+    /// Reviews built from a decrypted relay message can use this pair before
+    /// falling back to hash-based Verify resolution.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2456-L2468>
+    ///
+    /// > const { topic, payload, attestation, encryptedId, transportType } = args;
+    /// > hash: hashMessage(JSON.stringify(formatJsonRpcRequest("wc_sessionRequest", params, id))),
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.verify_attestation_jwt
+            .as_deref()
+            .zip(self.verify_encrypted_id.as_deref())
+    }
+
     /// Current policy classification for `verify_context`.
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
@@ -257,6 +289,43 @@ impl SessionRequestReview {
             .await
             .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
         Ok(&self.verify_context)
+    }
+
+    /// Resolves Verify context from a retained relay JWT, then falls back to hash.
+    ///
+    /// The explicit clock keeps expiry handling deterministic for tests and
+    /// callers. JWT verification errors are surfaced instead of silently using
+    /// the hash resolver, because a malformed relay-provided JWT is a distinct
+    /// trust signal.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L137>
+    ///
+    /// > if (decoded.payload.id !== encryptedId) return;
+    /// > const validation = await this.isValidJwtAttestation(attestationId);
+    pub async fn resolve_verify_context_at(
+        &mut self,
+        resolver: &VerifyResolver,
+        now_unix_seconds: u64,
+    ) -> Result<&VerifyContext, SessionRequestVerifyResolutionError> {
+        if let Some((attestation_jwt, encrypted_id)) =
+            self.verify_jwt_attestation()
+                .map(|(attestation_jwt, encrypted_id)| {
+                    (attestation_jwt.to_owned(), encrypted_id.to_owned())
+                })
+        {
+            self.verify_context = resolver
+                .resolve_jwt_for_context(
+                    &attestation_jwt,
+                    &encrypted_id,
+                    &self.verify_context,
+                    now_unix_seconds,
+                )
+                .await
+                .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
+            return Ok(&self.verify_context);
+        }
+
+        self.resolve_verify_context(resolver).await
     }
 
     /// Resolves Verify context with a caller-provided SDK-compatible hash.
@@ -360,6 +429,7 @@ mod tests {
         assert_eq!(review.published_at(), 1_700_000_000_000);
         assert_eq!(review.verify_context().verified.origin, "");
         assert!(review.verify_attestation_hash().is_none());
+        assert!(review.verify_jwt_attestation().is_none());
         assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(!review.is_expired_at(1_700_000_299));
         assert!(review.is_expired_at(1_700_000_300));

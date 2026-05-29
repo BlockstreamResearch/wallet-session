@@ -136,6 +136,38 @@ impl VerifyResolver {
         ))
     }
 
+    /// Resolves a Verify context from a relay-carried Verify v3 JWT.
+    ///
+    /// Use this for events that include both `attestation` and `encryptedId`
+    /// beside the encrypted relay payload. The JWT is verified with the Verify
+    /// v3 public key before it can change the context.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L137>
+    ///
+    /// > const { attestationId, hash, encryptedId } = params;
+    /// > if (decoded.payload.id !== encryptedId) return;
+    /// > const validation = await this.isValidJwtAttestation(attestationId);
+    pub async fn resolve_jwt_for_context(
+        &self,
+        attestation_jwt: &str,
+        encrypted_id: &str,
+        context: &VerifyContext,
+        now_unix_seconds: u64,
+    ) -> Result<VerifyContext, VerifyResolverError> {
+        let Some(attestation) = self
+            .resolve_jwt_attestation(attestation_jwt, encrypted_id, now_unix_seconds)
+            .await?
+        else {
+            return Ok(context.clone());
+        };
+
+        Ok(context_from_attestation(
+            context.clone(),
+            &attestation,
+            &context.verified.origin,
+        ))
+    }
+
     /// Fetches a hash-based attestation from a trusted Verify endpoint.
     ///
     /// HTTP 404 and other non-200 responses mean the server has no usable
@@ -495,7 +527,9 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
-    use wc_protocol::verify::{ALTERNATE_VERIFY_URL, DEFAULT_VERIFY_URL, VerifyAttestationHash};
+    use wc_protocol::verify::{
+        ALTERNATE_VERIFY_URL, DEFAULT_VERIFY_URL, VerifyAttestationHash, VerifyContext,
+    };
 
     use super::{VerifyResolver, trusted_verify_url};
     use crate::VerifyContextRisk;
@@ -672,6 +706,34 @@ mod tests {
         assert_eq!(attestation.origin, "https://example.com");
         assert_eq!(attestation.is_scam, Some(false));
         assert_eq!(server.take_request().await, "/public-key");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolver_maps_verified_jwt_to_context() -> Result<(), Box<dyn std::error::Error>> {
+        let server = VerifyTestServer::new(200, FIXTURE_PUBLIC_KEY_BODY).await?;
+        let resolver = VerifyResolver::with_timeout_and_trusted_urls_and_verify_v3_url(
+            std::time::Duration::from_secs(2),
+            Vec::new(),
+            server.url(),
+        )?;
+        let context = VerifyContext::unknown("https://example.com/path", DEFAULT_VERIFY_URL);
+
+        let context = resolver
+            .resolve_jwt_for_context(
+                FIXTURE_VERIFIED_JWT,
+                FIXTURE_ENCRYPTED_ID,
+                &context,
+                1_700_000_000,
+            )
+            .await?;
+
+        assert_eq!(context.verified.origin, "https://example.com");
+        assert_eq!(
+            crate::classify_verify_context(&context),
+            VerifyContextRisk::Valid
+        );
 
         Ok(())
     }

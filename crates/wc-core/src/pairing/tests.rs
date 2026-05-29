@@ -98,6 +98,8 @@ fn decodes_subscription_data_with_pairing_key() -> Result<(), Box<dyn std::error
         message: envelope.encode(EnvelopeEncoding::Base64),
         published_at: 1_700_000_000_000,
         tag: Some(1100),
+        attestation: Some("verify-jwt".to_owned()),
+        encrypted_id: Some("encrypted-id".to_owned()),
     };
 
     let received = decode_subscription_data(data, &sym_key)?;
@@ -105,6 +107,10 @@ fn decodes_subscription_data_with_pairing_key() -> Result<(), Box<dyn std::error
     assert!(received.encoded_message_len() > plaintext.len());
     assert_eq!(received.published_at(), 1_700_000_000_000);
     assert_eq!(received.tag(), Some(1100));
+    assert_eq!(
+        received.verify_jwt_attestation(),
+        Some(("verify-jwt", "encrypted-id"))
+    );
     assert_eq!(received.message().plaintext(), plaintext);
     assert!(matches!(received.payload(), PairingPayload::PairingPing(_)));
 
@@ -716,6 +722,40 @@ fn decodes_session_request_with_exact_verify_hash() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn decodes_session_request_with_verify_jwt_metadata() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let plaintext = r#"{"id":7,"jsonrpc":"2.0","method":"wc_sessionRequest","params":{"request":{"method":"personal_sign","params":[]},"chainId":"eip155:1"}}"#;
+    let envelope = Envelope::encrypt_type_0(plaintext, &sym_key)?;
+    let data = IrnSubscriptionData {
+        topic: subscription.topic().clone(),
+        message: envelope.encode(EnvelopeEncoding::Base64),
+        published_at: 1_700_000_000_000,
+        tag: Some(1108),
+        attestation: Some("verify-jwt".to_owned()),
+        encrypted_id: Some("encrypted-id".to_owned()),
+    };
+
+    let received = decode_session_message_data(data, &subscription, &session, 1_700_000_000)?;
+    let review = crate::SessionRequestReview::from_message(&received)?;
+
+    assert_eq!(
+        received.verify_jwt_attestation(),
+        Some(("verify-jwt", "encrypted-id"))
+    );
+    assert_eq!(
+        review.verify_jwt_attestation(),
+        Some(("verify-jwt", "encrypted-id"))
+    );
+
+    Ok(())
+}
+
+#[test]
 fn decodes_session_ping() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",
@@ -928,6 +968,8 @@ fn classifies_session_request_as_client_event() -> Result<(), Box<dyn std::error
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(session_request(
@@ -992,6 +1034,8 @@ fn classifies_unparsed_session_payload_as_unsupported() -> Result<(), Box<dyn st
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::Sign(SignMethod::SessionPing),
@@ -1024,6 +1068,8 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
         encoded_message_len: envelope.encode(EnvelopeEncoding::Base64).len(),
         published_at: 1_779_954_250_000,
         tag: Some(1100),
+        verify_attestation_jwt: Some("relay-verify-jwt".to_owned()),
+        verify_encrypted_id: Some("relay-encrypted-id".to_owned()),
         message: PairingMessage::decode_relay_message(
             &envelope.encode(EnvelopeEncoding::Base64),
             &sym_key,
@@ -1046,6 +1092,10 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
                 "https://example.com"
             );
             assert_eq!(proposal.verify_risk(), crate::VerifyContextRisk::Unknown);
+            assert_eq!(
+                proposal.verify_jwt_attestation(),
+                Some(("relay-verify-jwt", "relay-encrypted-id"))
+            );
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -1066,6 +1116,8 @@ fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::
         encoded_message_len: envelope.encode(EnvelopeEncoding::Base64).len(),
         published_at: 1_779_954_250_000,
         tag: Some(1116),
+        verify_attestation_jwt: Some("relay-verify-jwt".to_owned()),
+        verify_encrypted_id: Some("relay-encrypted-id".to_owned()),
         message: PairingMessage::decode_relay_message(
             &envelope.encode(EnvelopeEncoding::Base64),
             &sym_key,
@@ -1090,6 +1142,10 @@ fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::
             assert_eq!(
                 authenticate.verify_risk(),
                 crate::VerifyContextRisk::Unknown
+            );
+            assert_eq!(
+                authenticate.verify_jwt_attestation(),
+                Some(("relay-verify-jwt", "relay-encrypted-id"))
             );
         }
         other => panic!("unexpected event: {other:?}"),
@@ -1398,6 +1454,8 @@ fn builds_session_ping_response_publish() -> Result<(), Box<dyn std::error::Erro
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::SessionPing(JsonRpcRequest::new(
@@ -1431,6 +1489,8 @@ fn builds_session_update_response_publish() -> Result<(), Box<dyn std::error::Er
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1104),
         payload: SessionPayload::SessionUpdate(JsonRpcRequest::new(
@@ -1466,6 +1526,8 @@ fn builds_session_update_error_publish() -> Result<(), Box<dyn std::error::Error
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1104),
         payload: SessionPayload::SessionUpdate(JsonRpcRequest::new(
@@ -1507,6 +1569,8 @@ fn builds_session_extend_response_publish() -> Result<(), Box<dyn std::error::Er
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1106),
         payload: SessionPayload::SessionExtend(JsonRpcRequest::new(
@@ -1539,6 +1603,8 @@ fn builds_session_delete_response_publish() -> Result<(), Box<dyn std::error::Er
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1112),
         payload: SessionPayload::SessionDelete(JsonRpcRequest::new(
@@ -1836,6 +1902,8 @@ fn rejects_session_request_response_for_wrong_topic() -> Result<(), Box<dyn std:
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(request)),
@@ -1860,6 +1928,8 @@ fn rejects_non_request_session_response_target() -> Result<(), Box<dyn std::erro
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::Sign(SignMethod::SessionPing),
@@ -1888,6 +1958,8 @@ fn rejects_non_ping_session_response_target() -> Result<(), Box<dyn std::error::
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(session_request(
@@ -1917,6 +1989,8 @@ fn rejects_non_delete_session_response_target() -> Result<(), Box<dyn std::error
         encoded_message_len: 1,
         plaintext_len: 1,
         verify_attestation_hash: placeholder_verify_hash(),
+        verify_attestation_jwt: None,
+        verify_encrypted_id: None,
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::SessionPing(JsonRpcRequest::new(
@@ -1973,6 +2047,8 @@ fn encrypted_subscription_data_from_plaintext_for_topic(
         message: envelope.encode(EnvelopeEncoding::Base64),
         published_at: 1_779_954_250_000,
         tag,
+        attestation: None,
+        encrypted_id: None,
     })
 }
 

@@ -462,6 +462,28 @@ pub struct IrnSubscriptionData {
     /// Message classifier; the live relay may omit it on delivery.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<u64>,
+    /// Verify JWT forwarded with the relay message.
+    ///
+    /// The maintained Sign Client receives Verify v3 metadata beside the
+    /// encrypted payload before resolving `verifyContext`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2456-L2461>
+    ///
+    /// > const { topic, payload, attestation, encryptedId, transportType } = args;
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<String>,
+    /// Verify encrypted identifier matched against the JWT payload `id`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L123>
+    ///
+    /// > const { attestationId, hash, encryptedId } = params;
+    /// > if (decoded.payload.id !== encryptedId) return;
+    #[serde(
+        rename = "encryptedId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub encrypted_id: Option<String>,
 }
 
 /// `irn_fetchMessages` params.
@@ -769,6 +791,8 @@ mod tests {
                     "topic": "185355c71cc41c2891b71fdb80d6f13730f78cd8b47bf90e26eae52b55904f4b",
                     "message": "hello",
                     "publishedAt": 1_779_792_668_077_u64,
+                    "attestation": "verify-jwt",
+                    "encryptedId": "encrypted-id",
                 },
             },
         });
@@ -779,5 +803,13 @@ mod tests {
         assert_eq!(request.method(), "irn_subscription");
         assert_eq!(request.params.data.message, "hello");
         assert_eq!(request.params.data.tag, None);
+        assert_eq!(
+            request.params.data.attestation.as_deref(),
+            Some("verify-jwt")
+        );
+        assert_eq!(
+            request.params.data.encrypted_id.as_deref(),
+            Some("encrypted-id")
+        );
     }
 }

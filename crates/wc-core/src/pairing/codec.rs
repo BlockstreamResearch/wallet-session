@@ -29,6 +29,8 @@ pub(super) fn decode_subscription_data(
     sym_key: &PairingSymKey,
 ) -> Result<PairingReceivedMessage, PairingClientError> {
     let encoded_message_len = data.message.len();
+    let verify_attestation_jwt = data.attestation;
+    let verify_encrypted_id = data.encrypted_id;
     let message = PairingMessage::decode_relay_message(&data.message, sym_key)
         .map_err(|source| PairingClientError::PairingMessage { source })?;
     let payload = parse_pairing_payload(&message)?;
@@ -38,6 +40,8 @@ pub(super) fn decode_subscription_data(
         encoded_message_len,
         published_at: data.published_at,
         tag: data.tag,
+        verify_attestation_jwt,
+        verify_encrypted_id,
         message,
         payload,
     })
@@ -147,6 +151,8 @@ pub(super) fn decode_session_message_data_unchecked(
     let topic = data.topic;
     let published_at = data.published_at;
     let tag = data.tag;
+    let verify_attestation_jwt = data.attestation;
+    let verify_encrypted_id = data.encrypted_id;
 
     validate_session_message_route(&topic, subscription, session, now_unix_seconds)?;
 
@@ -166,6 +172,8 @@ pub(super) fn decode_session_message_data_unchecked(
         encoded_message_len,
         plaintext_len,
         verify_attestation_hash,
+        verify_attestation_jwt,
+        verify_encrypted_id,
         published_at,
         tag,
         payload,

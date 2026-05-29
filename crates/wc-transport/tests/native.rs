@@ -191,6 +191,8 @@ async fn native_transport_acknowledges_subscription_push() {
                 message: "encrypted-payload".to_owned(),
                 published_at: 1_779_882_524_426,
                 tag: None,
+                attestation: None,
+                encrypted_id: None,
             },
         },
     };

@@ -1307,6 +1307,27 @@ impl SingleSessionProposal {
         &self.verify_context
     }
 
+    /// Relay- or proposal-carried Verify v3 JWT and encrypted identifier.
+    ///
+    /// The protocol DTO keeps proposal params observed in current SDK traffic,
+    /// while the relay message keeps the transport-level fields. The pair is
+    /// only returned when both values are present.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2128-L2133>
+    ///
+    /// > attestationId: attestation,
+    /// > encryptedId,
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.message.verify_jwt_attestation().or_else(|| {
+            self.request
+                .params
+                .attestation
+                .as_deref()
+                .zip(self.request.params.encrypted_id.as_deref())
+        })
+    }
+
     /// Current policy classification for `verify_context`.
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
@@ -1331,6 +1352,41 @@ impl SingleSessionProposal {
             .resolve_hash_for_context(&hash, &self.verify_context)
             .await?;
         Ok(&self.verify_context)
+    }
+
+    /// Resolves Verify context from retained JWT metadata, then falls back to hash.
+    ///
+    /// JWT resolution uses an explicit clock so expiry behavior is testable.
+    /// Invalid relay-carried JWTs are returned as resolver errors; only absence
+    /// of the JWT pair falls back to the hash endpoint.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L137>
+    ///
+    /// > if (decoded.payload.id !== encryptedId) return;
+    /// > const validation = await this.isValidJwtAttestation(attestationId);
+    pub async fn resolve_verify_context_at(
+        &mut self,
+        resolver: &VerifyResolver,
+        now_unix_seconds: u64,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        if let Some((attestation_jwt, encrypted_id)) =
+            self.verify_jwt_attestation()
+                .map(|(attestation_jwt, encrypted_id)| {
+                    (attestation_jwt.to_owned(), encrypted_id.to_owned())
+                })
+        {
+            self.verify_context = resolver
+                .resolve_jwt_for_context(
+                    &attestation_jwt,
+                    &encrypted_id,
+                    &self.verify_context,
+                    now_unix_seconds,
+                )
+                .await?;
+            return Ok(&self.verify_context);
+        }
+
+        self.resolve_verify_context(resolver).await
     }
 
     /// Authentication subrequests embedded in this proposal.
@@ -1399,6 +1455,17 @@ impl SingleSessionAuthenticate {
         &self.verify_context
     }
 
+    /// Relay-carried Verify v3 JWT and encrypted identifier, when present.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2580>
+    ///
+    /// > attestationId: attestation,
+    /// > encryptedId,
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.message.verify_jwt_attestation()
+    }
+
     /// Current policy classification for `verify_context`.
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
@@ -1420,6 +1487,40 @@ impl SingleSessionAuthenticate {
             .resolve_hash_for_context(&hash, &self.verify_context)
             .await?;
         Ok(&self.verify_context)
+    }
+
+    /// Resolves Verify context from retained JWT metadata, then falls back to hash.
+    ///
+    /// This mirrors the SDK event path that receives `attestation` and
+    /// `encryptedId` beside the decrypted authentication payload.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2580>
+    ///
+    /// > attestationId: attestation,
+    /// > encryptedId,
+    pub async fn resolve_verify_context_at(
+        &mut self,
+        resolver: &VerifyResolver,
+        now_unix_seconds: u64,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        if let Some((attestation_jwt, encrypted_id)) =
+            self.verify_jwt_attestation()
+                .map(|(attestation_jwt, encrypted_id)| {
+                    (attestation_jwt.to_owned(), encrypted_id.to_owned())
+                })
+        {
+            self.verify_context = resolver
+                .resolve_jwt_for_context(
+                    &attestation_jwt,
+                    &encrypted_id,
+                    &self.verify_context,
+                    now_unix_seconds,
+                )
+                .await?;
+            return Ok(&self.verify_context);
+        }
+
+        self.resolve_verify_context(resolver).await
     }
 
     /// Original decrypted pairing-topic message.

@@ -71,6 +71,8 @@ pub struct SessionAuthenticateReview {
     expiry_timestamp: u64,
     published_at: u64,
     verify_context: VerifyContext,
+    verify_attestation_jwt: Option<String>,
+    verify_encrypted_id: Option<String>,
 }
 
 impl SessionAuthenticateReview {
@@ -82,7 +84,9 @@ impl SessionAuthenticateReview {
             return Err(SessionAuthenticateReviewError::NotSessionAuthenticate);
         };
 
-        Self::from_request(message.topic().clone(), message.published_at(), request)
+        let verify_context =
+            VerifyContext::unresolved_from_metadata(&request.params.requester.metadata);
+        Self::from_message_with_verify_context(message, verify_context)
     }
 
     /// Extracts review data and caller-resolved Verify context from a pairing message.
@@ -103,12 +107,20 @@ impl SessionAuthenticateReview {
             return Err(SessionAuthenticateReviewError::NotSessionAuthenticate);
         };
 
-        Self::from_request_with_verify_context(
+        let mut review = Self::from_request_with_verify_context(
             message.topic().clone(),
             message.published_at(),
             request,
             verify_context,
-        )
+        )?;
+        review.verify_attestation_jwt = message
+            .verify_jwt_attestation()
+            .map(|(jwt, _encrypted_id)| jwt.to_owned());
+        review.verify_encrypted_id = message
+            .verify_jwt_attestation()
+            .map(|(_jwt, encrypted_id)| encrypted_id.to_owned());
+
+        Ok(review)
     }
 
     /// Builds review data from a typed `wc_sessionAuthenticate` request.
@@ -179,6 +191,8 @@ impl SessionAuthenticateReview {
             expiry_timestamp: params.expiry_timestamp,
             published_at,
             verify_context,
+            verify_attestation_jwt: None,
+            verify_encrypted_id: None,
         }
     }
 
@@ -224,6 +238,24 @@ impl SessionAuthenticateReview {
         &self.verify_context
     }
 
+    /// Relay-carried Verify v3 JWT and encrypted identifier, when retained.
+    ///
+    /// `wc_sessionAuthenticate` carries origin-sensitive auth payloads, so
+    /// reviews built from relay messages keep the Verify v3 pair beside the
+    /// metadata-derived unresolved context.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2605>
+    ///
+    /// > attestationId: attestation,
+    /// > encryptedId,
+    /// > verifyContext,
+    #[must_use]
+    pub fn verify_jwt_attestation(&self) -> Option<(&str, &str)> {
+        self.verify_attestation_jwt
+            .as_deref()
+            .zip(self.verify_encrypted_id.as_deref())
+    }
+
     /// Current policy classification for `verify_context`.
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
@@ -248,6 +280,40 @@ impl SessionAuthenticateReview {
         self.verify_context = resolver
             .resolve_hash_for_context(hash, &self.verify_context)
             .await?;
+        Ok(&self.verify_context)
+    }
+
+    /// Resolves Verify context from retained relay JWT metadata when present.
+    ///
+    /// Reviews built from typed params have no transport metadata and therefore
+    /// keep the existing unresolved context. Use
+    /// `resolve_verify_context_with_hash` when only a hash is available.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/controllers/verify.ts#L117-L137>
+    ///
+    /// > if (decoded.payload.id !== encryptedId) return;
+    /// > const validation = await this.isValidJwtAttestation(attestationId);
+    pub async fn resolve_verify_context_at(
+        &mut self,
+        resolver: &VerifyResolver,
+        now_unix_seconds: u64,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        if let Some((attestation_jwt, encrypted_id)) =
+            self.verify_jwt_attestation()
+                .map(|(attestation_jwt, encrypted_id)| {
+                    (attestation_jwt.to_owned(), encrypted_id.to_owned())
+                })
+        {
+            self.verify_context = resolver
+                .resolve_jwt_for_context(
+                    &attestation_jwt,
+                    &encrypted_id,
+                    &self.verify_context,
+                    now_unix_seconds,
+                )
+                .await?;
+        }
+
         Ok(&self.verify_context)
     }
 
@@ -394,6 +460,7 @@ mod tests {
             review.verify_context().verified.origin,
             "https://example.com"
         );
+        assert!(review.verify_jwt_attestation().is_none());
         assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(review.is_expired_at(4_102_444_800));
 
