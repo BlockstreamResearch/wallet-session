@@ -31,7 +31,9 @@ pub use session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,
     SessionAuthenticateReviewError,
 };
-pub use session_request::{SessionRequestReview, SessionRequestReviewError};
+pub use session_request::{
+    SessionRequestReview, SessionRequestReviewError, SessionRequestVerifyResolutionError,
+};
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
     diff_session_namespaces,

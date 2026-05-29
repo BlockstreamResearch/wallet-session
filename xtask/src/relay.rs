@@ -2208,13 +2208,17 @@ fn print_ignored_session_message(message: &SessionReceivedMessage) {
 }
 
 fn print_session_request_review(review: &SessionRequestReview) {
+    let verify_hash = review
+        .verify_attestation_hash()
+        .map_or("missing", |hash| hash.as_str());
     println!(
-        "core-single-session-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} verify_origin={} verify_validation={} verify_risk={:?} params={}",
+        "core-single-session-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} verify_hash={} verify_origin={} verify_validation={} verify_risk={:?} params={}",
         review.topic(),
         review.request_id(),
         review.chain_id(),
         review.method(),
         review.expiry_timestamp(),
+        verify_hash,
         review.verify_context().verified.origin.as_str(),
         review.verify_context().verified.validation.as_str(),
         review.verify_risk(),

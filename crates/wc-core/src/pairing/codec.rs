@@ -8,6 +8,7 @@ use wc_protocol::{
     session::{
         JsonRpcErrorResponse, Session, SessionAckResponse, SessionSettleResponse, SignMethod,
     },
+    verify::VerifyAttestationHash,
 };
 
 use super::{
@@ -155,6 +156,7 @@ pub(super) fn decode_session_message_data_unchecked(
         .decrypt(subscription.sym_key())
         .map_err(|source| PairingClientError::SessionEnvelope { source })?;
     let plaintext_len = plaintext.len();
+    let verify_attestation_hash = VerifyAttestationHash::from_message(&plaintext);
     let json = serde_json::from_str::<serde_json::Value>(&plaintext)
         .map_err(|source| PairingClientError::SessionPayload { source })?;
     let payload = parse_session_payload(json)?;
@@ -163,6 +165,7 @@ pub(super) fn decode_session_message_data_unchecked(
         topic,
         encoded_message_len,
         plaintext_len,
+        verify_attestation_hash,
         published_at,
         tag,
         payload,

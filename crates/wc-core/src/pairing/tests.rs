@@ -47,6 +47,7 @@ use wc_protocol::{
         SessionTransportType, SessionUpdateParams, SessionUpdateResponse, SignMethod,
         session_ack_response,
     },
+    verify::VerifyAttestationHash,
 };
 
 const PAIRING_URI: &str = concat!(
@@ -667,6 +668,54 @@ fn decodes_authorized_session_request() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn decodes_session_request_with_exact_verify_hash() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let subscription = session_subscription(sym_key.clone())?;
+    let mut session = session_from_subscription(&subscription)?;
+    session.acknowledged = true;
+    let plaintext = concat!(
+        r#"{"id":7,"jsonrpc":"2.0","method":"wc_sessionRequest","params":{"#,
+        r#""request":{"method":"personal_sign","params":["0x68656c6c6f","#,
+        r#""0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],"#,
+        r#""expiryTimestamp":1700000300},"chainId":"eip155:1"}}"#
+    );
+    let data = encrypted_subscription_data_from_plaintext_for_topic(
+        plaintext,
+        &sym_key,
+        subscription.topic().clone(),
+        Some(1108),
+    )?;
+
+    let received = decode_session_message_data(data, &subscription, &session, 1_700_000_000)?;
+
+    assert_eq!(received.plaintext_len(), plaintext.len());
+    assert_eq!(
+        received.verify_attestation_hash().as_str(),
+        "c80b3a0b3cea362433fc277cbf54d43b6b277d8f829de423c671e1fe6e6b3797"
+    );
+    let review = crate::SessionRequestReview::from_message(&received)?;
+    assert_eq!(
+        review
+            .verify_attestation_hash()
+            .expect("received message has verify hash")
+            .as_str(),
+        "c80b3a0b3cea362433fc277cbf54d43b6b277d8f829de423c671e1fe6e6b3797"
+    );
+    match received.payload() {
+        SessionPayload::SessionRequest(request) => {
+            assert_eq!(request.id, 7);
+            assert_eq!(request.params.chain_id.as_str(), "eip155:1");
+            assert_eq!(request.params.request.method.as_str(), "personal_sign");
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
 fn decodes_session_ping() -> Result<(), Box<dyn std::error::Error>> {
     let sym_key = PairingSymKey::from_hex(
         "3333333333333333333333333333333333333333333333333333333333333333",
@@ -878,6 +927,7 @@ fn classifies_session_request_as_client_event() -> Result<(), Box<dyn std::error
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(session_request(
@@ -941,6 +991,7 @@ fn classifies_unparsed_session_payload_as_unsupported() -> Result<(), Box<dyn st
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::Sign(SignMethod::SessionPing),
@@ -1346,6 +1397,7 @@ fn builds_session_ping_response_publish() -> Result<(), Box<dyn std::error::Erro
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::SessionPing(JsonRpcRequest::new(
@@ -1378,6 +1430,7 @@ fn builds_session_update_response_publish() -> Result<(), Box<dyn std::error::Er
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1104),
         payload: SessionPayload::SessionUpdate(JsonRpcRequest::new(
@@ -1412,6 +1465,7 @@ fn builds_session_update_error_publish() -> Result<(), Box<dyn std::error::Error
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1104),
         payload: SessionPayload::SessionUpdate(JsonRpcRequest::new(
@@ -1452,6 +1506,7 @@ fn builds_session_extend_response_publish() -> Result<(), Box<dyn std::error::Er
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1106),
         payload: SessionPayload::SessionExtend(JsonRpcRequest::new(
@@ -1483,6 +1538,7 @@ fn builds_session_delete_response_publish() -> Result<(), Box<dyn std::error::Er
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1112),
         payload: SessionPayload::SessionDelete(JsonRpcRequest::new(
@@ -1779,6 +1835,7 @@ fn rejects_session_request_response_for_wrong_topic() -> Result<(), Box<dyn std:
         topic: RelayTopic::from_hex("55".repeat(32))?,
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(request)),
@@ -1802,6 +1859,7 @@ fn rejects_non_request_session_response_target() -> Result<(), Box<dyn std::erro
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::Sign(SignMethod::SessionPing),
@@ -1829,6 +1887,7 @@ fn rejects_non_ping_session_response_target() -> Result<(), Box<dyn std::error::
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1108),
         payload: SessionPayload::SessionRequest(Box::new(session_request(
@@ -1857,6 +1916,7 @@ fn rejects_non_delete_session_response_target() -> Result<(), Box<dyn std::error
         topic: subscription.topic().clone(),
         encoded_message_len: 1,
         plaintext_len: 1,
+        verify_attestation_hash: placeholder_verify_hash(),
         published_at: 1_779_954_250_000,
         tag: Some(1114),
         payload: SessionPayload::SessionPing(JsonRpcRequest::new(
@@ -1879,13 +1939,12 @@ fn encrypted_subscription_data(
     plaintext: &str,
     sym_key: &PairingSymKey,
 ) -> Result<IrnSubscriptionData, Box<dyn std::error::Error>> {
-    let envelope = Envelope::encrypt_type_0(plaintext, sym_key)?;
-    Ok(IrnSubscriptionData {
-        topic: RelayTopic::from_hex("11".repeat(32))?,
-        message: envelope.encode(EnvelopeEncoding::Base64),
-        published_at: 1_700_000_000_000,
-        tag: Some(1100),
-    })
+    encrypted_subscription_data_from_plaintext_for_topic(
+        plaintext,
+        sym_key,
+        RelayTopic::from_hex("11".repeat(32))?,
+        Some(1100),
+    )
 }
 
 fn encrypted_subscription_data_for_topic<T>(
@@ -1898,7 +1957,16 @@ where
     T: serde::Serialize,
 {
     let plaintext = serde_json::to_string(payload)?;
-    let envelope = Envelope::encrypt_type_0(&plaintext, sym_key)?;
+    encrypted_subscription_data_from_plaintext_for_topic(&plaintext, sym_key, topic, tag)
+}
+
+fn encrypted_subscription_data_from_plaintext_for_topic(
+    plaintext: &str,
+    sym_key: &PairingSymKey,
+    topic: RelayTopic,
+    tag: Option<u64>,
+) -> Result<IrnSubscriptionData, Box<dyn std::error::Error>> {
+    let envelope = Envelope::encrypt_type_0(plaintext, sym_key)?;
 
     Ok(IrnSubscriptionData {
         topic,
@@ -1906,6 +1974,10 @@ where
         published_at: 1_779_954_250_000,
         tag,
     })
+}
+
+fn placeholder_verify_hash() -> VerifyAttestationHash {
+    VerifyAttestationHash::from_message("{}")
 }
 
 fn pairing_subscription(

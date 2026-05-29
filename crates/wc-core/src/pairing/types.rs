@@ -12,6 +12,7 @@ use wc_protocol::{
         SessionProposeParams, SessionRequestParams, SessionSettleResponse, SessionUpdateParams,
         SignMethod,
     },
+    verify::VerifyAttestationHash,
 };
 
 use super::error::PairingClientError;
@@ -440,6 +441,7 @@ pub struct SessionReceivedMessage {
     pub(super) topic: RelayTopic,
     pub(super) encoded_message_len: usize,
     pub(super) plaintext_len: usize,
+    pub(super) verify_attestation_hash: VerifyAttestationHash,
     pub(super) published_at: u64,
     pub(super) tag: Option<u64>,
     pub(super) payload: SessionPayload,
@@ -631,6 +633,22 @@ impl SessionReceivedMessage {
     #[must_use]
     pub const fn plaintext_len(&self) -> usize {
         self.plaintext_len
+    }
+
+    /// Verify hash computed from the exact decrypted relay plaintext.
+    ///
+    /// The maintained Sign Client resolves session-request Verify context from
+    /// `hashMessage(JSON.stringify(formatJsonRpcRequest("wc_sessionRequest", params, id)))`.
+    /// That value depends on the exact JSON string that crossed the relay, so
+    /// the decoder hashes the plaintext before parsing and reserialization can
+    /// change object member order.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2462-L2468>
+    ///
+    /// > hash: hashMessage(JSON.stringify(formatJsonRpcRequest("wc_sessionRequest", params, id))),
+    #[must_use]
+    pub const fn verify_attestation_hash(&self) -> &VerifyAttestationHash {
+        &self.verify_attestation_hash
     }
 
     /// Relay server publish timestamp in milliseconds.

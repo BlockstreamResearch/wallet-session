@@ -71,6 +71,7 @@ pub struct SessionRequestReview {
     expiry_timestamp: Option<u64>,
     published_at: u64,
     verify_context: VerifyContext,
+    verify_attestation_hash: Option<VerifyAttestationHash>,
 }
 
 impl SessionRequestReview {
@@ -104,11 +105,12 @@ impl SessionRequestReview {
             return Err(SessionRequestReviewError::NotSessionRequest);
         };
 
-        Self::from_request_with_verify_context(
+        Self::from_request_with_verify_context_and_hash(
             message.topic().clone(),
             message.published_at(),
             request,
             verify_context,
+            Some(message.verify_attestation_hash().clone()),
         )
     }
 
@@ -118,11 +120,12 @@ impl SessionRequestReview {
         published_at: u64,
         request: &JsonRpcRequest<SessionRequestParams>,
     ) -> Result<Self, SessionRequestReviewError> {
-        Self::from_request_with_verify_context(
+        Self::from_request_with_verify_context_and_hash(
             topic,
             published_at,
             request,
             VerifyContext::unknown("", DEFAULT_VERIFY_URL),
+            None,
         )
     }
 
@@ -132,6 +135,22 @@ impl SessionRequestReview {
         published_at: u64,
         request: &JsonRpcRequest<SessionRequestParams>,
         verify_context: VerifyContext,
+    ) -> Result<Self, SessionRequestReviewError> {
+        Self::from_request_with_verify_context_and_hash(
+            topic,
+            published_at,
+            request,
+            verify_context,
+            None,
+        )
+    }
+
+    fn from_request_with_verify_context_and_hash(
+        topic: RelayTopic,
+        published_at: u64,
+        request: &JsonRpcRequest<SessionRequestParams>,
+        verify_context: VerifyContext,
+        verify_attestation_hash: Option<VerifyAttestationHash>,
     ) -> Result<Self, SessionRequestReviewError> {
         if request.method != SignMethod::SessionRequest {
             return Err(SessionRequestReviewError::MethodMismatch {
@@ -148,6 +167,7 @@ impl SessionRequestReview {
             expiry_timestamp: request.params.request.expiry_timestamp,
             published_at,
             verify_context,
+            verify_attestation_hash,
         })
     }
 
@@ -203,10 +223,40 @@ impl SessionRequestReview {
         &self.verify_context
     }
 
+    /// Retained Verify hash for reviews built from decrypted relay messages.
+    ///
+    /// Typed constructors such as `from_request` cannot know the exact JSON
+    /// string sent by the peer. Reviews built by the receive path retain the
+    /// SDK-compatible hash from `SessionReceivedMessage`.
+    #[must_use]
+    pub const fn verify_attestation_hash(&self) -> Option<&VerifyAttestationHash> {
+        self.verify_attestation_hash.as_ref()
+    }
+
     /// Current policy classification for `verify_context`.
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Resolves Verify context with the retained SDK-compatible hash.
+    ///
+    /// This is available for reviews built from a received session-topic
+    /// message. Use `resolve_verify_context_with_hash` when constructing a
+    /// review from already-typed data.
+    pub async fn resolve_verify_context(
+        &mut self,
+        resolver: &VerifyResolver,
+    ) -> Result<&VerifyContext, SessionRequestVerifyResolutionError> {
+        let hash = self
+            .verify_attestation_hash
+            .as_ref()
+            .ok_or(SessionRequestVerifyResolutionError::MissingHash)?;
+        self.verify_context = resolver
+            .resolve_hash_for_context(hash, &self.verify_context)
+            .await
+            .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
+        Ok(&self.verify_context)
     }
 
     /// Resolves Verify context with a caller-provided SDK-compatible hash.
@@ -254,6 +304,22 @@ pub enum SessionRequestReviewError {
     },
 }
 
+/// Verify resolution error for a session request review.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRequestVerifyResolutionError {
+    /// The review was built from typed data and has no exact relay plaintext hash.
+    #[error("session request verify hash is missing")]
+    MissingHash,
+
+    /// Verify resolver failed.
+    #[error("session request verify resolver failed")]
+    Resolver {
+        /// Resolver failure source.
+        #[source]
+        source: VerifyResolverError,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -293,9 +359,42 @@ mod tests {
         assert_eq!(review.expiry_timestamp(), Some(1_700_000_300));
         assert_eq!(review.published_at(), 1_700_000_000_000);
         assert_eq!(review.verify_context().verified.origin, "");
+        assert!(review.verify_attestation_hash().is_none());
         assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(!review.is_expired_at(1_700_000_299));
         assert!(review.is_expired_at(1_700_000_300));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolving_verify_context_requires_retained_hash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "personal_sign".parse()?,
+                    params: json!([]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let mut review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?;
+        let resolver = crate::VerifyResolver::new()?;
+
+        let error = review
+            .resolve_verify_context(&resolver)
+            .await
+            .expect_err("typed request has no exact relay hash");
+
+        assert!(matches!(
+            error,
+            super::SessionRequestVerifyResolutionError::MissingHash
+        ));
 
         Ok(())
     }
