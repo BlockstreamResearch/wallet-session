@@ -26,6 +26,7 @@ use super::{
     },
     error::PairingClientError,
     pairing_lifecycle::pairing_ping_response_publish,
+    session_authenticate::session_authenticate_error_publish,
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -996,6 +997,31 @@ impl PairingClient {
         error: JsonRpcError,
     ) -> Result<bool, PairingClientError> {
         let publish = session_proposal_reject_publish(subscription, proposal_id, error)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a `wc_sessionAuthenticate` JSON-RPC error response.
+    ///
+    /// Authentication requests arrive on the pairing topic, but the error
+    /// response is sent on `hashKey(receiverPublicKey)` with a type-1 envelope.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1448-L1465>
+    ///
+    /// > const responseTopic = hashKey(receiverPublicKey);
+    /// > await this.sendError({
+    /// > id,
+    pub async fn reject_session_authenticate(
+        &mut self,
+        subscription: &PairingSubscription,
+        message: &PairingReceivedMessage,
+        error: JsonRpcError,
+    ) -> Result<bool, PairingClientError> {
+        let responder =
+            X25519KeyPair::generate().map_err(|source| PairingClientError::KeyPair { source })?;
+        let publish = session_authenticate_error_publish(subscription, message, error, &responder)?;
         self.relay
             .publish(publish)
             .await

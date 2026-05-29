@@ -408,6 +408,8 @@ fn parse_pairing_payload(message: &PairingMessage) -> Result<PairingPayload, Pai
     match message.method() {
         PairingMessageMethod::Sign(SignMethod::SessionPropose) => parse_json_rpc(message)
             .map(|request| PairingPayload::SessionProposal(Box::new(request))),
+        PairingMessageMethod::Sign(SignMethod::SessionAuthenticate) => parse_json_rpc(message)
+            .map(|request| PairingPayload::SessionAuthenticate(Box::new(request))),
         PairingMessageMethod::Sign(method) => Ok(PairingPayload::Sign(*method)),
         PairingMessageMethod::Pairing(PairingMethod::Ping) => {
             parse_json_rpc(message).map(PairingPayload::PairingPing)

@@ -21,6 +21,20 @@ The current priority is protocol behavior over broad surface area:
 - keep the runtime model obvious;
 - add local edge-case tests for behavior that live tests cannot cover.
 
+## Near-Term Target Sequence
+
+The next target is the remaining Sign authentication and trust behavior, in this order:
+
+1. `wc_sessionAuthenticate` review/reject behavior through `SingleSessionClient`;
+2. CACAO approval behavior with caller-provided signatures;
+3. CACAO message formatting and signing helpers;
+4. Verify/origin trust context surfaced in review data;
+5. richer wallet policy primitives for authentication and session requests;
+6. broader interop scenarios against maintained JS Sign Client flows and selected real dapps;
+7. later ecosystem surfaces such as Notify, Push, and service-specific extras.
+
+Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
+
 ## Crate Boundaries
 
 Current workspace crates:
@@ -86,6 +100,7 @@ If future product requirements need multiple simultaneous sessions, that should 
 Current event model:
 
 - pairing proposals become `SingleSessionClientEvent::SessionProposal`;
+- pairing authentication requests become `SingleSessionClientEvent::SessionAuthenticate`;
 - non-proposal pairing messages remain visible as `SingleSessionClientEvent::PairingMessage`;
 - session-topic messages become `SingleSessionClientEvent::Session`;
 - session requests and session updates are tracked as one-shot pending decisions after they are surfaced, so response helpers cannot be reused to answer the same user-significant request twice;
@@ -193,6 +208,27 @@ Reference:
 - [Session Request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
 - [Session Request RPC method](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest)
 
+Session authentication follows the same explicit decision boundary.
+`wc_sessionAuthenticate` asks the wallet to sign CAIP-122/CACAO payloads.
+The runtime must not sign or approve authentication inside `SingleSessionClient::next_event()`.
+It exposes an auth review primitive and currently supports explicit rejection.
+
+Current session authentication flow:
+
+1. receive `wc_sessionAuthenticate`;
+2. expose it as `SingleSessionClientEvent::SessionAuthenticate`;
+3. caller extracts `SessionAuthenticateReview` for origin, requester, payload, chain, and expiry review;
+4. caller invokes `SingleSessionClient::reject_session_authenticate` when the request is not approved;
+5. core publishes a type-1 JSON-RPC error response on the requester public-key response topic and drops the pairing topic.
+
+Rationale: authentication is a wallet identity decision. CACAO signing, Verify context, and origin policy are security-sensitive primitives and must be explicit API steps rather than side effects of polling.
+
+Reference:
+
+- [Maintained Sign Client authentication event](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2568-L2605)
+- [Maintained Sign Client authentication rejection](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1433-L1468)
+- [CAIP-74 CACAO](https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification)
+
 Session expiry is a local runtime lifecycle event.
 `SingleSessionClient` does not run a background expirer, so `SingleSessionClient::next_event()` checks active session expiry before polling relay messages.
 When a session is expired, `SingleSessionClient` removes it from memory and returns `SingleSessionClientEvent::SessionExpired`.
@@ -213,6 +249,7 @@ Current security defaults:
 
 - no auto-approval;
 - explicit user/caller approval path;
+- explicit authentication review and rejection path;
 - explicit permission-change primitives before protocol acknowledgements;
 - in-memory state only;
 - one connection;

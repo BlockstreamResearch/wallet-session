@@ -13,8 +13,10 @@ The recommended wallet-facing surface is:
 - `SingleSessionRelayConfig`
 - `SingleSessionClientEvent`
 - `SingleSessionProposal`
+- `SingleSessionAuthenticate`
 - `SessionExpired`
 - `WalletCapabilities`
+- `SessionAuthenticateReview`
 - `SessionRequestReview`
 - `SessionNamespacesDiff`
 
@@ -114,6 +116,8 @@ The method:
 
 Session proposals are surfaced as `SingleSessionClientEvent::SessionProposal`.
 
+Session authentication requests are surfaced as `SingleSessionClientEvent::SessionAuthenticate`.
+
 Pairing ping is acknowledged automatically. Pairing delete clears the active pairing.
 
 Source:
@@ -149,6 +153,35 @@ Source:
 - [`WalletCapabilities::plan_session_approval`](../crates/wc-core/src/capabilities.rs)
 - [Session proposal RPC](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionpropose)
 - [Namespace approval](https://specs.walletconnect.com/2.0/specs/clients/sign/namespaces#approving-a-session-response)
+
+## Session Authentication Decisions
+
+`wc_sessionAuthenticate` asks the wallet to sign CAIP-122/CACAO authentication payloads.
+
+The runtime surfaces authentication requests as:
+
+```text
+SingleSessionClientEvent::SessionAuthenticate
+```
+
+Current supported path:
+
+1. caller receives the auth event;
+2. caller calls `session_authenticate_review`;
+3. caller applies origin/policy/user review;
+4. caller calls `reject_session_authenticate` when the request should not be approved;
+5. core publishes a type-1 JSON-RPC error response on the requester public-key response topic and unsubscribes the pairing topic.
+
+Approval with signed CACAOs is a follow-up slice. Until then, the client does not sign authentication payloads and does not auto-approve authentication.
+
+Source:
+
+- [`SingleSessionClient::session_authenticate_review`](../crates/wc-core/src/client.rs)
+- [`SingleSessionClient::reject_session_authenticate`](../crates/wc-core/src/client.rs)
+- [`SessionAuthenticateReview`](../crates/wc-core/src/session_authenticate.rs)
+- [Maintained Sign Client authentication request handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2568-L2605)
+- [Maintained Sign Client authentication rejection](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1433-L1468)
+- [CAIP-74 CACAO](https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification)
 
 ## Session Request Decisions
 
@@ -284,6 +317,7 @@ Important caller-visible state errors:
 - `EventQueueFull`;
 - `ReconnectCoolingDown`;
 - `DisconnectedByUser`;
+- `SessionAuthenticateReview`;
 - `SessionRequestDecisionMissing`;
 - `SessionUpdateDecisionMissing`.
 
@@ -305,13 +339,15 @@ That runs:
 - relay matrix;
 - single-session request;
 - single-session lifecycle update;
-- single-session disconnect.
+- single-session disconnect;
+- single-session authentication rejection.
 
 Focused high-level scenarios are also available:
 
 - `cargo run -p xtask --locked -- scenario single-session-request`;
 - `cargo run -p xtask --locked -- scenario single-session-lifecycle`;
 - `cargo run -p xtask --locked -- scenario single-session-disconnect`;
+- `cargo run -p xtask --locked -- scenario single-session-authenticate`;
 - `cargo run -p xtask --locked -- scenario single-session-live`.
 
 Underlying probe commands remain available:
@@ -319,8 +355,9 @@ Underlying probe commands remain available:
 - `relay-probe --core-single-session-client-session-request`;
 - `relay-probe --core-single-session-client-session-lifecycle`;
 - `relay-probe --core-single-session-client-disconnect`.
+- `relay-probe --core-single-session-client-session-authenticate`.
 
-These scenarios cover JS dapp pairing, proposal approval, session settlement, session request handling, session update handling, and disconnect publication through the single-session client.
+These scenarios cover JS dapp pairing, proposal approval, session settlement, session request handling, session update handling, disconnect publication, and authentication rejection through the single-session client.
 
 Source:
 

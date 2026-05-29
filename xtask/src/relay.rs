@@ -14,15 +14,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
-    DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage, SessionClientEvent,
-    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
-    SingleSessionClient, SingleSessionClientConfig, SingleSessionClientEvent,
-    SingleSessionProposal, WalletCapabilities, WalletChainCapability,
+    DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage,
+    SessionAuthenticateReview, SessionClientEvent, SessionLifecycleResponseMessage,
+    SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
+    SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
+    SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
+    SingleSessionClientEvent, SingleSessionProposal, WalletCapabilities, WalletChainCapability,
     low_level::{
         ApprovedSession, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
-        PairingSubscription, SESSION_REQUEST_RESPONSE_TAG, SessionSettleResponseMessage,
-        SessionSettleResponsePayload, SessionSubscription,
+        PairingSubscription, SESSION_AUTHENTICATE_REJECT_TAG, SESSION_REQUEST_RESPONSE_TAG,
+        SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
     },
 };
 use wc_protocol::{
@@ -66,6 +67,7 @@ pub enum ProbeMode {
     CoreSingleSessionClientSessionRequest,
     CoreSingleSessionClientSessionLifecycle,
     CoreSingleSessionClientDisconnect,
+    CoreSingleSessionClientSessionAuthenticate,
     PairingUri(String),
 }
 
@@ -106,6 +108,12 @@ pub async fn run(mode: ProbeMode) -> Result<()> {
         }
         ProbeMode::CoreSingleSessionClientDisconnect => {
             Box::pin(run_core_single_session_client_disconnect_probe(&config)).await
+        }
+        ProbeMode::CoreSingleSessionClientSessionAuthenticate => {
+            Box::pin(run_core_single_session_client_session_authenticate_probe(
+                &config,
+            ))
+            .await
         }
         ProbeMode::PairingUri(uri) => Box::pin(run_pairing_uri_probe(&config, &uri)).await,
     }
@@ -153,6 +161,68 @@ struct SessionHarness {
 struct PairingHarness {
     result_file: PathBuf,
     guard: ChildGuard,
+}
+
+struct AuthHarness {
+    result_file: PathBuf,
+    guard: ChildGuard,
+}
+
+impl AuthHarness {
+    async fn start(label: &str) -> Result<(Self, String)> {
+        let workspace_root = workspace_root()?;
+        let harness_dir = workspace_root.join("tools/js-harness");
+        let uri_file = js_harness_file(&workspace_root, JS_HARNESS_URI_FILE_STEM, "txt");
+        let result_file = js_harness_file(&workspace_root, JS_HARNESS_RESULT_FILE_STEM, "json");
+        if let Some(parent) = uri_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let _ = fs::remove_file(&uri_file);
+        let _ = fs::remove_file(&result_file);
+
+        let hold_ms = env::var("WC_JS_HARNESS_HOLD_MS").unwrap_or_else(|_| "120000".to_owned());
+
+        println!(
+            "core-single-session-client-session-authenticate harness_dir={} uri_file={} result_file={} hold_ms={hold_ms} label={label}",
+            harness_dir.display(),
+            uri_file.display(),
+            result_file.display()
+        );
+
+        let child = Command::new("bun")
+            .args(["run", "authenticate"])
+            .current_dir(&harness_dir)
+            .env("WC_JS_URI_FILE", &uri_file)
+            .env("WC_JS_RESULT_FILE", &result_file)
+            .env("WC_JS_HARNESS_HOLD_MS", &hold_ms)
+            .env_remove("WC_JS_PRINT_URI")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to start auth Bun harness in {}",
+                    harness_dir.display()
+                )
+            })?;
+        let mut guard = ChildGuard::new(child);
+        let uri = wait_for_js_pairing_uri(&uri_file, guard.child_mut()).await?;
+        Ok((Self { result_file, guard }, uri))
+    }
+
+    async fn expect_result(&mut self, expected_outcome: &str) -> Result<Value> {
+        let result = wait_for_js_result(&self.result_file, self.guard.child_mut()).await?;
+        if result.get("outcome").and_then(Value::as_str) != Some(expected_outcome) {
+            bail!("expected JS {expected_outcome} result, got {result}");
+        }
+        Ok(result)
+    }
+
+    fn terminate(&mut self) {
+        self.guard.terminate();
+    }
 }
 
 impl PairingHarness {
@@ -876,6 +946,60 @@ async fn run_core_single_session_client_session_request_probe(
     };
     let result = harness.expect_result(expected_outcome).await?;
     println!("core-single-session-client-session-request js_result={result}");
+    harness.terminate();
+
+    Ok(())
+}
+
+async fn run_core_single_session_client_session_authenticate_probe(
+    config: &RelayProbeConfig,
+) -> Result<()> {
+    let (mut harness, uri) = AuthHarness::start("reject").await?;
+    let mut client_config = PairingClientConfig::new(
+        config.project_id.clone(),
+        config.subscriber_auth_seed,
+        format!(
+            "xtask-core-single-session-client-authenticate-{}",
+            rpc_id()?.as_u64()
+        ),
+    );
+    client_config.relay_url.clone_from(&config.relay_url);
+    client_config.user_agent.clone_from(&config.user_agent);
+    client_config.receive_timeout = pairing_uri_wait_timeout();
+
+    let mut client =
+        SingleSessionClient::connect(&SingleSessionClientConfig::new(client_config)).await?;
+    println!(
+        "core-single-session-client-session-authenticate connected status={}",
+        client.status()
+    );
+    let pairing_topic = client.pair(uri.trim()).await?;
+    println!("core-single-session-client-session-authenticate pairing_topic={pairing_topic}");
+
+    let authenticate = wait_for_single_session_client_authenticate(&mut client).await?;
+    println!(
+        "core-single-session-client-session-authenticate request_id={} pairing_topic={}",
+        authenticate.request_id(),
+        authenticate.pairing_topic()
+    );
+    let review = client.session_authenticate_review(&authenticate)?;
+    print_session_authenticate_review(&review);
+    validate_session_authenticate_review(&review)?;
+    let reject_ack = client
+        .reject_session_authenticate(
+            &authenticate,
+            JsonRpcError::new(
+                JsonRpcErrorCode::UserRejected,
+                "User rejected authentication.",
+            ),
+        )
+        .await?;
+    println!(
+        "core-single-session-client-session-authenticate reject_ack={reject_ack} response_tag={SESSION_AUTHENTICATE_REJECT_TAG}"
+    );
+
+    let result = harness.expect_result("authenticate_error").await?;
+    println!("core-single-session-client-session-authenticate js_result={result}");
     harness.terminate();
 
     Ok(())
@@ -1679,11 +1803,49 @@ async fn wait_for_single_session_client_proposal(
             .context("no single-session client proposal event received")?;
         match event {
             SingleSessionClientEvent::SessionProposal(proposal) => return Ok(*proposal),
+            SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
+                print_ignored_single_session_client_authenticate(&authenticate);
+            }
             SingleSessionClientEvent::PairingMessage(message) => {
                 print_core_pairing_payload_metadata(
                     "core-single-session-client-session-request ignored_pairing_message",
                     &message,
                 )?;
+            }
+            SingleSessionClientEvent::Session(event) => {
+                print_ignored_single_session_client_event(&event);
+            }
+            SingleSessionClientEvent::SessionExpired(expired) => {
+                print_ignored_single_session_client_expired(&expired);
+            }
+        }
+    }
+}
+
+async fn wait_for_single_session_client_authenticate(
+    client: &mut SingleSessionClient,
+) -> Result<SingleSessionAuthenticate> {
+    loop {
+        let event = client
+            .next_event()
+            .await?
+            .context("no single-session client authenticate event received")?;
+        match event {
+            SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
+                return Ok(*authenticate);
+            }
+            SingleSessionClientEvent::PairingMessage(message) => {
+                print_core_pairing_payload_metadata(
+                    "core-single-session-client-session-authenticate ignored_pairing_message",
+                    &message,
+                )?;
+            }
+            SingleSessionClientEvent::SessionProposal(proposal) => {
+                println!(
+                    "core-single-session-client-session-authenticate ignored_proposal id={} pairing_topic={}",
+                    proposal.proposal_id(),
+                    proposal.pairing_topic()
+                );
             }
             SingleSessionClientEvent::Session(event) => {
                 print_ignored_single_session_client_event(&event);
@@ -1722,6 +1884,9 @@ async fn wait_for_single_session_client_session_request_event(
                     proposal.proposal_id(),
                     proposal.pairing_topic()
                 );
+            }
+            SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
+                print_ignored_single_session_client_authenticate(&authenticate);
             }
             SingleSessionClientEvent::SessionExpired(expired) => {
                 print_ignored_single_session_client_expired(&expired);
@@ -1778,11 +1943,22 @@ async fn wait_for_single_session_client_session_lifecycle_event(
                     proposal.pairing_topic()
                 );
             }
+            (_, SingleSessionClientEvent::SessionAuthenticate(authenticate)) => {
+                print_ignored_single_session_client_authenticate(&authenticate);
+            }
             (_, SingleSessionClientEvent::SessionExpired(expired)) => {
                 print_ignored_single_session_client_expired(&expired);
             }
         }
     }
+}
+
+fn print_ignored_single_session_client_authenticate(authenticate: &SingleSessionAuthenticate) {
+    println!(
+        "ignored_single_session_client_authenticate id={} pairing_topic={}",
+        authenticate.request_id(),
+        authenticate.pairing_topic()
+    );
 }
 
 fn print_ignored_single_session_client_expired(expired: &wc_core::SessionExpired) {
@@ -1982,6 +2158,65 @@ fn print_session_request_review(review: &SessionRequestReview) {
         review.expiry_timestamp(),
         review.params()
     );
+}
+
+fn print_session_authenticate_review(review: &SessionAuthenticateReview) {
+    println!(
+        "core-single-session-client-session-authenticate review topic={} id={} requester_name={} domain={} aud={} chains={} expiry={}",
+        review.topic(),
+        review.request_id(),
+        review.requester().metadata.name,
+        review.auth_payload().domain,
+        review.auth_payload().aud,
+        review
+            .auth_payload()
+            .chains
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        review.expiry_timestamp()
+    );
+}
+
+fn validate_session_authenticate_review(review: &SessionAuthenticateReview) -> Result<()> {
+    let expected_domain =
+        env::var("WC_JS_AUTH_DOMAIN").unwrap_or_else(|_| "example.com".to_owned());
+    let expected_aud =
+        env::var("WC_JS_AUTH_URI").unwrap_or_else(|_| "https://example.com/login".to_owned());
+    let expected_chains = env::var("WC_JS_AUTH_CHAINS").unwrap_or_else(|_| "eip155:1".to_owned());
+    let chains = review
+        .auth_payload()
+        .chains
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if review.auth_payload().domain != expected_domain {
+        bail!(
+            "session authenticate domain mismatch: expected {expected_domain}, got {}",
+            review.auth_payload().domain
+        );
+    }
+    if review.auth_payload().aud != expected_aud {
+        bail!(
+            "session authenticate audience mismatch: expected {expected_aud}, got {}",
+            review.auth_payload().aud
+        );
+    }
+    if chains != expected_chains {
+        bail!("session authenticate chains mismatch: expected {expected_chains}, got {chains}");
+    }
+    if review.is_expired_at(unix_timestamp()) {
+        bail!(
+            "session authenticate review is expired: id={} expiry={}",
+            review.request_id(),
+            review.expiry_timestamp()
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_session_request_review(review: &SessionRequestReview) -> Result<()> {
@@ -2675,6 +2910,23 @@ fn print_core_pairing_payload_metadata(
     match received.payload() {
         PairingPayload::SessionProposal(request) => {
             print_session_proposal_request_summary(label, request);
+        }
+        PairingPayload::SessionAuthenticate(request) => {
+            println!(
+                "{label} session_authenticate id={} requester_name={} domain={} chains={} expiry={}",
+                request.id,
+                request.params.requester.metadata.name,
+                request.params.auth_payload.domain,
+                request
+                    .params
+                    .auth_payload
+                    .chains
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                request.params.expiry_timestamp
+            );
         }
         PairingPayload::Sign(method) => {
             println!("{label} sign_request method={method}");

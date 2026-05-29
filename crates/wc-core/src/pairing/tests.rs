@@ -7,6 +7,7 @@ use super::{
         decode_subscription_data, validate_session_message_payload,
     },
     pairing_lifecycle::pairing_ping_response_publish,
+    session_authenticate::session_authenticate_error_publish,
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -24,19 +25,22 @@ use wc_protocol::{
     dto::pairing::{
         PairingJsonRpcRequest, PairingJsonRpcResponse, PairingMethod, PairingPingParams,
     },
-    envelope::{Envelope, EnvelopeEncoding},
-    key::{X25519KeyPair, X25519PrivateKey},
+    envelope::{Envelope, EnvelopeEncoding, EnvelopeType},
+    key::{
+        X25519KeyPair, X25519PrivateKey, derive_shared_sym_key, derive_topic_from_x25519_public_key,
+    },
     pairing::{PairingSymKey, PairingUri},
     pairing_message::PairingMessage,
     relay::{IrnPublish, IrnSubscriptionData, RelayTopic},
     session::{
-        DappMetadata, JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest,
-        JsonRpcResponse, RelayProtocolOptions, Session, SessionDeleteParams, SessionDeleteResponse,
-        SessionEvent, SessionEventName, SessionEventParams, SessionExtendParams,
-        SessionExtendResponse, SessionNamespace, SessionParticipant, SessionPingParams,
-        SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
-        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
-        SessionUpdateParams, SessionUpdateResponse, SignMethod, session_ack_response,
+        AuthPayload, CacaoHeaderType, DappMetadata, JsonRpcError, JsonRpcErrorCode,
+        JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, RelayProtocolOptions, Session,
+        SessionAuthenticateParams, SessionDeleteParams, SessionDeleteResponse, SessionEvent,
+        SessionEventName, SessionEventParams, SessionExtendParams, SessionExtendResponse,
+        SessionNamespace, SessionParticipant, SessionPingParams, SessionPingResponse,
+        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult,
+        SessionRequestParams, SessionSettleParams, SessionTransportType, SessionUpdateParams,
+        SessionUpdateResponse, SignMethod, session_ack_response,
     },
 };
 
@@ -97,6 +101,75 @@ fn decodes_subscription_data_with_pairing_key() -> Result<(), Box<dyn std::error
     assert_eq!(received.tag(), Some(1100));
     assert_eq!(received.message().plaintext(), plaintext);
     assert!(matches!(received.payload(), PairingPayload::PairingPing(_)));
+
+    Ok(())
+}
+
+#[test]
+fn decodes_session_authenticate_pairing_payload() -> Result<(), Box<dyn std::error::Error>> {
+    let sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let request = session_authenticate_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &sym_key,
+        RelayTopic::from_hex("11".repeat(32))?,
+        Some(1116),
+    )?;
+
+    let received = decode_subscription_data(data, &sym_key)?;
+
+    let PairingPayload::SessionAuthenticate(request) = received.payload() else {
+        panic!("expected session authenticate payload");
+    };
+    assert_eq!(request.id, 9);
+    assert_eq!(request.params.auth_payload.domain, "example.com");
+    assert_eq!(received.tag(), Some(1116));
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_authenticate_error_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let pairing_sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(pairing_sym_key.clone())?;
+    let request = session_authenticate_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &pairing_sym_key,
+        subscription.topic().clone(),
+        Some(1116),
+    )?;
+    let received = decode_subscription_data(data, &pairing_sym_key)?;
+    let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
+        "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+    )?);
+    let error = JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected.");
+
+    let publish = session_authenticate_error_publish(&subscription, &received, error, &responder)?;
+    let response_sym_key = derive_shared_sym_key(
+        responder.private_key(),
+        &request.params.requester.public_key,
+    );
+    let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
+    let response: JsonRpcErrorResponse = decrypt_publish(&publish, &response_sym_key)?;
+
+    assert_eq!(
+        publish.topic,
+        derive_topic_from_x25519_public_key(&request.params.requester.public_key)
+    );
+    assert_eq!(publish.ttl, SESSION_AUTHENTICATE_REJECT_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_AUTHENTICATE_REJECT_TAG);
+    assert_eq!(envelope.envelope_type(), EnvelopeType::Type1);
+    assert_eq!(
+        envelope.sender_public_key(),
+        Some(&responder.public_key().to_bytes())
+    );
+    assert_eq!(response.id, request.id);
+    assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
 
     Ok(())
 }
@@ -841,6 +914,43 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
             assert_eq!(
                 proposal.request().params.proposer.metadata.name,
                 "Probe Dapp"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::error::Error>> {
+    let request = session_authenticate_request()?;
+    let sym_key = PairingSymKey::from_hex(
+        "3333333333333333333333333333333333333333333333333333333333333333",
+    )?;
+    let plaintext = serde_json::to_string(&request)?;
+    let envelope = Envelope::encrypt_type_0(&plaintext, &sym_key)?;
+    let message = PairingReceivedMessage {
+        topic: RelayTopic::from_hex("11".repeat(32))?,
+        encoded_message_len: envelope.encode(EnvelopeEncoding::Base64).len(),
+        published_at: 1_779_954_250_000,
+        tag: Some(1116),
+        message: PairingMessage::decode_relay_message(
+            &envelope.encode(EnvelopeEncoding::Base64),
+            &sym_key,
+        )?,
+        payload: PairingPayload::SessionAuthenticate(Box::new(request)),
+    };
+
+    let event = crate::SingleSessionClientEvent::from_pairing_message(message);
+
+    match event {
+        crate::SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
+            assert_eq!(authenticate.request_id(), 9);
+            assert_eq!(authenticate.pairing_topic().as_str(), "11".repeat(32));
+            assert_eq!(
+                authenticate.request().params.auth_payload.domain,
+                "example.com"
             );
         }
         other => panic!("unexpected event: {other:?}"),
@@ -1800,6 +1910,45 @@ fn session_proposal_request()
     );
 
     serde_json::from_str(json).map_err(Into::into)
+}
+
+fn session_authenticate_request()
+-> Result<JsonRpcRequest<SessionAuthenticateParams>, Box<dyn std::error::Error>> {
+    Ok(JsonRpcRequest::new(
+        9,
+        SignMethod::SessionAuthenticate,
+        SessionAuthenticateParams {
+            requester: SessionParticipant {
+                public_key: X25519PrivateKey::from_hex(
+                    "4afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+                )?
+                .public_key(),
+                metadata: DappMetadata {
+                    name: "Authenticate Dapp".to_owned(),
+                    description: "Authentication probe".to_owned(),
+                    url: "https://example.com".to_owned(),
+                    icons: vec!["https://example.com/icon.png".to_owned()],
+                    verify_url: None,
+                    redirect: None,
+                },
+            },
+            auth_payload: AuthPayload {
+                kind: CacaoHeaderType::Caip122,
+                chains: vec!["eip155:1".parse()?],
+                aud: "https://example.com/login".to_owned(),
+                domain: "example.com".to_owned(),
+                version: "1".to_owned(),
+                nonce: "1234567890".to_owned(),
+                iat: "2026-05-28T12:00:00.000Z".to_owned(),
+                statement: Some("Sign in to Example".to_owned()),
+                exp: None,
+                nbf: None,
+                request_id: None,
+                resources: vec!["urn:recap:eyJhdHQiOnsifX0".to_owned()],
+            },
+            expiry_timestamp: 4_102_444_800,
+        },
+    ))
 }
 
 fn session_request(

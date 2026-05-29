@@ -3,6 +3,7 @@
 mod capabilities;
 mod client;
 mod pairing;
+mod session_authenticate;
 mod session_request;
 mod session_update;
 
@@ -12,9 +13,9 @@ pub use capabilities::{
 pub use client::{
     DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
     DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
-    DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SessionExpired, SingleSessionClient,
-    SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
-    SingleSessionClientEvent, SingleSessionProposal,
+    DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SessionExpired, SingleSessionAuthenticate,
+    SingleSessionClient, SingleSessionClientConfig, SingleSessionClientConnectionState,
+    SingleSessionClientError, SingleSessionClientEvent, SingleSessionProposal,
 };
 pub use pairing::{
     DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
@@ -23,6 +24,7 @@ pub use pairing::{
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
     SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
 };
+pub use session_authenticate::{SessionAuthenticateReview, SessionAuthenticateReviewError};
 pub use session_request::{SessionRequestReview, SessionRequestReviewError};
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
@@ -38,7 +40,9 @@ pub use wc_transport::RelayReconnectConfig;
 pub mod low_level {
     pub use crate::pairing::{
         ApprovedSession, PAIRING_PING_RESPONSE_TAG, PAIRING_PING_RESPONSE_TTL_SECONDS,
-        PairingClient, PairingClientConfig, PairingSubscription, SESSION_DELETE_REQUEST_TAG,
+        PairingClient, PairingClientConfig, PairingSubscription, SESSION_AUTHENTICATE_REJECT_TAG,
+        SESSION_AUTHENTICATE_REJECT_TTL_SECONDS, SESSION_AUTHENTICATE_RESPONSE_TAG,
+        SESSION_AUTHENTICATE_RESPONSE_TTL_SECONDS, SESSION_DELETE_REQUEST_TAG,
         SESSION_DELETE_REQUEST_TTL_SECONDS, SESSION_DELETE_RESPONSE_TAG,
         SESSION_DELETE_RESPONSE_TTL_SECONDS, SESSION_EVENT_REQUEST_TAG,
         SESSION_EVENT_REQUEST_TTL_SECONDS, SESSION_EVENT_RESPONSE_TAG,

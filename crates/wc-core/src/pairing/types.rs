@@ -5,10 +5,10 @@ use wc_protocol::{
     relay::RelayTopic,
     session::{
         DappMetadata, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, ScopedProperties,
-        Session, SessionAckResponse, SessionConfig, SessionDeleteParams, SessionEventParams,
-        SessionExtendParams, SessionNamespaces, SessionPingParams, SessionProperties,
-        SessionProposeParams, SessionRequestParams, SessionSettleResponse, SessionUpdateParams,
-        SignMethod,
+        Session, SessionAckResponse, SessionAuthenticateParams, SessionConfig, SessionDeleteParams,
+        SessionEventParams, SessionExtendParams, SessionNamespaces, SessionPingParams,
+        SessionProperties, SessionProposeParams, SessionRequestParams, SessionSettleResponse,
+        SessionUpdateParams, SignMethod,
     },
 };
 
@@ -727,6 +727,13 @@ impl PairingReceivedMessage {
 pub enum PairingPayload {
     /// `wc_sessionPropose` Sign API request.
     SessionProposal(Box<JsonRpcRequest<SessionProposeParams>>),
+    /// `wc_sessionAuthenticate` Sign API request.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2600-L2605>
+    ///
+    /// > this.client.events.emit("session_authenticate", {
+    /// > id,
+    SessionAuthenticate(Box<JsonRpcRequest<SessionAuthenticateParams>>),
     /// `wc_pairingPing` Pairing API request.
     PairingPing(PairingJsonRpcRequest<PairingPingParams>),
     /// `wc_pairingDelete` Pairing API request.

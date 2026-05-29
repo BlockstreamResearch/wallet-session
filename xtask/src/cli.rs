@@ -59,6 +59,9 @@ struct RelayProbeArgs {
     #[command(flatten)]
     core_single_session_client: CoreRelaySingleSessionClientProbeArgs,
 
+    #[command(flatten)]
+    core_single_session_client_auth: CoreRelaySingleSessionClientAuthProbeArgs,
+
     #[arg(long, value_name = "URI")]
     pairing_uri: Option<String>,
 }
@@ -100,6 +103,12 @@ struct CoreRelaySingleSessionClientProbeArgs {
 
     #[arg(long)]
     core_single_session_client_disconnect: bool,
+}
+
+#[derive(Debug, Args)]
+struct CoreRelaySingleSessionClientAuthProbeArgs {
+    #[arg(long)]
+    core_single_session_client_session_authenticate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -158,7 +167,19 @@ pub fn run() -> Result<()> {
 
 impl RelayProbeArgs {
     fn into_probe_mode(self) -> Result<relay::ProbeMode> {
-        let selected_count = usize::from(self.basic)
+        if self.selected_count() > 1 {
+            bail!("choose only one relay probe mode");
+        }
+
+        if let Some(mode) = self.explicit_mode() {
+            return Ok(mode);
+        }
+
+        probe_mode_from_env()
+    }
+
+    fn selected_count(&self) -> usize {
+        usize::from(self.basic)
             + usize::from(self.matrix)
             + usize::from(self.js_proposal)
             + usize::from(self.core.core_js_proposal)
@@ -179,86 +200,102 @@ impl RelayProbeArgs {
                 self.core_single_session_client
                     .core_single_session_client_disconnect,
             )
-            + usize::from(self.pairing_uri.is_some());
-        if selected_count > 1 {
-            bail!("choose only one relay probe mode");
-        }
+            + usize::from(
+                self.core_single_session_client_auth
+                    .core_single_session_client_session_authenticate,
+            )
+            + usize::from(self.pairing_uri.is_some())
+    }
 
+    fn explicit_mode(&self) -> Option<relay::ProbeMode> {
         if self.basic {
-            return Ok(relay::ProbeMode::Basic);
+            return Some(relay::ProbeMode::Basic);
         }
         if self.matrix {
-            return Ok(relay::ProbeMode::Matrix);
+            return Some(relay::ProbeMode::Matrix);
         }
         if self.js_proposal {
-            return Ok(relay::ProbeMode::JsProposal);
+            return Some(relay::ProbeMode::JsProposal);
         }
         if self.core.core_js_proposal {
-            return Ok(relay::ProbeMode::CoreJsProposal);
+            return Some(relay::ProbeMode::CoreJsProposal);
         }
         if self.core.core_js_approve_proposal {
-            return Ok(relay::ProbeMode::CoreJsApproveProposal);
+            return Some(relay::ProbeMode::CoreJsApproveProposal);
         }
         if self.core.core_js_reject_proposal {
-            return Ok(relay::ProbeMode::CoreJsRejectProposal);
+            return Some(relay::ProbeMode::CoreJsRejectProposal);
         }
         if self.core_pairing.core_js_pairing_lifecycle {
-            return Ok(relay::ProbeMode::CoreJsPairingLifecycle);
+            return Some(relay::ProbeMode::CoreJsPairingLifecycle);
         }
         if self.core_session.core_js_session_request {
-            return Ok(relay::ProbeMode::CoreJsSessionRequest);
+            return Some(relay::ProbeMode::CoreJsSessionRequest);
         }
         if self.core_session.core_js_session_lifecycle {
-            return Ok(relay::ProbeMode::CoreJsSessionLifecycle);
+            return Some(relay::ProbeMode::CoreJsSessionLifecycle);
         }
         if self
             .core_single_session_client
             .core_single_session_client_session_request
         {
-            return Ok(relay::ProbeMode::CoreSingleSessionClientSessionRequest);
+            return Some(relay::ProbeMode::CoreSingleSessionClientSessionRequest);
         }
         if self
             .core_single_session_client
             .core_single_session_client_session_lifecycle
         {
-            return Ok(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle);
+            return Some(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle);
         }
         if self
             .core_single_session_client
             .core_single_session_client_disconnect
         {
-            return Ok(relay::ProbeMode::CoreSingleSessionClientDisconnect);
+            return Some(relay::ProbeMode::CoreSingleSessionClientDisconnect);
         }
-        if let Some(uri) = self.pairing_uri {
-            return Ok(relay::ProbeMode::PairingUri(uri));
+        if self
+            .core_single_session_client_auth
+            .core_single_session_client_session_authenticate
+        {
+            return Some(relay::ProbeMode::CoreSingleSessionClientSessionAuthenticate);
+        }
+        if let Some(uri) = self.pairing_uri.as_ref() {
+            return Some(relay::ProbeMode::PairingUri(uri.clone()));
         }
 
-        match env::var("WC_RELAY_PROBE_MODE").as_deref() {
-            Ok("basic") | Err(_) => Ok(relay::ProbeMode::Basic),
-            Ok("matrix") => Ok(relay::ProbeMode::Matrix),
-            Ok("js-proposal") => Ok(relay::ProbeMode::JsProposal),
-            Ok("core-js-proposal") => Ok(relay::ProbeMode::CoreJsProposal),
-            Ok("core-js-approve-proposal") => Ok(relay::ProbeMode::CoreJsApproveProposal),
-            Ok("core-js-reject-proposal") => Ok(relay::ProbeMode::CoreJsRejectProposal),
-            Ok("core-js-pairing-lifecycle") => Ok(relay::ProbeMode::CoreJsPairingLifecycle),
-            Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
-            Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
-            Ok("core-single-session-client-session-request") => {
-                Ok(relay::ProbeMode::CoreSingleSessionClientSessionRequest)
-            }
-            Ok("core-single-session-client-session-lifecycle") => {
-                Ok(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle)
-            }
-            Ok("core-single-session-client-disconnect") => {
-                Ok(relay::ProbeMode::CoreSingleSessionClientDisconnect)
-            }
-            Ok("pairing-uri") => {
-                let uri = env::var("WC_PAIRING_URI")
-                    .context("set WC_PAIRING_URI when WC_RELAY_PROBE_MODE=pairing-uri")?;
-                Ok(relay::ProbeMode::PairingUri(uri))
-            }
-            Ok(other) => bail!("unknown WC_RELAY_PROBE_MODE: {other}"),
+        None
+    }
+}
+
+fn probe_mode_from_env() -> Result<relay::ProbeMode> {
+    match env::var("WC_RELAY_PROBE_MODE").as_deref() {
+        Ok("basic") | Err(_) => Ok(relay::ProbeMode::Basic),
+        Ok("matrix") => Ok(relay::ProbeMode::Matrix),
+        Ok("js-proposal") => Ok(relay::ProbeMode::JsProposal),
+        Ok("core-js-proposal") => Ok(relay::ProbeMode::CoreJsProposal),
+        Ok("core-js-approve-proposal") => Ok(relay::ProbeMode::CoreJsApproveProposal),
+        Ok("core-js-reject-proposal") => Ok(relay::ProbeMode::CoreJsRejectProposal),
+        Ok("core-js-pairing-lifecycle") => Ok(relay::ProbeMode::CoreJsPairingLifecycle),
+        Ok("core-js-session-request") => Ok(relay::ProbeMode::CoreJsSessionRequest),
+        Ok("core-js-session-lifecycle") => Ok(relay::ProbeMode::CoreJsSessionLifecycle),
+        Ok("core-single-session-client-session-request") => {
+            Ok(relay::ProbeMode::CoreSingleSessionClientSessionRequest)
         }
+        Ok("core-single-session-client-session-lifecycle") => {
+            Ok(relay::ProbeMode::CoreSingleSessionClientSessionLifecycle)
+        }
+        Ok("core-single-session-client-disconnect") => {
+            Ok(relay::ProbeMode::CoreSingleSessionClientDisconnect)
+        }
+        Ok("core-single-session-client-session-authenticate") => {
+            Ok(relay::ProbeMode::CoreSingleSessionClientSessionAuthenticate)
+        }
+        Ok("pairing-uri") => {
+            let uri = env::var("WC_PAIRING_URI")
+                .context("set WC_PAIRING_URI when WC_RELAY_PROBE_MODE=pairing-uri")?;
+            Ok(relay::ProbeMode::PairingUri(uri))
+        }
+        Ok(other) => bail!("unknown WC_RELAY_PROBE_MODE: {other}"),
     }
 }
 

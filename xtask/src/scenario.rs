@@ -20,6 +20,8 @@ pub enum ScenarioName {
     SingleSessionLifecycle,
     /// Single-session proposal approval and explicit disconnect.
     SingleSessionDisconnect,
+    /// Single-session authentication request rejection.
+    SingleSessionAuthenticate,
 }
 
 impl ScenarioName {
@@ -31,17 +33,23 @@ impl ScenarioName {
             Self::SingleSessionRequest => "single-session-request",
             Self::SingleSessionLifecycle => "single-session-lifecycle",
             Self::SingleSessionDisconnect => "single-session-disconnect",
+            Self::SingleSessionAuthenticate => "single-session-authenticate",
         }
     }
 
     const fn description(self) -> &'static str {
         match self {
-            Self::DefaultLive => "relay matrix plus single-session request/lifecycle/disconnect",
+            Self::DefaultLive => {
+                "relay matrix plus single-session request/lifecycle/disconnect/authenticate"
+            }
             Self::RelayMatrix => "relay publish, subscribe, fetch, unsubscribe, batch, envelope",
-            Self::SingleSessionLive => "single-session request, lifecycle update, and disconnect",
+            Self::SingleSessionLive => {
+                "single-session request, lifecycle update, disconnect, and authenticate"
+            }
             Self::SingleSessionRequest => "single-session proposal approval and request response",
             Self::SingleSessionLifecycle => "single-session proposal approval and session update",
             Self::SingleSessionDisconnect => "single-session proposal approval and disconnect",
+            Self::SingleSessionAuthenticate => "single-session authentication rejection",
         }
     }
 
@@ -52,16 +60,21 @@ impl ScenarioName {
                 ProbeMode::CoreSingleSessionClientSessionRequest,
                 ProbeMode::CoreSingleSessionClientSessionLifecycle,
                 ProbeMode::CoreSingleSessionClientDisconnect,
+                ProbeMode::CoreSingleSessionClientSessionAuthenticate,
             ],
             Self::RelayMatrix => &[ProbeMode::Matrix],
             Self::SingleSessionLive => &[
                 ProbeMode::CoreSingleSessionClientSessionRequest,
                 ProbeMode::CoreSingleSessionClientSessionLifecycle,
                 ProbeMode::CoreSingleSessionClientDisconnect,
+                ProbeMode::CoreSingleSessionClientSessionAuthenticate,
             ],
             Self::SingleSessionRequest => &[ProbeMode::CoreSingleSessionClientSessionRequest],
             Self::SingleSessionLifecycle => &[ProbeMode::CoreSingleSessionClientSessionLifecycle],
             Self::SingleSessionDisconnect => &[ProbeMode::CoreSingleSessionClientDisconnect],
+            Self::SingleSessionAuthenticate => {
+                &[ProbeMode::CoreSingleSessionClientSessionAuthenticate]
+            }
         }
     }
 }
@@ -130,6 +143,9 @@ impl ProbeMode {
                 "core-single-session-client-session-lifecycle"
             }
             Self::CoreSingleSessionClientDisconnect => "core-single-session-client-disconnect",
+            Self::CoreSingleSessionClientSessionAuthenticate => {
+                "core-single-session-client-session-authenticate"
+            }
             Self::PairingUri(_) => "pairing-uri",
         }
     }

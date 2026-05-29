@@ -268,7 +268,24 @@ pub fn derive_shared_sym_key(
 /// > const topic = overrideTopic || hashKey(symKey);
 #[must_use]
 pub fn derive_topic_from_sym_key(sym_key: &PairingSymKey) -> RelayTopic {
-    RelayTopic::from_bytes(Sha256::digest(sym_key.to_bytes()).into())
+    derive_topic_from_key_bytes(&sym_key.to_bytes())
+}
+
+/// Hashes an X25519 public key into the response topic used by type 1 messages.
+///
+/// `wc_sessionAuthenticate` responses are sent to `hashKey(receiverPublicKey)`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1448-L1450>
+///
+/// > const receiverPublicKey = pendingRequest.requester.publicKey;
+/// > const responseTopic = hashKey(receiverPublicKey);
+#[must_use]
+pub fn derive_topic_from_x25519_public_key(public_key: &X25519PublicKey) -> RelayTopic {
+    derive_topic_from_key_bytes(&public_key.to_bytes())
+}
+
+fn derive_topic_from_key_bytes(bytes: &[u8]) -> RelayTopic {
+    RelayTopic::from_bytes(Sha256::digest(bytes).into())
 }
 
 impl fmt::Display for X25519PublicKey {

@@ -8,6 +8,7 @@ mod codec;
 mod error;
 mod pairing_lifecycle;
 mod publish;
+mod session_authenticate;
 mod session_lifecycle;
 mod session_request;
 mod types;
@@ -279,3 +280,37 @@ pub const SESSION_PING_RESPONSE_TAG: u64 = 1115;
 /// > ttl: ONE_DAY,
 /// > tag: 1115,
 pub const SESSION_PING_RESPONSE_TTL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Relay tag used for approved `wc_sessionAuthenticate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L120-L123>
+///
+/// > res: {
+/// > ttl: ONE_HOUR,
+/// > tag: 1117,
+pub const SESSION_AUTHENTICATE_RESPONSE_TAG: u64 = 1117;
+
+/// Relay retention window for approved `wc_sessionAuthenticate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L120-L123>
+///
+/// > res: {
+/// > ttl: ONE_HOUR,
+pub const SESSION_AUTHENTICATE_RESPONSE_TTL_SECONDS: u64 = 60 * 60;
+
+/// Relay tag used for rejected `wc_sessionAuthenticate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L125-L128>
+///
+/// > reject: {
+/// > ttl: FIVE_MINUTES,
+/// > tag: 1118,
+pub const SESSION_AUTHENTICATE_REJECT_TAG: u64 = 1118;
+
+/// Relay retention window for rejected `wc_sessionAuthenticate` responses.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/cf822b5691a43ab1c2cce9daf5f070f7fbae7149/packages/sign-client/src/constants/engine.ts#L125-L128>
+///
+/// > reject: {
+/// > ttl: FIVE_MINUTES,
+pub const SESSION_AUTHENTICATE_REJECT_TTL_SECONDS: u64 = 5 * 60;

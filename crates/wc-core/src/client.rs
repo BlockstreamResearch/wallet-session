@@ -7,8 +7,8 @@ use std::{
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, Session, SessionDeleteParams,
-        SessionEventParams, SessionNamespaces, SessionProposeParams,
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, Session, SessionAuthenticateParams,
+        SessionDeleteParams, SessionEventParams, SessionNamespaces, SessionProposeParams,
     },
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
@@ -20,6 +20,7 @@ use crate::pairing::{
     SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
     SessionReceivedMessage, SessionSubscription,
 };
+use crate::session_authenticate::{SessionAuthenticateReview, SessionAuthenticateReviewError};
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 
@@ -546,6 +547,42 @@ impl SingleSessionClient {
         Ok(ack)
     }
 
+    /// Extracts wallet-facing review data from a `wc_sessionAuthenticate` event.
+    ///
+    /// This helper verifies that the authentication request still belongs to
+    /// the active pairing topic. It does not sign CACAOs and does not apply
+    /// wallet policy by itself.
+    pub fn session_authenticate_review(
+        &self,
+        authenticate: &SingleSessionAuthenticate,
+    ) -> Result<SessionAuthenticateReview, SingleSessionClientError> {
+        self.active_pairing(authenticate.pairing_topic())?;
+        SessionAuthenticateReview::from_message(authenticate.message())
+            .map_err(|source| SingleSessionClientError::SessionAuthenticateReview { source })
+    }
+
+    /// Rejects a queued `wc_sessionAuthenticate` event.
+    ///
+    /// Rejection publishes a type-1 error response on the requester public-key
+    /// response topic, then drops the pairing topic from the single-session
+    /// runtime.
+    pub async fn reject_session_authenticate(
+        &mut self,
+        authenticate: &SingleSessionAuthenticate,
+        reason: JsonRpcError,
+    ) -> Result<bool, SingleSessionClientError> {
+        let subscription = self.active_pairing(authenticate.pairing_topic())?.clone();
+        let ack = self
+            .pairing
+            .reject_session_authenticate(&subscription, authenticate.message(), reason)
+            .await
+            .map_err(SingleSessionClientError::from)?;
+        self.unsubscribe_pairing(&subscription).await?;
+        self.state = SingleSessionClientState::Idle;
+
+        Ok(ack)
+    }
+
     /// Publishes a success response for a `SessionClientEvent::SessionRequest`.
     pub async fn respond_session_request_success(
         &mut self,
@@ -952,6 +989,7 @@ impl SingleSessionClient {
                 }
             }
             PairingPayload::SessionProposal(_)
+            | PairingPayload::SessionAuthenticate(_)
             | PairingPayload::Sign(_)
             | PairingPayload::Unknown(_)
             | PairingPayload::Missing => {}
@@ -1077,6 +1115,8 @@ fn take_expired_session_from_state(
 pub enum SingleSessionClientEvent {
     /// A dapp proposed a session on a pairing topic.
     SessionProposal(Box<SingleSessionProposal>),
+    /// A dapp requested CAIP-122/CACAO authentication on a pairing topic.
+    SessionAuthenticate(Box<SingleSessionAuthenticate>),
     /// Pairing-topic message that is not a session proposal.
     PairingMessage(PairingReceivedMessage),
     /// Message on an acknowledged session topic.
@@ -1090,6 +1130,13 @@ impl SingleSessionClientEvent {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
                 Self::SessionProposal(Box::new(SingleSessionProposal {
+                    pairing_topic: message.topic().clone(),
+                    request: (**request).clone(),
+                    message,
+                }))
+            }
+            PairingPayload::SessionAuthenticate(request) => {
+                Self::SessionAuthenticate(Box::new(SingleSessionAuthenticate {
                     pairing_topic: message.topic().clone(),
                     request: (**request).clone(),
                     message,
@@ -1128,6 +1175,40 @@ impl SingleSessionProposal {
     /// Typed proposal request.
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest<SessionProposeParams> {
+        &self.request
+    }
+
+    /// Original decrypted pairing-topic message.
+    #[must_use]
+    pub const fn message(&self) -> &PairingReceivedMessage {
+        &self.message
+    }
+}
+
+/// Session-authenticate request retained for review or rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleSessionAuthenticate {
+    pairing_topic: RelayTopic,
+    request: JsonRpcRequest<SessionAuthenticateParams>,
+    message: PairingReceivedMessage,
+}
+
+impl SingleSessionAuthenticate {
+    /// Pairing topic that received the authentication request.
+    #[must_use]
+    pub const fn pairing_topic(&self) -> &RelayTopic {
+        &self.pairing_topic
+    }
+
+    /// JSON-RPC request id from `wc_sessionAuthenticate`.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request.id
+    }
+
+    /// Typed authentication request.
+    #[must_use]
+    pub const fn request(&self) -> &JsonRpcRequest<SessionAuthenticateParams> {
         &self.request
     }
 
@@ -1382,6 +1463,14 @@ pub enum SingleSessionClientError {
         /// Source review construction error.
         #[source]
         source: SessionRequestReviewError,
+    },
+
+    /// A pairing-topic message could not be converted to auth review data.
+    #[error("single-session client session authenticate review failed")]
+    SessionAuthenticateReview {
+        /// Source review construction error.
+        #[source]
+        source: SessionAuthenticateReviewError,
     },
 
     /// No pending caller decision exists for this session request.

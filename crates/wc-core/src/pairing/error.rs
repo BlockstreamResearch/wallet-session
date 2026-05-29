@@ -185,6 +185,10 @@ pub enum PairingClientError {
     #[error("session response target is not a session request")]
     SessionResponseTargetNotRequest,
 
+    /// A `wc_sessionAuthenticate` response was built from a different pairing message.
+    #[error("session authenticate response target is not a session authenticate request")]
+    SessionAuthenticateResponseTargetNotAuthenticate,
+
     /// A `wc_sessionPing` response was built from a different session message.
     #[error("session response target is not a session ping")]
     SessionResponseTargetNotPing,

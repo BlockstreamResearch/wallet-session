@@ -12,6 +12,7 @@ use chacha20poly1305::{
 };
 use getrandom::Error as RandomError;
 
+use crate::key::X25519PublicKey;
 use crate::pairing::PairingSymKey;
 
 /// `WalletConnect` envelope type byte.
@@ -114,6 +115,30 @@ impl Envelope {
         let mut iv = [0_u8; ENVELOPE_IV_BYTES];
         getrandom::fill(&mut iv).map_err(|error| EnvelopeError::Random { error })?;
         Self::encrypt_type_0_with_iv(message, sym_key, iv)
+    }
+
+    /// Encrypts a type 1 envelope with a fresh 12-byte IV.
+    ///
+    /// Type 1 adds the sender public key to the encrypted envelope. The caller
+    /// derives the shared symmetric key from the sender private key and receiver
+    /// public key before calling this function.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L88-L94>
+    ///
+    /// > if (validated.type === TYPE_1 && validated.senderPublicKey) {
+    /// > senderPublicKey = fromString(validated.senderPublicKey, BASE16);
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/c93ada3d30c178ff43b037c46fd3e9b28f109d91/packages/utils/src/crypto.ts#L141-L144>
+    ///
+    /// > return toString(concat([params.type, params.senderPublicKey, params.iv, params.sealed]), BASE64);
+    pub fn encrypt_type_1(
+        message: &str,
+        sym_key: &PairingSymKey,
+        sender_public_key: &X25519PublicKey,
+    ) -> Result<Self, EnvelopeError> {
+        let mut iv = [0_u8; ENVELOPE_IV_BYTES];
+        getrandom::fill(&mut iv).map_err(|error| EnvelopeError::Random { error })?;
+        Self::encrypt_type_1_with_iv(message, sym_key, sender_public_key, iv)
     }
 
     /// Decodes base64/base64url and splits envelope fields.
@@ -231,6 +256,26 @@ impl Envelope {
             iv: Some(iv),
             sealed,
             sender_public_key: None,
+        })
+    }
+
+    /// Encrypts a type 1 envelope with a caller-provided IV for vector tests.
+    fn encrypt_type_1_with_iv(
+        message: &str,
+        sym_key: &PairingSymKey,
+        sender_public_key: &X25519PublicKey,
+        iv: [u8; ENVELOPE_IV_BYTES],
+    ) -> Result<Self, EnvelopeError> {
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&sym_key.to_bytes()));
+        let sealed = cipher
+            .encrypt(Nonce::from_slice(&iv), message.as_bytes())
+            .map_err(|source| EnvelopeError::Encrypt { source })?;
+
+        Ok(Self {
+            kind: EnvelopeType::Type1,
+            iv: Some(iv),
+            sealed,
+            sender_public_key: Some(sender_public_key.to_bytes()),
         })
     }
 
@@ -505,6 +550,25 @@ mod tests {
         assert_eq!(
             encrypted.encode(EnvelopeEncoding::Base64),
             TEST_ENCODED_TYPE_0
+        );
+    }
+
+    #[test]
+    fn encrypts_type_1_matching_upstream_vector() {
+        let upstream =
+            Envelope::decode(TEST_ENCODED_TYPE_1, EnvelopeEncoding::Base64).expect("decodes");
+        let sender_public_key = X25519PublicKey::from_bytes(TEST_SENDER_PUBLIC_KEY);
+        let encrypted = Envelope::encrypt_type_1_with_iv(
+            TEST_MESSAGE,
+            &test_key(),
+            &sender_public_key,
+            *upstream.iv().unwrap(),
+        )
+        .expect("encrypts");
+
+        assert_eq!(
+            encrypted.encode(EnvelopeEncoding::Base64),
+            TEST_ENCODED_TYPE_1
         );
     }
 
