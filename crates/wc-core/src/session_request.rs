@@ -5,9 +5,11 @@ use wc_protocol::{
     caip::Caip2ChainId,
     relay::RelayTopic,
     session::{JsonRpcRequest, SessionMethod, SessionRequestParams, SignMethod},
+    verify::{DEFAULT_VERIFY_URL, VerifyContext},
 };
 
 use crate::pairing::{SessionPayload, SessionReceivedMessage};
+use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
 
 /// Wallet-facing review data for a valid `wc_sessionRequest`.
 ///
@@ -67,6 +69,7 @@ pub struct SessionRequestReview {
     params: Value,
     expiry_timestamp: Option<u64>,
     published_at: u64,
+    verify_context: VerifyContext,
 }
 
 impl SessionRequestReview {
@@ -74,11 +77,38 @@ impl SessionRequestReview {
     pub fn from_message(
         message: &SessionReceivedMessage,
     ) -> Result<Self, SessionRequestReviewError> {
+        Self::from_message_with_verify_context(
+            message,
+            VerifyContext::unknown("", DEFAULT_VERIFY_URL),
+        )
+    }
+
+    /// Extracts review data and caller-resolved Verify context from a session message.
+    ///
+    /// The maintained Sign Client attaches `verifyContext` to
+    /// `session_request` events after resolving it from the stored peer
+    /// metadata and request hash.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2456-L2474>
+    ///
+    /// > const verifyContext = await this.getVerifyContext({
+    /// > metadata: session.peer.metadata,
+    /// > const request = {
+    /// > verifyContext,
+    pub fn from_message_with_verify_context(
+        message: &SessionReceivedMessage,
+        verify_context: VerifyContext,
+    ) -> Result<Self, SessionRequestReviewError> {
         let SessionPayload::SessionRequest(request) = message.payload() else {
             return Err(SessionRequestReviewError::NotSessionRequest);
         };
 
-        Self::from_request(message.topic().clone(), message.published_at(), request)
+        Self::from_request_with_verify_context(
+            message.topic().clone(),
+            message.published_at(),
+            request,
+            verify_context,
+        )
     }
 
     /// Builds review data from a typed `wc_sessionRequest`.
@@ -86,6 +116,21 @@ impl SessionRequestReview {
         topic: RelayTopic,
         published_at: u64,
         request: &JsonRpcRequest<SessionRequestParams>,
+    ) -> Result<Self, SessionRequestReviewError> {
+        Self::from_request_with_verify_context(
+            topic,
+            published_at,
+            request,
+            VerifyContext::unknown("", DEFAULT_VERIFY_URL),
+        )
+    }
+
+    /// Builds review data from a typed request and caller-resolved Verify context.
+    pub fn from_request_with_verify_context(
+        topic: RelayTopic,
+        published_at: u64,
+        request: &JsonRpcRequest<SessionRequestParams>,
+        verify_context: VerifyContext,
     ) -> Result<Self, SessionRequestReviewError> {
         if request.method != SignMethod::SessionRequest {
             return Err(SessionRequestReviewError::MethodMismatch {
@@ -101,6 +146,7 @@ impl SessionRequestReview {
             params: request.params.request.params.clone(),
             expiry_timestamp: request.params.request.expiry_timestamp,
             published_at,
+            verify_context,
         })
     }
 
@@ -146,6 +192,22 @@ impl SessionRequestReview {
         self.published_at
     }
 
+    /// Verify context associated with the requesting dapp.
+    ///
+    /// `SingleSessionClient::session_request_review` seeds this from the
+    /// active session peer metadata. Lower-level constructors without session
+    /// metadata use an unresolved empty-origin context.
+    #[must_use]
+    pub const fn verify_context(&self) -> &VerifyContext {
+        &self.verify_context
+    }
+
+    /// Current policy classification for `verify_context`.
+    #[must_use]
+    pub const fn verify_risk(&self) -> VerifyContextRisk {
+        classify_verify_context(&self.verify_context)
+    }
+
     /// Whether the request expiry has passed at `now_unix_seconds`.
     #[must_use]
     pub fn is_expired_at(&self, now_unix_seconds: u64) -> bool {
@@ -175,9 +237,11 @@ mod tests {
     use wc_protocol::{
         relay::RelayTopic,
         session::{JsonRpcRequest, SessionRequest, SessionRequestParams, SignMethod},
+        verify::{VerifyContext, VerifyValidation},
     };
 
     use super::SessionRequestReview;
+    use crate::VerifyContextRisk;
 
     #[test]
     fn review_preserves_request_fields() -> Result<(), Box<dyn std::error::Error>> {
@@ -205,6 +269,8 @@ mod tests {
         assert_eq!(review.params(), &json!(["0x68656c6c6f"]));
         assert_eq!(review.expiry_timestamp(), Some(1_700_000_300));
         assert_eq!(review.published_at(), 1_700_000_000_000);
+        assert_eq!(review.verify_context().verified.origin, "");
+        assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(!review.is_expired_at(1_700_000_299));
         assert!(review.is_expired_at(1_700_000_300));
 
@@ -234,6 +300,42 @@ mod tests {
             super::SessionRequestReviewError::MethodMismatch {
                 method: SignMethod::SessionPing,
             }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn review_preserves_supplied_verify_context() -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "personal_sign".parse()?,
+                    params: json!([]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let verify_context =
+            VerifyContext::unknown("https://example.com", "https://verify.walletconnect.org");
+
+        let review = SessionRequestReview::from_request_with_verify_context(
+            RelayTopic::from_bytes([3; 32]),
+            1_700_000_000_000,
+            &request,
+            verify_context,
+        )?;
+
+        assert_eq!(
+            review.verify_context().verified.origin,
+            "https://example.com"
+        );
+        assert_eq!(
+            review.verify_context().verified.validation,
+            VerifyValidation::Unknown
         );
 
         Ok(())

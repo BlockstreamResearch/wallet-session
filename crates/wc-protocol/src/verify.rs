@@ -4,6 +4,21 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::session::DappMetadata;
+
+/// Default Verify endpoint used when dapp metadata has no `verifyUrl`.
+///
+/// The maintained Sign Client seeds `Verify.Context` with
+/// `metadata.verifyUrl || VERIFY_SERVER` before calling the Verify resolver.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L3289-L3295>
+///
+/// > verifyUrl: metadata.verifyUrl || VERIFY_SERVER,
+///
+/// A live `@walletconnect/sign-client` `session_proposal` probe observed this
+/// concrete URL when no metadata override was supplied.
+pub const DEFAULT_VERIFY_URL: &str = "https://verify.walletconnect.org";
+
 /// `WalletConnect` Verify context attached to approval-sensitive events.
 ///
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/core/verify.ts#L5-L13>
@@ -67,6 +82,49 @@ impl VerifyContext {
                 is_scam: None,
             },
         }
+    }
+
+    /// Builds the unresolved Verify context from peer metadata.
+    ///
+    /// This mirrors the SDK state before `core.verify.resolve(...)` completes:
+    /// origin comes from `metadata.url`, the Verify endpoint comes from
+    /// `metadata.verifyUrl` or the default Verify server, and validation remains
+    /// `UNKNOWN`.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L3289-L3309>
+    ///
+    /// > validation: "UNKNOWN",
+    /// > origin: metadata.url || "",
+    /// > verifyUrl: metadata.verifyUrl,
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wc_protocol::{
+    ///     session::DappMetadata,
+    ///     verify::{DEFAULT_VERIFY_URL, VerifyContext, VerifyValidation},
+    /// };
+    ///
+    /// let metadata = DappMetadata {
+    ///     name: "Example".to_owned(),
+    ///     description: "Example dapp".to_owned(),
+    ///     url: "https://example.com".to_owned(),
+    ///     icons: vec![],
+    ///     verify_url: None,
+    ///     redirect: None,
+    /// };
+    /// let context = VerifyContext::unresolved_from_metadata(&metadata);
+    ///
+    /// assert_eq!(context.verified.origin, "https://example.com");
+    /// assert_eq!(context.verified.verify_url, DEFAULT_VERIFY_URL);
+    /// assert_eq!(context.verified.validation, VerifyValidation::Unknown);
+    /// ```
+    #[must_use]
+    pub fn unresolved_from_metadata(metadata: &DappMetadata) -> Self {
+        Self::unknown(
+            metadata.url.clone(),
+            metadata.verify_url.as_deref().unwrap_or(DEFAULT_VERIFY_URL),
+        )
     }
 }
 

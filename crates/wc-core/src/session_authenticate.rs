@@ -6,9 +6,11 @@ use wc_protocol::{
         AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
         SessionNamespaces, SessionParticipant, SignMethod,
     },
+    verify::VerifyContext,
 };
 
 use crate::pairing::{PairingPayload, PairingReceivedMessage};
+use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
 
 /// Wallet-facing review data for a `wc_sessionAuthenticate` request.
 ///
@@ -67,6 +69,7 @@ pub struct SessionAuthenticateReview {
     auth_payload: AuthPayload,
     expiry_timestamp: u64,
     published_at: u64,
+    verify_context: VerifyContext,
 }
 
 impl SessionAuthenticateReview {
@@ -81,11 +84,49 @@ impl SessionAuthenticateReview {
         Self::from_request(message.topic().clone(), message.published_at(), request)
     }
 
+    /// Extracts review data and caller-resolved Verify context from a pairing message.
+    ///
+    /// The maintained Sign Client attaches `verifyContext` to
+    /// `session_authenticate` events.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2605>
+    ///
+    /// > const verifyContext = await this.getVerifyContext({
+    /// > metadata: requester.metadata,
+    /// > verifyContext,
+    pub fn from_message_with_verify_context(
+        message: &PairingReceivedMessage,
+        verify_context: VerifyContext,
+    ) -> Result<Self, SessionAuthenticateReviewError> {
+        let PairingPayload::SessionAuthenticate(request) = message.payload() else {
+            return Err(SessionAuthenticateReviewError::NotSessionAuthenticate);
+        };
+
+        Self::from_request_with_verify_context(
+            message.topic().clone(),
+            message.published_at(),
+            request,
+            verify_context,
+        )
+    }
+
     /// Builds review data from a typed `wc_sessionAuthenticate` request.
     pub fn from_request(
         topic: RelayTopic,
         published_at: u64,
         request: &JsonRpcRequest<SessionAuthenticateParams>,
+    ) -> Result<Self, SessionAuthenticateReviewError> {
+        let verify_context =
+            VerifyContext::unresolved_from_metadata(&request.params.requester.metadata);
+        Self::from_request_with_verify_context(topic, published_at, request, verify_context)
+    }
+
+    /// Builds review data from a typed request and caller-resolved Verify context.
+    pub fn from_request_with_verify_context(
+        topic: RelayTopic,
+        published_at: u64,
+        request: &JsonRpcRequest<SessionAuthenticateParams>,
+        verify_context: VerifyContext,
     ) -> Result<Self, SessionAuthenticateReviewError> {
         if request.method != SignMethod::SessionAuthenticate {
             return Err(SessionAuthenticateReviewError::MethodMismatch {
@@ -93,11 +134,12 @@ impl SessionAuthenticateReview {
             });
         }
 
-        Ok(Self::from_params(
+        Ok(Self::from_params_with_verify_context(
             topic,
             request.id,
             published_at,
             request.params.clone(),
+            verify_context,
         ))
     }
 
@@ -109,6 +151,25 @@ impl SessionAuthenticateReview {
         published_at: u64,
         params: SessionAuthenticateParams,
     ) -> Self {
+        let verify_context = VerifyContext::unresolved_from_metadata(&params.requester.metadata);
+        Self::from_params_with_verify_context(
+            topic,
+            request_id,
+            published_at,
+            params,
+            verify_context,
+        )
+    }
+
+    /// Builds review data from already validated params and Verify context.
+    #[must_use]
+    pub fn from_params_with_verify_context(
+        topic: RelayTopic,
+        request_id: u64,
+        published_at: u64,
+        params: SessionAuthenticateParams,
+        verify_context: VerifyContext,
+    ) -> Self {
         Self {
             topic,
             request_id,
@@ -116,6 +177,7 @@ impl SessionAuthenticateReview {
             auth_payload: params.auth_payload,
             expiry_timestamp: params.expiry_timestamp,
             published_at,
+            verify_context,
         }
     }
 
@@ -153,6 +215,18 @@ impl SessionAuthenticateReview {
     #[must_use]
     pub const fn published_at(&self) -> u64 {
         self.published_at
+    }
+
+    /// Verify context associated with the requesting dapp.
+    #[must_use]
+    pub const fn verify_context(&self) -> &VerifyContext {
+        &self.verify_context
+    }
+
+    /// Current policy classification for `verify_context`.
+    #[must_use]
+    pub const fn verify_risk(&self) -> VerifyContextRisk {
+        classify_verify_context(&self.verify_context)
     }
 
     /// Whether the request expiry has passed at `now_unix_seconds`.
@@ -262,7 +336,7 @@ pub enum SessionAuthenticateApprovalError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::SessionAuthenticateApprovalError;
+    use crate::{SessionAuthenticateApprovalError, VerifyContextRisk};
     use wc_protocol::{
         caip::NamespaceKey,
         did::DidPkh,
@@ -294,6 +368,11 @@ mod tests {
         assert_eq!(review.auth_payload().domain, "example.com");
         assert_eq!(review.expiry_timestamp(), 4_102_444_800);
         assert_eq!(review.published_at(), 1_779_954_250_000);
+        assert_eq!(
+            review.verify_context().verified.origin,
+            "https://example.com"
+        );
+        assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(review.is_expired_at(4_102_444_800));
 
         Ok(())

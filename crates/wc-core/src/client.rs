@@ -12,6 +12,7 @@ use wc_protocol::{
         SessionEventParams, SessionNamespaces, SessionParticipant, SessionProposeParams,
         SessionTransportType,
     },
+    verify::VerifyContext,
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
 
@@ -27,6 +28,7 @@ use crate::session_authenticate::{
 };
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
+use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
 
 /// Default number of fetched or internally queued events retained by `SingleSessionClient`.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -739,9 +741,11 @@ impl SingleSessionClient {
         message: &SessionReceivedMessage,
     ) -> Result<SessionRequestReview, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
-        self.client_session(message.topic())?
-            .ensure_pending_session_request(request_id)?;
-        SessionRequestReview::from_message(message)
+        let session = self.client_session(message.topic())?;
+        session.ensure_pending_session_request(request_id)?;
+        let verify_context =
+            VerifyContext::unresolved_from_metadata(&session.session.peer.metadata);
+        SessionRequestReview::from_message_with_verify_context(message, verify_context)
             .map_err(|source| SingleSessionClientError::SessionRequestReview { source })
     }
 
@@ -1229,16 +1233,24 @@ impl SingleSessionClientEvent {
     pub(crate) fn from_pairing_message(message: PairingReceivedMessage) -> Self {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
+                let request = (**request).clone();
+                let verify_context =
+                    VerifyContext::unresolved_from_metadata(&request.params.proposer.metadata);
                 Self::SessionProposal(Box::new(SingleSessionProposal {
                     pairing_topic: message.topic().clone(),
-                    request: (**request).clone(),
+                    request,
+                    verify_context,
                     message,
                 }))
             }
             PairingPayload::SessionAuthenticate(request) => {
+                let request = (**request).clone();
+                let verify_context =
+                    VerifyContext::unresolved_from_metadata(&request.params.requester.metadata);
                 Self::SessionAuthenticate(Box::new(SingleSessionAuthenticate {
                     pairing_topic: message.topic().clone(),
-                    request: (**request).clone(),
+                    request,
+                    verify_context,
                     message,
                 }))
             }
@@ -1256,6 +1268,7 @@ impl SingleSessionClientEvent {
 pub struct SingleSessionProposal {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionProposeParams>,
+    verify_context: VerifyContext,
     message: PairingReceivedMessage,
 }
 
@@ -1276,6 +1289,27 @@ impl SingleSessionProposal {
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest<SessionProposeParams> {
         &self.request
+    }
+
+    /// Unresolved Verify context built from proposal metadata.
+    ///
+    /// The maintained Sign Client emits `verifyContext` with
+    /// `session_proposal` events after seeding it from metadata and then
+    /// attempting Verify resolution.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/client.ts#L33-L36>
+    ///
+    /// > session_proposal: {
+    /// > verifyContext: Verify.Context;
+    #[must_use]
+    pub const fn verify_context(&self) -> &VerifyContext {
+        &self.verify_context
+    }
+
+    /// Current policy classification for `verify_context`.
+    #[must_use]
+    pub const fn verify_risk(&self) -> VerifyContextRisk {
+        classify_verify_context(&self.verify_context)
     }
 
     /// Authentication subrequests embedded in this proposal.
@@ -1307,6 +1341,7 @@ impl SingleSessionProposal {
 pub struct SingleSessionAuthenticate {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionAuthenticateParams>,
+    verify_context: VerifyContext,
     message: PairingReceivedMessage,
 }
 
@@ -1327,6 +1362,26 @@ impl SingleSessionAuthenticate {
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest<SessionAuthenticateParams> {
         &self.request
+    }
+
+    /// Unresolved Verify context built from authentication requester metadata.
+    ///
+    /// The maintained Sign Client emits `verifyContext` with
+    /// `session_authenticate` events.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/client.ts#L58-L61>
+    ///
+    /// > session_authenticate: {
+    /// > verifyContext: Verify.Context;
+    #[must_use]
+    pub const fn verify_context(&self) -> &VerifyContext {
+        &self.verify_context
+    }
+
+    /// Current policy classification for `verify_context`.
+    #[must_use]
+    pub const fn verify_risk(&self) -> VerifyContextRisk {
+        classify_verify_context(&self.verify_context)
     }
 
     /// Original decrypted pairing-topic message.

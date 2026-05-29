@@ -990,6 +990,11 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
                 proposal.request().params.proposer.metadata.name,
                 "Probe Dapp"
             );
+            assert_eq!(
+                proposal.verify_context().verified.origin,
+                "https://example.com"
+            );
+            assert_eq!(proposal.verify_risk(), crate::VerifyContextRisk::Unknown);
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -1026,6 +1031,14 @@ fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::
             assert_eq!(
                 authenticate.request().params.auth_payload.domain,
                 "example.com"
+            );
+            assert_eq!(
+                authenticate.verify_context().verified.origin,
+                "https://example.com"
+            );
+            assert_eq!(
+                authenticate.verify_risk(),
+                crate::VerifyContextRisk::Unknown
             );
         }
         other => panic!("unexpected event: {other:?}"),

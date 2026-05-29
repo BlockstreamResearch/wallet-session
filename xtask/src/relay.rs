@@ -900,9 +900,12 @@ async fn run_core_single_session_client_session_request_probe(
 
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-single-session-client-session-request proposal_id={} pairing_topic={}",
+        "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
         proposal.proposal_id(),
-        proposal.pairing_topic()
+        proposal.pairing_topic(),
+        proposal.verify_context().verified.origin.as_str(),
+        proposal.verify_context().verified.validation.as_str(),
+        proposal.verify_risk()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
@@ -1080,9 +1083,12 @@ async fn run_core_single_session_client_disconnect_probe(config: &RelayProbeConf
 
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-single-session-client-disconnect proposal_id={} pairing_topic={}",
+        "core-single-session-client-disconnect proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
         proposal.proposal_id(),
-        proposal.pairing_topic()
+        proposal.pairing_topic(),
+        proposal.verify_context().verified.origin.as_str(),
+        proposal.verify_context().verified.validation.as_str(),
+        proposal.verify_risk()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
@@ -1141,9 +1147,12 @@ async fn run_core_single_session_client_session_lifecycle_probe(
 
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-single-session-client-session-lifecycle proposal_id={} pairing_topic={}",
+        "core-single-session-client-session-lifecycle proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
         proposal.proposal_id(),
-        proposal.pairing_topic()
+        proposal.pairing_topic(),
+        proposal.verify_context().verified.origin.as_str(),
+        proposal.verify_context().verified.validation.as_str(),
+        proposal.verify_risk()
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
@@ -2200,19 +2209,22 @@ fn print_ignored_session_message(message: &SessionReceivedMessage) {
 
 fn print_session_request_review(review: &SessionRequestReview) {
     println!(
-        "core-single-session-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} params={}",
+        "core-single-session-client-session-request review topic={} id={} chain_id={} method={} expiry={:?} verify_origin={} verify_validation={} verify_risk={:?} params={}",
         review.topic(),
         review.request_id(),
         review.chain_id(),
         review.method(),
         review.expiry_timestamp(),
+        review.verify_context().verified.origin.as_str(),
+        review.verify_context().verified.validation.as_str(),
+        review.verify_risk(),
         review.params()
     );
 }
 
 fn print_session_authenticate_review(review: &SessionAuthenticateReview) {
     println!(
-        "core-single-session-client-session-authenticate review topic={} id={} requester_name={} domain={} aud={} chains={} expiry={}",
+        "core-single-session-client-session-authenticate review topic={} id={} requester_name={} domain={} aud={} chains={} expiry={} verify_origin={} verify_validation={} verify_risk={:?}",
         review.topic(),
         review.request_id(),
         review.requester().metadata.name,
@@ -2225,7 +2237,10 @@ fn print_session_authenticate_review(review: &SessionAuthenticateReview) {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(","),
-        review.expiry_timestamp()
+        review.expiry_timestamp(),
+        review.verify_context().verified.origin.as_str(),
+        review.verify_context().verified.validation.as_str(),
+        review.verify_risk()
     );
 }
 

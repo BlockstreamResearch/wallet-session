@@ -1,7 +1,10 @@
 //! Verify DTO tests.
 
 use serde_json::json;
-use wc_protocol::verify::{VerifyContext, VerifyValidation};
+use wc_protocol::{
+    session::DappMetadata,
+    verify::{DEFAULT_VERIFY_URL, VerifyContext, VerifyValidation},
+};
 
 const LIVE_VERIFY_CONTEXT_UNKNOWN_JSON: &str = r#"{
   "verified": {
@@ -76,4 +79,40 @@ fn preserves_scam_signal_when_present() {
     let context = serde_json::from_value::<VerifyContext>(value).expect("parses");
 
     assert!(context.verified.is_scam());
+}
+
+#[test]
+fn unresolved_context_uses_metadata_origin_and_default_verify_url() {
+    let metadata = DappMetadata {
+        name: "Example".to_owned(),
+        description: "Example dapp".to_owned(),
+        url: "https://example.com".to_owned(),
+        icons: vec![],
+        verify_url: None,
+        redirect: None,
+    };
+
+    let context = VerifyContext::unresolved_from_metadata(&metadata);
+
+    assert_eq!(context.verified.origin, "https://example.com");
+    assert_eq!(context.verified.verify_url, DEFAULT_VERIFY_URL);
+    assert_eq!(context.verified.validation, VerifyValidation::Unknown);
+}
+
+#[test]
+fn unresolved_context_preserves_metadata_verify_url_override() {
+    let metadata = DappMetadata {
+        name: "Example".to_owned(),
+        description: "Example dapp".to_owned(),
+        url: "https://example.com".to_owned(),
+        icons: vec![],
+        verify_url: Some("https://verify.example.com".to_owned()),
+        redirect: None,
+    };
+
+    let context = VerifyContext::unresolved_from_metadata(&metadata);
+
+    assert_eq!(context.verified.origin, "https://example.com");
+    assert_eq!(context.verified.verify_url, "https://verify.example.com");
+    assert_eq!(context.verified.validation, VerifyValidation::Unknown);
 }
