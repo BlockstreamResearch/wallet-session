@@ -12,7 +12,8 @@
     "authenticate": "bun run src/authenticate.ts",
     "sign-auth": "bun run src/sign-auth.ts",
     "pairing-lifecycle": "bun run src/pairing-lifecycle.ts",
-    "propose-session": "bun run src/propose-session.ts"
+    "propose-session": "bun run src/propose-session.ts",
+    "verify-context": "bun run src/verify-context.ts"
   },
   "trustedDependencies": [],
   "dependencies": {

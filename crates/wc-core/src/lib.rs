@@ -6,6 +6,7 @@ mod pairing;
 mod session_authenticate;
 mod session_request;
 mod session_update;
+mod verify_policy;
 
 pub use capabilities::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
@@ -34,6 +35,7 @@ pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
     diff_session_namespaces,
 };
+pub use verify_policy::{VerifyContextRisk, classify_verify_context};
 pub use wc_transport::RelayReconnectConfig;
 
 /// Lower-level pairing and session primitives used by live harnesses.
