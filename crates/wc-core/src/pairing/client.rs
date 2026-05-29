@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::timeout;
 use wc_protocol::{
-    key::X25519KeyPair,
+    key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
     pairing::PairingUri,
     relay::{DEFAULT_RELAY_URL, RelayAuthToken, RelayConnectionUrl, relay_auth_audience},
     session::{
@@ -41,9 +41,10 @@ use super::{
         session_request_validation_error,
     },
     types::{
-        ApprovedSession, PairingReceivedMessage, PairingSubscription, SessionClientEvent,
-        SessionLifecycleRequest, SessionLifecycleResponseMessage, SessionMessageOutcome,
-        SessionPayload, SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+        ApprovedSession, ApprovedSessionAuthenticate, PairingPayload, PairingReceivedMessage,
+        PairingSubscription, SessionClientEvent, SessionLifecycleRequest,
+        SessionLifecycleResponseMessage, SessionMessageOutcome, SessionPayload,
+        SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
         SessionSettleResponseMessage, SessionSubscription,
     },
 };
@@ -240,6 +241,32 @@ impl PairingClient {
         Ok(SessionSubscription {
             topic: subscription.topic().clone(),
             sym_key: subscription.sym_key().clone(),
+            subscription_id,
+        })
+    }
+
+    /// Subscribes to an authenticated session topic with its derived symmetric key.
+    ///
+    /// The maintained SDK subscribes the authenticated session topic before it
+    /// publishes the `wc_sessionAuthenticate` success response.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1377-L1380>
+    ///
+    /// > await this.client.core.relayer.subscribe(sessionTopic, { transportType });
+    pub async fn subscribe_session(
+        &mut self,
+        topic: wc_protocol::relay::RelayTopic,
+        sym_key: wc_protocol::pairing::PairingSymKey,
+    ) -> Result<SessionSubscription, PairingClientError> {
+        let subscription_id = self
+            .relay
+            .subscribe(topic.clone())
+            .await
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(SessionSubscription {
+            topic,
+            sym_key,
             subscription_id,
         })
     }
@@ -1035,6 +1062,8 @@ impl PairingClient {
     /// The caller supplies signed CACAO objects. The core generates only the
     /// X25519 responder key used for type-1 response encryption and responder
     /// metadata; it does not sign authentication messages.
+    /// When `subscribe_authenticated_session` is true, the derived session
+    /// topic is subscribed before the success response is published.
     ///
     /// <https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests>
     ///
@@ -1045,9 +1074,26 @@ impl PairingClient {
         message: &PairingReceivedMessage,
         wallet_metadata: wc_protocol::session::DappMetadata,
         cacaos: Vec<wc_protocol::session::Cacao>,
-    ) -> Result<bool, PairingClientError> {
+        subscribe_authenticated_session: bool,
+    ) -> Result<ApprovedSessionAuthenticate, PairingClientError> {
         let responder =
             X25519KeyPair::generate().map_err(|source| PairingClientError::KeyPair { source })?;
+        let PairingPayload::SessionAuthenticate(request) = message.payload() else {
+            return Err(PairingClientError::SessionAuthenticateResponseTargetNotAuthenticate);
+        };
+        let session_sym_key = derive_shared_sym_key(
+            responder.private_key(),
+            &request.params.requester.public_key,
+        );
+        let session_topic = derive_topic_from_sym_key(&session_sym_key);
+        let session_subscription = if subscribe_authenticated_session {
+            Some(
+                self.subscribe_session(session_topic.clone(), session_sym_key.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let publish = session_authenticate_success_publish(
             subscription,
             message,
@@ -1055,10 +1101,19 @@ impl PairingClient {
             cacaos,
             &responder,
         )?;
-        self.relay
+        let response_ack = self
+            .relay
             .publish(publish)
             .await
-            .map_err(|source| PairingClientError::Relay { source })
+            .map_err(|source| PairingClientError::Relay { source })?;
+
+        Ok(ApprovedSessionAuthenticate {
+            session_topic,
+            session_sym_key,
+            session_subscription,
+            responder_public_key: responder.public_key().clone(),
+            response_ack,
+        })
     }
 }
 

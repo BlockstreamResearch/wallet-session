@@ -7,8 +7,9 @@ use std::{
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, Session, SessionAuthenticateParams,
-        SessionDeleteParams, SessionEventParams, SessionNamespaces, SessionProposeParams,
+        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, RelayProtocolOptions, Session,
+        SessionAuthenticateParams, SessionDeleteParams, SessionEventParams, SessionNamespaces,
+        SessionParticipant, SessionProposeParams, SessionTransportType,
     },
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
@@ -566,14 +567,20 @@ impl SingleSessionClient {
     /// Approves a queued `wc_sessionAuthenticate` event with signed CACAOs.
     ///
     /// Approval publishes a type-1 success response on the requester public-key
-    /// response topic, then drops the pairing topic from the single-session
-    /// runtime. The caller owns message formatting, user approval, and signing;
-    /// this method only publishes the already signed CACAO objects.
+    /// response topic. If approval includes session namespaces, the runtime
+    /// subscribes the derived authenticated session topic and stores an
+    /// acknowledged session; otherwise it drops the pairing topic. The caller
+    /// owns message formatting, user approval, signing, and namespace policy.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1350-L1375>
+    ///
+    /// > if (approvedMethods?.length > 0) {
+    /// > session = {
     pub async fn approve_session_authenticate(
         &mut self,
         authenticate: &SingleSessionAuthenticate,
         approval: SessionAuthenticateApproval,
-    ) -> Result<bool, SingleSessionClientError> {
+    ) -> Result<SessionAuthenticateApprovalOutcome, SingleSessionClientError> {
         let subscription = self.active_pairing(authenticate.pairing_topic())?.clone();
         let request = authenticate.request();
         let now_unix_seconds = now_unix_seconds()?;
@@ -585,21 +592,72 @@ impl SingleSessionClient {
             });
         }
 
-        let (wallet_metadata, cacaos) = approval.into_parts();
-        let ack = self
+        let (wallet_metadata, cacaos, session_namespaces) = approval.into_parts();
+        let adopt_session = session_namespaces.is_some();
+        if adopt_session {
+            self.unsubscribe_pairing(&subscription).await?;
+        }
+        let approved = self
             .pairing
             .approve_session_authenticate(
                 &subscription,
                 authenticate.message(),
-                wallet_metadata,
-                cacaos,
+                wallet_metadata.clone(),
+                cacaos.clone(),
+                adopt_session,
             )
             .await
-            .map_err(SingleSessionClientError::from)?;
+            .map_err(|source| {
+                if adopt_session {
+                    self.state = SingleSessionClientState::Idle;
+                    self.queued_events.clear();
+                }
+                SingleSessionClientError::from(source)
+            })?;
+        if let Some(namespaces) = session_namespaces {
+            let Some(session_subscription) = approved.session_subscription().cloned() else {
+                self.state = SingleSessionClientState::Idle;
+                self.queued_events.clear();
+                return Err(
+                    SingleSessionClientError::SessionAuthenticateSubscriptionMissing {
+                        topic: approved.session_topic().clone(),
+                    },
+                );
+            };
+            let session = match authenticated_session(
+                &subscription,
+                request,
+                approved.session_topic().clone(),
+                approved.responder_public_key().clone(),
+                wallet_metadata,
+                cacaos,
+                namespaces,
+            ) {
+                Ok(session) => session,
+                Err(error) => {
+                    self.state = SingleSessionClientState::Idle;
+                    self.queued_events.clear();
+                    return Err(error);
+                }
+            };
+            self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+                session_subscription,
+                session.clone(),
+            )));
+
+            return Ok(SessionAuthenticateApprovalOutcome {
+                response_ack: approved.response_ack(),
+                session: Some(session),
+            });
+        }
+
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
 
-        Ok(ack)
+        Ok(SessionAuthenticateApprovalOutcome {
+            response_ack: approved.response_ack(),
+            session: None,
+        })
     }
 
     /// Rejects a queued `wc_sessionAuthenticate` event.
@@ -1281,6 +1339,35 @@ impl SessionExpired {
     }
 }
 
+/// Result of approving a `wc_sessionAuthenticate` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthenticateApprovalOutcome {
+    response_ack: bool,
+    session: Option<Session>,
+}
+
+impl SessionAuthenticateApprovalOutcome {
+    /// Relay ack for the auth success response publish.
+    #[must_use]
+    pub const fn response_ack(&self) -> bool {
+        self.response_ack
+    }
+
+    /// Auth-created session adopted by the single-session runtime.
+    ///
+    /// This is `None` when the approval did not include session namespaces.
+    #[must_use]
+    pub const fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
+    /// Moves the adopted session out of the approval result.
+    #[must_use]
+    pub fn into_session(self) -> Option<Session> {
+        self.session
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveSession {
     subscription: SessionSubscription,
@@ -1525,6 +1612,13 @@ pub enum SingleSessionClientError {
         now_unix_seconds: u64,
     },
 
+    /// Auth approval requested session adoption but no session subscription was returned.
+    #[error("single-session client session authenticate subscription missing")]
+    SessionAuthenticateSubscriptionMissing {
+        /// Derived authenticated session topic.
+        topic: RelayTopic,
+    },
+
     /// No pending caller decision exists for this session request.
     #[error("single-session client session request decision is not pending")]
     SessionRequestDecisionMissing {
@@ -1620,6 +1714,55 @@ fn session_extended_expiry() -> Result<u64, SingleSessionClientError> {
         .ok_or(SingleSessionClientError::SessionExpiryOverflow)
 }
 
+/// Builds the wallet-side session stored after `wc_sessionAuthenticate` approval.
+///
+/// The maintained SDK stores an acknowledged session when authenticated methods
+/// are granted, with the responder key as `controller` and the signed CACAOs in
+/// `authentication`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1350-L1375>
+///
+/// > session = {
+/// > topic: sessionTopic,
+/// > acknowledged: true,
+/// > authentication: auths,
+/// > namespaces: buildNamespacesFromAuth(
+fn authenticated_session(
+    pairing_subscription: &PairingSubscription,
+    request: &JsonRpcRequest<SessionAuthenticateParams>,
+    session_topic: RelayTopic,
+    responder_public_key: wc_protocol::key::X25519PublicKey,
+    wallet_metadata: wc_protocol::session::DappMetadata,
+    cacaos: Vec<wc_protocol::session::Cacao>,
+    namespaces: SessionNamespaces,
+) -> Result<Session, SingleSessionClientError> {
+    Ok(Session {
+        topic: session_topic,
+        pairing_topic: pairing_subscription.topic().clone(),
+        relay: RelayProtocolOptions {
+            protocol: "irn".to_owned(),
+            data: None,
+        },
+        expiry: session_extended_expiry()?,
+        acknowledged: true,
+        controller: responder_public_key.clone(),
+        namespaces,
+        required_namespaces: std::collections::BTreeMap::default(),
+        optional_namespaces: std::collections::BTreeMap::default(),
+        session_properties: None,
+        scoped_properties: None,
+        session_config: None,
+        self_participant: SessionParticipant {
+            public_key: responder_public_key,
+            metadata: wallet_metadata,
+        },
+        peer: request.params.requester.clone(),
+        authentication: Some(cacaos),
+        wallet_pay_result: None,
+        transport_type: Some(SessionTransportType::Relay),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
@@ -1629,7 +1772,7 @@ mod tests {
         DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
         DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SingleSessionClient,
         SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
-        SingleSessionClientState, take_expired_session_from_state,
+        SingleSessionClientState, authenticated_session, take_expired_session_from_state,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -1643,11 +1786,16 @@ mod tests {
         },
     };
     use wc_protocol::{
+        caip::NamespaceKey,
+        did::DidPkh,
         key::X25519PublicKey,
         pairing::PairingSymKey,
         relay::RelayTopic,
         session::{
-            DappMetadata, RelayProtocolOptions, Session, SessionParticipant, SessionTransportType,
+            AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
+            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
+            RelayProtocolOptions, Session, SessionAuthenticateParams, SessionNamespace,
+            SessionParticipant, SessionTransportType, SignMethod,
         },
     };
 
@@ -1741,6 +1889,50 @@ mod tests {
         assert_eq!(expired.expiry(), expiry);
         assert!(matches!(state, SingleSessionClientState::Idle));
         assert_eq!(take_expired_session_from_state(&mut state, expiry), None);
+    }
+
+    #[test]
+    fn authenticated_session_uses_responder_as_controller() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pairing_topic = RelayTopic::from_bytes([0x52; 32]);
+        let session_topic = RelayTopic::from_bytes([0x53; 32]);
+        let responder_public_key = X25519PublicKey::from_bytes([0x54; 32]);
+        let wallet_metadata = test_metadata("Wallet");
+        let namespaces = BTreeMap::from([(
+            NamespaceKey::parse("eip155")?,
+            SessionNamespace {
+                chains: Some(vec!["eip155:1".parse()?]),
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".parse()?],
+                methods: vec!["personal_sign".parse()?],
+                events: Vec::new(),
+            },
+        )]);
+        let cacaos = vec![test_cacao()?];
+        let subscription = PairingSubscription::for_test(
+            pairing_topic.clone(),
+            PairingSymKey::from_bytes([0x55; 32]),
+        );
+
+        let session = authenticated_session(
+            &subscription,
+            &auth_request()?,
+            session_topic.clone(),
+            responder_public_key.clone(),
+            wallet_metadata.clone(),
+            cacaos.clone(),
+            namespaces.clone(),
+        )?;
+
+        assert_eq!(session.topic, session_topic);
+        assert_eq!(session.pairing_topic, pairing_topic);
+        assert!(session.acknowledged);
+        assert_eq!(session.controller, responder_public_key);
+        assert_eq!(session.self_participant.metadata, wallet_metadata);
+        assert_eq!(session.authentication, Some(cacaos));
+        assert_eq!(session.namespaces, namespaces);
+        assert_eq!(session.transport_type, Some(SessionTransportType::Relay));
+
+        Ok(())
     }
 
     #[test]
@@ -2193,14 +2385,7 @@ mod tests {
 
     fn test_session(topic: RelayTopic, expiry: u64) -> Session {
         let public_key = X25519PublicKey::from_bytes([0x66; 32]);
-        let metadata = DappMetadata {
-            name: "Test".to_owned(),
-            description: "Test".to_owned(),
-            url: "https://example.com".to_owned(),
-            icons: Vec::new(),
-            verify_url: None,
-            redirect: None,
-        };
+        let metadata = test_metadata("Test");
 
         Session {
             topic,
@@ -2229,6 +2414,72 @@ mod tests {
             authentication: None,
             wallet_pay_result: None,
             transport_type: Some(SessionTransportType::Relay),
+        }
+    }
+
+    fn auth_request()
+    -> Result<JsonRpcRequest<SessionAuthenticateParams>, Box<dyn std::error::Error>> {
+        Ok(JsonRpcRequest::new(
+            42,
+            SignMethod::SessionAuthenticate,
+            SessionAuthenticateParams {
+                requester: SessionParticipant {
+                    public_key: X25519PublicKey::from_bytes([0x67; 32]),
+                    metadata: test_metadata("Dapp"),
+                },
+                auth_payload: AuthPayload {
+                    kind: CacaoHeaderType::Caip122,
+                    chains: vec!["eip155:1".parse()?],
+                    aud: "https://example.com/login".to_owned(),
+                    domain: "example.com".to_owned(),
+                    version: "1".to_owned(),
+                    nonce: "1234567890".to_owned(),
+                    iat: "2026-05-29T12:00:00.000Z".to_owned(),
+                    statement: Some("Sign in to Example".to_owned()),
+                    exp: None,
+                    nbf: None,
+                    request_id: None,
+                    resources: Vec::new(),
+                },
+                expiry_timestamp: FUTURE_SESSION_EXPIRY,
+            },
+        ))
+    }
+
+    fn test_cacao() -> Result<Cacao, Box<dyn std::error::Error>> {
+        Ok(Cacao {
+            h: CacaoHeader {
+                kind: CacaoHeaderType::Caip122,
+            },
+            p: CacaoPayload {
+                iss: DidPkh::parse("did:pkh:eip155:1:0x1111111111111111111111111111111111111111")?,
+                domain: "example.com".to_owned(),
+                aud: "https://example.com/login".to_owned(),
+                version: "1".to_owned(),
+                nonce: "1234567890".to_owned(),
+                iat: "2026-05-29T12:00:00.000Z".to_owned(),
+                statement: Some("Sign in to Example".to_owned()),
+                exp: None,
+                nbf: None,
+                request_id: None,
+                resources: Vec::new(),
+            },
+            s: CacaoSignature {
+                kind: CacaoSignatureType::Eip191,
+                signature: CacaoSignatureValue::from_wire("0x00"),
+                meta: None,
+            },
+        })
+    }
+
+    fn test_metadata(name: &str) -> DappMetadata {
+        DappMetadata {
+            name: name.to_owned(),
+            description: name.to_owned(),
+            url: "https://example.com".to_owned(),
+            icons: Vec::new(),
+            verify_url: None,
+            redirect: None,
         }
     }
 

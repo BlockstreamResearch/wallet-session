@@ -26,13 +26,12 @@ The current priority is protocol behavior over broad surface area:
 
 The next target is the remaining Sign authentication and trust behavior, in this order:
 
-1. auth-created session adoption after `wc_sessionAuthenticate` approval;
-2. CACAO message formatting and validation helpers;
-3. proposal authentication subrequest handling;
-4. Verify/origin trust context surfaced in review data;
-5. Wallet Call API DTO and review helpers;
-6. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
-7. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
+1. CACAO message formatting and validation helpers;
+2. proposal authentication subrequest handling;
+3. Verify/origin trust context surfaced in review data;
+4. Wallet Call API DTO and review helpers;
+5. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
+6. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
 
 Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
 
@@ -214,7 +213,7 @@ Reference:
 Session authentication follows the same explicit decision boundary.
 `wc_sessionAuthenticate` asks the wallet to sign CAIP-122/CACAO payloads.
 The runtime must not sign or approve authentication inside `SingleSessionClient::next_event()`.
-It exposes an auth review primitive and currently supports explicit rejection.
+It exposes auth review and explicit approve/reject primitives.
 
 Current session authentication flow:
 
@@ -223,15 +222,20 @@ Current session authentication flow:
 3. caller extracts `SessionAuthenticateReview` for origin, requester, payload, chain, and expiry review;
 4. caller signs authentication messages outside core and builds CACAO objects;
 5. caller invokes `SingleSessionClient::approve_session_authenticate` or `SingleSessionClient::reject_session_authenticate`;
-6. core publishes a type-1 JSON-RPC response on the requester public-key response topic and drops the pairing topic.
+6. core publishes a type-1 JSON-RPC response on the requester public-key response topic;
+7. if approval includes session namespaces, core derives and subscribes the authenticated session topic and stores an acknowledged session;
+8. if approval has no session namespaces, core drops the pairing topic and returns to idle.
 
 Rationale: authentication is a wallet identity decision. CACAO signing, Verify context, and origin policy are security-sensitive primitives and must be explicit API steps rather than side effects of polling.
 
-Current limitation: the maintained SDK may return a session alongside successful authentication. The live harness observes this shape, but the current runtime does not yet adopt that session. Session adoption is the next authentication slice.
+The maintained SDK derives the authenticated session topic from requester and responder keys, subscribes that topic, stores an acknowledged session when approved methods exist, then publishes the auth success response. `SingleSessionClient` mirrors that shape, but requires the caller to pass the approved session namespaces explicitly so session creation remains a wallet policy decision.
 
 Reference:
 
 - [Maintained Sign Client authentication event](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2568-L2605)
+- [Maintained Sign Client authenticated session creation](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1350-L1375)
+- [Maintained Sign Client authenticated session subscription](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1377-L1380)
+- [Maintained Sign Client authentication approval response](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1405-L1415)
 - [Maintained Sign Client authentication rejection](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1433-L1468)
 - [CAIP-74 CACAO](https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification)
 

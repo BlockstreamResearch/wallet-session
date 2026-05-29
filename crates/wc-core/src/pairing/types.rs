@@ -1,5 +1,6 @@
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingPingParams},
+    key::X25519PublicKey,
     pairing::PairingSymKey,
     pairing_message::PairingMessage,
     relay::RelayTopic,
@@ -97,7 +98,7 @@ impl SessionSubscription {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovedSession {
     pub(super) subscription: SessionSubscription,
-    pub(super) responder_public_key: wc_protocol::key::X25519PublicKey,
+    pub(super) responder_public_key: X25519PublicKey,
     pub(super) session_settle_request_id: u64,
     pub(super) session: Session,
     pub(super) proposal_response_ack: bool,
@@ -119,7 +120,7 @@ impl ApprovedSession {
 
     /// Wallet responder public key sent to the dapp.
     #[must_use]
-    pub const fn responder_public_key(&self) -> &wc_protocol::key::X25519PublicKey {
+    pub const fn responder_public_key(&self) -> &X25519PublicKey {
         &self.responder_public_key
     }
 
@@ -191,6 +192,52 @@ impl ApprovedSession {
     #[must_use]
     pub const fn session_settle_ack(&self) -> bool {
         self.session_settle_ack
+    }
+}
+
+/// Result of publishing a `wc_sessionAuthenticate` approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedSessionAuthenticate {
+    pub(super) session_topic: RelayTopic,
+    pub(super) session_sym_key: PairingSymKey,
+    pub(super) session_subscription: Option<SessionSubscription>,
+    pub(super) responder_public_key: X25519PublicKey,
+    pub(super) response_ack: bool,
+}
+
+impl ApprovedSessionAuthenticate {
+    /// Session topic derived from requester and responder X25519 keys.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1343-L1346>
+    ///
+    /// > const sessionTopic = await this.client.core.crypto.generateSharedKey(
+    #[must_use]
+    pub const fn session_topic(&self) -> &RelayTopic {
+        &self.session_topic
+    }
+
+    /// Symmetric key for encrypted messages on the derived session topic.
+    #[must_use]
+    pub const fn session_sym_key(&self) -> &PairingSymKey {
+        &self.session_sym_key
+    }
+
+    /// Active relay subscription for the authenticated session topic.
+    #[must_use]
+    pub const fn session_subscription(&self) -> Option<&SessionSubscription> {
+        self.session_subscription.as_ref()
+    }
+
+    /// Responder public key returned in the auth success result.
+    #[must_use]
+    pub const fn responder_public_key(&self) -> &X25519PublicKey {
+        &self.responder_public_key
+    }
+
+    /// Relay ack for the auth success response publish.
+    #[must_use]
+    pub const fn response_ack(&self) -> bool {
+        self.response_ack
     }
 }
 

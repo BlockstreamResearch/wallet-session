@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -28,7 +29,7 @@ use wc_core::{
     },
 };
 use wc_protocol::{
-    caip::{Caip2ChainId, Caip10AccountId},
+    caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingMethod, PairingPingParams},
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
@@ -40,7 +41,7 @@ use wc_protocol::{
     },
     session::{
         Cacao, DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
-        SessionEventParams, SessionMethod,
+        SessionEventParams, SessionMethod, SessionNamespace, SessionNamespaces,
     },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
@@ -1001,16 +1002,29 @@ async fn run_core_single_session_client_session_authenticate_probe(
     print_session_authenticate_review(&review);
     validate_session_authenticate_review(&review)?;
 
+    let mut adopted_session_topic = None;
     let expected_outcome = match response_mode.as_str() {
         "approve" => {
             let cacao = signed_auth_cacao_from_review(&review)?;
-            let approval = SessionAuthenticateApproval::new(auth_wallet_metadata(), vec![cacao])?;
-            let approve_ack = client
+            let namespaces = auth_session_namespaces(&review, &cacao)?;
+            let approval = SessionAuthenticateApproval::new(auth_wallet_metadata(), vec![cacao])?
+                .with_session_namespaces(namespaces);
+            let outcome = client
                 .approve_session_authenticate(&authenticate, approval)
                 .await?;
+            let adopted_session = outcome
+                .session()
+                .context("session authenticate approval did not adopt a session")?;
             println!(
-                "core-single-session-client-session-authenticate approve_ack={approve_ack} response_tag={SESSION_AUTHENTICATE_RESPONSE_TAG}"
+                "core-single-session-client-session-authenticate approve_ack={} response_tag={} active_session_topic={} acknowledged={} namespaces={} expiry={}",
+                outcome.response_ack(),
+                SESSION_AUTHENTICATE_RESPONSE_TAG,
+                adopted_session.topic,
+                adopted_session.acknowledged,
+                adopted_session.namespaces.len(),
+                adopted_session.expiry
             );
+            adopted_session_topic = Some(adopted_session.topic.to_string());
             "authenticate_response"
         }
         "reject" => {
@@ -1032,6 +1046,9 @@ async fn run_core_single_session_client_session_authenticate_probe(
     };
 
     let result = harness.expect_result(expected_outcome).await?;
+    if let Some(topic) = adopted_session_topic {
+        validate_authenticate_response_session(&result, &topic)?;
+    }
     println!("core-single-session-client-session-authenticate js_result={result}");
     harness.terminate();
 
@@ -2252,6 +2269,37 @@ fn validate_session_authenticate_review(review: &SessionAuthenticateReview) -> R
     Ok(())
 }
 
+/// Checks the maintained SDK session topic against the Rust-adopted topic.
+///
+/// The auth approval probe uses this as the live parity assertion: both peers
+/// must derive the same authenticated session topic from the type-1 response
+/// key agreement.
+fn validate_authenticate_response_session(
+    result: &Value,
+    active_session_topic: &str,
+) -> Result<()> {
+    let session = result
+        .get("result")
+        .and_then(|result| result.get("session"))
+        .context("authenticate response did not include a session")?;
+    let js_topic = session
+        .get("topic")
+        .and_then(Value::as_str)
+        .context("authenticate response session did not include a topic")?;
+    if js_topic != active_session_topic {
+        bail!("auth session topic mismatch: JS={js_topic}, Rust={active_session_topic}");
+    }
+    let acknowledged = session
+        .get("acknowledged")
+        .and_then(Value::as_bool)
+        .context("authenticate response session did not include acknowledged")?;
+    if !acknowledged {
+        bail!("authenticate response session is not acknowledged");
+    }
+
+    Ok(())
+}
+
 fn auth_wallet_metadata() -> DappMetadata {
     DappMetadata {
         name: "walletconnect-client-poc Rust auth wallet".to_owned(),
@@ -2261,6 +2309,58 @@ fn auth_wallet_metadata() -> DappMetadata {
         verify_url: None,
         redirect: None,
     }
+}
+
+/// Builds the same default auth namespace shape used by the JS harness.
+///
+/// The maintained utility maps signed accounts to namespaces, copies approved
+/// methods, and sets `chainChanged` plus `accountsChanged`.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/namespaces.ts#L274-L287>
+///
+/// ```text
+/// values.events = ["chainChanged", "accountsChanged"];
+/// ```
+fn auth_session_namespaces(
+    review: &SessionAuthenticateReview,
+    cacao: &Cacao,
+) -> Result<SessionNamespaces> {
+    let account = cacao.p.iss.account_id();
+    let chain = account.chain_id();
+    let methods = env::var("WC_JS_AUTH_METHODS")
+        .unwrap_or_else(|_| "personal_sign".to_owned())
+        .split(',')
+        .filter(|method| !method.is_empty())
+        .map(SessionMethod::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    if methods.is_empty() {
+        bail!("auth approval session namespaces require at least one method");
+    }
+    if !review
+        .auth_payload()
+        .chains
+        .iter()
+        .any(|requested| requested == &chain)
+    {
+        bail!("signed auth chain {chain} was not requested by wc_sessionAuthenticate");
+    }
+
+    let namespace = NamespaceKey::parse(chain.namespace())?;
+    let mut namespaces = BTreeMap::new();
+    namespaces.insert(
+        namespace,
+        SessionNamespace {
+            chains: Some(vec![chain]),
+            accounts: vec![account],
+            methods,
+            events: vec![
+                SessionEventName::parse("chainChanged")?,
+                SessionEventName::parse("accountsChanged")?,
+            ],
+        },
+    );
+
+    Ok(namespaces)
 }
 
 fn signed_auth_cacao_from_review(review: &SessionAuthenticateReview) -> Result<Cacao> {

@@ -4,7 +4,7 @@ use wc_protocol::{
     relay::RelayTopic,
     session::{
         AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
-        SessionParticipant, SignMethod,
+        SessionNamespaces, SessionParticipant, SignMethod,
     },
 };
 
@@ -177,6 +177,7 @@ impl SessionAuthenticateReview {
 pub struct SessionAuthenticateApproval {
     wallet_metadata: DappMetadata,
     cacaos: Vec<Cacao>,
+    session_namespaces: Option<SessionNamespaces>,
 }
 
 impl SessionAuthenticateApproval {
@@ -192,7 +193,23 @@ impl SessionAuthenticateApproval {
         Ok(Self {
             wallet_metadata,
             cacaos,
+            session_namespaces: None,
         })
+    }
+
+    /// Adds namespaces for an authenticated session created by this approval.
+    ///
+    /// The maintained SDK creates and stores an acknowledged session only when
+    /// approved methods are present.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1350-L1375>
+    ///
+    /// > if (approvedMethods?.length > 0) {
+    /// > session = {
+    #[must_use]
+    pub fn with_session_namespaces(mut self, namespaces: SessionNamespaces) -> Self {
+        self.session_namespaces = Some(namespaces);
+        self
     }
 
     /// Wallet metadata sent as the authentication responder.
@@ -207,8 +224,14 @@ impl SessionAuthenticateApproval {
         &self.cacaos
     }
 
-    pub(crate) fn into_parts(self) -> (DappMetadata, Vec<Cacao>) {
-        (self.wallet_metadata, self.cacaos)
+    /// Namespaces for the auth-created session, when the caller grants methods.
+    #[must_use]
+    pub const fn session_namespaces(&self) -> Option<&SessionNamespaces> {
+        self.session_namespaces.as_ref()
+    }
+
+    pub(crate) fn into_parts(self) -> (DappMetadata, Vec<Cacao>, Option<SessionNamespaces>) {
+        (self.wallet_metadata, self.cacaos, self.session_namespaces)
     }
 }
 
@@ -237,15 +260,19 @@ pub enum SessionAuthenticateApprovalError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::SessionAuthenticateApprovalError;
     use wc_protocol::{
+        caip::NamespaceKey,
         did::DidPkh,
         key::X25519PublicKey,
         relay::RelayTopic,
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
             CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
-            SessionAuthenticateParams, SessionParticipant, SignMethod,
+            SessionAuthenticateParams, SessionEventName, SessionMethod, SessionNamespace,
+            SessionParticipant, SignMethod,
         },
     };
 
@@ -307,6 +334,17 @@ mod tests {
             approval.cacaos()[0].p.iss.as_str(),
             "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_preserves_auth_session_namespaces() -> Result<(), Box<dyn std::error::Error>> {
+        let namespaces = session_namespaces()?;
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![cacao()?])?
+            .with_session_namespaces(namespaces.clone());
+
+        assert_eq!(approval.session_namespaces(), Some(&namespaces));
 
         Ok(())
     }
@@ -385,5 +423,21 @@ mod tests {
                 meta: None,
             },
         })
+    }
+
+    fn session_namespaces()
+    -> Result<wc_protocol::session::SessionNamespaces, Box<dyn std::error::Error>> {
+        Ok(BTreeMap::from([(
+            NamespaceKey::parse("eip155")?,
+            SessionNamespace {
+                chains: Some(vec!["eip155:1".parse()?]),
+                accounts: vec!["eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".parse()?],
+                methods: vec![SessionMethod::parse("personal_sign")?],
+                events: vec![
+                    SessionEventName::parse("chainChanged")?,
+                    SessionEventName::parse("accountsChanged")?,
+                ],
+            },
+        )]))
     }
 }

@@ -13,9 +13,10 @@ pub use capabilities::{
 pub use client::{
     DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
     DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
-    DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SessionExpired, SingleSessionAuthenticate,
-    SingleSessionClient, SingleSessionClientConfig, SingleSessionClientConnectionState,
-    SingleSessionClientError, SingleSessionClientEvent, SingleSessionProposal,
+    DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SessionAuthenticateApprovalOutcome,
+    SessionExpired, SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
+    SingleSessionClientConnectionState, SingleSessionClientError, SingleSessionClientEvent,
+    SingleSessionProposal,
 };
 pub use pairing::{
     DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
