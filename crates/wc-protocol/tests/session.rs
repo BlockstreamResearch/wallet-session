@@ -50,4 +50,5 @@ mod session {
     mod settle;
     mod types;
     mod update;
+    mod wallet_call;
 }

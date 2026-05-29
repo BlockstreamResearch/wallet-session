@@ -13,6 +13,7 @@ mod rpc;
 mod settle;
 mod types;
 mod update;
+mod wallet_call;
 
 pub use action::{SessionEventName, SessionEventNameError, SessionMethod, SessionMethodError};
 pub use authenticate::{
@@ -47,3 +48,10 @@ pub use types::{
     SessionParticipant, SessionProperties, SessionTransportType,
 };
 pub use update::SessionUpdateParams;
+pub use wallet_call::{
+    WalletCall, WalletCallMethod, WalletCallReceipt, WalletCallReceiptLog, WalletCallRequest,
+    WalletCallRequestError, WalletCapabilityMap, WalletGetCallsStatusParams,
+    WalletGetCallsStatusResult, WalletGetCapabilitiesParams, WalletGetCapabilitiesResult,
+    WalletSendCallsParams, WalletSendCallsRequest, WalletSendCallsResult,
+    WalletShowCallsStatusParams,
+};

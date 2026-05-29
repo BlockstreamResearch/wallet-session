@@ -56,7 +56,7 @@ Deliberate exclusions for this milestone:
 | Verify API | Surface `verifyContext` for proposal, auth, and request. | Partial | `VerifyContext` DTOs exist, live event fixtures exist, `SingleSessionClient` attaches unresolved metadata-based context, native hash-based resolver support exists, session-request reviews retain the exact SDK-compatible request hash, and Verify v3 JWT attestations can be validated with the fetched P-256 public key. Relay-carried JWT/encrypted-id metadata is now retained on pairing/session messages and can resolve proposal, auth, and request review contexts with explicit clock input. | Live Verify harness, `xtask verify-probe --public-key`, local resolver tests, and runtime review tests. | [Verify API](https://docs.walletconnect.network/wallet-sdk/web/verify#domain-risk-detection), [`VerifyContext`](../crates/wc-protocol/src/verify.rs), [`VerifyResolver`](../crates/wc-core/src/verify_resolver.rs) |
 | Verify policy | Wallets should warn on unknown/mismatch/threat states before approval. | Done for local classification | `classify_verify_context` classifies `VALID`, `UNKNOWN`, `INVALID`, and `isScam`; final approve/reject remains caller-owned. | Local policy matrix and live demo smoke tests. | [Verify implementation](https://docs.walletconnect.network/wallet-sdk/web/verify#implementation), [`VerifyContextRisk`](../crates/wc-core/src/verify_policy.rs) |
 | Wallet capabilities | Plan approved namespaces from supported chains/accounts/methods/events. | Partial | Extend policy model for auth methods, session properties, scoped properties, and method-specific constraints. | Local approval planner matrix. | [Namespaces](https://specs.walletconnect.com/2.0/specs/clients/sign/namespaces), [`WalletCapabilities`](../crates/wc-core/src/capabilities.rs) |
-| Wallet Call API | Handle EIP-5792 wallet request shapes and capability responses. | Missing | Add DTO/review helpers for `wallet_getCapabilities`, `wallet_sendCalls`, `wallet_getCallsStatus`, and `wallet_showCallsStatus`. Do not execute calls in core. | JSON fixtures, doctests, and live session request probe. | [Wallet Call API](https://docs.walletconnect.network/wallet-sdk/android/eip5792), [EIP-5792](https://eips.ethereum.org/EIPS/eip-5792) |
+| Wallet Call API | Handle EIP-5792 wallet request shapes and capability responses. | Done for DTO/review helpers | Keep execution caller-owned. Core recognizes `wallet_getCapabilities`, `wallet_sendCalls`, `wallet_getCallsStatus`, and `wallet_showCallsStatus` but does not submit transactions or disclose capabilities automatically. | Live `wallet_getCapabilities` and `wallet_sendCalls` probes, JSON fixtures, doctests, and malformed-param tests. | [Wallet Call API](https://docs.walletconnect.network/wallet-sdk/android/eip5792), [EIP-5792](https://eips.ethereum.org/EIPS/eip-5792), [`WalletCallRequest`](../crates/wc-protocol/src/dto/session/wallet_call.rs) |
 | Session properties | Dapps can request universal or chain-specific capability properties. | Missing | Preserve and review `sessionProperties` and `scopedProperties`; reject unsupported capability claims. | Proposal approval fixtures with CAIP-25 capability data. | [Wallet Call API, capabilities](https://docs.walletconnect.network/wallet-sdk/android/eip5792#capabilities-in-caip-25-connection-requests), [CAIP-25](https://github.com/ChainAgnostic/namespaces/blob/main/eip155/caip25.md) |
 | Expiry behavior | Proposal, auth request, session request, and session expiry must be explicit. | Partial | Add auth request expiry and proposal expiry events/errors where not already covered. | Deterministic clock tests; no wall-clock sleeps. | [Pairing API expiry](https://specs.walletconnect.com/2.0/specs/clients/core/pairing), [Sign events](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events) |
 | Link mode and redirects | SDKs expose redirect/link-mode metadata for app switching. | Partial | Preserve redirect metadata in review objects. Full link-mode transport is out of native-runtime scope unless needed for parity probes. | DTO tests and metadata preservation tests. | [Mobile linking](https://docs.walletconnect.network/wallet-sdk/android/mobile-linking), [Link Mode](https://docs.walletconnect.network/wallet-sdk/android/link-mode) |
@@ -70,12 +70,11 @@ Deliberate exclusions for this milestone:
 
 The next implementation sequence is:
 
-1. Wallet Call API DTO/review helpers.
-2. Session/scoped properties in proposal approval planning.
-3. Expiry coverage for proposal/auth/session-request edges.
-4. Interop scenarios for auth approval, Verify states, and Wallet Call API.
-5. Fuzz/adversarial parser coverage.
-6. API contract freeze and snapshots.
+1. Session/scoped properties in proposal approval planning.
+2. Expiry coverage for proposal/auth/session-request edges.
+3. Interop scenarios for auth approval, Verify states, and Wallet Call API.
+4. Fuzz/adversarial parser coverage.
+5. API contract freeze and snapshots.
 
 Each slice should follow the repository rule:
 

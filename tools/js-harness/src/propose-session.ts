@@ -21,6 +21,15 @@ const afterApprovalAction =
   process.env.WC_JS_AFTER_APPROVAL_ACTION ?? (sendSessionRequest ? "session_request" : "approved");
 const waitForSessionRequestResponse =
   process.env.WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE === "1";
+const proposalChains = envList("WC_JS_PROPOSAL_CHAINS", ["eip155:1"]);
+const proposalMethods = envList("WC_JS_PROPOSAL_METHODS", [
+  "personal_sign",
+  "eth_signTypedData_v4",
+]);
+const proposalEvents = envList("WC_JS_PROPOSAL_EVENTS", [
+  "accountsChanged",
+  "chainChanged",
+]);
 
 if (!uriFile && !printUri) {
   console.error("set WC_JS_URI_FILE or set WC_JS_PRINT_URI=1 to print the full pairing URI");
@@ -41,9 +50,9 @@ const signClient = await SignClient.init({
 const { uri, approval } = await signClient.connect({
   requiredNamespaces: {
     eip155: {
-      chains: ["eip155:1"],
-      methods: ["personal_sign", "eth_signTypedData_v4"],
-      events: ["accountsChanged", "chainChanged"],
+      chains: proposalChains,
+      methods: proposalMethods,
+      events: proposalEvents,
     },
   },
 });
@@ -143,6 +152,23 @@ try {
 
 function redactPairingUri(uri: string): string {
   return uri.replace(/([?&]symKey=)[^&]+/, "$1<redacted>");
+}
+
+function envList(name: string, fallback: string[]): string[] {
+  const value = process.env[name];
+  if (!value) {
+    return fallback;
+  }
+
+  const values = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  if (values.length === 0) {
+    throw new Error(`${name} must contain at least one comma-separated value`);
+  }
+
+  return values;
 }
 
 async function writeResult(result: Record<string, unknown>): Promise<void> {

@@ -4,7 +4,10 @@ use serde_json::Value;
 use wc_protocol::{
     caip::Caip2ChainId,
     relay::RelayTopic,
-    session::{JsonRpcRequest, SessionMethod, SessionRequestParams, SignMethod},
+    session::{
+        JsonRpcRequest, SessionMethod, SessionRequest, SessionRequestParams, SignMethod,
+        WalletCallRequest, WalletCallRequestError,
+    },
     verify::{DEFAULT_VERIFY_URL, VerifyAttestationHash, VerifyContext},
 };
 
@@ -217,6 +220,24 @@ impl SessionRequestReview {
         &self.params
     }
 
+    /// Parses this review as an EIP-5792 Wallet Call request when applicable.
+    ///
+    /// This helper only recognizes the method-specific JSON shape. Wallets
+    /// still decide whether the user should approve the request and whether
+    /// advertised capabilities are supported.
+    ///
+    /// <https://eips.ethereum.org/EIPS/eip-5792#wallet_sendcalls>
+    ///
+    /// > MUST NOT send any calls from the request if the user rejects the
+    /// > request
+    pub fn wallet_call_request(&self) -> Result<Option<WalletCallRequest>, WalletCallRequestError> {
+        WalletCallRequest::from_session_request(&SessionRequest {
+            method: self.method.clone(),
+            params: self.params.clone(),
+            expiry_timestamp: self.expiry_timestamp,
+        })
+    }
+
     /// Optional request expiry timestamp in unix seconds.
     #[must_use]
     pub const fn expiry_timestamp(&self) -> Option<u64> {
@@ -394,7 +415,10 @@ mod tests {
     use serde_json::json;
     use wc_protocol::{
         relay::RelayTopic,
-        session::{JsonRpcRequest, SessionRequest, SessionRequestParams, SignMethod},
+        session::{
+            JsonRpcRequest, SessionRequest, SessionRequestParams, SignMethod, WalletCallRequest,
+            WalletSendCallsParams,
+        },
         verify::{VerifyContext, VerifyValidation},
     };
 
@@ -528,6 +552,48 @@ mod tests {
         assert_eq!(
             review.verify_context().verified.validation,
             VerifyValidation::Unknown
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn review_parses_wallet_call_request() -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "wallet_sendCalls".parse()?,
+                    params: json!([{
+                        "version": "2.0.0",
+                        "chainId": "0x1",
+                        "atomicRequired": true,
+                        "calls": [{
+                            "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+                            "value": "0x0",
+                            "data": "0x"
+                        }]
+                    }]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?;
+
+        let wallet_call = review
+            .wallet_call_request()?
+            .expect("wallet_sendCalls should parse");
+
+        let WalletCallRequest::SendCalls(WalletSendCallsParams(send_calls)) = wallet_call else {
+            panic!("expected wallet_sendCalls");
+        };
+        assert_eq!(send_calls.chain_id, "0x1");
+        assert_eq!(
+            send_calls.calls[0].to.as_deref(),
+            Some("0xd46e8dd67c5d32be8058bb8eb970870f07244567")
         );
 
         Ok(())

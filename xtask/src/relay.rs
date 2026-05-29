@@ -41,7 +41,7 @@ use wc_protocol::{
     },
     session::{
         Cacao, DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
-        SessionEventParams, SessionMethod, SessionNamespace, SessionNamespaces,
+        SessionEventParams, SessionMethod, SessionNamespace, SessionNamespaces, WalletCallRequest,
     },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
@@ -2224,6 +2224,46 @@ fn print_session_request_review(review: &SessionRequestReview) {
         review.verify_risk(),
         review.params()
     );
+    match review.wallet_call_request() {
+        Ok(Some(WalletCallRequest::GetCapabilities(params))) => {
+            println!(
+                "core-single-session-client-session-request wallet_call method=wallet_getCapabilities address={} chains={}",
+                params.0,
+                params
+                    .1
+                    .as_ref()
+                    .map_or_else(|| "<all>".to_owned(), |chains| chains.join(","))
+            );
+        }
+        Ok(Some(WalletCallRequest::SendCalls(params))) => {
+            println!(
+                "core-single-session-client-session-request wallet_call method=wallet_sendCalls chain_id={} from={:?} atomic_required={} calls={}",
+                params.0.chain_id,
+                params.0.from,
+                params.0.atomic_required,
+                params.0.calls.len()
+            );
+        }
+        Ok(Some(WalletCallRequest::GetCallsStatus(params))) => {
+            println!(
+                "core-single-session-client-session-request wallet_call method=wallet_getCallsStatus id={}",
+                params.0
+            );
+        }
+        Ok(Some(WalletCallRequest::ShowCallsStatus(params))) => {
+            println!(
+                "core-single-session-client-session-request wallet_call method=wallet_showCallsStatus id={}",
+                params.0
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            println!(
+                "core-single-session-client-session-request wallet_call_parse_error method={} error={error}",
+                review.method()
+            );
+        }
+    }
 }
 
 fn print_session_authenticate_review(review: &SessionAuthenticateReview) {

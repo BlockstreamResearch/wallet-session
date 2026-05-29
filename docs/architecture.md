@@ -29,9 +29,8 @@ The next target is the remaining Sign authentication and trust behavior, in this
 1. CACAO message formatting and validation helpers;
 2. proposal authentication subrequest handling;
 3. Verify/origin trust context surfaced in review data;
-4. Wallet Call API DTO and review helpers;
-5. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
-6. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
+4. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
+5. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
 
 Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
 
@@ -204,11 +203,13 @@ Current session request flow:
 
 Rationale: the protocol can decide whether a request is authorized by namespace, but only the wallet/user can decide whether to sign or submit it.
 The review primitive keeps request id, topic, chain, method, params, and expiry available without requiring application code to downcast raw session payloads.
+For EIP-5792 Wallet Call methods, `SessionRequestReview::wallet_call_request` parses the method-specific params for review but still does not execute transactions or disclose capabilities on its own.
 
 Reference:
 
 - [Session Request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
 - [Session Request RPC method](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest)
+- [EIP-5792 Wallet Call API](https://eips.ethereum.org/EIPS/eip-5792)
 
 Session authentication follows the same explicit decision boundary.
 `wc_sessionAuthenticate` asks the wallet to sign CAIP-122/CACAO payloads.
