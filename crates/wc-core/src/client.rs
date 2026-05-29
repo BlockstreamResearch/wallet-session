@@ -12,7 +12,7 @@ use wc_protocol::{
         SessionEventParams, SessionNamespaces, SessionParticipant, SessionProposeParams,
         SessionTransportType,
     },
-    verify::VerifyContext,
+    verify::{VerifyAttestationHash, VerifyContext},
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
 
@@ -29,6 +29,7 @@ use crate::session_authenticate::{
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Default number of fetched or internally queued events retained by `SingleSessionClient`.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
@@ -1312,6 +1313,26 @@ impl SingleSessionProposal {
         classify_verify_context(&self.verify_context)
     }
 
+    /// Resolves Verify context from the exact decrypted proposal payload hash.
+    ///
+    /// The maintained Sign Client hashes `JSON.stringify(payload)` before
+    /// calling the Verify resolver. Pairing messages retain the exact decrypted
+    /// payload string, so this method can use the same hash input.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2128-L2133>
+    ///
+    /// > hash: hashMessage(JSON.stringify(payload)),
+    pub async fn resolve_verify_context(
+        &mut self,
+        resolver: &VerifyResolver,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        let hash = VerifyAttestationHash::from_message(self.message.message().plaintext());
+        self.verify_context = resolver
+            .resolve_hash_for_context(&hash, &self.verify_context)
+            .await?;
+        Ok(&self.verify_context)
+    }
+
     /// Authentication subrequests embedded in this proposal.
     ///
     /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L302-L333>
@@ -1382,6 +1403,23 @@ impl SingleSessionAuthenticate {
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Resolves Verify context from the exact decrypted authentication payload hash.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2580>
+    ///
+    /// > hash: hashMessage(JSON.stringify(payload)),
+    /// > metadata: requester.metadata,
+    pub async fn resolve_verify_context(
+        &mut self,
+        resolver: &VerifyResolver,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        let hash = VerifyAttestationHash::from_message(self.message.message().plaintext());
+        self.verify_context = resolver
+            .resolve_hash_for_context(&hash, &self.verify_context)
+            .await?;
+        Ok(&self.verify_context)
     }
 
     /// Original decrypted pairing-topic message.

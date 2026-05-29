@@ -1159,13 +1159,13 @@ pub(super) const fn validate_pairing_not_expired(
     pairing: &PairingUri,
     now_unix_seconds: u64,
 ) -> Result<(), PairingClientError> {
-    if let Some(expiry_timestamp) = pairing.expiry_timestamp()
-        && expiry_timestamp <= now_unix_seconds
-    {
-        return Err(PairingClientError::PairingExpired {
-            expiry_timestamp,
-            now_unix_seconds,
-        });
+    if let Some(expiry_timestamp) = pairing.expiry_timestamp() {
+        if expiry_timestamp <= now_unix_seconds {
+            return Err(PairingClientError::PairingExpired {
+                expiry_timestamp,
+                now_unix_seconds,
+            });
+        }
     }
 
     Ok(())

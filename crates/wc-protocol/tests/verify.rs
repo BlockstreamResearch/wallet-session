@@ -3,7 +3,7 @@
 use serde_json::json;
 use wc_protocol::{
     session::DappMetadata,
-    verify::{DEFAULT_VERIFY_URL, VerifyContext, VerifyValidation},
+    verify::{DEFAULT_VERIFY_URL, VerifyAttestationHash, VerifyContext, VerifyValidation},
 };
 
 const LIVE_VERIFY_CONTEXT_UNKNOWN_JSON: &str = r#"{
@@ -115,4 +115,31 @@ fn unresolved_context_preserves_metadata_verify_url_override() {
     assert_eq!(context.verified.origin, "https://example.com");
     assert_eq!(context.verified.verify_url, "https://verify.example.com");
     assert_eq!(context.verified.validation, VerifyValidation::Unknown);
+}
+
+#[test]
+fn verify_attestation_hash_matches_walletconnect_hash_message() {
+    let hash = VerifyAttestationHash::from_message("some");
+
+    assert_eq!(
+        hash.as_str(),
+        "a6b46dd0d1ae5e86cbc8f37e75ceeb6760230c1ca4ffbcb0c97b96dd7d9c464b"
+    );
+}
+
+#[test]
+fn verify_attestation_hash_rejects_non_lowercase_sha256_hex() {
+    assert!(VerifyAttestationHash::parse("abc").is_err());
+    assert!(
+        VerifyAttestationHash::parse(
+            "A6B46DD0D1AE5E86CBC8F37E75CEEB6760230C1CA4FFBCB0C97B96DD7D9C464B",
+        )
+        .is_err()
+    );
+    assert!(
+        VerifyAttestationHash::parse(
+            "zzb46dd0d1ae5e86cbc8f37e75ceeb6760230c1ca4ffbcb0c97b96dd7d9c464b",
+        )
+        .is_err()
+    );
 }

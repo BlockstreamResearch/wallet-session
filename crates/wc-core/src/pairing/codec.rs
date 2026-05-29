@@ -273,13 +273,13 @@ fn validate_session_payload(
 ) -> Result<(), PairingClientError> {
     match payload {
         SessionPayload::SessionRequest(request) => {
-            if let Some(expiry_timestamp) = request.params.request.expiry_timestamp
-                && expiry_timestamp <= now_unix_seconds
-            {
-                return Err(PairingClientError::SessionRequestExpired {
-                    expiry_timestamp,
-                    now_unix_seconds,
-                });
+            if let Some(expiry_timestamp) = request.params.request.expiry_timestamp {
+                if expiry_timestamp <= now_unix_seconds {
+                    return Err(PairingClientError::SessionRequestExpired {
+                        expiry_timestamp,
+                        now_unix_seconds,
+                    });
+                }
             }
 
             if !is_chain_authorized(&session.namespaces, &request.params.chain_id) {

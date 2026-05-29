@@ -169,13 +169,13 @@ fn validate_session_proposal_approval(
     proposal: &JsonRpcRequest<SessionProposeParams>,
     approval: &SessionProposalApproval,
 ) -> Result<(), PairingClientError> {
-    if let Some(pairing_topic) = &proposal.params.pairing_topic
-        && pairing_topic != &subscription.topic
-    {
-        return Err(PairingClientError::ProposalPairingTopicMismatch {
-            expected: subscription.topic.clone(),
-            actual: pairing_topic.clone(),
-        });
+    if let Some(pairing_topic) = &proposal.params.pairing_topic {
+        if pairing_topic != &subscription.topic {
+            return Err(PairingClientError::ProposalPairingTopicMismatch {
+                expected: subscription.topic.clone(),
+                actual: pairing_topic.clone(),
+            });
+        }
     }
 
     validate_approved_namespaces(&proposal.params.required_namespaces, &approval.namespaces)

@@ -6,11 +6,12 @@ use wc_protocol::{
         AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
         SessionNamespaces, SessionParticipant, SignMethod,
     },
-    verify::VerifyContext,
+    verify::{VerifyAttestationHash, VerifyContext},
 };
 
 use crate::pairing::{PairingPayload, PairingReceivedMessage};
 use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Wallet-facing review data for a `wc_sessionAuthenticate` request.
 ///
@@ -227,6 +228,27 @@ impl SessionAuthenticateReview {
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Resolves Verify context with a caller-provided SDK-compatible hash.
+    ///
+    /// The high-level `SingleSessionAuthenticate` event can resolve from the
+    /// retained exact decrypted payload. This review helper accepts an explicit
+    /// hash for callers that construct reviews directly.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2574-L2580>
+    ///
+    /// > hash: hashMessage(JSON.stringify(payload)),
+    /// > metadata: requester.metadata,
+    pub async fn resolve_verify_context_with_hash(
+        &mut self,
+        resolver: &VerifyResolver,
+        hash: &VerifyAttestationHash,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        self.verify_context = resolver
+            .resolve_hash_for_context(hash, &self.verify_context)
+            .await?;
+        Ok(&self.verify_context)
     }
 
     /// Whether the request expiry has passed at `now_unix_seconds`.

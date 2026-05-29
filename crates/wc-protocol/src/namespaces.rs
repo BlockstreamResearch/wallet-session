@@ -328,12 +328,12 @@ fn approved_permissions_by_chain(
             entry.events.extend(namespace.events.iter().cloned());
         }
 
-        if let Some(chain_id) = key.chain_id()
-            && key_chain_accounts == 0
-        {
-            return Err(NamespaceValidationError::MissingAccountForChain {
-                chain_id: chain_id.clone(),
-            });
+        if key_chain_accounts == 0 {
+            if let Some(chain_id) = key.chain_id() {
+                return Err(NamespaceValidationError::MissingAccountForChain {
+                    chain_id: chain_id.clone(),
+                });
+            }
         }
     }
 

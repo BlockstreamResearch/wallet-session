@@ -3,6 +3,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::session::DappMetadata;
 
@@ -18,6 +19,17 @@ use crate::session::DappMetadata;
 /// A live `@walletconnect/sign-client` `session_proposal` probe observed this
 /// concrete URL when no metadata override was supplied.
 pub const DEFAULT_VERIFY_URL: &str = "https://verify.walletconnect.org";
+
+/// Alternate trusted Verify endpoint accepted by the maintained SDK.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/core/src/constants/verify.ts#L3-L8>
+///
+/// ```text
+/// const VERIFY_SERVER_COM = "https://verify.walletconnect.com";
+/// const VERIFY_SERVER_ORG = "https://verify.walletconnect.org";
+/// export const TRUSTED_VERIFY_URLS = [VERIFY_SERVER_COM, VERIFY_SERVER_ORG];
+/// ```
+pub const ALTERNATE_VERIFY_URL: &str = "https://verify.walletconnect.com";
 
 /// `WalletConnect` Verify context attached to approval-sensitive events.
 ///
@@ -225,4 +237,113 @@ impl fmt::Display for VerifyValidation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// SHA-256 attestation hash used by the Verify resolver.
+///
+/// The maintained Sign Client passes `hashMessage(JSON.stringify(payload))` to
+/// `core.verify.resolve(...)` for proposal, authentication, and session-request
+/// verification.
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/crypto.ts#L63-L66>
+///
+/// > export function hashMessage(message: string): string {
+/// > const result = sha256(fromString(message, UTF8));
+///
+/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2128-L2133>
+///
+/// > hash: hashMessage(JSON.stringify(payload)),
+///
+/// # Examples
+///
+/// ```
+/// use wc_protocol::verify::VerifyAttestationHash;
+///
+/// let hash = VerifyAttestationHash::from_message("some");
+/// assert_eq!(
+///     hash.as_str(),
+///     "a6b46dd0d1ae5e86cbc8f37e75ceeb6760230c1ca4ffbcb0c97b96dd7d9c464b",
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct VerifyAttestationHash(String);
+
+impl VerifyAttestationHash {
+    /// Hashes a UTF-8 message with SHA-256 and lowercase hex encoding.
+    #[must_use]
+    pub fn from_message(message: &str) -> Self {
+        let digest = Sha256::digest(message.as_bytes());
+        Self(hex_lower(&digest))
+    }
+
+    /// Parses an already-computed Verify attestation hash.
+    pub fn parse(value: impl Into<String>) -> Result<Self, VerifyAttestationHashError> {
+        let value = value.into();
+        if value.len() != 64 {
+            return Err(VerifyAttestationHashError::WrongLength {
+                actual: value.len(),
+            });
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(VerifyAttestationHashError::InvalidHex);
+        }
+
+        Ok(Self(value))
+    }
+
+    /// Lowercase hex hash string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for VerifyAttestationHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for VerifyAttestationHash {
+    type Error = VerifyAttestationHashError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<VerifyAttestationHash> for String {
+    fn from(value: VerifyAttestationHash) -> Self {
+        value.0
+    }
+}
+
+/// Verify attestation hash parse error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VerifyAttestationHashError {
+    /// Verify attestation hashes are SHA-256 hex strings.
+    #[error("verify attestation hash must be 64 lowercase hex characters, got {actual}")]
+    WrongLength {
+        /// Number of characters in the rejected value.
+        actual: usize,
+    },
+
+    /// Hash contained a non-hex or uppercase character.
+    #[error("verify attestation hash must be lowercase hex")]
+    InvalidHex,
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
 }

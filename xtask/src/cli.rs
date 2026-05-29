@@ -32,6 +32,8 @@ enum Command {
     Pairing(JsonProbeArgs),
     #[command(name = "session-probe")]
     Session(JsonProbeArgs),
+    #[command(name = "verify-probe")]
+    Verify(VerifyProbeArgs),
     #[command(name = "scenario")]
     Scenario(ScenarioArgs),
 }
@@ -127,6 +129,18 @@ struct JsonProbeArgs {
 }
 
 #[derive(Debug, Args)]
+struct VerifyProbeArgs {
+    #[arg(long, value_name = "HASH")]
+    hash: Option<String>,
+
+    #[arg(long, value_name = "URL")]
+    metadata_url: Option<String>,
+
+    #[arg(long, value_name = "URL")]
+    verify_url: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct ScenarioArgs {
     #[arg(long)]
     list: bool,
@@ -154,6 +168,7 @@ pub fn run() -> Result<()> {
         Command::Session(args) => {
             probe::session::run(args.into_input("WC_SESSION_PROBE_JSON", "WC_SESSION_PROBE_FILE")?)
         }
+        Command::Verify(args) => run_async(probe::verify::run(args.into())),
         Command::Scenario(args) => {
             if args.list {
                 scenario::list();
@@ -161,6 +176,16 @@ pub fn run() -> Result<()> {
             } else {
                 run_async(scenario::run(args.name))
             }
+        }
+    }
+}
+
+impl From<VerifyProbeArgs> for probe::verify::VerifyProbeArgs {
+    fn from(args: VerifyProbeArgs) -> Self {
+        Self {
+            hash: args.hash,
+            metadata_url: args.metadata_url,
+            verify_url: args.verify_url,
         }
     }
 }

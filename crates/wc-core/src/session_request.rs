@@ -5,11 +5,12 @@ use wc_protocol::{
     caip::Caip2ChainId,
     relay::RelayTopic,
     session::{JsonRpcRequest, SessionMethod, SessionRequestParams, SignMethod},
-    verify::{DEFAULT_VERIFY_URL, VerifyContext},
+    verify::{DEFAULT_VERIFY_URL, VerifyAttestationHash, VerifyContext},
 };
 
 use crate::pairing::{SessionPayload, SessionReceivedMessage};
 use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Wallet-facing review data for a valid `wc_sessionRequest`.
 ///
@@ -206,6 +207,28 @@ impl SessionRequestReview {
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Resolves Verify context with a caller-provided SDK-compatible hash.
+    ///
+    /// The maintained Sign Client hashes
+    /// `JSON.stringify(formatJsonRpcRequest("wc_sessionRequest", params, id))`
+    /// for session requests. The caller should pass that exact hash when it is
+    /// available.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2462-L2468>
+    ///
+    /// > hash: hashMessage(JSON.stringify(formatJsonRpcRequest("wc_sessionRequest", params, id))),
+    /// > metadata: session.peer.metadata,
+    pub async fn resolve_verify_context_with_hash(
+        &mut self,
+        resolver: &VerifyResolver,
+        hash: &VerifyAttestationHash,
+    ) -> Result<&VerifyContext, VerifyResolverError> {
+        self.verify_context = resolver
+            .resolve_hash_for_context(hash, &self.verify_context)
+            .await?;
+        Ok(&self.verify_context)
     }
 
     /// Whether the request expiry has passed at `now_unix_seconds`.
