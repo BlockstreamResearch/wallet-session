@@ -1,11 +1,16 @@
 //! Session authentication DTOs.
 
-use std::fmt;
+mod cacao;
 
 use serde::{Deserialize, Serialize};
 
 use super::SessionParticipant;
 use crate::{caip::Caip2ChainId, did::DidPkh};
+
+pub use cacao::{
+    Cacao, CacaoBuildError, CacaoHeader, CacaoHeaderType, CacaoMessageError, CacaoPayload,
+    CacaoSignature, CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, RecapParseError,
+};
 
 /// Decrypted `wc_sessionAuthenticate` params.
 ///
@@ -165,321 +170,89 @@ pub struct AuthPayload {
     pub resources: Vec<String>,
 }
 
-/// CACAO header type value.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification>
-///
-/// > The header type will be `caip122` in reference to the [CAIP-122]
-/// > specification for the SIWx data model.
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L113-L115>
-///
-/// > interface CacaoHeader {
-/// > t: "caip122";
-/// > }
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CacaoHeaderType {
-    /// Current CAIP-74 header value used by `WalletConnect` Sign authentication.
-    Caip122,
-    /// Older CAIP-74 header value used by SIWE-only implementations.
-    Eip4361,
-    /// Unrecognized header value preserved for compatibility.
-    Other(String),
-}
-
-impl CacaoHeaderType {
-    /// Wire value stored in the CACAO header `t` field.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Caip122 => "caip122",
-            Self::Eip4361 => "eip4361",
-            Self::Other(value) => value,
-        }
+impl AuthPayload {
+    /// Builds the `WalletConnect` auth message that a wallet signs for this payload.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L69-L119>
+    ///
+    /// > export const formatMessage = (cacao: AuthTypes.FormatMessageParams, iss: string) => {
+    /// > const header = `${cacao.domain} wants you to sign in with your ${getNamespaceNameFromNamespace(didNamespace)} account:`;
+    /// > const message = [
+    ///
+    /// `WalletConnect`'s helper derives the displayed address and chain reference
+    /// from `iss`, not from `authPayload.chains`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wc_protocol::{did::DidPkh, session::{AuthPayload, CacaoHeaderType}};
+    ///
+    /// let payload = AuthPayload {
+    ///     kind: CacaoHeaderType::Caip122,
+    ///     chains: vec!["eip155:1".parse()?],
+    ///     aud: "https://example.com/login".to_owned(),
+    ///     domain: "example.com".to_owned(),
+    ///     version: "1".to_owned(),
+    ///     nonce: "1234567890".to_owned(),
+    ///     iat: "2026-05-29T10:42:19.478Z".to_owned(),
+    ///     statement: Some("Sign in to Example".to_owned()),
+    ///     exp: None,
+    ///     nbf: None,
+    ///     request_id: None,
+    ///     resources: Vec::new(),
+    /// };
+    /// let issuer = DidPkh::parse(
+    ///     "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87",
+    /// )?;
+    ///
+    /// let message = payload.format_message(&issuer)?;
+    /// assert!(message.starts_with("example.com wants you to sign in with your Ethereum account:"));
+    /// assert!(message.contains("Chain ID: 1"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn format_message(&self, issuer: &DidPkh) -> Result<String, CacaoMessageError> {
+        CacaoPayload::copy_from_auth_payload(self, issuer).format_message()
     }
 
-    /// Converts a wire value into a known type or a lossless fallback.
-    #[must_use]
-    pub fn from_wire(value: impl Into<String>) -> Self {
-        let value = value.into();
-        match value.as_str() {
-            "caip122" => Self::Caip122,
-            "eip4361" => Self::Eip4361,
-            _ => Self::Other(value),
-        }
-    }
-}
-
-impl Serialize for CacaoHeaderType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for CacaoHeaderType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::from_wire(value))
-    }
-}
-
-/// CACAO header.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification>
-///
-/// > Header uniquely identifies the payload format:
-/// >
-/// > type Header struct {
-/// > t String // specifies format of the payload
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/cacao.ts#L130-L133>
-///
-/// > const authObject: AuthTypes.Cacao = {
-/// > h: {
-/// > t: "caip122",
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacaoHeader {
-    /// Payload format identifier serialized as `t`.
-    #[serde(rename = "t")]
-    pub kind: CacaoHeaderType,
-}
-
-/// CACAO payload.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
-///
-/// > type Payload struct {
-/// > domain String // =domain
-/// > iss String // = DID pkh
-/// > aud String // =uri
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
-///
-/// > issuer here is [did:pkh](https://github.com/w3c-ccg/did-pkh/blob/main/did-pkh-method-draft.md), which includes both blockchain address and blockchain network information.
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L121-L128>
-///
-/// > if (!iss.includes("did:pkh:")) {
-/// > iss = `did:pkh:${iss}`;
-/// > }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacaoPayload {
-    /// DID PKH issuer containing the account namespace, reference, and address.
-    pub iss: DidPkh,
-    /// Domain requesting authentication.
-    pub domain: String,
-    /// URI identifying the authentication audience.
-    pub aud: String,
-    /// Payload version.
-    pub version: String,
-    /// Randomized token used by the dapp.
-    pub nonce: String,
-    /// Issued-at timestamp.
-    pub iat: String,
-    /// Human-readable statement signed by the account.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub statement: Option<String>,
-    /// Expiration timestamp in RFC 3339 format.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exp: Option<String>,
-    /// Not-before timestamp in RFC 3339 format.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nbf: Option<String>,
-    /// System-specific request identifier serialized as `requestId`.
-    #[serde(rename = "requestId", default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    /// Resource URIs signed into the authentication payload.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resources: Vec<String>,
-}
-
-/// CACAO signature type value.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#signature-verification>
-///
-/// > Signature verification goes according to `t` in `SignatureMeta`:
-/// > For example,
-/// >
-/// > - `eip191`: use [EIP-191](https://eips.ethereum.org/EIPS/eip-191),
-/// > - `eip1271`: use [EIP-1271](https://eips.ethereum.org/EIPS/eip-1271).
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L117-L120>
-///
-/// > interface CacaoSignature {
-/// > t: "eip191" | "eip1271";
-/// > s: string;
-/// > m?: string;
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CacaoSignatureType {
-    /// EIP-191 message signature.
-    Eip191,
-    /// EIP-1271 contract signature.
-    Eip1271,
-    /// Unrecognized signature type preserved for compatibility.
-    Other(String),
-}
-
-impl CacaoSignatureType {
-    /// Wire value stored in the CACAO signature `t` field.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Eip191 => "eip191",
-            Self::Eip1271 => "eip1271",
-            Self::Other(value) => value,
-        }
+    /// Copies the auth request fields into the CACAO payload shape.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L121-L149>
+    ///
+    /// > const authObject: AuthTypes.Cacao = {
+    /// > h: {
+    /// > t: "caip122",
+    /// > },
+    /// > p: {
+    /// > iss,
+    /// > domain: requestPayload.domain,
+    ///
+    /// The request's `chains` list is authorization input; it is not copied
+    /// into `CacaoPayload`.
+    pub fn to_cacao_payload(&self, issuer: &DidPkh) -> Result<CacaoPayload, CacaoBuildError> {
+        CacaoPayload::from_auth_payload(self, issuer)
     }
 
-    /// Converts a wire value into a known type or a lossless fallback.
-    #[must_use]
-    pub fn from_wire(value: impl Into<String>) -> Self {
-        let value = value.into();
-        match value.as_str() {
-            "eip191" => Self::Eip191,
-            "eip1271" => Self::Eip1271,
-            _ => Self::Other(value),
-        }
+    /// Builds a signed CACAO object from caller-provided signature bytes.
+    ///
+    /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L121-L149>
+    ///
+    /// > s: signature,
+    ///
+    /// Signing remains outside this crate. This helper only builds the object
+    /// that wraps an already-produced signature.
+    pub fn to_cacao(
+        &self,
+        issuer: &DidPkh,
+        signature: CacaoSignature,
+    ) -> Result<Cacao, CacaoBuildError> {
+        Ok(Cacao {
+            h: CacaoHeader {
+                kind: CacaoHeaderType::Caip122,
+            },
+            p: self.to_cacao_payload(issuer)?,
+            s: signature,
+        })
     }
-}
-
-impl Serialize for CacaoSignatureType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for CacaoSignatureType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Ok(Self::from_wire(value))
-    }
-}
-
-/// CACAO signature bytes as represented by the `WalletConnect` Sign wire format.
-///
-/// CAIP-74 models the field as bytes.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/ebacdb90283ded501350bd0011db4362734f9c4b/CAIPs/caip-74.md#specification>
-///
-/// > type Signature struct {
-/// > t String
-/// > m optional SignatureMeta
-/// > s Bytes
-///
-/// `WalletConnect`'s current public type carries those bytes as a string.
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L117-L120>
-///
-/// > interface CacaoSignature {
-/// > t: "eip191" | "eip1271";
-/// > s: string;
-///
-/// The maintained helper passes the signature object through unchanged, so this
-/// type preserves the wire string instead of assuming a single hex convention.
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/utils/src/cacao.ts#L121-L149>
-///
-/// > s: signature,
-///
-/// # Examples
-///
-/// ```
-/// use wc_protocol::session::CacaoSignatureValue;
-///
-/// let live = CacaoSignatureValue::from_wire("0x5851cc642b66ba30");
-/// assert_eq!(live.as_str(), "0x5851cc642b66ba30");
-///
-/// let caip_example = CacaoSignatureValue::from_wire("5ccb134ad3d874c");
-/// assert_eq!(caip_example.to_string(), "5ccb134ad3d874c");
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CacaoSignatureValue(String);
-
-impl CacaoSignatureValue {
-    /// Stores the SDK wire signature string without normalization.
-    #[must_use]
-    pub fn from_wire(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrows the preserved wire signature.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Returns the preserved wire signature.
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl fmt::Display for CacaoSignatureValue {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// CACAO signature.
-///
-/// <https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification>
-///
-/// > type Signature struct {
-/// > t String
-/// > m optional SignatureMeta
-/// > s Bytes
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacaoSignature {
-    /// Signature verification type serialized as `t`.
-    #[serde(rename = "t")]
-    pub kind: CacaoSignatureType,
-    /// Signature bytes encoded as the SDK wire string `s`.
-    #[serde(rename = "s")]
-    pub signature: CacaoSignatureValue,
-    /// Optional signature metadata serialized as `m`.
-    #[serde(rename = "m", default, skip_serializing_if = "Option::is_none")]
-    pub meta: Option<String>,
-}
-
-/// Chain-agnostic account authentication object.
-///
-/// <https://github.com/WalletConnect/walletconnect-specs/blob/ecbbf6e114687812fd0366fb59dff8c0a8e3c9ec/docs/specs/clients/sign/rpc-methods.md#wc_sessionauthenticate>
-///
-/// > // Success result (array of signed CACAOs)
-/// > [{
-/// > "h": CacaoHeader,
-/// > "p": CacaoPayload,
-/// > "s": CacaoSignature
-///
-/// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/auth.ts#L123-L127>
-///
-/// > interface Cacao {
-/// > h: CacaoHeader;
-/// > p: CacaoPayload;
-/// > s: CacaoSignature;
-/// > }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cacao {
-    /// CACAO header serialized as `h`.
-    pub h: CacaoHeader,
-    /// CACAO payload serialized as `p`.
-    pub p: CacaoPayload,
-    /// CACAO signature serialized as `s`.
-    pub s: CacaoSignature,
 }
 
 /// Current SDK JSON-RPC result for approved `wc_sessionAuthenticate`.

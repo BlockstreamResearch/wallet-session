@@ -2,10 +2,10 @@ use serde_json::json;
 
 use super::{chain, chain_strings, did_pkh, public_key};
 use wc_protocol::session::{
-    AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-    CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
-    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams,
-    SessionAuthenticateResult, SessionParticipant, SignMethod,
+    AuthPayload, Cacao, CacaoBuildError, CacaoHeader, CacaoHeaderType, CacaoPayload,
+    CacaoSignature, CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, DappMetadata,
+    JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+    SessionAuthenticateParams, SessionAuthenticateResult, SessionParticipant, SignMethod,
 };
 
 const LIVE_SESSION_AUTHENTICATE_JSON: &str = r#"{
@@ -92,6 +92,10 @@ const LIVE_SESSION_AUTHENTICATE_REJECT_JSON: &str = r#"{
     "message": "User rejected."
   }
 }"#;
+
+const LIVE_JS_FORMATTED_AUTH_MESSAGE_WITH_RECAP: &str = "example.com wants you to sign in with your Ethereum account:\n0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'request': 'personal_sign' for 'eip155'.\n\nURI: https://example.com/login\nVersion: 1\nChain ID: 1\nNonce: 1234567890\nIssued At: 2026-05-29T10:42:19.478Z\nResources:\n- urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ";
+
+const LIVE_JS_FORMATTED_AUTH_MESSAGE_WITH_OPTIONAL_FIELDS: &str = "wallet.example wants you to sign in with your Solana account:\n7EYnhQoR9KHSCv1Snc5yM6W8ki6mQq3VK6g1T3wM7Xw\n\nReview access\n\nURI: https://example.com/auth\nVersion: 1\nChain ID: 4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ\nNonce: abcdef123456\nIssued At: 2026-05-29T10:42:19.478Z\nExpiration Time: 2026-05-29T11:42:19.478Z\nNot Before: 2026-05-29T10:40:19.478Z\nRequest ID: req-42\nResources:\n- https://example.com/resource";
 
 #[test]
 fn deserializes_live_authenticate_shape() {
@@ -275,6 +279,186 @@ fn deserializes_live_authenticate_approve_result_shape() {
 
     let payload_value = serde_json::to_value(&cacao.p).expect("serializes payload");
     assert!(payload_value.get("chains").is_none());
+}
+
+#[test]
+fn formats_live_auth_payload_message_like_walletconnect_js_with_recap() {
+    let payload = AuthPayload {
+        kind: CacaoHeaderType::Caip122,
+        chains: vec![chain("eip155:1")],
+        aud: "https://example.com/login".to_owned(),
+        domain: "example.com".to_owned(),
+        version: "1".to_owned(),
+        nonce: "1234567890".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: Some(String::new()),
+        exp: None,
+        nbf: None,
+        request_id: None,
+        resources: vec![
+            "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ"
+                .to_owned(),
+        ],
+    };
+    let issuer = did_pkh("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87");
+
+    assert_eq!(
+        payload.format_message(&issuer).expect("formats message"),
+        LIVE_JS_FORMATTED_AUTH_MESSAGE_WITH_RECAP
+    );
+}
+
+#[test]
+fn formats_live_cacao_payload_message_like_walletconnect_js_with_optional_fields() {
+    let payload = CacaoPayload {
+        iss: did_pkh(
+            "did:pkh:solana:4sGjMW1sUnHzSxGspuhpqLDx6wiyjNtZ:7EYnhQoR9KHSCv1Snc5yM6W8ki6mQq3VK6g1T3wM7Xw",
+        ),
+        domain: "wallet.example".to_owned(),
+        aud: "https://example.com/auth".to_owned(),
+        version: "1".to_owned(),
+        nonce: "abcdef123456".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: Some("Review access".to_owned()),
+        exp: Some("2026-05-29T11:42:19.478Z".to_owned()),
+        nbf: Some("2026-05-29T10:40:19.478Z".to_owned()),
+        request_id: Some("req-42".to_owned()),
+        resources: vec!["https://example.com/resource".to_owned()],
+    };
+
+    assert_eq!(
+        payload.format_message().expect("formats message"),
+        LIVE_JS_FORMATTED_AUTH_MESSAGE_WITH_OPTIONAL_FIELDS
+    );
+}
+
+#[test]
+fn builds_cacao_from_auth_payload_like_walletconnect_js() {
+    let auth_payload = AuthPayload {
+        kind: CacaoHeaderType::Other("future-auth-type".to_owned()),
+        chains: vec![chain("eip155:1")],
+        aud: "https://example.com/login".to_owned(),
+        domain: "example.com".to_owned(),
+        version: "1".to_owned(),
+        nonce: "1234567890".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: Some("Sign in to Example".to_owned()),
+        exp: None,
+        nbf: None,
+        request_id: None,
+        resources: Vec::new(),
+    };
+    let issuer = did_pkh("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87");
+    let signature = CacaoSignature {
+        kind: CacaoSignatureType::Eip191,
+        signature: CacaoSignatureValue::from_wire("0x00"),
+        meta: None,
+    };
+
+    let cacao = auth_payload
+        .to_cacao(&issuer, signature)
+        .expect("builds cacao");
+
+    assert_eq!(cacao.h.kind, CacaoHeaderType::Caip122);
+    assert_eq!(cacao.p.iss, issuer);
+    assert_eq!(cacao.p.domain, "example.com");
+    assert_eq!(cacao.p.aud, "https://example.com/login");
+    assert_eq!(cacao.p.statement.as_deref(), Some("Sign in to Example"));
+    assert_eq!(cacao.s.signature.as_str(), "0x00");
+    assert_eq!(
+        serde_json::to_value(&cacao).expect("serializes")["p"].get("chains"),
+        None
+    );
+}
+
+#[test]
+fn rejects_cacao_build_when_issuer_chain_was_not_requested() {
+    let auth_payload = AuthPayload {
+        kind: CacaoHeaderType::Caip122,
+        chains: vec![chain("eip155:1")],
+        aud: "https://example.com/login".to_owned(),
+        domain: "example.com".to_owned(),
+        version: "1".to_owned(),
+        nonce: "1234567890".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: None,
+        exp: None,
+        nbf: None,
+        request_id: None,
+        resources: Vec::new(),
+    };
+    let issuer = did_pkh("did:pkh:eip155:137:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87");
+
+    assert_eq!(
+        auth_payload
+            .to_cacao_payload(&issuer)
+            .expect_err("issuer chain rejected"),
+        CacaoBuildError::IssuerChainNotRequested {
+            issuer_chain: chain("eip155:137")
+        }
+    );
+}
+
+#[test]
+fn validates_cacao_against_auth_payload_before_signature_verification() {
+    let auth_payload = AuthPayload {
+        kind: CacaoHeaderType::Caip122,
+        chains: vec![chain("eip155:1")],
+        aud: "https://example.com/login".to_owned(),
+        domain: "example.com".to_owned(),
+        version: "1".to_owned(),
+        nonce: "1234567890".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: Some("Sign in".to_owned()),
+        exp: Some("2026-05-29T11:42:19.478Z".to_owned()),
+        nbf: Some("2026-05-29T10:40:19.478Z".to_owned()),
+        request_id: Some("req-42".to_owned()),
+        resources: vec!["https://example.com/resource".to_owned()],
+    };
+    let issuer = did_pkh("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87");
+    let signature = CacaoSignature {
+        kind: CacaoSignatureType::Eip191,
+        signature: CacaoSignatureValue::from_wire("0x00"),
+        meta: None,
+    };
+    let mut cacao = auth_payload
+        .to_cacao(&issuer, signature)
+        .expect("builds cacao");
+
+    cacao
+        .validate_against_auth_payload(&auth_payload)
+        .expect("matches auth payload");
+
+    cacao.p.nonce = "different".to_owned();
+    assert_eq!(
+        cacao
+            .validate_against_auth_payload(&auth_payload)
+            .expect_err("nonce mismatch rejected"),
+        CacaoValidationError::NonceMismatch
+    );
+}
+
+#[test]
+fn invalid_recap_resource_keeps_typed_source() {
+    let payload = CacaoPayload {
+        iss: did_pkh("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"),
+        domain: "example.com".to_owned(),
+        aud: "https://example.com/login".to_owned(),
+        version: "1".to_owned(),
+        nonce: "1234567890".to_owned(),
+        iat: "2026-05-29T10:42:19.478Z".to_owned(),
+        statement: None,
+        exp: None,
+        nbf: None,
+        request_id: None,
+        resources: vec!["urn:recap:not-base64".to_owned()],
+    };
+
+    let error = payload
+        .format_message()
+        .expect_err("malformed recap rejected");
+
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 #[test]
