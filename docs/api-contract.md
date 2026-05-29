@@ -3,6 +3,7 @@
 Status: current `wc-core` public API contract for the single-session proof of concept.
 
 This document describes the behavior exposed by the top-level `wc_core` API. It does not describe every lower-level DTO or transport primitive.
+The broader SDK parity target and deliberate exclusions are tracked in [`sdk-parity.md`](./sdk-parity.md).
 
 ## Public Surface
 

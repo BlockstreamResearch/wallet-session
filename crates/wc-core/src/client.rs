@@ -1604,6 +1604,8 @@ mod tests {
         low_level::{PairingSubscription, SessionSubscription},
     };
 
+    const FUTURE_SESSION_EXPIRY: u64 = 4_102_444_800;
+
     #[test]
     fn client_config_uses_default_event_queue_capacity() {
         let pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
@@ -1694,7 +1696,7 @@ mod tests {
         let topic = RelayTopic::from_bytes([0x56; 32]);
         let mut session = ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x57; 32])),
-            test_session(topic.clone(), 1_779_999_999),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
         );
 
         assert!(session.mark_session_request_pending(42));
@@ -1723,7 +1725,7 @@ mod tests {
         let topic = RelayTopic::from_bytes([0x58; 32]);
         let mut session = ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x59; 32])),
-            test_session(topic.clone(), 1_779_999_999),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
         );
 
         assert!(session.mark_session_update_pending(99));
@@ -1835,7 +1837,7 @@ mod tests {
             .expect("connects to first relay websocket");
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x48; 32])),
-            test_session(topic.clone(), 1_779_999_999),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
         )));
 
         client.reconnect().await.expect("reconnects");
@@ -1949,7 +1951,7 @@ mod tests {
             .expect("connects to first relay websocket");
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0x4c; 32])),
-            test_session(topic.clone(), 1_779_999_999),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
         )));
 
         let error = client

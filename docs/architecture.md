@@ -7,6 +7,7 @@ It is not a final production architecture.
 When a change revises one of these decisions, the change should update this document in the same commit.
 
 The current wallet-facing API behavior is specified in [`api-contract.md`](./api-contract.md).
+The current WalletConnect SDK parity target is tracked in [`sdk-parity.md`](./sdk-parity.md).
 
 ## Goals
 
@@ -25,15 +26,17 @@ The current priority is protocol behavior over broad surface area:
 
 The next target is the remaining Sign authentication and trust behavior, in this order:
 
-1. `wc_sessionAuthenticate` review/reject behavior through `SingleSessionClient`;
-2. CACAO approval behavior with caller-provided signatures;
-3. CACAO message formatting and signing helpers;
+1. `wc_sessionAuthenticate` approval behavior with caller-provided CACAO objects;
+2. CACAO message formatting and validation helpers;
+3. auth-only versus auth-plus-session result handling;
 4. Verify/origin trust context surfaced in review data;
-5. richer wallet policy primitives for authentication and session requests;
-6. broader interop scenarios against maintained JS Sign Client flows and selected real dapps;
-7. later ecosystem surfaces such as Notify, Push, and service-specific extras.
+5. Wallet Call API DTO and review helpers;
+6. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
+7. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
 
 Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
+
+Detailed status and exclusions are tracked in [`sdk-parity.md`](./sdk-parity.md).
 
 ## Crate Boundaries
 
