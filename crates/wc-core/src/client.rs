@@ -20,7 +20,9 @@ use crate::pairing::{
     SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
     SessionReceivedMessage, SessionSubscription,
 };
-use crate::session_authenticate::{SessionAuthenticateReview, SessionAuthenticateReviewError};
+use crate::session_authenticate::{
+    SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
+};
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
 
@@ -559,6 +561,45 @@ impl SingleSessionClient {
         self.active_pairing(authenticate.pairing_topic())?;
         SessionAuthenticateReview::from_message(authenticate.message())
             .map_err(|source| SingleSessionClientError::SessionAuthenticateReview { source })
+    }
+
+    /// Approves a queued `wc_sessionAuthenticate` event with signed CACAOs.
+    ///
+    /// Approval publishes a type-1 success response on the requester public-key
+    /// response topic, then drops the pairing topic from the single-session
+    /// runtime. The caller owns message formatting, user approval, and signing;
+    /// this method only publishes the already signed CACAO objects.
+    pub async fn approve_session_authenticate(
+        &mut self,
+        authenticate: &SingleSessionAuthenticate,
+        approval: SessionAuthenticateApproval,
+    ) -> Result<bool, SingleSessionClientError> {
+        let subscription = self.active_pairing(authenticate.pairing_topic())?.clone();
+        let request = authenticate.request();
+        let now_unix_seconds = now_unix_seconds()?;
+        if request.params.is_expired_at(now_unix_seconds) {
+            return Err(SingleSessionClientError::SessionAuthenticateExpired {
+                request_id: request.id,
+                expiry: request.params.expiry_timestamp,
+                now_unix_seconds,
+            });
+        }
+
+        let (wallet_metadata, cacaos) = approval.into_parts();
+        let ack = self
+            .pairing
+            .approve_session_authenticate(
+                &subscription,
+                authenticate.message(),
+                wallet_metadata,
+                cacaos,
+            )
+            .await
+            .map_err(SingleSessionClientError::from)?;
+        self.unsubscribe_pairing(&subscription).await?;
+        self.state = SingleSessionClientState::Idle;
+
+        Ok(ack)
     }
 
     /// Rejects a queued `wc_sessionAuthenticate` event.
@@ -1471,6 +1512,17 @@ pub enum SingleSessionClientError {
         /// Source review construction error.
         #[source]
         source: SessionAuthenticateReviewError,
+    },
+
+    /// Authentication request expired before caller approval.
+    #[error("single-session client session authenticate request expired")]
+    SessionAuthenticateExpired {
+        /// JSON-RPC request id from the expired auth request.
+        request_id: u64,
+        /// Request expiry timestamp.
+        expiry: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
     },
 
     /// No pending caller decision exists for this session request.

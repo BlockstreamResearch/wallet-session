@@ -3,7 +3,8 @@
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        AuthPayload, JsonRpcRequest, SessionAuthenticateParams, SessionParticipant, SignMethod,
+        AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
+        SessionParticipant, SignMethod,
     },
 };
 
@@ -161,6 +162,56 @@ impl SessionAuthenticateReview {
     }
 }
 
+/// Caller-provided approval data for a `wc_sessionAuthenticate` request.
+///
+/// Core does not sign authentication messages. The caller formats the message,
+/// obtains user consent, signs with wallet-owned key material, builds CACAO
+/// objects, and passes those signed objects into this approval primitive.
+///
+/// <https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests>
+///
+/// > Build the authentication object(s)
+/// > ...
+/// > auths: [auth],
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthenticateApproval {
+    wallet_metadata: DappMetadata,
+    cacaos: Vec<Cacao>,
+}
+
+impl SessionAuthenticateApproval {
+    /// Builds approval data from wallet metadata and signed CACAO objects.
+    pub fn new(
+        wallet_metadata: DappMetadata,
+        cacaos: Vec<Cacao>,
+    ) -> Result<Self, SessionAuthenticateApprovalError> {
+        if cacaos.is_empty() {
+            return Err(SessionAuthenticateApprovalError::EmptyCacaos);
+        }
+
+        Ok(Self {
+            wallet_metadata,
+            cacaos,
+        })
+    }
+
+    /// Wallet metadata sent as the authentication responder.
+    #[must_use]
+    pub const fn wallet_metadata(&self) -> &DappMetadata {
+        &self.wallet_metadata
+    }
+
+    /// Signed CACAO objects returned to the requester.
+    #[must_use]
+    pub fn cacaos(&self) -> &[Cacao] {
+        &self.cacaos
+    }
+
+    pub(crate) fn into_parts(self) -> (DappMetadata, Vec<Cacao>) {
+        (self.wallet_metadata, self.cacaos)
+    }
+}
+
 /// Session-authentication review construction error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SessionAuthenticateReviewError {
@@ -176,18 +227,31 @@ pub enum SessionAuthenticateReviewError {
     },
 }
 
+/// Session-authentication approval construction error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionAuthenticateApprovalError {
+    /// Approval must include at least one signed CACAO.
+    #[error("session authenticate approval requires at least one CACAO")]
+    EmptyCacaos,
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::SessionAuthenticateApprovalError;
     use wc_protocol::{
+        did::DidPkh,
         key::X25519PublicKey,
         relay::RelayTopic,
         session::{
-            AuthPayload, CacaoHeaderType, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
-            SessionParticipant, SignMethod,
+            AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
+            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
+            SessionAuthenticateParams, SessionParticipant, SignMethod,
         },
     };
 
-    use super::{SessionAuthenticateReview, SessionAuthenticateReviewError};
+    use super::{
+        SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
+    };
 
     #[test]
     fn builds_review_from_request() -> Result<(), Box<dyn std::error::Error>> {
@@ -220,6 +284,28 @@ mod tests {
             SessionAuthenticateReviewError::MethodMismatch {
                 method: SignMethod::SessionPropose
             }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_requires_at_least_one_cacao() {
+        let error = SessionAuthenticateApproval::new(wallet_metadata(), Vec::new())
+            .expect_err("empty approval is rejected");
+
+        assert_eq!(error, SessionAuthenticateApprovalError::EmptyCacaos);
+    }
+
+    #[test]
+    fn approval_preserves_caller_provided_cacaos() -> Result<(), Box<dyn std::error::Error>> {
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![cacao()?])?;
+
+        assert_eq!(approval.wallet_metadata().name, "Wallet");
+        assert_eq!(approval.cacaos().len(), 1);
+        assert_eq!(
+            approval.cacaos()[0].p.iss.as_str(),
+            "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
         );
 
         Ok(())
@@ -262,5 +348,42 @@ mod tests {
                 expiry_timestamp: 4_102_444_800,
             },
         ))
+    }
+
+    fn wallet_metadata() -> DappMetadata {
+        DappMetadata {
+            name: "Wallet".to_owned(),
+            description: "Wallet".to_owned(),
+            url: "https://example.com/wallet".to_owned(),
+            icons: Vec::new(),
+            redirect: None,
+            verify_url: None,
+        }
+    }
+
+    fn cacao() -> Result<Cacao, Box<dyn std::error::Error>> {
+        Ok(Cacao {
+            h: CacaoHeader {
+                kind: CacaoHeaderType::Caip122,
+            },
+            p: CacaoPayload {
+                iss: DidPkh::parse("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87")?,
+                domain: "example.com".to_owned(),
+                aud: "https://example.com/login".to_owned(),
+                version: "1".to_owned(),
+                nonce: "1234567890".to_owned(),
+                iat: "2026-05-28T12:00:00.000Z".to_owned(),
+                statement: Some("Sign in to Example".to_owned()),
+                exp: None,
+                nbf: None,
+                request_id: None,
+                resources: Vec::new(),
+            },
+            s: CacaoSignature {
+                kind: CacaoSignatureType::Eip191,
+                signature: CacaoSignatureValue::from_wire("0x00"),
+                meta: None,
+            },
+        })
     }
 }

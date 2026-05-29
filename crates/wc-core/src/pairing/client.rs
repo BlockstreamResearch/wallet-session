@@ -26,7 +26,9 @@ use super::{
     },
     error::PairingClientError,
     pairing_lifecycle::pairing_ping_response_publish,
-    session_authenticate::session_authenticate_error_publish,
+    session_authenticate::{
+        session_authenticate_error_publish, session_authenticate_success_publish,
+    },
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -1022,6 +1024,37 @@ impl PairingClient {
         let responder =
             X25519KeyPair::generate().map_err(|source| PairingClientError::KeyPair { source })?;
         let publish = session_authenticate_error_publish(subscription, message, error, &responder)?;
+        self.relay
+            .publish(publish)
+            .await
+            .map_err(|source| PairingClientError::Relay { source })
+    }
+
+    /// Publishes a `wc_sessionAuthenticate` JSON-RPC success response.
+    ///
+    /// The caller supplies signed CACAO objects. The core generates only the
+    /// X25519 responder key used for type-1 response encryption and responder
+    /// metadata; it does not sign authentication messages.
+    ///
+    /// <https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests>
+    ///
+    /// > at a minimum, one SIWE message must be signed
+    pub async fn approve_session_authenticate(
+        &mut self,
+        subscription: &PairingSubscription,
+        message: &PairingReceivedMessage,
+        wallet_metadata: wc_protocol::session::DappMetadata,
+        cacaos: Vec<wc_protocol::session::Cacao>,
+    ) -> Result<bool, PairingClientError> {
+        let responder =
+            X25519KeyPair::generate().map_err(|source| PairingClientError::KeyPair { source })?;
+        let publish = session_authenticate_success_publish(
+            subscription,
+            message,
+            wallet_metadata,
+            cacaos,
+            &responder,
+        )?;
         self.relay
             .publish(publish)
             .await

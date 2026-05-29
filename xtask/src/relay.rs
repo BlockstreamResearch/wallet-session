@@ -15,15 +15,16 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage,
-    SessionAuthenticateReview, SessionClientEvent, SessionLifecycleResponseMessage,
-    SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
-    SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
+    SessionAuthenticateApproval, SessionAuthenticateReview, SessionClientEvent,
+    SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
+    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
     SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
     SingleSessionClientEvent, SingleSessionProposal, WalletCapabilities, WalletChainCapability,
     low_level::{
         ApprovedSession, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
-        PairingSubscription, SESSION_AUTHENTICATE_REJECT_TAG, SESSION_REQUEST_RESPONSE_TAG,
-        SessionSettleResponseMessage, SessionSettleResponsePayload, SessionSubscription,
+        PairingSubscription, SESSION_AUTHENTICATE_REJECT_TAG, SESSION_AUTHENTICATE_RESPONSE_TAG,
+        SESSION_REQUEST_RESPONSE_TAG, SessionSettleResponseMessage, SessionSettleResponsePayload,
+        SessionSubscription,
     },
 };
 use wc_protocol::{
@@ -38,7 +39,7 @@ use wc_protocol::{
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
     },
     session::{
-        DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
+        Cacao, DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
         SessionEventParams, SessionMethod,
     },
     session::{
@@ -52,6 +53,13 @@ const NO_DELIVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const JS_HARNESS_URI_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const JS_HARNESS_URI_FILE_STEM: &str = "live-pairing-uri";
 const JS_HARNESS_RESULT_FILE_STEM: &str = "live-pairing-result";
+
+#[derive(Debug, serde::Deserialize)]
+struct SignedAuthFixture {
+    address: String,
+    iss: String,
+    cacao: Cacao,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeMode {
@@ -954,7 +962,14 @@ async fn run_core_single_session_client_session_request_probe(
 async fn run_core_single_session_client_session_authenticate_probe(
     config: &RelayProbeConfig,
 ) -> Result<()> {
-    let (mut harness, uri) = AuthHarness::start("reject").await?;
+    let response_mode =
+        env::var("WC_CORE_SESSION_AUTHENTICATE_RESPONSE").unwrap_or_else(|_| "reject".to_owned());
+    if !matches!(response_mode.as_str(), "reject" | "approve") {
+        bail!(
+            "unknown WC_CORE_SESSION_AUTHENTICATE_RESPONSE={response_mode}; expected reject or approve"
+        );
+    }
+    let (mut harness, uri) = AuthHarness::start(&response_mode).await?;
     let mut client_config = PairingClientConfig::new(
         config.project_id.clone(),
         config.subscriber_auth_seed,
@@ -985,20 +1000,38 @@ async fn run_core_single_session_client_session_authenticate_probe(
     let review = client.session_authenticate_review(&authenticate)?;
     print_session_authenticate_review(&review);
     validate_session_authenticate_review(&review)?;
-    let reject_ack = client
-        .reject_session_authenticate(
-            &authenticate,
-            JsonRpcError::new(
-                JsonRpcErrorCode::UserRejected,
-                "User rejected authentication.",
-            ),
-        )
-        .await?;
-    println!(
-        "core-single-session-client-session-authenticate reject_ack={reject_ack} response_tag={SESSION_AUTHENTICATE_REJECT_TAG}"
-    );
 
-    let result = harness.expect_result("authenticate_error").await?;
+    let expected_outcome = match response_mode.as_str() {
+        "approve" => {
+            let cacao = signed_auth_cacao_from_review(&review)?;
+            let approval = SessionAuthenticateApproval::new(auth_wallet_metadata(), vec![cacao])?;
+            let approve_ack = client
+                .approve_session_authenticate(&authenticate, approval)
+                .await?;
+            println!(
+                "core-single-session-client-session-authenticate approve_ack={approve_ack} response_tag={SESSION_AUTHENTICATE_RESPONSE_TAG}"
+            );
+            "authenticate_response"
+        }
+        "reject" => {
+            let reject_ack = client
+                .reject_session_authenticate(
+                    &authenticate,
+                    JsonRpcError::new(
+                        JsonRpcErrorCode::UserRejected,
+                        "User rejected authentication.",
+                    ),
+                )
+                .await?;
+            println!(
+                "core-single-session-client-session-authenticate reject_ack={reject_ack} response_tag={SESSION_AUTHENTICATE_REJECT_TAG}"
+            );
+            "authenticate_error"
+        }
+        _ => unreachable!("validated response mode"),
+    };
+
+    let result = harness.expect_result(expected_outcome).await?;
     println!("core-single-session-client-session-authenticate js_result={result}");
     harness.terminate();
 
@@ -2217,6 +2250,51 @@ fn validate_session_authenticate_review(review: &SessionAuthenticateReview) -> R
     }
 
     Ok(())
+}
+
+fn auth_wallet_metadata() -> DappMetadata {
+    DappMetadata {
+        name: "walletconnect-client-poc Rust auth wallet".to_owned(),
+        description: "Live WalletConnect authentication responder for Rust probes".to_owned(),
+        url: "https://github.com/BlockstreamResearch/walletconnect-client-poc".to_owned(),
+        icons: vec!["https://walletconnect.com/walletconnect-logo.png".to_owned()],
+        verify_url: None,
+        redirect: None,
+    }
+}
+
+fn signed_auth_cacao_from_review(review: &SessionAuthenticateReview) -> Result<Cacao> {
+    let workspace_root = workspace_root()?;
+    let harness_dir = workspace_root.join("tools/js-harness");
+    let auth_payload = serde_json::to_string(review.auth_payload())?;
+    let output = Command::new("bun")
+        .args(["run", "sign-auth"])
+        .current_dir(&harness_dir)
+        .env("WC_JS_AUTH_PAYLOAD_JSON", auth_payload)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run auth signing harness in {}",
+                harness_dir.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        bail!(
+            "auth signing harness failed status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let signed = serde_json::from_slice::<SignedAuthFixture>(&output.stdout)
+        .context("auth signing harness returned invalid JSON")?;
+    println!(
+        "core-single-session-client-session-authenticate signed_cacao address={} iss={}",
+        signed.address, signed.iss
+    );
+    Ok(signed.cacao)
 }
 
 fn validate_session_request_review(review: &SessionRequestReview) -> Result<()> {

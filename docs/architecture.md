@@ -26,9 +26,9 @@ The current priority is protocol behavior over broad surface area:
 
 The next target is the remaining Sign authentication and trust behavior, in this order:
 
-1. `wc_sessionAuthenticate` approval behavior with caller-provided CACAO objects;
+1. auth-created session adoption after `wc_sessionAuthenticate` approval;
 2. CACAO message formatting and validation helpers;
-3. auth-only versus auth-plus-session result handling;
+3. proposal authentication subrequest handling;
 4. Verify/origin trust context surfaced in review data;
 5. Wallet Call API DTO and review helpers;
 6. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
@@ -221,10 +221,13 @@ Current session authentication flow:
 1. receive `wc_sessionAuthenticate`;
 2. expose it as `SingleSessionClientEvent::SessionAuthenticate`;
 3. caller extracts `SessionAuthenticateReview` for origin, requester, payload, chain, and expiry review;
-4. caller invokes `SingleSessionClient::reject_session_authenticate` when the request is not approved;
-5. core publishes a type-1 JSON-RPC error response on the requester public-key response topic and drops the pairing topic.
+4. caller signs authentication messages outside core and builds CACAO objects;
+5. caller invokes `SingleSessionClient::approve_session_authenticate` or `SingleSessionClient::reject_session_authenticate`;
+6. core publishes a type-1 JSON-RPC response on the requester public-key response topic and drops the pairing topic.
 
 Rationale: authentication is a wallet identity decision. CACAO signing, Verify context, and origin policy are security-sensitive primitives and must be explicit API steps rather than side effects of polling.
+
+Current limitation: the maintained SDK may return a session alongside successful authentication. The live harness observes this shape, but the current runtime does not yet adopt that session. Session adoption is the next authentication slice.
 
 Reference:
 

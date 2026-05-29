@@ -10,12 +10,15 @@
     "check:supply-chain": "bun run src/check-supply-chain.ts",
     "check:types": "tsc --noEmit",
     "authenticate": "bun run src/authenticate.ts",
+    "sign-auth": "bun run src/sign-auth.ts",
     "pairing-lifecycle": "bun run src/pairing-lifecycle.ts",
     "propose-session": "bun run src/propose-session.ts"
   },
   "trustedDependencies": [],
   "dependencies": {
-    "@walletconnect/sign-client": "2.23.9"
+    "@walletconnect/sign-client": "2.23.9",
+    "@walletconnect/utils": "2.23.9",
+    "ox": "0.9.3"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",

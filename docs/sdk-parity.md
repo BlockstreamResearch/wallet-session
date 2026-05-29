@@ -49,7 +49,7 @@ Deliberate exclusions for this milestone:
 | Session request | Receive `wc_sessionRequest`, reject deterministic authorization failures, surface valid requests, and respond once. | Done | Add method-specific review helpers for high-value wallet methods. | Live request/response scenario plus duplicate/unauthorized/expired local tests. | [Session request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request), [`SessionRequestReview`](../crates/wc-core/src/session_request.rs) |
 | Session lifecycle | Handle update, extend, event, ping, delete, disconnect, and session expiry. | Done | Keep update approval explicit and expiry one-shot. | Lifecycle live scenario plus local one-shot decision tests. | [Session events](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events), [`session_lifecycle`](../crates/wc-core/src/pairing/session_lifecycle.rs) |
 | `wc_sessionAuthenticate` reject | Receive auth request, expose review, reject explicitly, publish type-1 error response. | Done | Keep rejection path as the negative control for auth approval. | `xtask scenario single-session-authenticate`. | [One-click Auth, rejecting](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#rejecting-authentication-requests), [`reject_session_authenticate`](../crates/wc-core/src/client.rs) |
-| `wc_sessionAuthenticate` approve | Approve auth with caller-provided CACAO auth objects. | Missing | Add approval API that accepts signed auth objects, publishes type-1 success, and handles auth-only vs auth-plus-session results. | Live JS authenticate approval probe; local response topic/envelope tests. | [One-click Auth, approving](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests), [maintained rejection/response topic code](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1433-L1468) |
+| `wc_sessionAuthenticate` approve | Approve auth with caller-provided CACAO auth objects. | Partial | Approval API accepts signed auth objects and publishes type-1 success. Next slice: adopt auth-created session data when the SDK returns it. | Live JS authenticate approval probe; local response topic/envelope tests. | [One-click Auth, approving](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests), [maintained response topic code](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1405-L1415) |
 | CACAO payloads | Populate auth payload, format auth message, and build CACAO objects. | Partial | Implement CAIP-122/CACAO helpers without taking custody of wallet private keys. The caller signs; core formats and validates. | Doctests for message formatting; fixtures for single-chain and multi-chain payloads. | [One-click Auth, payloads](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#authentication-objectspayloads), [CAIP-74 CACAO](https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification), [CAIP-122](https://chainagnostic.org/CAIPs/caip-122) |
 | Auth plus session | Some auth approvals establish a session; some only authenticate. | Missing | Detect result shape, store session only when SDK returns session data, otherwise clear pairing. | JS auth-only and auth-plus-session live fixtures. | [One-click Auth, approving](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests) |
 | Proposal subrequests | Session proposals can carry authentication subrequests. | Missing | Surface `requests.authentication` alongside proposal review and include `proposalRequestsResponses.authentication` on approval/rejection. | Live proposal-with-auth fixture and local DTO tests. | [One-click Auth](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth), [`SessionAuthenticateParams`](../crates/wc-protocol/src/dto/session/authenticate.rs) |
@@ -70,17 +70,16 @@ Deliberate exclusions for this milestone:
 
 The next implementation sequence is:
 
-1. `wc_sessionAuthenticate` approval with caller-provided CACAO objects.
+1. Auth-created session adoption after `wc_sessionAuthenticate` approval.
 2. CACAO payload/message helpers with CAIP references and doctests.
-3. Auth-only versus auth-plus-session result handling.
-4. Proposal authentication subrequest handling.
-5. Verify context DTOs and policy helpers.
-6. Wallet Call API DTO/review helpers.
-7. Session/scoped properties in proposal approval planning.
-8. Expiry coverage for proposal/auth/session-request edges.
-9. Interop scenarios for auth approval, Verify states, and Wallet Call API.
-10. Fuzz/adversarial parser coverage.
-11. API contract freeze and snapshots.
+3. Proposal authentication subrequest handling.
+4. Verify context DTOs and policy helpers.
+5. Wallet Call API DTO/review helpers.
+6. Session/scoped properties in proposal approval planning.
+7. Expiry coverage for proposal/auth/session-request edges.
+8. Interop scenarios for auth approval, Verify states, and Wallet Call API.
+9. Fuzz/adversarial parser coverage.
+10. API contract freeze and snapshots.
 
 Each slice should follow the repository rule:
 

@@ -24,7 +24,10 @@ pub use pairing::{
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
     SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
 };
-pub use session_authenticate::{SessionAuthenticateReview, SessionAuthenticateReviewError};
+pub use session_authenticate::{
+    SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,
+    SessionAuthenticateReviewError,
+};
 pub use session_request::{SessionRequestReview, SessionRequestReviewError};
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,

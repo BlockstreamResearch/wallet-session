@@ -165,22 +165,29 @@ The runtime surfaces authentication requests as:
 SingleSessionClientEvent::SessionAuthenticate
 ```
 
-Current supported path:
+Supported paths:
 
 1. caller receives the auth event;
 2. caller calls `session_authenticate_review`;
 3. caller applies origin/policy/user review;
-4. caller calls `reject_session_authenticate` when the request should not be approved;
-5. core publishes a type-1 JSON-RPC error response on the requester public-key response topic and unsubscribes the pairing topic.
+4. caller signs authentication messages outside core and builds signed CACAO objects;
+5. caller calls one of:
+   - `approve_session_authenticate`;
+   - `reject_session_authenticate`;
+6. core publishes a type-1 JSON-RPC response on the requester public-key response topic and unsubscribes the pairing topic.
 
-Approval with signed CACAOs is a follow-up slice. Until then, the client does not sign authentication payloads and does not auto-approve authentication.
+Core does not sign authentication payloads and does not auto-approve authentication. If the maintained SDK returns a session together with the authentication result, current core approval does not yet adopt that session.
 
 Source:
 
 - [`SingleSessionClient::session_authenticate_review`](../crates/wc-core/src/client.rs)
+- [`SingleSessionClient::approve_session_authenticate`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::reject_session_authenticate`](../crates/wc-core/src/client.rs)
+- [`SessionAuthenticateApproval`](../crates/wc-core/src/session_authenticate.rs)
 - [`SessionAuthenticateReview`](../crates/wc-core/src/session_authenticate.rs)
+- [One-click Auth approval](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests)
 - [Maintained Sign Client authentication request handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2568-L2605)
+- [Maintained Sign Client authentication approval](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1405-L1415)
 - [Maintained Sign Client authentication rejection](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1433-L1468)
 - [CAIP-74 CACAO](https://github.com/ChainAgnostic/CAIPs/blob/master/CAIPs/caip-74.md#specification)
 

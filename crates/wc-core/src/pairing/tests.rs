@@ -7,7 +7,9 @@ use super::{
         decode_subscription_data, validate_session_message_payload,
     },
     pairing_lifecycle::pairing_ping_response_publish,
-    session_authenticate::session_authenticate_error_publish,
+    session_authenticate::{
+        session_authenticate_error_publish, session_authenticate_success_publish,
+    },
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
         session_event_request_publish, session_extend_request_publish,
@@ -22,6 +24,7 @@ use super::{
     *,
 };
 use wc_protocol::{
+    did::DidPkh,
     dto::pairing::{
         PairingJsonRpcRequest, PairingJsonRpcResponse, PairingMethod, PairingPingParams,
     },
@@ -33,14 +36,15 @@ use wc_protocol::{
     pairing_message::PairingMessage,
     relay::{IrnPublish, IrnSubscriptionData, RelayTopic},
     session::{
-        AuthPayload, CacaoHeaderType, DappMetadata, JsonRpcError, JsonRpcErrorCode,
+        AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
+        CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
         JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, RelayProtocolOptions, Session,
-        SessionAuthenticateParams, SessionDeleteParams, SessionDeleteResponse, SessionEvent,
-        SessionEventName, SessionEventParams, SessionExtendParams, SessionExtendResponse,
-        SessionNamespace, SessionParticipant, SessionPingParams, SessionPingResponse,
-        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult,
-        SessionRequestParams, SessionSettleParams, SessionTransportType, SessionUpdateParams,
-        SessionUpdateResponse, SignMethod, session_ack_response,
+        SessionAuthenticateParams, SessionAuthenticateResult, SessionDeleteParams,
+        SessionDeleteResponse, SessionEvent, SessionEventName, SessionEventParams,
+        SessionExtendParams, SessionExtendResponse, SessionNamespace, SessionParticipant,
+        SessionPingParams, SessionPingResponse, SessionProposeErrorResponse, SessionProposeParams,
+        SessionProposeResult, SessionRequestParams, SessionSettleParams, SessionTransportType,
+        SessionUpdateParams, SessionUpdateResponse, SignMethod, session_ack_response,
     },
 };
 
@@ -170,6 +174,60 @@ fn builds_session_authenticate_error_publish() -> Result<(), Box<dyn std::error:
     );
     assert_eq!(response.id, request.id);
     assert_eq!(response.error.code, JsonRpcErrorCode::UserRejected);
+
+    Ok(())
+}
+
+#[test]
+fn builds_session_authenticate_success_publish() -> Result<(), Box<dyn std::error::Error>> {
+    let pairing_sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(pairing_sym_key.clone())?;
+    let request = session_authenticate_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &pairing_sym_key,
+        subscription.topic().clone(),
+        Some(1116),
+    )?;
+    let received = decode_subscription_data(data, &pairing_sym_key)?;
+    let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
+        "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+    )?);
+    let publish = session_authenticate_success_publish(
+        &subscription,
+        &received,
+        wallet_metadata(),
+        vec![auth_cacao()?],
+        &responder,
+    )?;
+    let response_sym_key = derive_shared_sym_key(
+        responder.private_key(),
+        &request.params.requester.public_key,
+    );
+    let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
+    let response: JsonRpcResponse<SessionAuthenticateResult> =
+        decrypt_publish(&publish, &response_sym_key)?;
+
+    assert_eq!(
+        publish.topic,
+        derive_topic_from_x25519_public_key(&request.params.requester.public_key)
+    );
+    assert_eq!(publish.ttl, SESSION_AUTHENTICATE_RESPONSE_TTL_SECONDS);
+    assert_eq!(publish.tag, SESSION_AUTHENTICATE_RESPONSE_TAG);
+    assert_eq!(envelope.envelope_type(), EnvelopeType::Type1);
+    assert_eq!(
+        envelope.sender_public_key(),
+        Some(&responder.public_key().to_bytes())
+    );
+    assert_eq!(response.id, request.id);
+    assert_eq!(response.result.responder.metadata.name, "Rust Wallet");
+    assert_eq!(response.result.cacaos.len(), 1);
+    assert_eq!(
+        response.result.cacaos[0].p.iss.as_str(),
+        "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
+    );
 
     Ok(())
 }
@@ -1998,6 +2056,32 @@ fn wallet_metadata() -> DappMetadata {
         verify_url: None,
         redirect: None,
     }
+}
+
+fn auth_cacao() -> Result<Cacao, Box<dyn std::error::Error>> {
+    Ok(Cacao {
+        h: CacaoHeader {
+            kind: CacaoHeaderType::Caip122,
+        },
+        p: CacaoPayload {
+            iss: DidPkh::parse("did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87")?,
+            domain: "example.com".to_owned(),
+            aud: "https://example.com/login".to_owned(),
+            version: "1".to_owned(),
+            nonce: "1234567890".to_owned(),
+            iat: "2026-05-28T12:00:00.000Z".to_owned(),
+            statement: Some("Sign in to Example".to_owned()),
+            exp: None,
+            nbf: None,
+            request_id: None,
+            resources: vec!["urn:recap:eyJhdHQiOnsifX0".to_owned()],
+        },
+        s: CacaoSignature {
+            kind: CacaoSignatureType::Eip191,
+            signature: CacaoSignatureValue::from_wire("0x00"),
+            meta: None,
+        },
+    })
 }
 
 fn decrypt_publish<T>(
