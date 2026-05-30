@@ -79,6 +79,12 @@ The `single_session_state` corpus includes sanitized variants for:
   the live scenario;
 - an expired link-mode-shaped session.
 
+The `session_json_rpc` corpus includes sanitized Sign request variants for:
+
+- session proposal metadata and namespace shapes;
+- AppKit link-mode proposal redirect metadata;
+- Wallet Call request methods observed through live scenarios.
+
 The `verify` corpus includes sanitized live/fixture variants for:
 
 - unresolved JS SDK `verifyContext`;
