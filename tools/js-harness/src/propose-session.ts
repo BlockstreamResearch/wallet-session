@@ -30,6 +30,8 @@ const proposalEvents = envList("WC_JS_PROPOSAL_EVENTS", [
   "accountsChanged",
   "chainChanged",
 ]);
+const sessionProperties = jsonEnv("WC_JS_SESSION_PROPERTIES_JSON");
+const scopedProperties = jsonEnv("WC_JS_SCOPED_PROPERTIES_JSON");
 
 if (!uriFile && !printUri) {
   console.error("set WC_JS_URI_FILE or set WC_JS_PRINT_URI=1 to print the full pairing URI");
@@ -47,7 +49,7 @@ const signClient = await SignClient.init({
   },
 });
 
-const { uri, approval } = await signClient.connect({
+const connectParams = {
   requiredNamespaces: {
     eip155: {
       chains: proposalChains,
@@ -55,7 +57,11 @@ const { uri, approval } = await signClient.connect({
       events: proposalEvents,
     },
   },
-});
+  ...(sessionProperties ? { sessionProperties } : {}),
+  ...(scopedProperties ? { scopedProperties } : {}),
+};
+
+const { uri, approval } = await signClient.connect(connectParams);
 
 if (!uri) {
   console.error("sign-client did not return a pairing URI");
@@ -169,6 +175,15 @@ function envList(name: string, fallback: string[]): string[] {
   }
 
   return values;
+}
+
+function jsonEnv(name: string): unknown | undefined {
+  const value = process.env[name];
+  if (!value) {
+    return undefined;
+  }
+
+  return JSON.parse(value) as unknown;
 }
 
 async function writeResult(result: Record<string, unknown>): Promise<void> {

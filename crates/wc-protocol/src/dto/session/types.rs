@@ -251,12 +251,19 @@ pub struct SessionParticipant {
     pub metadata: DappMetadata,
 }
 
-/// Optional string session properties.
+/// Optional session properties.
 ///
 /// <https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/types/src/sign-client/session.ts#L21-L22>
 ///
 /// > type SessionProperties = ProposalTypes.SessionProperties;
-pub type SessionProperties = BTreeMap<String, String>;
+///
+/// Wallet Call API capabilities can also be predeclared in this map during
+/// CAIP-25 connection negotiation.
+///
+/// <https://docs.walletconnect.network/wallet-sdk/android/eip5792#session-properties>
+///
+/// > dApps can request capabilities through `sessionProperties`
+pub type SessionProperties = BTreeMap<String, Value>;
 
 /// Optional namespace-scoped properties.
 ///

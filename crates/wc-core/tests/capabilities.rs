@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::json;
 use wc_core::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
 };
@@ -282,6 +283,139 @@ fn chain_key_proposal_keeps_chain_scoped_approved_namespace()
         approval
             .namespaces
             .contains_key(&NamespaceKey::parse("eip155:1")?)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn approval_includes_supported_session_and_scoped_properties()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut proposal = proposal(
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["wallet_sendCalls"], ["accountsChanged"])?,
+        )])?,
+        ProposalNamespaces::new(),
+    )?;
+    proposal.params.session_properties = Some(BTreeMap::from([
+        ("atomic".to_owned(), json!({"status": "supported"})),
+        ("futureOptional".to_owned(), json!({"optional": true})),
+    ]));
+    proposal.params.scoped_properties = Some(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!({
+            "atomic": {"status": "supported"},
+            "paymasterService": {"optional": true}
+        }),
+    )]));
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["wallet_sendCalls"],
+        ["accountsChanged"],
+    )?])?
+    .with_session_properties(BTreeMap::from([(
+        "atomic".to_owned(),
+        json!({"status": "ready"}),
+    )]))
+    .with_scoped_properties(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!({"atomic": {"status": "supported"}}),
+    )]));
+
+    let approval =
+        capabilities.plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)?;
+
+    assert_eq!(
+        approval.session_properties.as_ref().expect("properties")["atomic"],
+        json!({"status": "ready"})
+    );
+    assert!(
+        approval
+            .session_properties
+            .as_ref()
+            .expect("properties")
+            .get("futureOptional")
+            .is_none()
+    );
+    assert_eq!(
+        approval.scoped_properties.as_ref().expect("scoped")["eip155:1"]["atomic"],
+        json!({"status": "supported"})
+    );
+    assert!(
+        approval.scoped_properties.as_ref().expect("scoped")["eip155:1"]
+            .get("paymasterService")
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn unsupported_required_session_property_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut proposal = proposal(
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["wallet_sendCalls"], ["accountsChanged"])?,
+        )])?,
+        ProposalNamespaces::new(),
+    )?;
+    proposal.params.session_properties = Some(BTreeMap::from([(
+        "atomic".to_owned(),
+        json!({"status": "supported"}),
+    )]));
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["wallet_sendCalls"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("unsupported required session property must reject");
+
+    assert_eq!(
+        error,
+        ProposalPlanningError::UnsupportedSessionProperty {
+            property: "atomic".to_owned(),
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn unsupported_required_scoped_property_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut proposal = proposal(
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["wallet_sendCalls"], ["accountsChanged"])?,
+        )])?,
+        ProposalNamespaces::new(),
+    )?;
+    proposal.params.scoped_properties = Some(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!({"paymasterService": {"supported": true}}),
+    )]));
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["wallet_sendCalls"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("unsupported required scoped property must reject");
+
+    assert_eq!(
+        error,
+        ProposalPlanningError::UnsupportedScopedProperty {
+            scope: "eip155:1".to_owned(),
+            property: "paymasterService".to_owned(),
+        }
     );
 
     Ok(())

@@ -64,13 +64,13 @@ pub struct SessionProposeParams {
     /// Proposal namespaces the wallet may satisfy.
     #[serde(rename = "optionalNamespaces", default)]
     pub optional_namespaces: ProposalNamespaces,
-    /// Optional string session properties requested by the dapp.
+    /// Optional session properties requested by the dapp.
     #[serde(
         rename = "sessionProperties",
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub session_properties: Option<BTreeMap<String, String>>,
+    pub session_properties: Option<super::SessionProperties>,
     /// Optional namespace-scoped properties requested by the dapp.
     #[serde(
         rename = "scopedProperties",

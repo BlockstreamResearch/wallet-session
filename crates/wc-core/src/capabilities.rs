@@ -2,12 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use serde_json::Value;
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, CaipNamespace, NamespaceKey},
     namespaces::{NamespaceValidationError, validate_approved_namespaces},
     session::{
-        DappMetadata, JsonRpcRequest, ProposalNamespace, ProposalNamespaces, SessionEventName,
-        SessionMethod, SessionNamespace, SessionNamespaces, SessionProposeParams,
+        DappMetadata, JsonRpcRequest, ProposalNamespace, ProposalNamespaces, ScopedProperties,
+        SessionEventName, SessionMethod, SessionNamespace, SessionNamespaces, SessionProperties,
+        SessionProposeParams,
     },
 };
 
@@ -92,6 +94,8 @@ use crate::pairing::SessionProposalApproval;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WalletCapabilities {
     chains: BTreeMap<Caip2ChainId, WalletChainCapability>,
+    session_properties: SessionProperties,
+    scoped_properties: ScopedProperties,
 }
 
 impl WalletCapabilities {
@@ -142,6 +146,35 @@ impl WalletCapabilities {
         self.chains.get(chain_id)
     }
 
+    /// Adds wallet-owned session properties available during proposal approval.
+    ///
+    /// These are capability declarations the wallet is willing to return in
+    /// `wc_sessionSettle`. Requested values from the dapp are not echoed.
+    ///
+    /// <https://docs.walletconnect.network/wallet-sdk/android/eip5792#wallet-response>
+    ///
+    /// > The wallet’s response should specify the capabilities it supports
+    #[must_use]
+    pub fn with_session_properties(mut self, session_properties: SessionProperties) -> Self {
+        self.session_properties = session_properties;
+        self
+    }
+
+    /// Adds wallet-owned scoped properties available during proposal approval.
+    ///
+    /// Scoped properties are keyed by namespace or CAIP-2 chain and are only
+    /// returned for scopes that are also approved in session namespaces.
+    ///
+    /// <https://github.com/ChainAgnostic/namespaces/blob/main/eip155/caip25.md#session-properties>
+    ///
+    /// > both parties can put such objects in the appropriately-keyed
+    /// > `scopedProperties` partition for chain-specific capabilities
+    #[must_use]
+    pub fn with_scoped_properties(mut self, scoped_properties: ScopedProperties) -> Self {
+        self.scoped_properties = scoped_properties;
+        self
+    }
+
     /// Plans approval data for a decrypted `wc_sessionPropose` request.
     ///
     /// Required namespaces are all-or-error. Optional namespaces approve the
@@ -185,11 +218,20 @@ impl WalletCapabilities {
         validate_approved_namespaces(&proposal.params.required_namespaces, &namespaces)
             .map_err(|source| ProposalPlanningError::ApprovalNamespaces { source })?;
 
-        Ok(SessionProposalApproval::new(
-            namespaces,
-            wallet_metadata,
-            expiry,
-        ))
+        let session_properties = plan_session_properties(
+            proposal.params.session_properties.as_ref(),
+            &self.session_properties,
+        )?;
+        let scoped_properties = plan_scoped_properties(
+            proposal.params.scoped_properties.as_ref(),
+            &self.scoped_properties,
+            &namespaces,
+        )?;
+
+        let mut approval = SessionProposalApproval::new(namespaces, wallet_metadata, expiry);
+        approval.session_properties = session_properties;
+        approval.scoped_properties = scoped_properties;
+        Ok(approval)
     }
 
     fn add_proposal_namespaces(
@@ -452,6 +494,22 @@ pub enum ProposalPlanningError {
     /// No required or optional proposal namespace can be approved.
     #[error("session proposal has no namespaces supported by this wallet")]
     NoSupportedNamespaces,
+
+    /// Dapp requested a required session property the wallet cannot provide.
+    #[error("wallet does not support requested session property {property}")]
+    UnsupportedSessionProperty {
+        /// Unsupported property key.
+        property: String,
+    },
+
+    /// Dapp requested a required scoped property the wallet cannot provide.
+    #[error("wallet does not support requested scoped property {property} for {scope}")]
+    UnsupportedScopedProperty {
+        /// Top-level scoped property key.
+        scope: String,
+        /// Unsupported property key within that scope.
+        property: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,6 +638,147 @@ fn approval_key(proposal_key: &NamespaceKey, chain_id: &Caip2ChainId) -> Namespa
 
 fn namespace_component(key: &NamespaceKey) -> CaipNamespace {
     CaipNamespace::parse(key.namespace()).expect("NamespaceKey validates its namespace component")
+}
+
+fn plan_session_properties(
+    requested: Option<&SessionProperties>,
+    supported: &SessionProperties,
+) -> Result<Option<SessionProperties>, ProposalPlanningError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+
+    let mut approved = SessionProperties::new();
+    for (property, requested_value) in requested {
+        if let Some(supported_value) = supported.get(property) {
+            approved.insert(property.clone(), supported_value.clone());
+        } else if !is_optional_property(requested_value) {
+            return Err(ProposalPlanningError::UnsupportedSessionProperty {
+                property: property.clone(),
+            });
+        }
+    }
+
+    Ok(non_empty(approved))
+}
+
+fn plan_scoped_properties(
+    requested: Option<&ScopedProperties>,
+    supported: &ScopedProperties,
+    approved_namespaces: &SessionNamespaces,
+) -> Result<Option<ScopedProperties>, ProposalPlanningError> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+
+    let mut approved = ScopedProperties::new();
+    for (scope, requested_value) in requested {
+        let scope_is_approved = is_property_scope_approved(scope, approved_namespaces);
+        let Some(supported_value) = supported.get(scope).filter(|_| scope_is_approved) else {
+            reject_required_scoped_properties(scope, requested_value)?;
+            continue;
+        };
+
+        let planned = plan_scoped_property_value(scope, requested_value, supported_value)?;
+        if !planned.is_null() {
+            approved.insert(scope.clone(), planned);
+        }
+    }
+
+    Ok(non_empty(approved))
+}
+
+fn plan_scoped_property_value(
+    scope: &str,
+    requested: &Value,
+    supported: &Value,
+) -> Result<Value, ProposalPlanningError> {
+    let (Value::Object(requested_properties), Value::Object(supported_properties)) =
+        (requested, supported)
+    else {
+        return Ok(supported.clone());
+    };
+
+    let mut approved = serde_json::Map::new();
+    for (property, requested_value) in requested_properties {
+        if let Some(supported_value) = supported_properties.get(property) {
+            approved.insert(property.clone(), supported_value.clone());
+        } else if !is_optional_property(requested_value) {
+            return Err(ProposalPlanningError::UnsupportedScopedProperty {
+                scope: scope.to_owned(),
+                property: property.clone(),
+            });
+        }
+    }
+
+    if approved.is_empty() {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Object(approved))
+    }
+}
+
+fn reject_required_scoped_properties(
+    scope: &str,
+    requested: &Value,
+) -> Result<(), ProposalPlanningError> {
+    if let Value::Object(properties) = requested {
+        if let Some((property, _)) = properties
+            .iter()
+            .find(|(_property, value)| !is_optional_property(value))
+        {
+            return Err(ProposalPlanningError::UnsupportedScopedProperty {
+                scope: scope.to_owned(),
+                property: property.clone(),
+            });
+        }
+        return Ok(());
+    }
+
+    if is_optional_property(requested) {
+        Ok(())
+    } else {
+        Err(ProposalPlanningError::UnsupportedScopedProperty {
+            scope: scope.to_owned(),
+            property: scope.to_owned(),
+        })
+    }
+}
+
+fn is_property_scope_approved(scope: &str, approved_namespaces: &SessionNamespaces) -> bool {
+    let Ok(scope_key) = NamespaceKey::parse(scope) else {
+        return false;
+    };
+
+    if approved_namespaces.contains_key(&scope_key) {
+        return true;
+    }
+
+    if let Some(chain_id) = scope_key.chain_id() {
+        return approved_namespaces.iter().any(|(key, namespace)| {
+            key.namespace() == chain_id.namespace()
+                && namespace
+                    .chains
+                    .as_ref()
+                    .is_some_and(|chains| chains.contains(chain_id))
+        });
+    }
+
+    approved_namespaces
+        .keys()
+        .any(|key| key.namespace() == scope_key.namespace())
+}
+
+fn is_optional_property(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get("optional"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn non_empty<T>(map: BTreeMap<String, T>) -> Option<BTreeMap<String, T>> {
+    if map.is_empty() { None } else { Some(map) }
 }
 
 fn dedupe<T>(items: Vec<T>) -> Vec<T>

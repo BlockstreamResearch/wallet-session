@@ -115,7 +115,7 @@ fn serializes_current_optional_fields() {
             expiry: 1_780_418_257,
             session_properties: Some(BTreeMap::from([(
                 "caip154-mandatory".to_owned(),
-                "true".to_owned(),
+                json!("true"),
             )])),
             scoped_properties: Some(BTreeMap::from([(
                 "eip155:1".to_owned(),

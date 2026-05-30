@@ -326,6 +326,40 @@ fn uses_deprecated_expiry_fallback() {
 }
 
 #[test]
+fn deserializes_wallet_call_capability_properties() {
+    let mut value = serde_json::from_str::<serde_json::Value>(SESSION_PROPOSE_JSON)
+        .expect("proposal fixture parses");
+    value["params"]["sessionProperties"] = json!({
+        "atomic": {
+            "status": "supported"
+        }
+    });
+    value["params"]["scopedProperties"] = json!({
+        "eip155:5": {
+            "paymasterService": {
+                "supported": true
+            }
+        }
+    });
+
+    let request = serde_json::from_value::<JsonRpcRequest<SessionProposeParams>>(value)
+        .expect("session proposal with properties parses");
+
+    assert_eq!(
+        request
+            .params
+            .session_properties
+            .as_ref()
+            .expect("properties")["atomic"],
+        json!({"status": "supported"})
+    );
+    assert_eq!(
+        request.params.scoped_properties.as_ref().expect("scoped")["eip155:5"]["paymasterService"],
+        json!({"supported": true})
+    );
+}
+
+#[test]
 fn serializes_current_type_names() {
     let request = JsonRpcRequest::new(
         1,
@@ -356,7 +390,7 @@ fn serializes_current_type_names() {
             optional_namespaces: ProposalNamespaces::new(),
             session_properties: Some(BTreeMap::from([(
                 "caip154-mandatory".to_owned(),
-                "true".to_owned(),
+                json!("true"),
             )])),
             scoped_properties: Some(BTreeMap::from([(
                 "eip155:1".to_owned(),

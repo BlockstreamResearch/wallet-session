@@ -29,7 +29,7 @@ The next target is the remaining Sign authentication and trust behavior, in this
 1. CACAO message formatting and validation helpers;
 2. proposal authentication subrequest handling;
 3. Verify/origin trust context surfaced in review data;
-4. richer wallet policy primitives for authentication, session properties, scoped properties, and wallet methods;
+4. richer wallet policy primitives for authentication and wallet methods;
 5. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
 
 Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
@@ -162,6 +162,10 @@ Policy:
 - required namespaces are all-or-error;
 - optional namespaces approve only the supported chain/method/event intersection;
 - accounts must match the capability chain;
+- requested `sessionProperties` and `scopedProperties` are answered only with
+  wallet-owned supported values;
+- unsupported optional properties are omitted, while unsupported required
+  properties reject approval planning;
 - planned namespaces are revalidated with `wc-protocol` namespace validation before approval.
 
 Rationale: namespace approval is a wallet security decision. The core can help calculate a safe approval shape, but the caller still owns user consent.
@@ -350,7 +354,6 @@ These are intentionally not finalized:
 - explicit drop policy reporting for flooded event queues;
 - browser/Wasm transport;
 - UniFFI and mobile bindings;
-- richer wallet capability model beyond chains/accounts/methods/events;
 - CACAO signing and authentication workflow behavior;
 - complete production threat model artifact.
 

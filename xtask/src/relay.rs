@@ -900,21 +900,35 @@ async fn run_core_single_session_client_session_request_probe(
 
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     println!(
-        "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
+        "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?} session_properties={} scoped_properties={}",
         proposal.proposal_id(),
         proposal.pairing_topic(),
         proposal.verify_context().verified.origin.as_str(),
         proposal.verify_context().verified.validation.as_str(),
-        proposal.verify_risk()
+        proposal.verify_risk(),
+        proposal
+            .request()
+            .params
+            .session_properties
+            .as_ref()
+            .map_or(0, BTreeMap::len),
+        proposal
+            .request()
+            .params
+            .scoped_properties
+            .as_ref()
+            .map_or(0, BTreeMap::len)
     );
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
     println!(
-        "core-single-session-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={}",
+        "core-single-session-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={} session_properties={} scoped_properties={}",
         session.topic,
         session.acknowledged,
         session.namespaces.len(),
-        session.expiry
+        session.expiry,
+        session.session_properties.as_ref().map_or(0, BTreeMap::len),
+        session.scoped_properties.as_ref().map_or(0, BTreeMap::len)
     );
 
     let session_message = wait_for_single_session_client_session_request_event(&mut client).await?;
@@ -3040,7 +3054,17 @@ fn probe_wallet_capabilities() -> Result<WalletCapabilities> {
         )?);
     }
 
-    WalletCapabilities::new(capabilities).map_err(Into::into)
+    let mut capabilities = WalletCapabilities::new(capabilities)?;
+    if let Ok(value) = env::var("WC_APPROVAL_SESSION_PROPERTIES_JSON") {
+        capabilities =
+            capabilities.with_session_properties(serde_json::from_value(parse_json_env(&value)?)?);
+    }
+    if let Ok(value) = env::var("WC_APPROVAL_SCOPED_PROPERTIES_JSON") {
+        capabilities =
+            capabilities.with_scoped_properties(serde_json::from_value(parse_json_env(&value)?)?);
+    }
+
+    Ok(capabilities)
 }
 
 fn env_list(name: &str, default: &str) -> Result<Vec<String>> {
