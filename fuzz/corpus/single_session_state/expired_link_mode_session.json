@@ -1,0 +1,67 @@
+{
+  "session": {
+    "topic": "7777777777777777777777777777777777777777777777777777777777777777",
+    "pairingTopic": "8888888888888888888888888888888888888888888888888888888888888888",
+    "relay": {
+      "protocol": "irn"
+    },
+    "expiry": 0,
+    "acknowledged": true,
+    "controller": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "namespaces": {
+      "eip155:1": {
+        "accounts": [
+          "eip155:1:0x1111111111111111111111111111111111111111"
+        ],
+        "methods": [
+          "personal_sign"
+        ],
+        "events": []
+      }
+    },
+    "requiredNamespaces": {},
+    "optionalNamespaces": {},
+    "self": {
+      "publicKey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "metadata": {
+        "name": "Rust wallet",
+        "description": "Expired sanitized session",
+        "url": "https://example.com/wallet",
+        "icons": []
+      }
+    },
+    "peer": {
+      "publicKey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "metadata": {
+        "name": "Link mode dapp",
+        "description": "Sanitized expired link-mode peer",
+        "url": "https://example.com/dapp",
+        "icons": [],
+        "redirect": {
+          "universal": "https://example.com/dapp"
+        }
+      }
+    },
+    "transportType": "link_mode"
+  },
+  "requestIds": [
+    0,
+    1,
+    18446744073709551615
+  ],
+  "updateIds": [
+    0,
+    1,
+    18446744073709551615
+  ],
+  "operationIds": [
+    0,
+    1,
+    2,
+    3,
+    0,
+    5,
+    6,
+    7
+  ]
+}

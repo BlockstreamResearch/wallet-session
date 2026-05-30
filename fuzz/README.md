@@ -49,3 +49,11 @@ Seed corpus policy:
 - copy live SDK examples only after removing secrets, topics, project IDs, and
   any user data;
 - use AppKit Lab and JS harness captures as corpus seeds, not as fuzz targets.
+
+The `single_session_state` corpus includes sanitized variants for:
+
+- a normal acknowledged session with pending request/update IDs;
+- an auth-created session carrying CACAO objects;
+- an AppKit-style Wallet Call/capability session with `sessionProperties`,
+  `scopedProperties`, redirect metadata, and Wallet Call methods;
+- an expired link-mode-shaped session.
