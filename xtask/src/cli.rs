@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{api_snapshot, probe, relay, scenario};
+use crate::{api_snapshot, lab, probe, relay, scenario};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,6 +38,8 @@ enum Command {
     Verify(VerifyProbeArgs),
     #[command(name = "scenario")]
     Scenario(ScenarioArgs),
+    #[command(name = "lab")]
+    Lab(LabArgs),
 }
 
 #[derive(Debug, Args)]
@@ -164,6 +166,70 @@ struct ScenarioArgs {
 }
 
 #[derive(Debug, Args)]
+struct LabArgs {
+    #[command(subcommand)]
+    command: LabCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LabCommand {
+    #[command(name = "routes")]
+    Routes(LabRoutesArgs),
+    #[command(name = "catalog")]
+    Catalog(LabCatalogArgs),
+    #[command(name = "capture-uri")]
+    CaptureUri(LabCaptureUriArgs),
+}
+
+#[derive(Debug, Args)]
+struct LabRoutesArgs {
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct LabCatalogArgs {
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    validate: bool,
+
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct LabCaptureUriArgs {
+    #[arg(long, value_name = "URL")]
+    base_url: Option<String>,
+
+    #[arg(long)]
+    headed: bool,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long, default_value = "wagmi")]
+    scenario: String,
+
+    #[arg(long)]
+    show_uri: bool,
+
+    #[arg(long, value_name = "MS")]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Args)]
 struct ApiSnapshotArgs {
     #[arg(long, default_value = "target/doc/wc_core.json")]
     rustdoc_json: PathBuf,
@@ -207,6 +273,7 @@ pub fn run() -> Result<()> {
                 scenario::run(args.name)
             }
         }
+        Command::Lab(args) => lab::run(args.into()),
     }
 }
 
@@ -239,6 +306,32 @@ impl From<VerifyProbeArgs> for probe::verify::VerifyProbeArgs {
             now_unix_seconds: args.now_unix_seconds,
             metadata_url: args.metadata_url,
             verify_url: args.verify_url,
+        }
+    }
+}
+
+impl From<LabArgs> for lab::LabCommand {
+    fn from(args: LabArgs) -> Self {
+        match args.command {
+            LabCommand::Routes(args) => Self::Routes(lab::LabRoutesRequest {
+                base_url: args.base_url,
+                json: args.json,
+                timeout_ms: args.timeout_ms,
+            }),
+            LabCommand::Catalog(args) => Self::Catalog(lab::LabCatalogRequest {
+                base_url: args.base_url,
+                json: args.json,
+                validate: args.validate,
+                timeout_ms: args.timeout_ms,
+            }),
+            LabCommand::CaptureUri(args) => Self::CaptureUri(lab::LabCaptureUriRequest {
+                base_url: args.base_url,
+                headed: args.headed,
+                json: args.json,
+                scenario: args.scenario,
+                show_uri: args.show_uri,
+                timeout_ms: args.timeout_ms,
+            }),
         }
     }
 }

@@ -2,6 +2,7 @@
 
 mod api_snapshot;
 mod cli;
+mod lab;
 mod probe;
 mod relay;
 mod relay_socket;
