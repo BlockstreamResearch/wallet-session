@@ -36,6 +36,8 @@ pub enum ScenarioName {
     WalletCallLive,
     /// AppKit-style CAIP-25 capability proposal and Wallet Call response.
     AppkitCapabilityProposal,
+    /// AppKit-style proposal carrying redirect and link-mode metadata.
+    AppkitLinkModeProposal,
     /// Verify public-key and JS SDK Verify context scenarios.
     VerifyLive,
     /// Auth, Verify, and Wallet Call SDK interop scenarios.
@@ -58,6 +60,7 @@ impl ScenarioName {
             Self::WalletCallSendCalls => "wallet-call-send-calls",
             Self::WalletCallLive => "wallet-call-live",
             Self::AppkitCapabilityProposal => "appkit-capability-proposal",
+            Self::AppkitLinkModeProposal => "appkit-link-mode-proposal",
             Self::VerifyLive => "verify-live",
             Self::InteropLive => "interop-live",
         }
@@ -84,6 +87,9 @@ impl ScenarioName {
             Self::WalletCallLive => "Wallet Call request matrix",
             Self::AppkitCapabilityProposal => {
                 "AppKit-style proposal with CAIP-25 session/scoped properties"
+            }
+            Self::AppkitLinkModeProposal => {
+                "AppKit-style proposal with redirect/link-mode metadata"
             }
             Self::VerifyLive => "Verify public key and JS SDK verifyContext",
             Self::InteropLive => "auth approval/rejection, Verify, and Wallet Call interop",
@@ -117,6 +123,7 @@ impl ScenarioName {
             Self::WalletCallSendCalls => &[WALLET_SEND_CALLS],
             Self::WalletCallLive => &[WALLET_GET_CAPABILITIES, WALLET_SEND_CALLS],
             Self::AppkitCapabilityProposal => &[APPKIT_CAPABILITY_PROPOSAL],
+            Self::AppkitLinkModeProposal => &[APPKIT_LINK_MODE_PROPOSAL],
             Self::VerifyLive => &[VERIFY_PUBLIC_KEY, VERIFY_CONTEXT],
             Self::InteropLive => &[
                 SINGLE_SESSION_AUTH_REJECT,
@@ -124,6 +131,7 @@ impl ScenarioName {
                 VERIFY_PUBLIC_KEY,
                 VERIFY_CONTEXT,
                 APPKIT_CAPABILITY_PROPOSAL,
+                APPKIT_LINK_MODE_PROPOSAL,
                 WALLET_GET_CAPABILITIES,
                 WALLET_SEND_CALLS,
             ],
@@ -272,6 +280,8 @@ const APPKIT_APPROVAL_SESSION_PROPERTIES: &str = r#"{"atomic":{"status":"ready"}
 const APPKIT_PROPOSAL_SCOPED_PROPERTIES: &str =
     r#"{"eip155:1":{"atomic":{"status":"supported"},"paymasterService":{"optional":true}}}"#;
 const APPKIT_APPROVAL_SCOPED_PROPERTIES: &str = r#"{"eip155:1":{"atomic":{"status":"supported"}}}"#;
+const APPKIT_LINK_MODE_REDIRECT: &str =
+    r#"{"native":"appkit-lab://","universal":"https://appkit-lab.reown.com","linkMode":true}"#;
 
 const WALLET_GET_CAPABILITIES: ScenarioStep = ScenarioStep {
     label: "wallet-call-get-capabilities",
@@ -364,6 +374,21 @@ const APPKIT_CAPABILITY_PROPOSAL: ScenarioStep = ScenarioStep {
     ],
 };
 
+const APPKIT_LINK_MODE_PROPOSAL: ScenarioStep = ScenarioStep {
+    label: "appkit-link-mode-proposal",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_METADATA_NAME", "AppKit Lab dapp"),
+        ("WC_JS_METADATA_URL", "https://appkit-lab.reown.com"),
+        ("WC_JS_METADATA_REDIRECT_JSON", APPKIT_LINK_MODE_REDIRECT),
+    ],
+};
+
 const VERIFY_PUBLIC_KEY: ScenarioStep = ScenarioStep {
     label: "verify-public-key",
     command: ScenarioCommand::Xtask(&["verify-probe", "--public-key"]),
@@ -421,6 +446,7 @@ mod tests {
                 "verify-public-key",
                 "verify-context",
                 "appkit-capability-proposal",
+                "appkit-link-mode-proposal",
                 "wallet-call-get-capabilities",
                 "wallet-call-send-calls",
             ]
@@ -455,6 +481,23 @@ mod tests {
                 .iter()
                 .any(|(key, value)| *key == "WC_CORE_SESSION_REQUEST_RESULT_JSON"
                     && value.contains("0x000000"))
+        );
+    }
+
+    #[test]
+    fn appkit_link_mode_step_pins_redirect_metadata() {
+        let step = ScenarioName::AppkitLinkModeProposal.steps()[0];
+
+        assert_eq!(step.label, "appkit-link-mode-proposal");
+        assert!(
+            step.env
+                .contains(&("WC_JS_METADATA_URL", "https://appkit-lab.reown.com"))
+        );
+        assert!(
+            step.env
+                .iter()
+                .any(|(key, value)| *key == "WC_JS_METADATA_REDIRECT_JSON"
+                    && value.contains("\"linkMode\":true"))
         );
     }
 

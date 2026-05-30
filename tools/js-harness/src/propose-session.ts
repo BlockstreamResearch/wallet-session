@@ -30,8 +30,9 @@ const proposalEvents = envList("WC_JS_PROPOSAL_EVENTS", [
   "accountsChanged",
   "chainChanged",
 ]);
-const sessionProperties = jsonEnv("WC_JS_SESSION_PROPERTIES_JSON");
-const scopedProperties = jsonEnv("WC_JS_SCOPED_PROPERTIES_JSON");
+const metadataRedirect = jsonEnv("WC_JS_METADATA_REDIRECT_JSON") as
+  | MetadataRedirect
+  | undefined;
 
 if (!uriFile && !printUri) {
   console.error("set WC_JS_URI_FILE or set WC_JS_PRINT_URI=1 to print the full pairing URI");
@@ -42,14 +43,25 @@ const signClient = await SignClient.init({
   projectId,
   relayUrl,
   metadata: {
-    name: "walletconnect-client-poc JS harness",
+    name: process.env.WC_JS_METADATA_NAME ?? "walletconnect-client-poc JS harness",
     description: "Live WalletConnect proposal generator for Rust protocol probes",
-    url: "https://github.com/BlockstreamResearch/walletconnect-client-poc",
+    url:
+      process.env.WC_JS_METADATA_URL ??
+      "https://github.com/BlockstreamResearch/walletconnect-client-poc",
     icons: ["https://walletconnect.com/walletconnect-logo.png"],
+    ...(metadataRedirect ? { redirect: metadataRedirect } : {}),
   },
 });
 
-const connectParams = {
+type ConnectParams = Parameters<typeof signClient.connect>[0];
+
+const sessionProperties = jsonEnv("WC_JS_SESSION_PROPERTIES_JSON") as
+  | ConnectParams["sessionProperties"]
+  | undefined;
+const scopedProperties = jsonEnv("WC_JS_SCOPED_PROPERTIES_JSON") as
+  | ConnectParams["scopedProperties"]
+  | undefined;
+const connectParams: ConnectParams = {
   requiredNamespaces: {
     eip155: {
       chains: proposalChains,
@@ -57,9 +69,13 @@ const connectParams = {
       events: proposalEvents,
     },
   },
-  ...(sessionProperties ? { sessionProperties } : {}),
-  ...(scopedProperties ? { scopedProperties } : {}),
 };
+if (sessionProperties) {
+  connectParams.sessionProperties = sessionProperties;
+}
+if (scopedProperties) {
+  connectParams.scopedProperties = scopedProperties;
+}
 
 const { uri, approval } = await signClient.connect(connectParams);
 
@@ -185,6 +201,12 @@ function jsonEnv(name: string): unknown | undefined {
 
   return JSON.parse(value) as unknown;
 }
+
+type MetadataRedirect = {
+  native?: string;
+  universal?: string;
+  linkMode?: boolean;
+};
 
 async function writeResult(result: Record<string, unknown>): Promise<void> {
   if (!resultFile) {

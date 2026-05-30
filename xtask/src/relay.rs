@@ -452,6 +452,19 @@ where
     Ok(())
 }
 
+fn assert_string_env_matches(env_name: &str, actual: &str, label: &str) -> Result<()> {
+    let Ok(expected) = env::var(env_name) else {
+        return Ok(());
+    };
+
+    if actual != expected {
+        bail!("{label} mismatch for {env_name}: expected {expected}, got {actual}");
+    }
+
+    println!("{label} {env_name}=matched");
+    Ok(())
+}
+
 struct RelayProbeConfig {
     project_id: String,
     relay_url: String,
@@ -1010,6 +1023,22 @@ fn print_and_assert_single_session_proposal_properties(
         "WC_JS_SCOPED_PROPERTIES_JSON",
         proposal.request().params.scoped_properties.as_ref(),
         "core-single-session-client-session-request proposal_scoped_properties",
+    )?;
+    assert_string_env_matches(
+        "WC_JS_METADATA_URL",
+        &proposal.request().params.proposer.metadata.url,
+        "core-single-session-client-session-request proposal_metadata_url",
+    )?;
+    assert_optional_json_env_matches(
+        "WC_JS_METADATA_REDIRECT_JSON",
+        proposal
+            .request()
+            .params
+            .proposer
+            .metadata
+            .redirect
+            .as_ref(),
+        "core-single-session-client-session-request proposal_metadata_redirect",
     )
 }
 
