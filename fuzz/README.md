@@ -17,6 +17,18 @@ Run a short local smoke pass:
 just fuzz_smoke
 ```
 
+Run a bounded regression pass over every target:
+
+```sh
+just fuzz_regression
+```
+
+For a shorter local check of the regression recipe:
+
+```sh
+just fuzz_regression 10
+```
+
 Run the fuzz crate supply-chain check:
 
 ```sh
@@ -24,8 +36,14 @@ just fuzz_deny
 ```
 
 The smoke recipe uses `-s none` and `-runs=1` so it works as a deterministic
-target/corpus validation check. Longer local fuzzing should use the default
-sanitizer when it works on the host:
+target/corpus validation check. The regression recipe keeps `-s none` for
+host-stable bounded runs and accepts a configurable `-runs` value, defaulting to
+`1000`.
+
+Both recipes copy the checked-in seed corpus into `target/fuzz-run-corpus`
+before running libFuzzer. This keeps routine smoke and regression runs from
+mutating checked-in seed files. Longer local fuzzing should use the default
+sanitizer and the checked-in corpus when the host supports it:
 
 ```sh
 cargo +nightly fuzz run pairing_uri

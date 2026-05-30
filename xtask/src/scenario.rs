@@ -32,6 +32,10 @@ pub enum ScenarioName {
     WalletCallGetCapabilities,
     /// Single-session `wallet_sendCalls` request review and response.
     WalletCallSendCalls,
+    /// Single-session `wallet_getCallsStatus` request review and response.
+    WalletCallGetCallsStatus,
+    /// Single-session `wallet_showCallsStatus` request review and response.
+    WalletCallShowCallsStatus,
     /// Wallet Call API request review scenarios.
     WalletCallLive,
     /// AppKit-style CAIP-25 capability proposal and Wallet Call response.
@@ -58,6 +62,8 @@ impl ScenarioName {
             Self::SingleSessionAuthenticateApprove => "single-session-authenticate-approve",
             Self::WalletCallGetCapabilities => "wallet-call-get-capabilities",
             Self::WalletCallSendCalls => "wallet-call-send-calls",
+            Self::WalletCallGetCallsStatus => "wallet-call-get-calls-status",
+            Self::WalletCallShowCallsStatus => "wallet-call-show-calls-status",
             Self::WalletCallLive => "wallet-call-live",
             Self::AppkitCapabilityProposal => "appkit-capability-proposal",
             Self::AppkitLinkModeProposal => "appkit-link-mode-proposal",
@@ -84,6 +90,8 @@ impl ScenarioName {
             Self::SingleSessionAuthenticateApprove => "single-session authentication approval",
             Self::WalletCallGetCapabilities => "Wallet Call wallet_getCapabilities request",
             Self::WalletCallSendCalls => "Wallet Call wallet_sendCalls request",
+            Self::WalletCallGetCallsStatus => "Wallet Call wallet_getCallsStatus request",
+            Self::WalletCallShowCallsStatus => "Wallet Call wallet_showCallsStatus request",
             Self::WalletCallLive => "Wallet Call request matrix",
             Self::AppkitCapabilityProposal => {
                 "AppKit-style proposal with CAIP-25 session/scoped properties"
@@ -121,7 +129,14 @@ impl ScenarioName {
             Self::SingleSessionAuthenticateApprove => &[SINGLE_SESSION_AUTH_APPROVE],
             Self::WalletCallGetCapabilities => &[WALLET_GET_CAPABILITIES],
             Self::WalletCallSendCalls => &[WALLET_SEND_CALLS],
-            Self::WalletCallLive => &[WALLET_GET_CAPABILITIES, WALLET_SEND_CALLS],
+            Self::WalletCallGetCallsStatus => &[WALLET_GET_CALLS_STATUS],
+            Self::WalletCallShowCallsStatus => &[WALLET_SHOW_CALLS_STATUS],
+            Self::WalletCallLive => &[
+                WALLET_GET_CAPABILITIES,
+                WALLET_SEND_CALLS,
+                WALLET_GET_CALLS_STATUS,
+                WALLET_SHOW_CALLS_STATUS,
+            ],
             Self::AppkitCapabilityProposal => &[APPKIT_CAPABILITY_PROPOSAL],
             Self::AppkitLinkModeProposal => &[APPKIT_LINK_MODE_PROPOSAL],
             Self::VerifyLive => &[VERIFY_PUBLIC_KEY, VERIFY_CONTEXT],
@@ -134,6 +149,8 @@ impl ScenarioName {
                 APPKIT_LINK_MODE_PROPOSAL,
                 WALLET_GET_CAPABILITIES,
                 WALLET_SEND_CALLS,
+                WALLET_GET_CALLS_STATUS,
+                WALLET_SHOW_CALLS_STATUS,
             ],
         }
     }
@@ -274,6 +291,14 @@ const WALLET_GET_CAPABILITIES_RESULT: &str = r#"{"eip155:1":{"atomic":{"status":
 const WALLET_SEND_CALLS_PARAMS: &str = r#"[{"version":"2.0.0","from":"0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb","chainId":"0x1","atomicRequired":true,"calls":[{"to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","value":"0x0","data":"0x"}],"capabilities":{"paymasterService":{"url":"https://example.com/paymaster","optional":true}}}]"#;
 const WALLET_SEND_CALLS_RESULT: &str =
     r#"{"id":"0x0000000000000000000000000000000000000000000000000000000000000001"}"#;
+#[cfg(test)]
+const WALLET_CALL_ID: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+const WALLET_GET_CALLS_STATUS_PARAMS: &str =
+    r#"["0x0000000000000000000000000000000000000000000000000000000000000001"]"#;
+const WALLET_GET_CALLS_STATUS_RESULT: &str = r#"{"version":"2.0.0","id":"0x0000000000000000000000000000000000000000000000000000000000000001","chainId":"0x1","status":200,"atomic":true,"receipts":[]}"#;
+const WALLET_SHOW_CALLS_STATUS_PARAMS: &str =
+    r#"["0x0000000000000000000000000000000000000000000000000000000000000001"]"#;
+const WALLET_SHOW_CALLS_STATUS_RESULT: &str = "null";
 const APPKIT_PROPOSAL_SESSION_PROPERTIES: &str =
     r#"{"atomic":{"status":"supported"},"futureOptional":{"optional":true}}"#;
 const APPKIT_APPROVAL_SESSION_PROPERTIES: &str = r#"{"atomic":{"status":"ready"}}"#;
@@ -325,6 +350,52 @@ const WALLET_SEND_CALLS: ScenarioStep = ScenarioStep {
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_SEND_CALLS_RESULT,
+        ),
+    ],
+};
+
+const WALLET_GET_CALLS_STATUS: ScenarioStep = ScenarioStep {
+    label: "wallet-call-get-calls-status",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_METHODS", "wallet_getCallsStatus"),
+        ("WC_APPROVAL_METHODS", "wallet_getCallsStatus"),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCallsStatus"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_GET_CALLS_STATUS_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_GET_CALLS_STATUS_RESULT,
+        ),
+    ],
+};
+
+const WALLET_SHOW_CALLS_STATUS: ScenarioStep = ScenarioStep {
+    label: "wallet-call-show-calls-status",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_METHODS", "wallet_showCallsStatus"),
+        ("WC_APPROVAL_METHODS", "wallet_showCallsStatus"),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_showCallsStatus"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_SHOW_CALLS_STATUS_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_SHOW_CALLS_STATUS_RESULT,
         ),
     ],
 };
@@ -428,7 +499,7 @@ fn ensure_success(label: &str, status: ExitStatus) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScenarioCommand, ScenarioName};
+    use super::{ScenarioCommand, ScenarioName, WALLET_CALL_ID};
 
     #[test]
     fn interop_live_covers_auth_verify_and_wallet_call_steps() {
@@ -449,6 +520,8 @@ mod tests {
                 "appkit-link-mode-proposal",
                 "wallet-call-get-capabilities",
                 "wallet-call-send-calls",
+                "wallet-call-get-calls-status",
+                "wallet-call-show-calls-status",
             ]
         );
     }
@@ -457,7 +530,7 @@ mod tests {
     fn wallet_call_steps_pin_methods_and_results() {
         let steps = ScenarioName::WalletCallLive.steps();
 
-        assert_eq!(steps.len(), 2);
+        assert_eq!(steps.len(), 4);
         assert!(
             steps[0]
                 .env
@@ -467,6 +540,16 @@ mod tests {
             steps[1]
                 .env
                 .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_sendCalls"))
+        );
+        assert!(
+            steps[2]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCallsStatus"))
+        );
+        assert!(
+            steps[3]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_showCallsStatus"))
         );
         assert!(
             steps[0]
@@ -481,6 +564,30 @@ mod tests {
                 .iter()
                 .any(|(key, value)| *key == "WC_CORE_SESSION_REQUEST_RESULT_JSON"
                     && value.contains("0x000000"))
+        );
+        assert!(
+            steps[2]
+                .env
+                .iter()
+                .any(|(key, value)| *key == "WC_CORE_SESSION_REQUEST_RESULT_JSON"
+                    && value.contains("\"status\":200"))
+        );
+        assert!(
+            steps[3]
+                .env
+                .contains(&("WC_CORE_SESSION_REQUEST_RESULT_JSON", "null"))
+        );
+        assert!(
+            steps[2]
+                .env
+                .iter()
+                .any(|(_, value)| value.contains(WALLET_CALL_ID))
+        );
+        assert!(
+            steps[3]
+                .env
+                .iter()
+                .any(|(_, value)| value.contains(WALLET_CALL_ID))
         );
     }
 
