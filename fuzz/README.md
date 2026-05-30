@@ -33,12 +33,13 @@ cargo +nightly fuzz run pairing_uri
 
 The first target set is intentionally byte-oriented. It covers pairing URIs,
 identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, namespace
-validation, and CACAO auth payload/message validation. Structure-aware fuzzing
-with `Arbitrary` should be added once these parser boundaries are stable.
+validation, CACAO auth payload/message validation, and single-session pending
+decision/expiry state. Structure-aware fuzzing with `Arbitrary` should be added
+once these parser boundaries are stable.
 
-Stateful `SingleSessionClient` fuzzing should wait until there is a public or
-in-crate mock runtime harness. A target that only models one-shot decisions
-inside the fuzzer would not exercise the production runtime.
+The `single_session_state` target uses `wc-core`'s non-default `testkit`
+feature. It does not duplicate the one-shot model inside the fuzzer; it calls
+the same in-memory pending decision and expiry primitives used by the client.
 
 Seed corpus policy:
 

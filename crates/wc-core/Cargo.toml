@@ -12,6 +12,11 @@ keywords = ["walletconnect", "client"]
 categories = ["cryptography::cryptocurrencies", "network-programming"]
 publish = false
 
+[features]
+# Enables deterministic state harnesses for fuzzing and integration tests.
+# The feature is off by default so production users only see the runtime API.
+testkit = []
+
 [lints]
 workspace = true
 

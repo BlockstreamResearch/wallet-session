@@ -9,6 +9,17 @@ mod session_update;
 mod verify_policy;
 mod verify_resolver;
 
+#[cfg(feature = "testkit")]
+pub mod testkit {
+    //! Deterministic harnesses for fuzzing and integration tests.
+    //!
+    //! These helpers exercise internal state primitives without opening a relay
+    //! socket. They are feature-gated because wallet applications should use
+    //! `SingleSessionClient` directly.
+
+    pub use crate::client::testkit::*;
+}
+
 pub use capabilities::{
     ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
 };

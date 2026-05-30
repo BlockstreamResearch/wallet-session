@@ -1,0 +1,62 @@
+{
+  "session": {
+    "topic": "1111111111111111111111111111111111111111111111111111111111111111",
+    "pairingTopic": "2222222222222222222222222222222222222222222222222222222222222222",
+    "relay": {
+      "protocol": "irn"
+    },
+    "expiry": 1780470684,
+    "acknowledged": true,
+    "controller": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
+    "namespaces": {
+      "eip155": {
+        "accounts": [
+          "eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
+        ],
+        "chains": [
+          "eip155:1"
+        ],
+        "events": [
+          "chainChanged",
+          "accountsChanged"
+        ],
+        "methods": [
+          "personal_sign"
+        ]
+      }
+    },
+    "requiredNamespaces": {},
+    "optionalNamespaces": {},
+    "self": {
+      "publicKey": "0ceffdac17e7dfed1a2a452b699f8e8fe98180c30fb5651c34ac828d61eb5337",
+      "metadata": {
+        "name": "Wallet",
+        "description": "Wallet",
+        "url": "https://example.com/wallet",
+        "icons": []
+      }
+    },
+    "peer": {
+      "publicKey": "a3ad5e26070ddb2809200c6f56e739333512015bceeadbb8ea1731c4c7ddb207",
+      "metadata": {
+        "name": "Dapp",
+        "description": "Dapp",
+        "url": "https://example.com/dapp",
+        "icons": []
+      }
+    },
+    "transportType": "relay"
+  },
+  "requestIds": [
+    1,
+    1,
+    42,
+    18446744073709551615
+  ],
+  "updateIds": [
+    2,
+    2,
+    99,
+    18446744073709551615
+  ]
+}

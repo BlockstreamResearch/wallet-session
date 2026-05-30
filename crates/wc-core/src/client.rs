@@ -2187,6 +2187,9 @@ fn authenticated_session(
     })
 }
 
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};

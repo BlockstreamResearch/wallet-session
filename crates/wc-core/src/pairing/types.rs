@@ -68,7 +68,7 @@ pub struct SessionSubscription {
 
 impl SessionSubscription {
     /// Builds a session subscription for deterministic core-runtime tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub(crate) fn for_test(topic: RelayTopic, sym_key: PairingSymKey) -> Self {
         Self {
             topic,
