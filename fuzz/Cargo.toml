@@ -1,0 +1,61 @@
+[package]
+name = "walletconnect-client-poc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# `cargo-fuzz` drives LLVM libFuzzer through `libfuzzer-sys`.
+# It is the smallest Rust-specific dependency needed for coverage-guided fuzz
+# targets and matches the tool pinned in the workspace metadata.
+libfuzzer-sys = "=0.4.12"
+
+# Fuzz targets deserialize existing protocol DTOs from arbitrary JSON bytes.
+# This keeps malformed JSON and malformed protocol shapes in one target without
+# introducing a second generator dependency for the first fuzzing slice.
+serde_json = "=1.0.150"
+
+# The fuzz crate exercises public parser/DTO APIs without becoming a workspace
+# member, matching the standard `cargo-fuzz` layout.
+wc-core = { path = "../crates/wc-core" }
+wc-protocol = { path = "../crates/wc-protocol" }
+
+[[bin]]
+name = "pairing_uri"
+path = "fuzz_targets/pairing_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identifiers"
+path = "fuzz_targets/identifiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_decode"
+path = "fuzz_targets/envelope_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_json_rpc"
+path = "fuzz_targets/session_json_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "namespaces"
+path = "fuzz_targets/namespaces.rs"
+test = false
+doc = false
+bench = false

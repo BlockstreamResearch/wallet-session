@@ -1,3 +1,6 @@
 target/
 .DS_Store
 tools/js-harness/node_modules/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/

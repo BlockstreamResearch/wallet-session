@@ -6,6 +6,7 @@ members = [
     "crates/wc-transport",
     "xtask",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +21,7 @@ stable = "1.95.0"
 
 [workspace.metadata.rbmt.tools]
 cargo-deny = "0.19.4"
+cargo-fuzz = "0.13.1"
 cargo-hack = "0.6.44"
 just = "1.45.0"
 

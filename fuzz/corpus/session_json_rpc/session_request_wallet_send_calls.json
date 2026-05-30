@@ -1,0 +1,33 @@
+{
+  "id": 1780130292311543,
+  "jsonrpc": "2.0",
+  "method": "wc_sessionRequest",
+  "params": {
+    "chainId": "eip155:1",
+    "request": {
+      "method": "wallet_sendCalls",
+      "params": [
+        {
+          "version": "2.0.0",
+          "from": "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
+          "chainId": "0x1",
+          "atomicRequired": true,
+          "calls": [
+            {
+              "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+              "value": "0x0",
+              "data": "0x"
+            }
+          ],
+          "capabilities": {
+            "paymasterService": {
+              "url": "https://example.com/paymaster",
+              "optional": true
+            }
+          }
+        }
+      ],
+      "expiryTimestamp": 1780130592
+    }
+  }
+}
