@@ -32,7 +32,7 @@ The next target is the remaining Sign authentication and trust behavior, in this
 4. richer wallet policy primitives for authentication and wallet methods;
 5. broader interop scenarios against maintained JS Sign Client flows and selected live demos.
 
-Rationale: authentication and origin trust are closer to the current single-session runtime than mobile/Wasm bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
+Rationale: authentication and origin trust are closer to the current single-session runtime than mobile bindings or persistence. They should be built as explicit wallet decisions first, then hardened with interop and fuzz coverage.
 
 Detailed status and exclusions are tracked in [`sdk-parity.md`](./sdk-parity.md).
 
@@ -52,7 +52,7 @@ Boundary rules:
 - `wc-core` owns wallet behavior: pairing/session orchestration, event emission, approval planning, and request response APIs.
 - `wc-core` top-level exports should describe the single-session wallet API. Lower-level protocol-step primitives belong under `wc_core::low_level` so harness code can use them without making them look like the recommended app surface.
 - `xtask` may use production primitives, but production crates must not depend on `xtask`.
-- Future UniFFI/Wasm layers should be wrappers only: type conversion, async adaptation, memory/lifetime adaptation, and packaging.
+- Future UniFFI layers should be wrappers only: type conversion, async adaptation, memory/lifetime adaptation, and packaging.
 
 Rationale: WalletConnect behavior spans pairing, relay delivery, encryption, namespace validation, session approval, session requests, expiry, and user rejection. Splitting protocol, transport, and runtime behavior keeps each primitive reviewable and testable.
 
@@ -357,7 +357,6 @@ These are intentionally not finalized:
 - durable storage and restore;
 - persisted symmetric key handling;
 - explicit drop policy reporting for flooded event queues;
-- browser/Wasm transport;
 - UniFFI and mobile bindings;
 - CACAO signing and authentication workflow behavior;
 - complete production threat model artifact.

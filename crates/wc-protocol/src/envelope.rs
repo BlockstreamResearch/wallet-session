@@ -83,14 +83,10 @@ impl Envelope {
     /// > const iv = typeof params.iv !== "undefined" ? fromString(params.iv, BASE16) : randomBytes(IV_LENGTH);
     /// > const sealed = box.encrypt(fromString(params.message, UTF8));
     ///
-    /// TODO(wasm): `getrandom` does not support `wasm32-unknown-unknown`
-    /// automatically. Before compiling this crate directly for `wc-wasm`, route
-    /// IV generation through the Wasm wrapper/core runtime or enable the
-    /// documented `wasm_js` backend in the final Wasm package.
-    ///
-    /// <https://docs.rs/getrandom/0.3.4/getrandom/#webassembly-support>
-    ///
-    /// > the `wasm32-unknown-unknown` target ... is not automatically supported
+    /// TODO(random-backend): non-native targets need an explicit randomness
+    /// backend. Before compiling this crate for those targets, route IV
+    /// generation through the outer runtime or enable a documented `getrandom`
+    /// backend.
     ///
     /// # Examples
     ///

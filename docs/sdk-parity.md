@@ -5,7 +5,7 @@ Status: target matrix for the single-session WalletConnect wallet runtime.
 This document defines what "SDK parity" means for this repository. It does not
 change the deliberate product boundary from [`architecture.md`](./architecture.md):
 one foreground `SingleSessionClient`, one relay connection, one active session,
-in-memory state, and no UniFFI/Wasm bindings yet.
+in-memory state, and no UniFFI bindings yet.
 
 ## Milestone Target
 
@@ -25,7 +25,6 @@ Deliberate exclusions for this milestone:
 - persistence across process restarts;
 - multiple simultaneous sessions;
 - mobile bindings;
-- Wasm bindings;
 - Notify, Push, and service-specific product extras unless they become required
   by the Sign authentication/session flows.
 
@@ -64,7 +63,7 @@ Deliberate exclusions for this milestone:
 | Fuzz and adversarial coverage | Parsers and runtime must reject malformed or hostile input. | Partial | Byte-level fuzz targets now cover pairing URIs, identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, namespace validation, CACAO auth payload/message validation, Verify context/JWT/public-key DTOs, and relay-free single-session state transitions through the `testkit` harness. The state target covers pending decisions, pairing-to-session replacement, stale topics, update approval mutation, extend, delete, and expiry. Its corpus includes sanitized auth-created, Wallet Call/AppKit-style capability, and expired link-mode session seeds; Verify corpus seeds include live context/public-key shapes and JWT fixtures. | `just fuzz_smoke` validates corpus/target health; `just fuzz_regression` runs bounded regression passes; corpus seeds come from sanitized JS/AppKit examples and local adversarial tests. | [Rust Fuzz Book](https://rust-fuzz.github.io/book/cargo-fuzz.html), [`verify`](../fuzz/fuzz_targets/verify.rs), [`verify corpus`](../fuzz/corpus/verify), [`single_session_state`](../fuzz/fuzz_targets/single_session_state.rs), [`single_session_state corpus`](../fuzz/corpus/single_session_state), [`testkit`](../crates/wc-core/src/client/testkit.rs), [`wc-core` tests](../crates/wc-core/src/pairing/tests.rs) |
 | Persistence | Restore sessions/keys across process restarts. | Deferred | Not part of this milestone. Requires a separate key-storage and restore threat model. | None in this milestone. | [`architecture.md` state model](./architecture.md#state-model) |
 | Multi-session | Maintain many simultaneous dapp sessions. | Deferred | Not part of this milestone. Future work should introduce a separate multi-session client. | None in this milestone. | [`architecture.md` runtime model](./architecture.md#runtime-model) |
-| UniFFI/Wasm | Bind Rust runtime to Swift/Kotlin/JS. | Deferred | Add after API contract freezes. Bindings must remain wrappers only. | Binding generation smoke tests later. | [`architecture.md` crate boundaries](./architecture.md#crate-boundaries) |
+| UniFFI | Bind Rust runtime to Swift/Kotlin. | Deferred | Add after API contract freezes. Bindings must remain wrappers only. | Binding generation smoke tests later. | [`architecture.md` crate boundaries](./architecture.md#crate-boundaries) |
 
 ## Implementation Order
 

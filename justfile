@@ -30,6 +30,19 @@ test:
 deny:
     cargo rbmt --lock-file existing run --toolchain stable -- deny check advisories bans licenses sources
 
+# Run RustSec advisory checks against the checked-in lockfile.
+audit:
+    cargo rbmt --lock-file existing run --toolchain stable -- audit
+
+# Detect dependencies that are no longer used by the workspace crates.
+machete:
+    cargo rbmt --lock-file existing run --toolchain stable -- machete
+
+# Check the Bun/TypeScript live harness with its pinned lockfile and supply-chain policy.
+js_harness_check:
+    cd tools/js-harness && bun install --frozen-lockfile
+    cd tools/js-harness && bun run check
+
 # Run cargo-deny checks for the excluded fuzz crate.
 fuzz_deny:
     cargo deny --manifest-path fuzz/Cargo.toml check --config fuzz/deny.toml advisories bans licenses sources
@@ -66,6 +79,24 @@ _fuzz_with_corpus_copy fuzz_target runs:
     rsync -a --delete fuzz/corpus/{{fuzz_target}}/ target/fuzz-run-corpus/{{fuzz_target}}/
     cargo +{{nightly}} fuzz run -s none {{fuzz_target}} target/fuzz-run-corpus/{{fuzz_target}} -- -runs={{runs}}
 
+# Validate public Reown Lab routes that can be checked without secrets or browser automation.
+lab_catalog_check:
+    cargo run -p xtask -- lab catalog --validate --timeout-ms 15000
+
+# Run non-secret online checks suitable for CI.
+ci_online_checks:
+    just lab_catalog_check
+
+# Run live WalletConnect interop scenarios when CI has a Reown/WalletConnect project ID.
+ci_live_scenarios:
+    if [ -z "${REOWN_PROJECT_ID:-${WALLETCONNECT_PROJECT_ID:-}}" ]; then \
+        echo "skipping live scenarios: set REOWN_PROJECT_ID or WALLETCONNECT_PROJECT_ID"; \
+        exit 0; \
+    fi; \
+    just js_harness_check; \
+    cargo run -p xtask -- scenario default-live; \
+    cargo run -p xtask -- scenario interop-live
+
 # Generate rustdoc JSON used by API snapshot recipes.
 api_snapshot_json:
     cargo +{{nightly}} rustdoc -p wc-core --all-features -- -Z unstable-options --output-format json
@@ -89,4 +120,17 @@ check_all:
     just build_features
     just test
     just deny
+    just audit
+    just machete
+    just js_harness_check
+    just fuzz_deny
+    just fuzz_build
+    just fuzz_smoke
+    just fuzz_regression
     just api_snapshot_check
+
+# Run the complete CI gate.
+ci_all:
+    just check_all
+    just ci_online_checks
+    just ci_live_scenarios

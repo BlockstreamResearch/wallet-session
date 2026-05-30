@@ -62,6 +62,7 @@ type RouteStatus = {
 
 const DEFAULT_BASE_URL = "https://lab.reown.com/";
 const DEFAULT_TIMEOUT_MS = 15_000;
+const ROUTE_VALIDATION_CONCURRENCY = 8;
 const LAB_HOME_REFERENCE =
   "https://github.com/reown-com/appkit/blob/main/apps/laboratory/src/utils/DataUtil.ts";
 const LAB_CONFIG_REFERENCE =
@@ -286,35 +287,56 @@ async function fetchPublicRouteNames(args: ParsedArgs): Promise<string[]> {
 
 async function validateRoutes(args: ParsedArgs, names: string[]): Promise<RouteStatus[]> {
   const statuses: RouteStatus[] = [];
-  for (const name of names) {
-    const entry = findScenario(name);
-    const route = entry?.route ?? `/appkit?name=${encodeURIComponent(name)}`;
-    const url = new URL(route, normalizedBaseUrl(args.baseUrl));
-    try {
-      const response = await fetchWithTimeout(url.toString(), args.timeoutMs);
-      const body = await response.text();
-      const rendersConfigNotFound = body.includes("Config not found");
-      const ok = response.ok && !rendersConfigNotFound;
-      statuses.push({
-        bodyHint: rendersConfigNotFound ? "Config not found" : "",
-        expectation: entry?.expectation ?? "valid",
-        name,
-        ok,
-        route,
-        status: response.status,
-      });
-    } catch (error) {
-      statuses.push({
-        bodyHint: error instanceof Error ? error.message : String(error),
-        expectation: entry?.expectation ?? "valid",
-        name,
-        ok: false,
-        route,
-        status: null,
-      });
-    }
-  }
+
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(ROUTE_VALIDATION_CONCURRENCY, names.length) },
+    async () => {
+      while (nextIndex < names.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+
+        const name = names[currentIndex];
+        if (!name) {
+          continue;
+        }
+        statuses[currentIndex] = await validateRoute(args, name);
+      }
+    },
+  );
+  await Promise.all(workers);
+
   return statuses;
+}
+
+async function validateRoute(args: ParsedArgs, name: string): Promise<RouteStatus> {
+  const entry = findScenario(name);
+  const route = entry?.route ?? `/appkit?name=${encodeURIComponent(name)}`;
+  const url = new URL(route, normalizedBaseUrl(args.baseUrl));
+
+  try {
+    const response = await fetchWithTimeout(url.toString(), args.timeoutMs);
+    const body = await response.text();
+    const rendersConfigNotFound = body.includes("Config not found");
+    const ok = response.ok && !rendersConfigNotFound;
+    return {
+      bodyHint: rendersConfigNotFound ? "Config not found" : "",
+      expectation: entry?.expectation ?? "valid",
+      name,
+      ok,
+      route,
+      status: response.status,
+    };
+  } catch (error) {
+    return {
+      bodyHint: error instanceof Error ? error.message : String(error),
+      expectation: entry?.expectation ?? "valid",
+      name,
+      ok: false,
+      route,
+      status: null,
+    };
+  }
 }
 
 function printStatuses(label: string, statuses: RouteStatus[], json: boolean): void {
