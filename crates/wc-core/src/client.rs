@@ -311,15 +311,20 @@ impl SingleSessionClient {
             .map_err(SingleSessionClientError::from)?;
         let topic = subscription.topic().clone();
         let mut fetched_events = Vec::with_capacity(fetched.len());
-        let mut pairing_deleted = false;
+        let mut pairing_closed = false;
 
         for message in fetched {
-            pairing_deleted |= matches!(message.payload(), PairingPayload::PairingDelete(_));
-            fetched_events.push(self.handle_pairing_message(&subscription, message).await?);
+            let event = self.handle_pairing_message(&subscription, message).await?;
+            pairing_closed |= event.closes_pairing_topic();
+            fetched_events.push(event);
+            if pairing_closed {
+                break;
+            }
         }
 
-        if pairing_deleted {
+        if pairing_closed {
             self.unsubscribe_pairing(&subscription).await?;
+            self.state = SingleSessionClientState::Idle;
         } else {
             self.state = SingleSessionClientState::Pairing(subscription);
         }
@@ -418,10 +423,12 @@ impl SingleSessionClient {
                 .await
                 .map_err(SingleSessionClientError::from)?;
             if let Some(message) = message {
-                return self
-                    .handle_pairing_message(&subscription, message)
-                    .await
-                    .map(Some);
+                let event = self.handle_pairing_message(&subscription, message).await?;
+                if event.closes_pairing_topic() {
+                    self.unsubscribe_pairing(&subscription).await?;
+                    self.state = SingleSessionClientState::Idle;
+                }
+                return Ok(Some(event));
             }
 
             return Ok(None);
@@ -500,6 +507,15 @@ impl SingleSessionClient {
         approval: SessionProposalApproval,
     ) -> Result<Session, SingleSessionClientError> {
         let subscription = self.active_pairing(proposal.pairing_topic())?.clone();
+        if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
+            self.unsubscribe_pairing(&subscription).await?;
+            self.state = SingleSessionClientState::Idle;
+            return Err(SingleSessionClientError::SessionProposalExpired {
+                proposal_id: expired.proposal_id,
+                expiry: expired.expiry,
+                now_unix_seconds: expired.now_unix_seconds,
+            });
+        }
         let approved = self
             .pairing
             .approve_session_proposal(&subscription, proposal.request(), approval)
@@ -543,6 +559,15 @@ impl SingleSessionClient {
         reason: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.active_pairing(proposal.pairing_topic())?.clone();
+        if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
+            self.unsubscribe_pairing(&subscription).await?;
+            self.state = SingleSessionClientState::Idle;
+            return Err(SingleSessionClientError::SessionProposalExpired {
+                proposal_id: expired.proposal_id,
+                expiry: expired.expiry,
+                now_unix_seconds: expired.now_unix_seconds,
+            });
+        }
         let ack = self
             .pairing
             .reject_session_proposal(&subscription, proposal.proposal_id(), reason)
@@ -589,6 +614,8 @@ impl SingleSessionClient {
         let request = authenticate.request();
         let now_unix_seconds = now_unix_seconds()?;
         if request.params.is_expired_at(now_unix_seconds) {
+            self.unsubscribe_pairing(&subscription).await?;
+            self.state = SingleSessionClientState::Idle;
             return Err(SingleSessionClientError::SessionAuthenticateExpired {
                 request_id: request.id,
                 expiry: request.params.expiry_timestamp,
@@ -675,6 +702,17 @@ impl SingleSessionClient {
         reason: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
         let subscription = self.active_pairing(authenticate.pairing_topic())?.clone();
+        let request = authenticate.request();
+        let now_unix_seconds = now_unix_seconds()?;
+        if request.params.is_expired_at(now_unix_seconds) {
+            self.unsubscribe_pairing(&subscription).await?;
+            self.state = SingleSessionClientState::Idle;
+            return Err(SingleSessionClientError::SessionAuthenticateExpired {
+                request_id: request.id,
+                expiry: request.params.expiry_timestamp,
+                now_unix_seconds,
+            });
+        }
         let ack = self
             .pairing
             .reject_session_authenticate(&subscription, authenticate.message(), reason)
@@ -1085,22 +1123,18 @@ impl SingleSessionClient {
                     .await
                     .map_err(SingleSessionClientError::from)?;
             }
-            PairingPayload::PairingDelete(_) => {
-                if matches!(
-                    &self.state,
-                    SingleSessionClientState::Pairing(subscription) if subscription.topic() == message.topic()
-                ) {
-                    self.state = SingleSessionClientState::Idle;
-                }
-            }
-            PairingPayload::SessionProposal(_)
+            PairingPayload::PairingDelete(_)
+            | PairingPayload::SessionProposal(_)
             | PairingPayload::SessionAuthenticate(_)
             | PairingPayload::Sign(_)
             | PairingPayload::Unknown(_)
             | PairingPayload::Missing => {}
         }
 
-        Ok(SingleSessionClientEvent::from_pairing_message(message))
+        Ok(SingleSessionClientEvent::from_pairing_message_at(
+            message,
+            now_unix_seconds()?,
+        ))
     }
 
     /// Applies deterministic session-topic side effects for the polling API.
@@ -1224,6 +1258,10 @@ pub enum SingleSessionClientEvent {
     SessionAuthenticate(Box<SingleSessionAuthenticate>),
     /// Pairing-topic message that is not a session proposal.
     PairingMessage(PairingReceivedMessage),
+    /// Proposal expired before it could be approved or rejected.
+    SessionProposalExpired(SessionProposalExpired),
+    /// Authentication request expired before it could be approved or rejected.
+    SessionAuthenticateExpired(SessionAuthenticateRequestExpired),
     /// Message on an acknowledged session topic.
     Session(SessionClientEvent),
     /// Local session expiry detected before polling relay messages.
@@ -1231,6 +1269,44 @@ pub enum SingleSessionClientEvent {
 }
 
 impl SingleSessionClientEvent {
+    pub(crate) fn from_pairing_message_at(
+        message: PairingReceivedMessage,
+        now_unix_seconds: u64,
+    ) -> Self {
+        match message.payload() {
+            PairingPayload::SessionProposal(request) => {
+                if let Some(expiry) = request.params.effective_expiry_timestamp() {
+                    if expiry <= now_unix_seconds {
+                        return Self::SessionProposalExpired(SessionProposalExpired {
+                            pairing_topic: message.topic().clone(),
+                            proposal_id: request.id,
+                            expiry,
+                            now_unix_seconds,
+                        });
+                    }
+                }
+            }
+            PairingPayload::SessionAuthenticate(request)
+                if request.params.is_expired_at(now_unix_seconds) =>
+            {
+                return Self::SessionAuthenticateExpired(SessionAuthenticateRequestExpired {
+                    pairing_topic: message.topic().clone(),
+                    request_id: request.id,
+                    expiry: request.params.expiry_timestamp,
+                    now_unix_seconds,
+                });
+            }
+            PairingPayload::SessionAuthenticate(_)
+            | PairingPayload::PairingPing(_)
+            | PairingPayload::PairingDelete(_)
+            | PairingPayload::Sign(_)
+            | PairingPayload::Unknown(_)
+            | PairingPayload::Missing => {}
+        }
+
+        Self::from_pairing_message(message)
+    }
+
     pub(crate) fn from_pairing_message(message: PairingReceivedMessage) -> Self {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
@@ -1262,6 +1338,19 @@ impl SingleSessionClientEvent {
             | PairingPayload::Missing => Self::PairingMessage(message),
         }
     }
+
+    const fn closes_pairing_topic(&self) -> bool {
+        match self {
+            Self::SessionProposalExpired(_) | Self::SessionAuthenticateExpired(_) => true,
+            Self::PairingMessage(message) => {
+                matches!(message.payload(), PairingPayload::PairingDelete(_))
+            }
+            Self::SessionProposal(_)
+            | Self::SessionAuthenticate(_)
+            | Self::Session(_)
+            | Self::SessionExpired(_) => false,
+        }
+    }
 }
 
 /// Session proposal retained for approval or rejection.
@@ -1284,6 +1373,36 @@ impl SingleSessionProposal {
     #[must_use]
     pub const fn proposal_id(&self) -> u64 {
         self.request.id
+    }
+
+    /// Proposal expiry timestamp when it was included in the request.
+    ///
+    /// `WalletConnect` wallet guidance treats proposal expiry as a UI boundary:
+    /// after expiry, the proposal modal should be removed and approval or
+    /// rejection should fail.
+    ///
+    /// <https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry>
+    ///
+    /// > user has 5 minutes for the approval or rejection decision
+    #[must_use]
+    pub const fn expiry_timestamp(&self) -> Option<u64> {
+        self.request.params.effective_expiry_timestamp()
+    }
+
+    /// Whether the proposal expiry has passed at `now_unix_seconds`.
+    #[must_use]
+    pub fn is_expired_at(&self, now_unix_seconds: u64) -> bool {
+        self.request.params.is_expired_at(now_unix_seconds)
+    }
+
+    fn expired_at(&self, now_unix_seconds: u64) -> Option<SessionProposalExpired> {
+        let expiry = self.expiry_timestamp()?;
+        (expiry <= now_unix_seconds).then(|| SessionProposalExpired {
+            pairing_topic: self.pairing_topic.clone(),
+            proposal_id: self.proposal_id(),
+            expiry,
+            now_unix_seconds,
+        })
     }
 
     /// Typed proposal request.
@@ -1435,6 +1554,18 @@ impl SingleSessionAuthenticate {
         self.request.id
     }
 
+    /// Authentication request expiry timestamp in unix seconds.
+    #[must_use]
+    pub const fn expiry_timestamp(&self) -> u64 {
+        self.request.params.expiry_timestamp
+    }
+
+    /// Whether the authentication request expiry has passed at `now_unix_seconds`.
+    #[must_use]
+    pub const fn is_expired_at(&self, now_unix_seconds: u64) -> bool {
+        self.request.params.is_expired_at(now_unix_seconds)
+    }
+
     /// Typed authentication request.
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest<SessionAuthenticateParams> {
@@ -1527,6 +1658,76 @@ impl SingleSessionAuthenticate {
     #[must_use]
     pub const fn message(&self) -> &PairingReceivedMessage {
         &self.message
+    }
+}
+
+/// Proposal removed because its expiry timestamp has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProposalExpired {
+    pairing_topic: RelayTopic,
+    proposal_id: u64,
+    expiry: u64,
+    now_unix_seconds: u64,
+}
+
+impl SessionProposalExpired {
+    /// Pairing topic closed after the stale proposal was observed.
+    #[must_use]
+    pub const fn pairing_topic(&self) -> &RelayTopic {
+        &self.pairing_topic
+    }
+
+    /// JSON-RPC request ID from the expired proposal.
+    #[must_use]
+    pub const fn proposal_id(&self) -> u64 {
+        self.proposal_id
+    }
+
+    /// Expiry timestamp carried by the proposal.
+    #[must_use]
+    pub const fn expiry(&self) -> u64 {
+        self.expiry
+    }
+
+    /// Unix timestamp used for the expiry comparison.
+    #[must_use]
+    pub const fn now_unix_seconds(&self) -> u64 {
+        self.now_unix_seconds
+    }
+}
+
+/// Authentication request removed because its expiry timestamp has passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthenticateRequestExpired {
+    pairing_topic: RelayTopic,
+    request_id: u64,
+    expiry: u64,
+    now_unix_seconds: u64,
+}
+
+impl SessionAuthenticateRequestExpired {
+    /// Pairing topic closed after the stale authentication request was observed.
+    #[must_use]
+    pub const fn pairing_topic(&self) -> &RelayTopic {
+        &self.pairing_topic
+    }
+
+    /// JSON-RPC request ID from the expired authentication request.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Expiry timestamp carried by the authentication request.
+    #[must_use]
+    pub const fn expiry(&self) -> u64 {
+        self.expiry
+    }
+
+    /// Unix timestamp used for the expiry comparison.
+    #[must_use]
+    pub const fn now_unix_seconds(&self) -> u64 {
+        self.now_unix_seconds
     }
 }
 
@@ -1775,6 +1976,17 @@ pub enum SingleSessionClientError {
     #[error("single-session client session expiry overflow")]
     SessionExpiryOverflow,
 
+    /// Proposal expired before caller approval or rejection.
+    #[error("single-session client session proposal expired")]
+    SessionProposalExpired {
+        /// JSON-RPC request id from the expired proposal.
+        proposal_id: u64,
+        /// Proposal expiry timestamp.
+        expiry: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
+    },
+
     /// `SingleSessionClient` event queue cannot retain all pending messages.
     #[error("single-session client event queue full")]
     EventQueueFull {
@@ -1984,7 +2196,8 @@ mod tests {
         DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
         DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SingleSessionClient,
         SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
-        SingleSessionClientState, authenticated_session, take_expired_session_from_state,
+        SingleSessionClientEvent, SingleSessionClientState, authenticated_session,
+        take_expired_session_from_state,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -2006,13 +2219,15 @@ mod tests {
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
             CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
-            RelayProtocolOptions, Session, SessionAuthenticateParams, SessionNamespace,
-            SessionParticipant, SessionTransportType, SignMethod,
+            ProposalNamespaces, Proposer, RelayProtocolOptions, Session, SessionAuthenticateParams,
+            SessionNamespace, SessionParticipant, SessionProposeParams, SessionTransportType,
+            SignMethod,
         },
     };
 
     use crate::{
-        PairingClientError, RelayReconnectConfig, SingleSessionRelayConfig,
+        PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
+        SingleSessionRelayConfig,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -2101,6 +2316,65 @@ mod tests {
         assert_eq!(expired.expiry(), expiry);
         assert!(matches!(state, SingleSessionClientState::Idle));
         assert_eq!(take_expired_session_from_state(&mut state, expiry), None);
+    }
+
+    #[test]
+    fn expired_session_proposal_becomes_terminal_pairing_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x51; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x52; 32]);
+        let request = session_proposal_request(99);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+
+        let event = SingleSessionClientEvent::from_pairing_message_at(message, 100);
+        assert!(event.closes_pairing_topic());
+        match event {
+            SingleSessionClientEvent::SessionProposalExpired(expired) => {
+                assert_eq!(expired.pairing_topic(), &topic);
+                assert_eq!(expired.proposal_id(), 41);
+                assert_eq!(expired.expiry(), 99);
+                assert_eq!(expired.now_unix_seconds(), 100);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn expired_session_authenticate_becomes_terminal_pairing_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x53; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x54; 32]);
+        let mut request = auth_request()?;
+        request.params.expiry_timestamp = 99;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionAuthenticate(Box::new(request)),
+        );
+
+        let event = SingleSessionClientEvent::from_pairing_message_at(message, 100);
+        assert!(event.closes_pairing_topic());
+        match event {
+            SingleSessionClientEvent::SessionAuthenticateExpired(expired) => {
+                assert_eq!(expired.pairing_topic(), &topic);
+                assert_eq!(expired.request_id(), 42);
+                assert_eq!(expired.expiry(), 99);
+                assert_eq!(expired.now_unix_seconds(), 100);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -2656,6 +2930,34 @@ mod tests {
                 expiry_timestamp: FUTURE_SESSION_EXPIRY,
             },
         ))
+    }
+
+    fn session_proposal_request(expiry_timestamp: u64) -> JsonRpcRequest<SessionProposeParams> {
+        JsonRpcRequest::new(
+            41,
+            SignMethod::SessionPropose,
+            SessionProposeParams {
+                id: Some(41),
+                pairing_topic: Some(RelayTopic::from_bytes([0x51; 32])),
+                expiry: None,
+                expiry_timestamp: Some(expiry_timestamp),
+                relays: vec![RelayProtocolOptions {
+                    protocol: "irn".to_owned(),
+                    data: None,
+                }],
+                proposer: Proposer {
+                    public_key: X25519PublicKey::from_bytes([0x68; 32]),
+                    metadata: test_metadata("Dapp"),
+                },
+                required_namespaces: ProposalNamespaces::new(),
+                optional_namespaces: ProposalNamespaces::new(),
+                session_properties: None,
+                scoped_properties: None,
+                attestation: None,
+                encrypted_id: None,
+                requests: None,
+            },
+        )
     }
 
     fn test_cacao() -> Result<Cacao, Box<dyn std::error::Error>> {

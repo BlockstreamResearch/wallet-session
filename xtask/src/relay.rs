@@ -1879,6 +1879,12 @@ async fn wait_for_single_session_client_proposal(
             SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
                 print_ignored_single_session_client_authenticate(&authenticate);
             }
+            SingleSessionClientEvent::SessionProposalExpired(expired) => {
+                print_ignored_single_session_client_proposal_expired(&expired);
+            }
+            SingleSessionClientEvent::SessionAuthenticateExpired(expired) => {
+                print_ignored_single_session_client_authenticate_expired(&expired);
+            }
             SingleSessionClientEvent::PairingMessage(message) => {
                 print_core_pairing_payload_metadata(
                     "core-single-session-client-session-request ignored_pairing_message",
@@ -1920,6 +1926,12 @@ async fn wait_for_single_session_client_authenticate(
                     proposal.pairing_topic()
                 );
             }
+            SingleSessionClientEvent::SessionProposalExpired(expired) => {
+                print_ignored_single_session_client_proposal_expired(&expired);
+            }
+            SingleSessionClientEvent::SessionAuthenticateExpired(expired) => {
+                print_ignored_single_session_client_authenticate_expired(&expired);
+            }
             SingleSessionClientEvent::Session(event) => {
                 print_ignored_single_session_client_event(&event);
             }
@@ -1960,6 +1972,12 @@ async fn wait_for_single_session_client_session_request_event(
             }
             SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
                 print_ignored_single_session_client_authenticate(&authenticate);
+            }
+            SingleSessionClientEvent::SessionProposalExpired(expired) => {
+                print_ignored_single_session_client_proposal_expired(&expired);
+            }
+            SingleSessionClientEvent::SessionAuthenticateExpired(expired) => {
+                print_ignored_single_session_client_authenticate_expired(&expired);
             }
             SingleSessionClientEvent::SessionExpired(expired) => {
                 print_ignored_single_session_client_expired(&expired);
@@ -2019,6 +2037,12 @@ async fn wait_for_single_session_client_session_lifecycle_event(
             (_, SingleSessionClientEvent::SessionAuthenticate(authenticate)) => {
                 print_ignored_single_session_client_authenticate(&authenticate);
             }
+            (_, SingleSessionClientEvent::SessionProposalExpired(expired)) => {
+                print_ignored_single_session_client_proposal_expired(&expired);
+            }
+            (_, SingleSessionClientEvent::SessionAuthenticateExpired(expired)) => {
+                print_ignored_single_session_client_authenticate_expired(&expired);
+            }
             (_, SingleSessionClientEvent::SessionExpired(expired)) => {
                 print_ignored_single_session_client_expired(&expired);
             }
@@ -2031,6 +2055,28 @@ fn print_ignored_single_session_client_authenticate(authenticate: &SingleSession
         "ignored_single_session_client_authenticate id={} pairing_topic={}",
         authenticate.request_id(),
         authenticate.pairing_topic()
+    );
+}
+
+fn print_ignored_single_session_client_proposal_expired(expired: &wc_core::SessionProposalExpired) {
+    println!(
+        "ignored_single_session_client_proposal_expired id={} pairing_topic={} expiry={} now={}",
+        expired.proposal_id(),
+        expired.pairing_topic(),
+        expired.expiry(),
+        expired.now_unix_seconds()
+    );
+}
+
+fn print_ignored_single_session_client_authenticate_expired(
+    expired: &wc_core::SessionAuthenticateRequestExpired,
+) {
+    println!(
+        "ignored_single_session_client_authenticate_expired id={} pairing_topic={} expiry={} now={}",
+        expired.request_id(),
+        expired.pairing_topic(),
+        expired.expiry(),
+        expired.now_unix_seconds()
     );
 }
 

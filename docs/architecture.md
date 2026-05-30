@@ -102,6 +102,7 @@ Current event model:
 
 - pairing proposals become `SingleSessionClientEvent::SessionProposal`;
 - pairing authentication requests become `SingleSessionClientEvent::SessionAuthenticate`;
+- expired pairing-topic proposal/authentication messages become terminal expired events instead of review events;
 - non-proposal pairing messages remain visible as `SingleSessionClientEvent::PairingMessage`;
 - session-topic messages become `SingleSessionClientEvent::Session`;
 - session requests and session updates are tracked as one-shot pending decisions after they are surfaced, so response helpers cannot be reused to answer the same user-significant request twice;
@@ -116,6 +117,7 @@ Current event model:
 Reference:
 
 - [Session Request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
+- [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry)
 
 ## State Model
 
@@ -248,6 +250,8 @@ Session expiry is a local runtime lifecycle event.
 `SingleSessionClient` does not run a background expirer, so `SingleSessionClient::next_event()` checks active session expiry before polling relay messages.
 When a session is expired, `SingleSessionClient` removes it from memory and returns `SingleSessionClientEvent::SessionExpired`.
 The caller can update UI and refuse follow-up actions against that topic.
+The same foreground boundary applies to stale proposal/authentication messages: if expiry has already passed when the pairing-topic message is read, the runtime returns an expired event and removes the pairing topic.
+If the caller retained an earlier proposal/authentication event until after expiry, approve/reject methods fail with an expiry error and remove the pairing topic without publishing a stale response.
 
 Rationale: an expired session should not remain available for signing or lifecycle operations.
 The maintained Sign Client deletes the stored session and emits `session_expire` from its expirer callback; the proof-of-concept keeps the same transition in the foreground polling path.
@@ -255,6 +259,7 @@ The maintained Sign Client deletes the stored session and emits `session_expire`
 Reference:
 
 - [Maintained Sign Client expirer handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2714-L2727)
+- [Best practices, session request expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-request-expiry)
 
 ## Security Posture
 

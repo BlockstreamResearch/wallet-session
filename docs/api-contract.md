@@ -116,8 +116,12 @@ The method:
 5. returns the pairing topic.
 
 Session proposals are surfaced as `SingleSessionClientEvent::SessionProposal`.
+Expired proposal messages are surfaced as `SingleSessionClientEvent::SessionProposalExpired`
+and close the active pairing topic.
 
 Session authentication requests are surfaced as `SingleSessionClientEvent::SessionAuthenticate`.
+Expired authentication messages are surfaced as
+`SingleSessionClientEvent::SessionAuthenticateExpired` and close the active pairing topic.
 
 Pairing ping is acknowledged automatically. Pairing delete clears the active pairing.
 
@@ -125,6 +129,7 @@ Source:
 
 - [`SingleSessionClient::pair`](../crates/wc-core/src/client.rs)
 - [Pairing API](https://specs.walletconnect.com/2.0/specs/clients/core/pairing)
+- [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry)
 - [Relay fetch messages](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#fetch-messages)
 - [Relay subscribe](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe)
 
@@ -312,10 +317,20 @@ If the active session is expired:
 2. `SingleSessionClientEvent::SessionExpired` is returned;
 3. later actions against that topic fail with `SessionMissing`.
 
+If a stale proposal or authentication request is received on the pairing topic,
+the pairing topic is removed and an expired event is returned instead of a
+review event. If the caller tries to approve or reject a retained proposal/auth
+event after its expiry, the method returns an expiry error and clears the
+pairing topic without publishing a stale response.
+
 Source:
 
+- [`SessionProposalExpired`](../crates/wc-core/src/client.rs)
+- [`SessionAuthenticateRequestExpired`](../crates/wc-core/src/client.rs)
 - [`SessionExpired`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::next_event`](../crates/wc-core/src/client.rs)
+- [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry)
+- [Best practices, session request expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-request-expiry)
 - [Maintained Sign Client expirer handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2714-L2727)
 
 ## Error Contract

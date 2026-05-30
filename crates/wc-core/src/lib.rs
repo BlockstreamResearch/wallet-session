@@ -16,7 +16,8 @@ pub use client::{
     DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
     DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
     DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SessionAuthenticateApprovalOutcome,
-    SessionExpired, SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
+    SessionAuthenticateRequestExpired, SessionExpired, SessionProposalExpired,
+    SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
     SingleSessionClientConnectionState, SingleSessionClientError, SingleSessionClientEvent,
     SingleSessionProposal,
 };

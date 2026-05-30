@@ -763,6 +763,32 @@ pub struct PairingReceivedMessage {
 }
 
 impl PairingReceivedMessage {
+    /// Builds a pairing message for deterministic core-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        topic: RelayTopic,
+        sym_key: &PairingSymKey,
+        plaintext: &str,
+        payload: PairingPayload,
+    ) -> Self {
+        let envelope = wc_protocol::envelope::Envelope::encrypt_type_0(plaintext, sym_key)
+            .expect("test pairing envelope encrypts");
+        let encoded_message = envelope.encode(wc_protocol::envelope::EnvelopeEncoding::Base64);
+        let message = PairingMessage::decode_relay_message(&encoded_message, sym_key)
+            .expect("test pairing message decodes");
+
+        Self {
+            topic,
+            encoded_message_len: encoded_message.len(),
+            published_at: 0,
+            tag: None,
+            verify_attestation_jwt: None,
+            verify_encrypted_id: None,
+            message,
+            payload,
+        }
+    }
+
     /// Relay topic that delivered this message.
     #[must_use]
     pub const fn topic(&self) -> &RelayTopic {
