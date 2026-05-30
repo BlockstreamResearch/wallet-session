@@ -1,0 +1,8 @@
+{
+  "verified": {
+    "verifyUrl": "https://verify.walletconnect.org",
+    "validation": "VALID",
+    "origin": "https://evil.example",
+    "isScam": true
+  }
+}

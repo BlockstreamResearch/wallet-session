@@ -1,0 +1,7 @@
+{
+  "verified": {
+    "verifyUrl": "https://verify.walletconnect.org",
+    "validation": "UNKNOWN",
+    "origin": "https://example.com"
+  }
+}

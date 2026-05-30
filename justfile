@@ -46,6 +46,7 @@ fuzz_smoke:
     just _fuzz_with_corpus_copy session_json_rpc 1
     just _fuzz_with_corpus_copy namespaces 1
     just _fuzz_with_corpus_copy cacao 1
+    just _fuzz_with_corpus_copy verify 1
     just _fuzz_with_corpus_copy single_session_state 1
 
 # Run a bounded regression fuzz pass over every target.
@@ -56,6 +57,7 @@ fuzz_regression runs="1000":
     just _fuzz_with_corpus_copy session_json_rpc {{runs}}
     just _fuzz_with_corpus_copy namespaces {{runs}}
     just _fuzz_with_corpus_copy cacao {{runs}}
+    just _fuzz_with_corpus_copy verify {{runs}}
     just _fuzz_with_corpus_copy single_session_state {{runs}}
 
 # Run one fuzz target against a copied corpus so smoke/regression runs do not mutate checked-in seeds.
