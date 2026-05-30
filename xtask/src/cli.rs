@@ -186,7 +186,7 @@ pub fn run() -> Result<()> {
                 scenario::list();
                 Ok(())
             } else {
-                run_async(scenario::run(args.name))
+                scenario::run(args.name)
             }
         }
     }

@@ -60,7 +60,7 @@ Deliberate exclusions for this milestone:
 | Session properties | Dapps can request universal or chain-specific capability properties. | Done for approval planning | `WalletCapabilities` accepts wallet-owned `sessionProperties` and `scopedProperties`; approval returns supported values, omits optional unsupported values, and rejects required unsupported claims. | Live supported/unsupported proposal probes plus local approval planner fixtures with CAIP-25 capability data. | [Wallet Call API, capabilities](https://docs.walletconnect.network/wallet-sdk/android/eip5792#capabilities-in-caip-25-connection-requests), [CAIP-25](https://github.com/ChainAgnostic/namespaces/blob/main/eip155/caip25.md), [`WalletCapabilities`](../crates/wc-core/src/capabilities.rs) |
 | Expiry behavior | Proposal, auth request, session request, and session expiry must be explicit. | Done | Proposal/auth messages received after expiry produce terminal expired events; stale approve/reject calls fail without publishing; session requests are auto-rejected when expired; active session expiry is surfaced once and clears runtime state. | Live expired session-request auto-reject probe plus deterministic proposal/auth/session expiry tests. | [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry), [Best practices, session request expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-request-expiry), [`SingleSessionClientEvent`](../crates/wc-core/src/client.rs) |
 | Link mode and redirects | SDKs expose redirect/link-mode metadata for app switching. | Partial | Preserve redirect metadata in review objects. Full link-mode transport is out of native-runtime scope unless needed for parity probes. | DTO tests and metadata preservation tests. | [Mobile linking](https://docs.walletconnect.network/wallet-sdk/android/mobile-linking), [Link Mode](https://docs.walletconnect.network/wallet-sdk/android/link-mode) |
-| Interop matrix | Behavior should match maintained JS SDK and selected live demos. | Partial | Add named scenarios for proposal, auth approval/rejection, Verify states, Wallet Call API requests, malformed input, and lifecycle. | `xtask scenario` suites with pinned JS harness dependencies. | [AppKit Lab](https://appkit-lab.reown.com), [WalletConnect demo wallet](https://react-wallet.walletconnect.com) |
+| Interop matrix | Behavior should match maintained JS SDK and selected live demos. | Partial | Named scenarios cover proposal, auth approval/rejection, Verify public-key/context, Wallet Call API requests, and lifecycle. Keep adding malformed input and selected live-demo scenarios as new behavior lands. | `xtask scenario interop-live`, focused `verify-live` and `wallet-call-live` suites, plus pinned JS harness dependencies. | [AppKit Lab](https://appkit-lab.reown.com), [WalletConnect demo wallet](https://react-wallet.walletconnect.com), [`xtask` scenarios](../xtask/src/scenario.rs) |
 | Fuzz and adversarial coverage | Parsers and runtime must reject malformed or hostile input. | Partial | Add fuzz targets for URI, JSON-RPC, namespaces, CAIP, CACAO, and envelopes; add replay/duplicate tests around one-shot decisions. | `cargo fuzz` targets later; local adversarial tests now. | [`wc-protocol`](../crates/wc-protocol/src), [`wc-core` tests](../crates/wc-core/src/pairing/tests.rs) |
 | Persistence | Restore sessions/keys across process restarts. | Deferred | Not part of this milestone. Requires a separate key-storage and restore threat model. | None in this milestone. | [`architecture.md` state model](./architecture.md#state-model) |
 | Multi-session | Maintain many simultaneous dapp sessions. | Deferred | Not part of this milestone. Future work should introduce a separate multi-session client. | None in this milestone. | [`architecture.md` runtime model](./architecture.md#runtime-model) |
@@ -70,9 +70,9 @@ Deliberate exclusions for this milestone:
 
 The next implementation sequence is:
 
-1. Interop scenarios for auth approval, Verify states, and Wallet Call API.
-2. Fuzz/adversarial parser coverage.
-3. API contract freeze and snapshots.
+1. Fuzz/adversarial parser coverage.
+2. API contract freeze and snapshots.
+3. Selected live-demo interop scenarios after the harness shape is stable.
 
 Each slice should follow the repository rule:
 

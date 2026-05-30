@@ -377,7 +377,25 @@ Focused high-level scenarios are also available:
 - `cargo run -p xtask --locked -- scenario single-session-lifecycle`;
 - `cargo run -p xtask --locked -- scenario single-session-disconnect`;
 - `cargo run -p xtask --locked -- scenario single-session-authenticate`;
+- `cargo run -p xtask --locked -- scenario single-session-authenticate-approve`;
 - `cargo run -p xtask --locked -- scenario single-session-live`.
+
+The broader SDK interop scenario is:
+
+```sh
+cargo run -p xtask --locked -- scenario interop-live
+```
+
+That runs authentication rejection, authentication approval, Verify public-key
+fetching, a JS SDK Verify context fixture, `wallet_getCapabilities`, and
+`wallet_sendCalls`.
+
+Focused interop scenarios are also available:
+
+- `cargo run -p xtask --locked -- scenario verify-live`;
+- `cargo run -p xtask --locked -- scenario wallet-call-live`;
+- `cargo run -p xtask --locked -- scenario wallet-call-get-capabilities`;
+- `cargo run -p xtask --locked -- scenario wallet-call-send-calls`.
 
 Underlying probe commands remain available:
 
@@ -385,9 +403,15 @@ Underlying probe commands remain available:
 - `relay-probe --core-single-session-client-session-lifecycle`;
 - `relay-probe --core-single-session-client-disconnect`.
 - `relay-probe --core-single-session-client-session-authenticate`.
+- `verify-probe --public-key`.
 
-These scenarios cover JS dapp pairing, proposal approval, session settlement, session request handling, session update handling, disconnect publication, and authentication rejection through the single-session client.
+These scenarios cover JS dapp pairing, proposal approval, session settlement,
+session request handling, session update handling, disconnect publication,
+authentication rejection and approval, Verify context capture, and Wallet Call
+request review through the single-session client.
 
 Source:
 
 - [`xtask/src/relay.rs`](../xtask/src/relay.rs)
+- [`xtask/src/scenario.rs`](../xtask/src/scenario.rs)
+- [`tools/js-harness/src/verify-context.ts`](../tools/js-harness/src/verify-context.ts)
