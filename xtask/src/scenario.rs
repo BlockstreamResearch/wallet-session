@@ -34,6 +34,8 @@ pub enum ScenarioName {
     WalletCallSendCalls,
     /// Wallet Call API request review scenarios.
     WalletCallLive,
+    /// AppKit-style CAIP-25 capability proposal and Wallet Call response.
+    AppkitCapabilityProposal,
     /// Verify public-key and JS SDK Verify context scenarios.
     VerifyLive,
     /// Auth, Verify, and Wallet Call SDK interop scenarios.
@@ -55,6 +57,7 @@ impl ScenarioName {
             Self::WalletCallGetCapabilities => "wallet-call-get-capabilities",
             Self::WalletCallSendCalls => "wallet-call-send-calls",
             Self::WalletCallLive => "wallet-call-live",
+            Self::AppkitCapabilityProposal => "appkit-capability-proposal",
             Self::VerifyLive => "verify-live",
             Self::InteropLive => "interop-live",
         }
@@ -79,6 +82,9 @@ impl ScenarioName {
             Self::WalletCallGetCapabilities => "Wallet Call wallet_getCapabilities request",
             Self::WalletCallSendCalls => "Wallet Call wallet_sendCalls request",
             Self::WalletCallLive => "Wallet Call request matrix",
+            Self::AppkitCapabilityProposal => {
+                "AppKit-style proposal with CAIP-25 session/scoped properties"
+            }
             Self::VerifyLive => "Verify public key and JS SDK verifyContext",
             Self::InteropLive => "auth approval/rejection, Verify, and Wallet Call interop",
         }
@@ -110,12 +116,14 @@ impl ScenarioName {
             Self::WalletCallGetCapabilities => &[WALLET_GET_CAPABILITIES],
             Self::WalletCallSendCalls => &[WALLET_SEND_CALLS],
             Self::WalletCallLive => &[WALLET_GET_CAPABILITIES, WALLET_SEND_CALLS],
+            Self::AppkitCapabilityProposal => &[APPKIT_CAPABILITY_PROPOSAL],
             Self::VerifyLive => &[VERIFY_PUBLIC_KEY, VERIFY_CONTEXT],
             Self::InteropLive => &[
                 SINGLE_SESSION_AUTH_REJECT,
                 SINGLE_SESSION_AUTH_APPROVE,
                 VERIFY_PUBLIC_KEY,
                 VERIFY_CONTEXT,
+                APPKIT_CAPABILITY_PROPOSAL,
                 WALLET_GET_CAPABILITIES,
                 WALLET_SEND_CALLS,
             ],
@@ -258,6 +266,12 @@ const WALLET_GET_CAPABILITIES_RESULT: &str = r#"{"eip155:1":{"atomic":{"status":
 const WALLET_SEND_CALLS_PARAMS: &str = r#"[{"version":"2.0.0","from":"0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb","chainId":"0x1","atomicRequired":true,"calls":[{"to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","value":"0x0","data":"0x"}],"capabilities":{"paymasterService":{"url":"https://example.com/paymaster","optional":true}}}]"#;
 const WALLET_SEND_CALLS_RESULT: &str =
     r#"{"id":"0x0000000000000000000000000000000000000000000000000000000000000001"}"#;
+const APPKIT_PROPOSAL_SESSION_PROPERTIES: &str =
+    r#"{"atomic":{"status":"supported"},"futureOptional":{"optional":true}}"#;
+const APPKIT_APPROVAL_SESSION_PROPERTIES: &str = r#"{"atomic":{"status":"ready"}}"#;
+const APPKIT_PROPOSAL_SCOPED_PROPERTIES: &str =
+    r#"{"eip155:1":{"atomic":{"status":"supported"},"paymasterService":{"optional":true}}}"#;
+const APPKIT_APPROVAL_SCOPED_PROPERTIES: &str = r#"{"eip155:1":{"atomic":{"status":"supported"}}}"#;
 
 const WALLET_GET_CAPABILITIES: ScenarioStep = ScenarioStep {
     label: "wallet-call-get-capabilities",
@@ -301,6 +315,51 @@ const WALLET_SEND_CALLS: ScenarioStep = ScenarioStep {
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_SEND_CALLS_RESULT,
+        ),
+    ],
+};
+
+const APPKIT_CAPABILITY_PROPOSAL: ScenarioStep = ScenarioStep {
+    label: "appkit-capability-proposal",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        (
+            "WC_JS_PROPOSAL_METHODS",
+            "wallet_getCapabilities,wallet_sendCalls",
+        ),
+        (
+            "WC_APPROVAL_METHODS",
+            "wallet_getCapabilities,wallet_sendCalls",
+        ),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCapabilities"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_GET_CAPABILITIES_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_GET_CAPABILITIES_RESULT,
+        ),
+        (
+            "WC_JS_SESSION_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SESSION_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_JS_SCOPED_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SCOPED_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SCOPED_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SCOPED_PROPERTIES,
         ),
     ],
 };
@@ -361,6 +420,7 @@ mod tests {
                 "single-session-authenticate-approve",
                 "verify-public-key",
                 "verify-context",
+                "appkit-capability-proposal",
                 "wallet-call-get-capabilities",
                 "wallet-call-send-calls",
             ]

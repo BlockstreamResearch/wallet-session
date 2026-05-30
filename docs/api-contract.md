@@ -419,13 +419,14 @@ cargo run -p xtask --locked -- scenario interop-live
 ```
 
 That runs authentication rejection, authentication approval, Verify public-key
-fetching, a JS SDK Verify context fixture, `wallet_getCapabilities`, and
-`wallet_sendCalls`.
+fetching, a JS SDK Verify context fixture, an AppKit-style CAIP-25
+capability proposal, `wallet_getCapabilities`, and `wallet_sendCalls`.
 
 Focused interop scenarios are also available:
 
 - `cargo run -p xtask --locked -- scenario verify-live`;
 - `cargo run -p xtask --locked -- scenario wallet-call-live`;
+- `cargo run -p xtask --locked -- scenario appkit-capability-proposal`;
 - `cargo run -p xtask --locked -- scenario wallet-call-get-capabilities`;
 - `cargo run -p xtask --locked -- scenario wallet-call-send-calls`.
 
@@ -439,8 +440,9 @@ Underlying probe commands remain available:
 
 These scenarios cover JS dapp pairing, proposal approval, session settlement,
 session request handling, session update handling, disconnect publication,
-authentication rejection and approval, Verify context capture, and Wallet Call
-request review through the single-session client.
+authentication rejection and approval, Verify context capture, AppKit-style
+`sessionProperties`/`scopedProperties` negotiation, and Wallet Call request
+review through the single-session client.
 
 Source:
 

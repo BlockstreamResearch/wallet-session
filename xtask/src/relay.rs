@@ -12,6 +12,7 @@ use crate::util::{
     pairing_uri_wait_timeout, redact, rpc_id, unix_timestamp,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
 use wc_core::{
@@ -422,6 +423,33 @@ async fn wait_for_js_result(result_file: &Path, child: &mut Child) -> Result<Val
 
 fn parse_json_env(value: &str) -> Result<Value> {
     serde_json::from_str(value).with_context(|| format!("failed to parse JSON env value: {value}"))
+}
+
+fn assert_optional_json_env_matches<T>(
+    env_name: &str,
+    actual: Option<&T>,
+    label: &str,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    let Ok(expected_raw) = env::var(env_name) else {
+        return Ok(());
+    };
+
+    let expected = parse_json_env(&expected_raw)?;
+    let actual = actual
+        .map(serde_json::to_value)
+        .transpose()
+        .with_context(|| format!("failed to serialize {label}"))?
+        .unwrap_or(Value::Null);
+
+    if actual != expected {
+        bail!("{label} mismatch for {env_name}: expected {expected}, got {actual}");
+    }
+
+    println!("{label} {env_name}=matched");
+    Ok(())
 }
 
 struct RelayProbeConfig {
@@ -899,37 +927,10 @@ async fn run_core_single_session_client_session_request_probe(
     println!("core-single-session-client-session-request pairing_topic={pairing_topic}");
 
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
-    println!(
-        "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?} session_properties={} scoped_properties={}",
-        proposal.proposal_id(),
-        proposal.pairing_topic(),
-        proposal.verify_context().verified.origin.as_str(),
-        proposal.verify_context().verified.validation.as_str(),
-        proposal.verify_risk(),
-        proposal
-            .request()
-            .params
-            .session_properties
-            .as_ref()
-            .map_or(0, BTreeMap::len),
-        proposal
-            .request()
-            .params
-            .scoped_properties
-            .as_ref()
-            .map_or(0, BTreeMap::len)
-    );
+    print_and_assert_single_session_proposal_properties(&proposal)?;
     let approval = approval_for_probe(proposal.request())?;
     let session = client.approve_session(&proposal, approval).await?;
-    println!(
-        "core-single-session-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={} session_properties={} scoped_properties={}",
-        session.topic,
-        session.acknowledged,
-        session.namespaces.len(),
-        session.expiry,
-        session.session_properties.as_ref().map_or(0, BTreeMap::len),
-        session.scoped_properties.as_ref().map_or(0, BTreeMap::len)
-    );
+    print_and_assert_single_session_approved_session_properties(&session)?;
 
     let session_message = wait_for_single_session_client_session_request_event(&mut client).await?;
     print_session_message(
@@ -975,6 +976,63 @@ async fn run_core_single_session_client_session_request_probe(
     harness.terminate();
 
     Ok(())
+}
+
+fn print_and_assert_single_session_proposal_properties(
+    proposal: &SingleSessionProposal,
+) -> Result<()> {
+    println!(
+        "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?} session_properties={} scoped_properties={}",
+        proposal.proposal_id(),
+        proposal.pairing_topic(),
+        proposal.verify_context().verified.origin.as_str(),
+        proposal.verify_context().verified.validation.as_str(),
+        proposal.verify_risk(),
+        proposal
+            .request()
+            .params
+            .session_properties
+            .as_ref()
+            .map_or(0, BTreeMap::len),
+        proposal
+            .request()
+            .params
+            .scoped_properties
+            .as_ref()
+            .map_or(0, BTreeMap::len)
+    );
+    assert_optional_json_env_matches(
+        "WC_JS_SESSION_PROPERTIES_JSON",
+        proposal.request().params.session_properties.as_ref(),
+        "core-single-session-client-session-request proposal_session_properties",
+    )?;
+    assert_optional_json_env_matches(
+        "WC_JS_SCOPED_PROPERTIES_JSON",
+        proposal.request().params.scoped_properties.as_ref(),
+        "core-single-session-client-session-request proposal_scoped_properties",
+    )
+}
+
+fn print_and_assert_single_session_approved_session_properties(session: &Session) -> Result<()> {
+    println!(
+        "core-single-session-client-session-request active_session topic={} acknowledged={} namespaces={} expiry={} session_properties={} scoped_properties={}",
+        session.topic,
+        session.acknowledged,
+        session.namespaces.len(),
+        session.expiry,
+        session.session_properties.as_ref().map_or(0, BTreeMap::len),
+        session.scoped_properties.as_ref().map_or(0, BTreeMap::len)
+    );
+    assert_optional_json_env_matches(
+        "WC_APPROVAL_SESSION_PROPERTIES_JSON",
+        session.session_properties.as_ref(),
+        "core-single-session-client-session-request approved_session_properties",
+    )?;
+    assert_optional_json_env_matches(
+        "WC_APPROVAL_SCOPED_PROPERTIES_JSON",
+        session.scoped_properties.as_ref(),
+        "core-single-session-client-session-request approved_scoped_properties",
+    )
 }
 
 async fn run_core_single_session_client_session_authenticate_probe(
