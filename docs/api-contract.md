@@ -25,10 +25,13 @@ Lower-level protocol-step items live under `wc_core::low_level`. They are availa
 
 Rationale: lower-level primitives expose individual protocol steps such as direct publish, direct response, and direct subscription handling. Composing those incorrectly can bypass the single-session runtime boundary.
 
+The `testkit` module is feature-gated and exists for deterministic fuzzing and integration tests. It is not part of the wallet-facing runtime contract.
+
 Source:
 
 - [`wc-core/src/lib.rs`](../crates/wc-core/src/lib.rs)
 - [`wc-core/src/client.rs`](../crates/wc-core/src/client.rs)
+- [`wc-core/src/client/testkit.rs`](../crates/wc-core/src/client/testkit.rs)
 
 ## Runtime Shape
 
@@ -354,6 +357,35 @@ Source:
 
 - [`SingleSessionClientError`](../crates/wc-core/src/client.rs)
 - [`PairingClientError`](../crates/wc-core/src/pairing/error.rs)
+
+## API Snapshot
+
+The checked-in public API snapshot is [`api-snapshots/wc-core.txt`](../api-snapshots/wc-core.txt).
+
+It is generated from rustdoc JSON with `wc-core --all-features`, so it includes:
+
+- top-level `wc_core` exports;
+- `wc_core::low_level`;
+- feature-gated `wc_core::testkit`.
+
+Update it after an intentional public API change:
+
+```sh
+just api_snapshot_update
+```
+
+Check it without modifying files:
+
+```sh
+just api_snapshot_check
+```
+
+`just check_all` runs the snapshot check. Any diff should be reviewed as an API contract change, not treated as formatting churn.
+
+Source:
+
+- [`xtask/src/api_snapshot.rs`](../xtask/src/api_snapshot.rs)
+- [`api-snapshots/wc-core.txt`](../api-snapshots/wc-core.txt)
 
 ## Live Coverage
 

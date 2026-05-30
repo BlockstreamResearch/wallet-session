@@ -48,6 +48,18 @@ fuzz_smoke:
     cargo +{{nightly}} fuzz run -s none cacao -- -runs=1
     cargo +{{nightly}} fuzz run -s none single_session_state -- -runs=1
 
+# Generate rustdoc JSON used by API snapshot recipes.
+api_snapshot_json:
+    cargo +{{nightly}} rustdoc -p wc-core --all-features -- -Z unstable-options --output-format json
+
+# Update the checked-in wc-core public API snapshot.
+api_snapshot_update: api_snapshot_json
+    cargo run -p xtask -- api-snapshot --update
+
+# Check the checked-in wc-core public API snapshot.
+api_snapshot_check: api_snapshot_json
+    cargo run -p xtask -- api-snapshot --check
+
 # Check code the same way CI does.
 check_all:
     cargo --version
@@ -59,3 +71,4 @@ check_all:
     just build_features
     just test
     just deny
+    just api_snapshot_check

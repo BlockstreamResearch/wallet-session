@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::{probe, relay, scenario};
+use crate::{api_snapshot, probe, relay, scenario};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -22,6 +22,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "api-snapshot")]
+    ApiSnapshot(ApiSnapshotArgs),
     #[command(name = "relay-probe")]
     Relay(RelayProbeArgs),
     #[command(name = "crypto-probe")]
@@ -161,6 +163,21 @@ struct ScenarioArgs {
     name: scenario::ScenarioName,
 }
 
+#[derive(Debug, Args)]
+struct ApiSnapshotArgs {
+    #[arg(long, default_value = "target/doc/wc_core.json")]
+    rustdoc_json: PathBuf,
+
+    #[arg(long, default_value = "api-snapshots/wc-core.txt")]
+    output: PathBuf,
+
+    #[arg(long)]
+    check: bool,
+
+    #[arg(long)]
+    update: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonProbeInput {
     Json(String),
@@ -169,6 +186,7 @@ pub enum JsonProbeInput {
 
 pub fn run() -> Result<()> {
     match Cli::parse().command {
+        Command::ApiSnapshot(args) => run_api_snapshot(args),
         Command::Relay(args) => run_async(relay::run(args.into_probe_mode()?)),
         Command::Crypto => probe::crypto::run(),
         Command::Auth(args) => {
@@ -189,6 +207,25 @@ pub fn run() -> Result<()> {
                 scenario::run(args.name)
             }
         }
+    }
+}
+
+fn run_api_snapshot(args: ApiSnapshotArgs) -> Result<()> {
+    if args.check && args.update {
+        bail!("choose only one of --check or --update");
+    }
+
+    let request = api_snapshot::ApiSnapshotRequest {
+        rustdoc_json: args.rustdoc_json,
+        output: args.output,
+    };
+
+    if args.check {
+        api_snapshot::check(&request)
+    } else if args.update {
+        api_snapshot::update(&request)
+    } else {
+        api_snapshot::print(&request)
     }
 }
 

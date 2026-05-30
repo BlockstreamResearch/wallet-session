@@ -1,0 +1,567 @@
+# wc-core public API snapshot
+# Generated from rustdoc JSON with wc-core --all-features.
+# Update with: just api_snapshot_update
+
+crate wc_core 0.1.0
+
+const wc_core::DEFAULT_PAIRING_RECEIVE_TIMEOUT
+
+const wc_core::DEFAULT_SESSION_EXPIRY_SECONDS
+
+const wc_core::DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY
+
+const wc_core::DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT
+
+const wc_core::DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN
+
+const wc_core::DEFAULT_VERIFY_RESOLVER_TIMEOUT
+
+enum wc_core::PairingClientError
+  variant PairingUri
+  variant PairingExpired
+  variant RelayAuth
+  variant Clock
+  variant Relay
+  variant KeyPair
+  variant Namespace
+  variant ReceiveTimedOut
+  variant UnexpectedTopic
+  variant PairingUnsubscribeRejected
+  variant PairingMessage
+  variant ProposalPairingTopicMismatch
+  variant Envelope
+  variant PairingPayload
+  variant OutboundPayload
+  variant SessionEnvelope
+  variant SessionPayload
+  variant SessionResponseMissingId
+  variant SessionResponseIdMismatch
+  variant SessionSettleUnsupportedPayload
+  variant SessionLifecycleUnsupportedPayload
+  variant SessionLifecycleResponseNotReceived
+  variant SessionResponseTargetNotRequest
+  variant SessionAuthenticateResponseTargetNotAuthenticate
+  variant SessionResponseTargetNotPing
+  variant SessionResponseTargetNotUpdate
+  variant SessionResponseTargetNotExtend
+  variant SessionResponseTargetNotDelete
+  variant PairingResponseTargetNotPing
+  variant SessionSettleRejected
+  variant SessionSubscriptionTopicMismatch
+  variant SessionNotAcknowledged
+  variant SessionExpired
+  variant SessionRequestExpired
+  variant SessionUnauthorizedChain
+  variant SessionUnauthorizedMethod
+  variant SessionUnauthorizedEvent
+  variant SignRpcId
+  fn parse_pairing_uri
+
+enum wc_core::PairingPayload
+  variant SessionProposal
+  variant SessionAuthenticate
+  variant PairingPing
+  variant PairingDelete
+  variant Sign
+  variant Unknown
+  variant Missing
+
+struct wc_core::PairingReceivedMessage
+  const fn encoded_message_len
+  const fn message
+  const fn payload
+  const fn published_at
+  const fn tag
+  const fn topic
+  fn verify_jwt_attestation
+
+enum wc_core::ProposalPlanningError
+  variant ProposalNamespaces
+  variant ApprovalNamespaces
+  variant MissingRequiredChain
+  variant MissingRequiredAccount
+  variant MissingRequiredMethod
+  variant MissingRequiredEvent
+  variant NoSupportedNamespaces
+  variant UnsupportedSessionProperty
+  variant UnsupportedScopedProperty
+
+struct wc_core::RelayReconnectConfig
+
+struct wc_core::SessionAuthenticateApproval
+  const fn session_namespaces
+  const fn wallet_metadata
+  fn cacaos
+  fn new
+  fn with_session_namespaces
+
+enum wc_core::SessionAuthenticateApprovalError
+  variant EmptyCacaos
+
+struct wc_core::SessionAuthenticateApprovalOutcome
+  const fn response_ack
+  const fn session
+  fn into_session
+
+struct wc_core::SessionAuthenticateRequestExpired
+  const fn expiry
+  const fn now_unix_seconds
+  const fn pairing_topic
+  const fn request_id
+
+struct wc_core::SessionAuthenticateReview
+  async fn resolve_verify_context_at
+  async fn resolve_verify_context_with_hash
+  const fn auth_payload
+  const fn expiry_timestamp
+  const fn is_expired_at
+  const fn published_at
+  const fn request_id
+  const fn requester
+  const fn topic
+  const fn verify_context
+  const fn verify_risk
+  fn from_message
+  fn from_message_with_verify_context
+  fn from_params
+  fn from_params_with_verify_context
+  fn from_request
+  fn from_request_with_verify_context
+  fn verify_jwt_attestation
+
+enum wc_core::SessionAuthenticateReviewError
+  variant NotSessionAuthenticate
+  variant MethodMismatch
+
+enum wc_core::SessionClientEvent
+  variant SessionRequest
+  variant SessionUpdate
+  variant SessionExtend
+  variant SessionEvent
+  variant SessionPing
+  variant SessionDelete
+  variant Unsupported
+  variant RejectedSessionRequest
+  const fn from_message
+  const fn message
+  const fn rejection
+  const fn topic
+
+struct wc_core::SessionExpired
+  const fn expiry
+  const fn topic
+
+struct wc_core::SessionLifecycleRequest
+  const fn method
+  const fn publish_ack
+  const fn request_id
+  const fn request_tag
+  const fn response_tag
+  const fn topic
+
+struct wc_core::SessionLifecycleResponseMessage
+  const fn encoded_message_len
+  const fn payload
+  const fn published_at
+  const fn tag
+  const fn topic
+
+enum wc_core::SessionLifecycleResponsePayload
+  variant Success
+  variant Error
+
+struct wc_core::SessionNamespacePermissionSet
+  const fn namespaces
+  fn is_empty
+
+struct wc_core::SessionNamespacePermissions
+  fn accounts
+  fn chains
+  fn events
+  fn methods
+
+struct wc_core::SessionNamespacesDiff
+  const fn added
+  const fn removed
+  fn between
+  fn has_additions
+  fn has_removals
+  fn is_empty
+
+enum wc_core::SessionPayload
+  variant SessionRequest
+  variant SessionUpdate
+  variant SessionExtend
+  variant SessionEvent
+  variant SessionPing
+  variant SessionDelete
+  variant Sign
+  variant Unknown
+  variant Missing
+
+struct wc_core::SessionProposalApproval
+  fn new
+
+struct wc_core::SessionProposalExpired
+  const fn expiry
+  const fn now_unix_seconds
+  const fn pairing_topic
+  const fn proposal_id
+
+struct wc_core::SessionReceivedMessage
+  const fn encoded_message_len
+  const fn payload
+  const fn plaintext_len
+  const fn published_at
+  const fn tag
+  const fn topic
+  const fn verify_attestation_hash
+  fn verify_jwt_attestation
+
+struct wc_core::SessionRequestRejection
+  const fn error
+  const fn request_id
+  const fn response_ack
+  const fn topic
+
+struct wc_core::SessionRequestReview
+  async fn resolve_verify_context
+  async fn resolve_verify_context_at
+  async fn resolve_verify_context_with_hash
+  const fn chain_id
+  const fn expiry_timestamp
+  const fn method
+  const fn params
+  const fn published_at
+  const fn request_id
+  const fn topic
+  const fn verify_attestation_hash
+  const fn verify_context
+  const fn verify_risk
+  fn from_message
+  fn from_message_with_verify_context
+  fn from_request
+  fn from_request_with_verify_context
+  fn is_expired_at
+  fn verify_jwt_attestation
+  fn wallet_call_request
+
+enum wc_core::SessionRequestReviewError
+  variant NotSessionRequest
+  variant MethodMismatch
+
+enum wc_core::SessionRequestVerifyResolutionError
+  variant MissingHash
+  variant Resolver
+
+struct wc_core::SingleSessionAuthenticate
+  async fn resolve_verify_context
+  async fn resolve_verify_context_at
+  const fn expiry_timestamp
+  const fn is_expired_at
+  const fn message
+  const fn pairing_topic
+  const fn request
+  const fn request_id
+  const fn verify_context
+  const fn verify_risk
+  fn verify_jwt_attestation
+
+struct wc_core::SingleSessionClient
+  async fn approve_session
+  async fn approve_session_authenticate
+  async fn approve_session_update
+  async fn connect
+  async fn disconnect
+  async fn emit_session_event
+  async fn extend_session
+  async fn next_event
+  async fn pair
+  async fn reconnect
+  async fn reject_session
+  async fn reject_session_authenticate
+  async fn reject_session_update
+  async fn respond_session_request_error
+  async fn respond_session_request_success
+  async fn shutdown
+  async fn update_session
+  const fn connection_state
+  const fn status
+  fn active_session
+  fn session_authenticate_review
+  fn session_request_review
+  fn session_update_diff
+
+struct wc_core::SingleSessionClientConfig
+  const fn automatic_reconnect_cooldown
+  const fn max_queued_events
+  const fn new
+  const fn pairing
+  const fn receive_timeouts_before_reconnect
+  const fn reconnect
+  const fn with_automatic_reconnect_cooldown
+  const fn with_max_queued_events
+  const fn with_receive_timeouts_before_reconnect
+  const fn with_reconnect
+
+enum wc_core::SingleSessionClientConnectionState
+  variant Connected
+  variant Reconnecting
+  variant DisconnectedByUser
+  variant Unavailable
+
+enum wc_core::SingleSessionClientError
+  variant Pairing
+  variant ActivePairingExists
+  variant ActiveSessionExists
+  variant PairingSubscriptionMissing
+  variant SessionMissing
+  variant SessionSettleResponseMissing
+  variant SessionLifecycleResponseMissing
+  variant SessionLifecycleRejected
+  variant Clock
+  variant SessionExpiryOverflow
+  variant SessionProposalExpired
+  variant EventQueueFull
+  variant ReconnectCoolingDown
+  variant DisconnectedByUser
+  variant SessionRequestReview
+  variant SessionAuthenticateReview
+  variant SessionAuthenticateExpired
+  variant SessionAuthenticateSubscriptionMissing
+  variant SessionRequestDecisionMissing
+  variant SessionUpdateDecisionMissing
+
+enum wc_core::SingleSessionClientEvent
+  variant SessionProposal
+  variant SessionAuthenticate
+  variant PairingMessage
+  variant SessionProposalExpired
+  variant SessionAuthenticateExpired
+  variant Session
+  variant SessionExpired
+
+struct wc_core::SingleSessionProposal
+  async fn resolve_verify_context
+  async fn resolve_verify_context_at
+  const fn expiry_timestamp
+  const fn message
+  const fn pairing_topic
+  const fn proposal_id
+  const fn request
+  const fn verify_context
+  const fn verify_risk
+  fn authentication_requests
+  fn is_expired_at
+  fn verify_jwt_attestation
+
+struct wc_core::SingleSessionRelayConfig
+  fn new
+
+struct wc_core::VerifyAttestation
+
+enum wc_core::VerifyContextRisk
+  variant Valid
+  variant Unknown
+  variant Invalid
+  variant Scam
+  const fn requires_explicit_user_review
+  const fn should_reject_by_default
+
+struct wc_core::VerifyResolver
+  async fn fetch_verify_public_key
+  async fn resolve_attestation_hash
+  async fn resolve_hash_for_context
+  async fn resolve_hash_for_metadata
+  async fn resolve_jwt_attestation
+  async fn resolve_jwt_for_context
+  fn new
+  fn with_timeout
+
+enum wc_core::VerifyResolverError
+  variant Task
+  variant Http
+  variant Json
+  variant PublicKeyStatus
+  variant VerifyJwtDecode
+  variant VerifyPublicKey
+  variant VerifyAlgorithmUnavailable
+  variant VerifySignatureEncoding
+  variant VerifySignature
+  variant VerifyJwtExpired
+
+struct wc_core::WalletCapabilities
+  fn chain
+  fn insert
+  fn new
+  fn plan_session_approval
+  fn with_scoped_properties
+  fn with_session_properties
+
+enum wc_core::WalletCapabilityError
+  variant EmptyAccounts
+  variant AccountChainMismatch
+
+struct wc_core::WalletChainCapability
+  const fn chain_id
+  fn accounts
+  fn events
+  fn methods
+  fn new
+
+fn wc_core::classify_verify_context
+
+fn wc_core::diff_session_namespaces
+
+mod wc_core::low_level
+
+struct wc_core::low_level::ApprovedSession
+  const fn pending_session
+  const fn proposal_response_ack
+  const fn responder_public_key
+  const fn session_settle_ack
+  const fn session_settle_request_id
+  const fn session_topic
+  const fn subscription
+  fn acknowledged_session
+
+const wc_core::low_level::PAIRING_PING_RESPONSE_TAG
+
+const wc_core::low_level::PAIRING_PING_RESPONSE_TTL_SECONDS
+
+struct wc_core::low_level::PairingClient
+  async fn approve_session_authenticate
+  async fn approve_session_proposal
+  async fn close
+  async fn connect
+  async fn disconnect_session
+  async fn emit_session_event
+  async fn extend_session
+  async fn fetch_pairing_messages
+  async fn next_pairing_message
+  async fn next_session_event
+  async fn next_session_lifecycle_response
+  async fn next_session_message
+  async fn next_session_message_or_reject
+  async fn next_session_settle_response
+  async fn reconnect
+  async fn reject_session_authenticate
+  async fn reject_session_proposal
+  async fn reject_session_update
+  async fn respond_pairing_ping
+  async fn respond_session_delete
+  async fn respond_session_extend
+  async fn respond_session_ping
+  async fn respond_session_request_error
+  async fn respond_session_request_success
+  async fn respond_session_update
+  async fn resubscribe_pairing
+  async fn resubscribe_session
+  async fn subscribe_pairing
+  async fn subscribe_session
+  async fn unsubscribe_pairing
+  async fn update_session
+  const fn status
+
+struct wc_core::low_level::PairingClientConfig
+  fn new
+
+struct wc_core::low_level::PairingSubscription
+  const fn sym_key
+  const fn topic
+  fn subscription_id
+
+const wc_core::low_level::SESSION_AUTHENTICATE_REJECT_TAG
+
+const wc_core::low_level::SESSION_AUTHENTICATE_REJECT_TTL_SECONDS
+
+const wc_core::low_level::SESSION_AUTHENTICATE_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_AUTHENTICATE_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_DELETE_REQUEST_TAG
+
+const wc_core::low_level::SESSION_DELETE_REQUEST_TTL_SECONDS
+
+const wc_core::low_level::SESSION_DELETE_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_DELETE_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_EVENT_REQUEST_TAG
+
+const wc_core::low_level::SESSION_EVENT_REQUEST_TTL_SECONDS
+
+const wc_core::low_level::SESSION_EVENT_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_EVENT_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_EXTEND_REQUEST_TAG
+
+const wc_core::low_level::SESSION_EXTEND_REQUEST_TTL_SECONDS
+
+const wc_core::low_level::SESSION_EXTEND_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_EXTEND_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_PROPOSE_REJECT_TAG
+
+const wc_core::low_level::SESSION_PROPOSE_REJECT_TTL_SECONDS
+
+const wc_core::low_level::SESSION_PROPOSE_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_PROPOSE_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_REQUEST_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_REQUEST_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_SETTLE_REQUEST_TAG
+
+const wc_core::low_level::SESSION_SETTLE_REQUEST_TTL_SECONDS
+
+const wc_core::low_level::SESSION_SETTLE_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_SETTLE_RESPONSE_TTL_SECONDS
+
+const wc_core::low_level::SESSION_UPDATE_REQUEST_TAG
+
+const wc_core::low_level::SESSION_UPDATE_REQUEST_TTL_SECONDS
+
+const wc_core::low_level::SESSION_UPDATE_RESPONSE_TAG
+
+const wc_core::low_level::SESSION_UPDATE_RESPONSE_TTL_SECONDS
+
+enum wc_core::low_level::SessionMessageOutcome
+  variant Received
+  variant Rejected
+
+struct wc_core::low_level::SessionSettleResponseMessage
+  const fn encoded_message_len
+  const fn payload
+  const fn published_at
+  const fn tag
+  const fn topic
+
+enum wc_core::low_level::SessionSettleResponsePayload
+  variant Success
+  variant Error
+
+struct wc_core::low_level::SessionSubscription
+  const fn sym_key
+  const fn topic
+  fn subscription_id
+
+mod wc_core::testkit
+
+struct wc_core::testkit::SingleSessionStateHarness
+  const fn active_session
+  const fn idle
+  const fn is_idle
+  fn complete_session_request
+  fn complete_session_update
+  fn mark_session_request_pending
+  fn mark_session_update_pending
+  fn new_session
+  fn take_expired_session_at
+
+fn wc_core::trusted_verify_url

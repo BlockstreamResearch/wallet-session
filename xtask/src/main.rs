@@ -1,5 +1,6 @@
 //! Development harnesses for live `WalletConnect` protocol exploration.
 
+mod api_snapshot;
 mod cli;
 mod probe;
 mod relay;

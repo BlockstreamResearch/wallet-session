@@ -334,7 +334,7 @@ impl SessionAuthenticateReview {
 ///
 /// > Build the authentication object(s)
 /// > ...
-/// > auths: [auth],
+/// > auths: \[auth],
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAuthenticateApproval {
     wallet_metadata: DappMetadata,
