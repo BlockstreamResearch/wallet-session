@@ -419,16 +419,18 @@ cargo run -p xtask --locked -- scenario interop-live
 ```
 
 That runs authentication rejection, authentication approval, Verify public-key
-fetching, a JS SDK Verify context fixture, an AppKit-style CAIP-25
-capability proposal, an AppKit-style link-mode proposal,
+fetching, a JS SDK Verify context fixture, an AppKit-style CAIP-25 Wallet Call
+matrix, and an AppKit-style link-mode proposal. The Wallet Call matrix covers
 `wallet_getCapabilities`, `wallet_sendCalls`, `wallet_getCallsStatus`, and
-`wallet_showCallsStatus`.
+`wallet_showCallsStatus` while preserving requested and approved
+`sessionProperties`/`scopedProperties`.
 
 Focused interop scenarios are also available:
 
 - `cargo run -p xtask --locked -- scenario verify-live`;
 - `cargo run -p xtask --locked -- scenario wallet-call-live`;
 - `cargo run -p xtask --locked -- scenario appkit-capability-proposal`;
+- `cargo run -p xtask --locked -- scenario appkit-wallet-call-live`;
 - `cargo run -p xtask --locked -- scenario appkit-link-mode-proposal`;
 - `cargo run -p xtask --locked -- scenario wallet-call-get-capabilities`;
 - `cargo run -p xtask --locked -- scenario wallet-call-send-calls`;

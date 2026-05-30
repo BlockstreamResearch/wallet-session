@@ -40,6 +40,8 @@ pub enum ScenarioName {
     WalletCallLive,
     /// AppKit-style CAIP-25 capability proposal and Wallet Call response.
     AppkitCapabilityProposal,
+    /// AppKit-style CAIP-25 proposal with the Wallet Call request matrix.
+    AppkitWalletCallLive,
     /// AppKit-style proposal carrying redirect and link-mode metadata.
     AppkitLinkModeProposal,
     /// Verify public-key and JS SDK Verify context scenarios.
@@ -66,6 +68,7 @@ impl ScenarioName {
             Self::WalletCallShowCallsStatus => "wallet-call-show-calls-status",
             Self::WalletCallLive => "wallet-call-live",
             Self::AppkitCapabilityProposal => "appkit-capability-proposal",
+            Self::AppkitWalletCallLive => "appkit-wallet-call-live",
             Self::AppkitLinkModeProposal => "appkit-link-mode-proposal",
             Self::VerifyLive => "verify-live",
             Self::InteropLive => "interop-live",
@@ -95,6 +98,9 @@ impl ScenarioName {
             Self::WalletCallLive => "Wallet Call request matrix",
             Self::AppkitCapabilityProposal => {
                 "AppKit-style proposal with CAIP-25 session/scoped properties"
+            }
+            Self::AppkitWalletCallLive => {
+                "AppKit-style CAIP-25 proposal and Wallet Call request matrix"
             }
             Self::AppkitLinkModeProposal => {
                 "AppKit-style proposal with redirect/link-mode metadata"
@@ -138,6 +144,12 @@ impl ScenarioName {
                 WALLET_SHOW_CALLS_STATUS,
             ],
             Self::AppkitCapabilityProposal => &[APPKIT_CAPABILITY_PROPOSAL],
+            Self::AppkitWalletCallLive => &[
+                APPKIT_CAPABILITY_PROPOSAL,
+                APPKIT_WALLET_SEND_CALLS,
+                APPKIT_WALLET_GET_CALLS_STATUS,
+                APPKIT_WALLET_SHOW_CALLS_STATUS,
+            ],
             Self::AppkitLinkModeProposal => &[APPKIT_LINK_MODE_PROPOSAL],
             Self::VerifyLive => &[VERIFY_PUBLIC_KEY, VERIFY_CONTEXT],
             Self::InteropLive => &[
@@ -146,11 +158,10 @@ impl ScenarioName {
                 VERIFY_PUBLIC_KEY,
                 VERIFY_CONTEXT,
                 APPKIT_CAPABILITY_PROPOSAL,
+                APPKIT_WALLET_SEND_CALLS,
+                APPKIT_WALLET_GET_CALLS_STATUS,
+                APPKIT_WALLET_SHOW_CALLS_STATUS,
                 APPKIT_LINK_MODE_PROPOSAL,
-                WALLET_GET_CAPABILITIES,
-                WALLET_SEND_CALLS,
-                WALLET_GET_CALLS_STATUS,
-                WALLET_SHOW_CALLS_STATUS,
             ],
         }
     }
@@ -299,6 +310,8 @@ const WALLET_GET_CALLS_STATUS_RESULT: &str = r#"{"version":"2.0.0","id":"0x00000
 const WALLET_SHOW_CALLS_STATUS_PARAMS: &str =
     r#"["0x0000000000000000000000000000000000000000000000000000000000000001"]"#;
 const WALLET_SHOW_CALLS_STATUS_RESULT: &str = "null";
+const WALLET_CALL_METHODS: &str =
+    "wallet_getCapabilities,wallet_sendCalls,wallet_getCallsStatus,wallet_showCallsStatus";
 const APPKIT_PROPOSAL_SESSION_PROPERTIES: &str =
     r#"{"atomic":{"status":"supported"},"futureOptional":{"optional":true}}"#;
 const APPKIT_APPROVAL_SESSION_PROPERTIES: &str = r#"{"atomic":{"status":"ready"}}"#;
@@ -409,14 +422,8 @@ const APPKIT_CAPABILITY_PROPOSAL: ScenarioStep = ScenarioStep {
     env: &[
         ("WC_JS_HARNESS_HOLD_MS", "60000"),
         ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
-        (
-            "WC_JS_PROPOSAL_METHODS",
-            "wallet_getCapabilities,wallet_sendCalls",
-        ),
-        (
-            "WC_APPROVAL_METHODS",
-            "wallet_getCapabilities,wallet_sendCalls",
-        ),
+        ("WC_JS_PROPOSAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_APPROVAL_METHODS", WALLET_CALL_METHODS),
         ("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCapabilities"),
         (
             "WC_JS_SESSION_REQUEST_PARAMS_JSON",
@@ -425,6 +432,123 @@ const APPKIT_CAPABILITY_PROPOSAL: ScenarioStep = ScenarioStep {
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_GET_CAPABILITIES_RESULT,
+        ),
+        (
+            "WC_JS_SESSION_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SESSION_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_JS_SCOPED_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SCOPED_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SCOPED_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SCOPED_PROPERTIES,
+        ),
+    ],
+};
+
+const APPKIT_WALLET_SEND_CALLS: ScenarioStep = ScenarioStep {
+    label: "appkit-wallet-call-send-calls",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_APPROVAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_sendCalls"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_SEND_CALLS_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_SEND_CALLS_RESULT,
+        ),
+        (
+            "WC_JS_SESSION_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SESSION_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_JS_SCOPED_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SCOPED_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SCOPED_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SCOPED_PROPERTIES,
+        ),
+    ],
+};
+
+const APPKIT_WALLET_GET_CALLS_STATUS: ScenarioStep = ScenarioStep {
+    label: "appkit-wallet-call-get-calls-status",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_APPROVAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCallsStatus"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_GET_CALLS_STATUS_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_GET_CALLS_STATUS_RESULT,
+        ),
+        (
+            "WC_JS_SESSION_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SESSION_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SESSION_PROPERTIES,
+        ),
+        (
+            "WC_JS_SCOPED_PROPERTIES_JSON",
+            APPKIT_PROPOSAL_SCOPED_PROPERTIES,
+        ),
+        (
+            "WC_APPROVAL_SCOPED_PROPERTIES_JSON",
+            APPKIT_APPROVAL_SCOPED_PROPERTIES,
+        ),
+    ],
+};
+
+const APPKIT_WALLET_SHOW_CALLS_STATUS: ScenarioStep = ScenarioStep {
+    label: "appkit-wallet-call-show-calls-status",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_APPROVAL_METHODS", WALLET_CALL_METHODS),
+        ("WC_JS_SESSION_REQUEST_METHOD", "wallet_showCallsStatus"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            WALLET_SHOW_CALLS_STATUS_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            WALLET_SHOW_CALLS_STATUS_RESULT,
         ),
         (
             "WC_JS_SESSION_PROPERTIES_JSON",
@@ -517,11 +641,10 @@ mod tests {
                 "verify-public-key",
                 "verify-context",
                 "appkit-capability-proposal",
+                "appkit-wallet-call-send-calls",
+                "appkit-wallet-call-get-calls-status",
+                "appkit-wallet-call-show-calls-status",
                 "appkit-link-mode-proposal",
-                "wallet-call-get-capabilities",
-                "wallet-call-send-calls",
-                "wallet-call-get-calls-status",
-                "wallet-call-show-calls-status",
             ]
         );
     }
@@ -588,6 +711,58 @@ mod tests {
                 .env
                 .iter()
                 .any(|(_, value)| value.contains(WALLET_CALL_ID))
+        );
+    }
+
+    #[test]
+    fn appkit_wallet_call_steps_pin_capability_properties() {
+        let steps = ScenarioName::AppkitWalletCallLive.steps();
+
+        assert_eq!(steps.len(), 4);
+        for step in steps {
+            assert!(
+                step.env
+                    .contains(&("WC_JS_PROPOSAL_METHODS", "wallet_getCapabilities,wallet_sendCalls,wallet_getCallsStatus,wallet_showCallsStatus"))
+            );
+            assert!(
+                step.env
+                    .iter()
+                    .any(|(key, value)| *key == "WC_JS_SESSION_PROPERTIES_JSON"
+                        && value.contains("futureOptional"))
+            );
+            assert!(
+                step.env
+                    .iter()
+                    .any(|(key, value)| *key == "WC_JS_SCOPED_PROPERTIES_JSON"
+                        && value.contains("paymasterService"))
+            );
+            assert!(
+                step.env
+                    .iter()
+                    .any(|(key, value)| *key == "WC_APPROVAL_SESSION_PROPERTIES_JSON"
+                        && value.contains("\"ready\""))
+            );
+        }
+
+        assert!(
+            steps[0]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCapabilities"))
+        );
+        assert!(
+            steps[1]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_sendCalls"))
+        );
+        assert!(
+            steps[2]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_getCallsStatus"))
+        );
+        assert!(
+            steps[3]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "wallet_showCallsStatus"))
         );
     }
 
