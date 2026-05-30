@@ -31,8 +31,14 @@ sanitizer when it works on the host:
 cargo +nightly fuzz run pairing_uri
 ```
 
-The first target set is intentionally byte-oriented. Structure-aware fuzzing
+The first target set is intentionally byte-oriented. It covers pairing URIs,
+identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, namespace
+validation, and CACAO auth payload/message validation. Structure-aware fuzzing
 with `Arbitrary` should be added once these parser boundaries are stable.
+
+Stateful `SingleSessionClient` fuzzing should wait until there is a public or
+in-crate mock runtime harness. A target that only models one-shot decisions
+inside the fuzzer would not exercise the production runtime.
 
 Seed corpus policy:
 

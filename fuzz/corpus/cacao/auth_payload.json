@@ -1,0 +1,16 @@
+{
+  "type": "caip122",
+  "chains": ["eip155:1", "eip155:137"],
+  "aud": "https://example.com/login",
+  "domain": "example.com",
+  "version": "1",
+  "nonce": "1234567890",
+  "iat": "2026-05-30T08:41:59.471Z",
+  "statement": "Sign in to Example",
+  "exp": "2026-05-30T09:41:59.471Z",
+  "nbf": "2026-05-30T08:40:59.471Z",
+  "requestId": "auth-1",
+  "resources": [
+    "https://example.com/terms"
+  ]
+}

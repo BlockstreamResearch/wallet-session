@@ -45,6 +45,7 @@ fuzz_smoke:
     cargo +{{nightly}} fuzz run -s none envelope_decode -- -runs=1
     cargo +{{nightly}} fuzz run -s none session_json_rpc -- -runs=1
     cargo +{{nightly}} fuzz run -s none namespaces -- -runs=1
+    cargo +{{nightly}} fuzz run -s none cacao -- -runs=1
 
 # Check code the same way CI does.
 check_all:

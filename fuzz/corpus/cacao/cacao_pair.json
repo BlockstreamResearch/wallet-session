@@ -1,0 +1,36 @@
+{
+  "authPayload": {
+    "type": "caip122",
+    "chains": ["eip155:1"],
+    "aud": "https://example.com/login",
+    "domain": "example.com",
+    "version": "1",
+    "nonce": "1234567890",
+    "iat": "2026-05-30T08:41:59.471Z",
+    "statement": "Sign in to Example",
+    "resources": [
+      "urn:recap:eyJhdHQiOnsiaHR0cHM6Ly9leGFtcGxlLmNvbSI6eyJ3YWxsZXQvY29ubmVjdCI6W3t9XX19fQ"
+    ]
+  },
+  "cacao": {
+    "h": {
+      "t": "caip122"
+    },
+    "p": {
+      "iss": "did:pkh:eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb",
+      "domain": "example.com",
+      "aud": "https://example.com/login",
+      "version": "1",
+      "nonce": "1234567890",
+      "iat": "2026-05-30T08:41:59.471Z",
+      "statement": "Sign in to Example",
+      "resources": [
+        "urn:recap:eyJhdHQiOnsiaHR0cHM6Ly9leGFtcGxlLmNvbSI6eyJ3YWxsZXQvY29ubmVjdCI6W3t9XX19fQ"
+      ]
+    },
+    "s": {
+      "t": "eip191",
+      "s": "0x00"
+    }
+  }
+}

@@ -59,3 +59,10 @@ path = "fuzz_targets/namespaces.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cacao"
+path = "fuzz_targets/cacao.rs"
+test = false
+doc = false
+bench = false
