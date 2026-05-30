@@ -553,15 +553,33 @@ struct wc_core::low_level::SessionSubscription
 
 mod wc_core::testkit
 
+enum wc_core::testkit::SingleSessionHarnessState
+  variant Idle
+  variant Pairing
+  variant Session
+
 struct wc_core::testkit::SingleSessionStateHarness
   const fn active_session
   const fn idle
   const fn is_idle
+  const fn state
+  fn adopt_session_from_pairing
+  fn approve_session_update_on
+  fn begin_pairing
   fn complete_session_request
+  fn complete_session_request_on
   fn complete_session_update
+  fn complete_session_update_on
+  fn inject_pairing_delete
+  fn inject_session_delete
+  fn inject_session_extend
   fn mark_session_request_pending
+  fn mark_session_request_pending_on
   fn mark_session_update_pending
+  fn mark_session_update_pending_on
   fn new_session
+  fn pending_session_request_count
+  fn pending_session_update_count
   fn take_expired_session_at
 
 fn wc_core::trusted_verify_url

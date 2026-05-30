@@ -58,5 +58,34 @@
     2,
     99,
     18446744073709551615
-  ]
+  ],
+  "operationIds": [
+    1,
+    1,
+    2,
+    2,
+    1780470685,
+    3,
+    5,
+    8
+  ],
+  "namespaces": {
+    "eip155": {
+      "accounts": [
+        "eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
+      ],
+      "chains": [
+        "eip155:1"
+      ],
+      "events": [
+        "chainChanged",
+        "accountsChanged",
+        "message"
+      ],
+      "methods": [
+        "personal_sign",
+        "eth_sendTransaction"
+      ]
+    }
+  }
 }

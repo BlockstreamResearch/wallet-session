@@ -721,7 +721,7 @@ pub struct PairingSubscription {
 
 impl PairingSubscription {
     /// Builds a pairing subscription for deterministic core-runtime tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub(crate) fn for_test(topic: RelayTopic, sym_key: PairingSymKey) -> Self {
         Self {
             topic,
