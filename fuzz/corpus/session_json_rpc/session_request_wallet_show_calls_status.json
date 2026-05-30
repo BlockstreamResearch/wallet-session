@@ -1,0 +1,15 @@
+{
+  "id": 1780137136058352,
+  "jsonrpc": "2.0",
+  "method": "wc_sessionRequest",
+  "params": {
+    "chainId": "eip155:1",
+    "request": {
+      "method": "wallet_showCallsStatus",
+      "params": [
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+      ],
+      "expiryTimestamp": 1780137435
+    }
+  }
+}

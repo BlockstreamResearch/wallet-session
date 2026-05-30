@@ -50,9 +50,9 @@ cargo +nightly fuzz run pairing_uri
 ```
 
 The first target set is intentionally byte-oriented. It covers pairing URIs,
-identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, namespace
-validation, CACAO auth payload/message validation, and single-session runtime
-state.
+identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, AppKit-style Wallet
+Call request shapes, namespace validation, CACAO auth payload/message
+validation, and single-session runtime state.
 
 The `single_session_state` target uses `wc-core`'s non-default `testkit`
 feature. It does not duplicate the one-shot model inside the fuzzer; it calls
@@ -74,4 +74,6 @@ The `single_session_state` corpus includes sanitized variants for:
 - an auth-created session carrying CACAO objects;
 - an AppKit-style Wallet Call/capability session with `sessionProperties`,
   `scopedProperties`, redirect metadata, and Wallet Call methods;
+- an AppKit Wallet Call matrix session with status-request IDs captured from
+  the live scenario;
 - an expired link-mode-shaped session.
