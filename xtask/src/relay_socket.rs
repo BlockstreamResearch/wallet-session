@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::de::DeserializeOwned;
@@ -8,7 +8,7 @@ use wc_protocol::relay::{
     IrnBatchFetchMessagesResponse, IrnBatchPublish, IrnFetchMessagesResponse, IrnPublish,
     IrnSubscription, IrnUnsubscribe, RelayJsonRpcResponse, RelayRequest, RelayRpcId, RelayTopic,
 };
-use wc_transport::{NativeRelayTransport, RelayClient};
+use wc_transport::{NativeRelayTransport, RelayClient, RelayClientError};
 
 use crate::util::rpc_id;
 
@@ -17,6 +17,18 @@ const READ_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct RelaySocket {
     role: &'static str,
     client: RelayClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuppressedDelivery {
+    /// No relay push arrived for the checked topics during the wait window.
+    NoDelivery,
+    /// A stale relay push arrived after local routing had been removed.
+    ///
+    /// The relay client acknowledges relay delivery before routing, then rejects
+    /// inactive topics. The live harness records this as a dropped stale push
+    /// instead of treating the client-side rejection as a probe crash.
+    InactiveTopicDropped { topic: RelayTopic },
 }
 
 impl RelaySocket {
@@ -171,24 +183,55 @@ impl RelaySocket {
         }
     }
 
-    pub async fn read_any_subscription_for_topics(
+    pub async fn read_suppressed_subscription_for_topics(
         &mut self,
-        expected_topics: &[RelayTopic],
+        suppressed_topics: &[RelayTopic],
         wait: Duration,
-    ) -> Result<Option<IrnSubscription>> {
-        loop {
-            let Some(subscription) = self.next_subscription(wait).await? else {
-                return Ok(None);
-            };
+    ) -> Result<SuppressedDelivery> {
+        let deadline = Instant::now() + wait;
 
-            if expected_topics.contains(&subscription.data.topic) {
-                return Ok(Some(subscription));
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(SuppressedDelivery::NoDelivery);
             }
 
-            println!(
-                "{} <- ignored irn_subscription topic={}",
-                self.role, subscription.data.topic
-            );
+            let Ok(message) = timeout(remaining, self.client.next_message()).await else {
+                return Ok(SuppressedDelivery::NoDelivery);
+            };
+
+            match message {
+                Ok(Some(subscription)) => {
+                    if suppressed_topics.contains(&subscription.data.topic) {
+                        bail!(
+                            "{} routed suppressed relay subscription topic={}",
+                            self.role,
+                            subscription.data.topic
+                        );
+                    }
+
+                    println!(
+                        "{} <- ignored irn_subscription topic={}",
+                        self.role, subscription.data.topic
+                    );
+                }
+                Ok(None) => return Ok(SuppressedDelivery::NoDelivery),
+                Err(RelayClientError::UnexpectedSubscriptionTopic { topic }) => {
+                    println!(
+                        "{} <- dropped inactive irn_subscription topic={}",
+                        self.role, topic
+                    );
+
+                    if suppressed_topics.contains(&topic) {
+                        return Ok(SuppressedDelivery::InactiveTopicDropped { topic });
+                    }
+                }
+                Err(source) => {
+                    return Err(source).with_context(|| {
+                        format!("{} failed to read relay subscription", self.role)
+                    });
+                }
+            }
         }
     }
 

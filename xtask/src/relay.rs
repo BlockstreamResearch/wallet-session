@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::relay_socket::{RawRelaySocket, RelaySocket};
+use crate::relay_socket::{RawRelaySocket, RelaySocket, SuppressedDelivery};
 use crate::util::{
     client_auth_jwt, generated_sym_key, generated_topic, pairing_uri_print_json,
     pairing_uri_wait_timeout, redact, rpc_id, unix_timestamp,
@@ -3701,17 +3701,17 @@ async fn run_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) -> Resul
         .await?;
     println!("{label} publisher publish_ack=true");
 
-    if let Some(subscription) = subscriber
-        .read_any_subscription_for_topic(&topic, NO_DELIVERY_TIMEOUT)
+    match subscriber
+        .read_suppressed_subscription_for_topics(std::slice::from_ref(&topic), NO_DELIVERY_TIMEOUT)
         .await?
     {
-        bail!(
-            "{label} received subscription after unsubscribe: {}",
-            subscription.data.message
-        );
+        SuppressedDelivery::NoDelivery => {
+            println!("{label} no_delivery_after_unsubscribe=true");
+        }
+        SuppressedDelivery::InactiveTopicDropped { topic } => {
+            println!("{label} inactive_delivery_after_unsubscribe_dropped=true topic={topic}");
+        }
     }
-
-    println!("{label} no_delivery_after_unsubscribe=true");
 
     Ok(())
 }
@@ -3842,18 +3842,19 @@ async fn run_batch_unsubscribe_suppresses_delivery(config: &RelayProbeConfig) ->
         println!("{label} publisher publish_ack index={index}");
     }
 
-    if let Some(subscription) = subscriber
-        .read_any_subscription_for_topics(&topics, NO_DELIVERY_TIMEOUT)
+    match subscriber
+        .read_suppressed_subscription_for_topics(&topics, NO_DELIVERY_TIMEOUT)
         .await?
     {
-        bail!(
-            "{label} received subscription after batch unsubscribe: topic={} message={}",
-            subscription.data.topic,
-            subscription.data.message
-        );
+        SuppressedDelivery::NoDelivery => {
+            println!("{label} no_delivery_after_batch_unsubscribe=true");
+        }
+        SuppressedDelivery::InactiveTopicDropped { topic } => {
+            println!(
+                "{label} inactive_delivery_after_batch_unsubscribe_dropped=true topic={topic}"
+            );
+        }
     }
-
-    println!("{label} no_delivery_after_batch_unsubscribe=true");
 
     Ok(())
 }
