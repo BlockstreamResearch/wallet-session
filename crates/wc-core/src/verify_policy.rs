@@ -1,6 +1,105 @@
 //! Verify context policy helpers.
 
-use wc_protocol::verify::{VerifyContext, VerifyValidation};
+use wc_protocol::{
+    relay::RelayTopic,
+    verify::{VerifyAttestationHash, VerifyContext, VerifyValidation},
+};
+
+/// Wallet action that requires Verify risk to be surfaced before proceeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyRiskSurface {
+    /// `wc_sessionPropose` approval.
+    SessionProposalApproval,
+    /// `wc_sessionAuthenticate` approval with CACAO auth objects.
+    SessionAuthenticateApproval,
+    /// `wc_sessionRequest` success response that can carry a signing result.
+    SessionRequestSigning,
+}
+
+/// Wallet-facing Verify risk review required by approval/signing APIs.
+///
+/// This value is a deliberate API boundary: callers obtain it from the
+/// proposal/auth/request review object they are about to present to policy/UI,
+/// then pass the same value into the approval or success-response method. That
+/// keeps the `VALID`/`UNKNOWN`/`INVALID`/scam signal visible in the type-level
+/// workflow instead of leaving it as an optional side lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyRiskReview {
+    surface: VerifyRiskSurface,
+    topic: RelayTopic,
+    request_id: u64,
+    payload_hash: Option<VerifyAttestationHash>,
+    verify_context: VerifyContext,
+    risk: VerifyContextRisk,
+}
+
+impl VerifyRiskReview {
+    pub(crate) const fn new(
+        surface: VerifyRiskSurface,
+        topic: RelayTopic,
+        request_id: u64,
+        payload_hash: Option<VerifyAttestationHash>,
+        verify_context: VerifyContext,
+    ) -> Self {
+        let risk = classify_verify_context(&verify_context);
+        Self {
+            surface,
+            topic,
+            request_id,
+            payload_hash,
+            verify_context,
+            risk,
+        }
+    }
+
+    /// Approval/signing surface this review authorizes.
+    #[must_use]
+    pub const fn surface(&self) -> VerifyRiskSurface {
+        self.surface
+    }
+
+    /// Pairing or session topic associated with the reviewed request.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// JSON-RPC request id associated with the reviewed request.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Verify hash of the exact reviewed payload, when retained.
+    #[must_use]
+    pub const fn payload_hash(&self) -> Option<&VerifyAttestationHash> {
+        self.payload_hash.as_ref()
+    }
+
+    /// Verify context that should be surfaced to wallet policy/UI.
+    #[must_use]
+    pub const fn verify_context(&self) -> &VerifyContext {
+        &self.verify_context
+    }
+
+    /// Classified Verify risk that should be surfaced to wallet policy/UI.
+    #[must_use]
+    pub const fn risk(&self) -> VerifyContextRisk {
+        self.risk
+    }
+
+    /// Whether the wallet UI should display an explicit Verify warning.
+    #[must_use]
+    pub const fn requires_explicit_user_review(&self) -> bool {
+        self.risk.requires_explicit_user_review()
+    }
+
+    /// Whether a conservative wallet should reject without further approval UI.
+    #[must_use]
+    pub const fn should_reject_by_default(&self) -> bool {
+        self.risk.should_reject_by_default()
+    }
+}
 
 /// Wallet-facing Verify risk classification.
 ///

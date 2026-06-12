@@ -125,6 +125,7 @@ struct wc_core::SessionAuthenticateReview
   const fn request_id
   const fn requester
   const fn topic
+  const fn verify_attestation_hash
   const fn verify_context
   const fn verify_risk
   fn from_message
@@ -134,6 +135,7 @@ struct wc_core::SessionAuthenticateReview
   fn from_request
   fn from_request_with_verify_context
   fn verify_jwt_attestation
+  fn verify_risk_review
 
 enum wc_core::SessionAuthenticateReviewError
   variant NotSessionAuthenticate
@@ -250,6 +252,7 @@ struct wc_core::SessionRequestReview
   fn from_request_with_verify_context
   fn is_expired_at
   fn verify_jwt_attestation
+  fn verify_risk_review
   fn wallet_call_request
 
 enum wc_core::SessionRequestReviewError
@@ -334,6 +337,7 @@ enum wc_core::SingleSessionClientError
   variant DisconnectedByUser
   variant SessionRequestReview
   variant SessionAuthenticateReview
+  variant VerifyRiskReviewMismatch
   variant SessionAuthenticateExpired
   variant SessionRequestExpired
   variant SessionAuthenticateSubscriptionMissing
@@ -362,6 +366,7 @@ struct wc_core::SingleSessionProposal
   fn authentication_requests
   fn is_expired_at
   fn verify_jwt_attestation
+  fn verify_risk_review
 
 struct wc_core::SingleSessionRelayConfig
   fn new
@@ -397,6 +402,21 @@ enum wc_core::VerifyResolverError
   variant VerifySignatureEncoding
   variant VerifySignature
   variant VerifyJwtExpired
+
+struct wc_core::VerifyRiskReview
+  const fn payload_hash
+  const fn request_id
+  const fn requires_explicit_user_review
+  const fn risk
+  const fn should_reject_by_default
+  const fn surface
+  const fn topic
+  const fn verify_context
+
+enum wc_core::VerifyRiskSurface
+  variant SessionProposalApproval
+  variant SessionAuthenticateApproval
+  variant SessionRequestSigning
 
 struct wc_core::WalletCapabilities
   fn chain

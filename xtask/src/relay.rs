@@ -958,7 +958,10 @@ async fn run_core_single_session_client_session_request_probe(
     let proposal = wait_for_single_session_client_proposal(&mut client).await?;
     print_and_assert_single_session_proposal_properties(&proposal)?;
     let approval = approval_for_probe(proposal.request())?;
-    let session = client.approve_session(&proposal, approval).await?;
+    let proposal_verify_review = proposal.verify_risk_review();
+    let session = client
+        .approve_session(&proposal, &proposal_verify_review, approval)
+        .await?;
     print_and_assert_single_session_approved_session_properties(&session)?;
 
     let session_message = wait_for_single_session_client_session_request_event(&mut client).await?;
@@ -969,6 +972,7 @@ async fn run_core_single_session_client_session_request_probe(
     let review = client.session_request_review(&session_message)?;
     print_session_request_review(&review);
     validate_session_request_review(&review)?;
+    let request_verify_review = review.verify_risk_review();
     let response_ack = match response_mode.as_str() {
         "success" => {
             let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
@@ -976,7 +980,7 @@ async fn run_core_single_session_client_session_request_probe(
                 |value| parse_json_env(&value),
             )?;
             client
-                .respond_session_request_success(&session_message, result)
+                .respond_session_request_success(&session_message, &request_verify_review, result)
                 .await?
         }
         "error" => {
@@ -1132,8 +1136,9 @@ async fn run_core_single_session_client_session_authenticate_probe(
             let namespaces = auth_session_namespaces(&review, &cacao)?;
             let approval = SessionAuthenticateApproval::new(auth_wallet_metadata(), vec![cacao])?
                 .with_session_namespaces(namespaces);
+            let auth_verify_review = review.verify_risk_review();
             let outcome = client
-                .approve_session_authenticate(&authenticate, approval)
+                .approve_session_authenticate(&authenticate, &auth_verify_review, approval)
                 .await?;
             let adopted_session = outcome
                 .session()
@@ -1214,7 +1219,10 @@ async fn run_core_single_session_client_disconnect_probe(config: &RelayProbeConf
         proposal.verify_risk()
     );
     let approval = approval_for_probe(proposal.request())?;
-    let session = client.approve_session(&proposal, approval).await?;
+    let proposal_verify_review = proposal.verify_risk_review();
+    let session = client
+        .approve_session(&proposal, &proposal_verify_review, approval)
+        .await?;
     println!(
         "core-single-session-client-disconnect active_session topic={} acknowledged={} namespaces={} expiry={}",
         session.topic,
@@ -1281,7 +1289,10 @@ async fn run_core_single_session_client_session_lifecycle_probe(
         proposal.verify_risk()
     );
     let approval = approval_for_probe(proposal.request())?;
-    let session = client.approve_session(&proposal, approval).await?;
+    let proposal_verify_review = proposal.verify_risk_review();
+    let session = client
+        .approve_session(&proposal, &proposal_verify_review, approval)
+        .await?;
     println!(
         "core-single-session-client-session-lifecycle active_session topic={} acknowledged={} namespaces={} expiry={}",
         session.topic,

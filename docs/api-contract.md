@@ -19,6 +19,8 @@ The recommended wallet-facing surface is:
 - `WalletCapabilities`
 - `SessionAuthenticateReview`
 - `SessionRequestReview`
+- `VerifyRiskReview`
+- `VerifyRiskSurface`
 - `SessionNamespacesDiff`
 
 Lower-level protocol-step items live under `wc_core::low_level`. They are available for harnesses and focused protocol tests, but application code should prefer `SingleSessionClient`.
@@ -26,6 +28,8 @@ Lower-level protocol-step items live under `wc_core::low_level`. They are availa
 Rationale: lower-level primitives expose individual protocol steps such as direct publish, direct response, and direct subscription handling. Composing those incorrectly can bypass the single-session runtime boundary.
 
 The `testkit` module is feature-gated and exists for deterministic fuzzing and integration tests. It is not part of the wallet-facing runtime contract.
+
+`VerifyRiskReview` values are produced by the review object being shown to wallet policy/UI. Approval and success-response APIs require the matching review token, including the approval surface, topic, request ID, and exact reviewed payload hash.
 
 Source:
 
@@ -143,11 +147,12 @@ Source:
 Approval path:
 
 1. caller reviews the proposal;
-2. caller builds `SessionProposalApproval`;
-3. optional: caller uses `WalletCapabilities::plan_session_approval`;
-4. caller calls `approve_session`;
-5. core publishes approval and settle messages;
-6. core stores the session only after settle acknowledgement.
+2. caller obtains and surfaces `proposal.verify_risk_review()`;
+3. caller builds `SessionProposalApproval`;
+4. optional: caller uses `WalletCapabilities::plan_session_approval`;
+5. caller calls `approve_session` with the matching `VerifyRiskReview`;
+6. core publishes approval and settle messages;
+7. core stores the session only after settle acknowledgement.
 
 Rejection path:
 
@@ -177,14 +182,15 @@ Supported paths:
 
 1. caller receives the auth event;
 2. caller calls `session_authenticate_review`;
-3. caller applies origin/policy/user review;
-4. caller signs authentication messages outside core and builds signed CACAO objects;
-5. caller calls one of:
-   - `approve_session_authenticate`;
+3. caller obtains and surfaces `review.verify_risk_review()`;
+4. caller applies origin/policy/user review;
+5. caller signs authentication messages outside core and builds signed CACAO objects;
+6. caller calls one of:
+   - `approve_session_authenticate` with the matching `VerifyRiskReview`;
    - `reject_session_authenticate`;
-6. core publishes a type-1 JSON-RPC response on the requester public-key response topic;
-7. if approval includes session namespaces, core adopts an acknowledged authenticated session;
-8. if approval omits session namespaces, core clears the pairing and returns to idle.
+7. core publishes a type-1 JSON-RPC response on the requester public-key response topic;
+8. if approval includes session namespaces, core adopts an acknowledged authenticated session;
+9. if approval omits session namespaces, core clears the pairing and returns to idle.
 
 Core does not sign authentication payloads and does not auto-approve authentication. 
 Auth-created sessions are explicit: the caller opts in by passing namespaces through `SessionAuthenticateApproval::with_session_namespaces`.
@@ -222,12 +228,14 @@ The receive path rejects deterministic protocol failures before surfacing an eve
 For a surfaced request, the caller should:
 
 1. call `session_request_review`;
-2. show the request to policy/UI;
-3. call exactly one of:
-   - `respond_session_request_success`;
+2. obtain and surface `review.verify_risk_review()`;
+3. show the request to policy/UI;
+4. call exactly one of:
+   - `respond_session_request_success` with the matching `VerifyRiskReview`;
    - `respond_session_request_error`.
 
 The client tracks surfaced request IDs as one-shot pending decisions. Once a response is acknowledged, the request is removed from the pending set. A second response attempt returns `SessionRequestDecisionMissing`.
+The success path requires the matching Verify review because it can carry a signature, submitted transaction, or other wallet-side result. The review is bound to the exact reviewed payload hash, so a stale review for the same topic and request ID cannot authorize a different payload. The error path remains available for rejection without a Verify token.
 
 Source:
 
@@ -350,6 +358,7 @@ Important caller-visible state errors:
 - `ReconnectCoolingDown`;
 - `DisconnectedByUser`;
 - `SessionAuthenticateReview`;
+- `VerifyRiskReviewMismatch`;
 - `SessionRequestDecisionMissing`;
 - `SessionUpdateDecisionMissing`.
 

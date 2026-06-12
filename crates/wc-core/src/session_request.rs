@@ -12,7 +12,9 @@ use wc_protocol::{
 };
 
 use crate::pairing::{SessionPayload, SessionReceivedMessage};
-use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_policy::{
+    VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
+};
 use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Wallet-facing review data for a valid `wc_sessionRequest`.
@@ -290,6 +292,18 @@ impl SessionRequestReview {
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Verify risk review required before returning a signing/result success.
+    #[must_use]
+    pub fn verify_risk_review(&self) -> VerifyRiskReview {
+        VerifyRiskReview::new(
+            VerifyRiskSurface::SessionRequestSigning,
+            self.topic.clone(),
+            self.request_id,
+            self.verify_attestation_hash.clone(),
+            self.verify_context.clone(),
+        )
     }
 
     /// Resolves Verify context with the retained SDK-compatible hash.

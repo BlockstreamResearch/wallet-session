@@ -10,7 +10,9 @@ use wc_protocol::{
 };
 
 use crate::pairing::{PairingPayload, PairingReceivedMessage};
-use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_policy::{
+    VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
+};
 use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Wallet-facing review data for a `wc_sessionAuthenticate` request.
@@ -71,6 +73,7 @@ pub struct SessionAuthenticateReview {
     expiry_timestamp: u64,
     published_at: u64,
     verify_context: VerifyContext,
+    verify_attestation_hash: Option<VerifyAttestationHash>,
     verify_attestation_jwt: Option<String>,
     verify_encrypted_id: Option<String>,
 }
@@ -113,6 +116,9 @@ impl SessionAuthenticateReview {
             request,
             verify_context,
         )?;
+        review.verify_attestation_hash = Some(VerifyAttestationHash::from_message(
+            message.message().plaintext(),
+        ));
         review.verify_attestation_jwt = message
             .verify_jwt_attestation()
             .map(|(jwt, _encrypted_id)| jwt.to_owned());
@@ -191,6 +197,7 @@ impl SessionAuthenticateReview {
             expiry_timestamp: params.expiry_timestamp,
             published_at,
             verify_context,
+            verify_attestation_hash: None,
             verify_attestation_jwt: None,
             verify_encrypted_id: None,
         }
@@ -260,6 +267,24 @@ impl SessionAuthenticateReview {
     #[must_use]
     pub const fn verify_risk(&self) -> VerifyContextRisk {
         classify_verify_context(&self.verify_context)
+    }
+
+    /// Verify hash computed from the exact decrypted pairing payload, when retained.
+    #[must_use]
+    pub const fn verify_attestation_hash(&self) -> Option<&VerifyAttestationHash> {
+        self.verify_attestation_hash.as_ref()
+    }
+
+    /// Verify risk review required before approving authentication.
+    #[must_use]
+    pub fn verify_risk_review(&self) -> VerifyRiskReview {
+        VerifyRiskReview::new(
+            VerifyRiskSurface::SessionAuthenticateApproval,
+            self.topic.clone(),
+            self.request_id,
+            self.verify_attestation_hash.clone(),
+            self.verify_context.clone(),
+        )
     }
 
     /// Resolves Verify context with a caller-provided SDK-compatible hash.

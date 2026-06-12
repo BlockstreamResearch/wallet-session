@@ -50,7 +50,9 @@ pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
     diff_session_namespaces,
 };
-pub use verify_policy::{VerifyContextRisk, classify_verify_context};
+pub use verify_policy::{
+    VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
+};
 pub use verify_resolver::{
     DEFAULT_VERIFY_RESOLVER_TIMEOUT, VerifyAttestation, VerifyResolver, VerifyResolverError,
     trusted_verify_url,

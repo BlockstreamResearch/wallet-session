@@ -28,7 +28,9 @@ use crate::session_authenticate::{
 };
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
-use crate::verify_policy::{VerifyContextRisk, classify_verify_context};
+use crate::verify_policy::{
+    VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
+};
 use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 
 /// Default number of fetched or internally queued events retained by `SingleSessionClient`.
@@ -504,9 +506,19 @@ impl SingleSessionClient {
     pub async fn approve_session(
         &mut self,
         proposal: &SingleSessionProposal,
+        verify_review: &VerifyRiskReview,
         approval: SessionProposalApproval,
     ) -> Result<Session, SingleSessionClientError> {
         let subscription = self.active_pairing(proposal.pairing_topic())?.clone();
+        ensure_verify_risk_review(
+            verify_review,
+            VerifyRiskSurface::SessionProposalApproval,
+            proposal.pairing_topic(),
+            proposal.proposal_id(),
+            Some(&VerifyAttestationHash::from_message(
+                proposal.message().message().plaintext(),
+            )),
+        )?;
         if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
@@ -611,10 +623,20 @@ impl SingleSessionClient {
     pub async fn approve_session_authenticate(
         &mut self,
         authenticate: &SingleSessionAuthenticate,
+        verify_review: &VerifyRiskReview,
         approval: SessionAuthenticateApproval,
     ) -> Result<SessionAuthenticateApprovalOutcome, SingleSessionClientError> {
         let subscription = self.active_pairing(authenticate.pairing_topic())?.clone();
         let request = authenticate.request();
+        ensure_verify_risk_review(
+            verify_review,
+            VerifyRiskSurface::SessionAuthenticateApproval,
+            authenticate.pairing_topic(),
+            request.id,
+            Some(&VerifyAttestationHash::from_message(
+                authenticate.message().message().plaintext(),
+            )),
+        )?;
         let now_unix_seconds = now_unix_seconds()?;
         if request.params.is_expired_at(now_unix_seconds) {
             self.unsubscribe_pairing(&subscription).await?;
@@ -731,6 +753,7 @@ impl SingleSessionClient {
     pub async fn respond_session_request_success(
         &mut self,
         message: &SessionReceivedMessage,
+        verify_review: &VerifyRiskReview,
         result: impl Into<serde_json::Value>,
     ) -> Result<bool, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
@@ -738,6 +761,13 @@ impl SingleSessionClient {
         self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_request(request_id)?;
+        ensure_verify_risk_review(
+            verify_review,
+            VerifyRiskSurface::SessionRequestSigning,
+            message.topic(),
+            request_id,
+            Some(message.verify_attestation_hash()),
+        )?;
         self.ensure_session_request_fresh(message, request_id, now_unix_seconds)?;
         let subscription = self.session_subscription(message.topic())?.clone();
         let response_ack = self
@@ -1537,6 +1567,20 @@ impl SingleSessionProposal {
         classify_verify_context(&self.verify_context)
     }
 
+    /// Verify risk review required before approving this proposal.
+    #[must_use]
+    pub fn verify_risk_review(&self) -> VerifyRiskReview {
+        VerifyRiskReview::new(
+            VerifyRiskSurface::SessionProposalApproval,
+            self.pairing_topic.clone(),
+            self.proposal_id(),
+            Some(VerifyAttestationHash::from_message(
+                self.message.message().plaintext(),
+            )),
+            self.verify_context.clone(),
+        )
+    }
+
     /// Resolves Verify context from the exact decrypted proposal payload hash.
     ///
     /// The maintained Sign Client hashes `JSON.stringify(payload)` before
@@ -2120,6 +2164,27 @@ pub enum SingleSessionClientError {
         source: SessionAuthenticateReviewError,
     },
 
+    /// Verify risk review does not match the approval or signing operation.
+    #[error("single-session client verify risk review mismatch")]
+    VerifyRiskReviewMismatch {
+        /// Expected approval/signing surface.
+        expected_surface: VerifyRiskSurface,
+        /// Expected pairing or session topic.
+        expected_topic: RelayTopic,
+        /// Expected JSON-RPC request id.
+        expected_request_id: u64,
+        /// Expected Verify hash for the reviewed payload.
+        expected_payload_hash: Option<VerifyAttestationHash>,
+        /// Actual review surface.
+        actual_surface: VerifyRiskSurface,
+        /// Actual review topic.
+        actual_topic: RelayTopic,
+        /// Actual review request id.
+        actual_request_id: u64,
+        /// Actual Verify hash carried by the review.
+        actual_payload_hash: Option<VerifyAttestationHash>,
+    },
+
     /// Authentication request expired before caller approval.
     #[error("single-session client session authenticate request expired")]
     SessionAuthenticateExpired {
@@ -2261,6 +2326,33 @@ fn ensure_session_request_message_fresh(
     Ok(())
 }
 
+fn ensure_verify_risk_review(
+    review: &VerifyRiskReview,
+    expected_surface: VerifyRiskSurface,
+    expected_topic: &RelayTopic,
+    expected_request_id: u64,
+    expected_payload_hash: Option<&VerifyAttestationHash>,
+) -> Result<(), SingleSessionClientError> {
+    if review.surface() == expected_surface
+        && review.topic() == expected_topic
+        && review.request_id() == expected_request_id
+        && review.payload_hash() == expected_payload_hash
+    {
+        return Ok(());
+    }
+
+    Err(SingleSessionClientError::VerifyRiskReviewMismatch {
+        expected_surface,
+        expected_topic: expected_topic.clone(),
+        expected_request_id,
+        expected_payload_hash: expected_payload_hash.cloned(),
+        actual_surface: review.surface(),
+        actual_topic: review.topic().clone(),
+        actual_request_id: review.request_id(),
+        actual_payload_hash: review.payload_hash().cloned(),
+    })
+}
+
 fn inbound_session_extend_expiry(
     message: &SessionReceivedMessage,
 ) -> Result<u64, SingleSessionClientError> {
@@ -2376,13 +2468,17 @@ mod tests {
             SessionProposeParams, SessionRequest, SessionRequestParams, SessionTransportType,
             SessionUpdateParams, SignMethod,
         },
-        verify::{DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyContext, VerifyValidation},
+        verify::{
+            DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyAttestationHash, VerifyContext,
+            VerifyValidation,
+        },
     };
 
     use crate::{
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
-        SessionPayload, SessionReceivedMessage, SingleSessionAuthenticate,
-        SingleSessionRelayConfig,
+        SessionAuthenticateApproval, SessionPayload, SessionProposalApproval,
+        SessionReceivedMessage, SessionRequestReview, SingleSessionAuthenticate,
+        SingleSessionProposal, SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -2683,6 +2779,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proposal_approval_requires_matching_verify_risk_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x78; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x79; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        let plaintext = serde_json::to_string(&request)?;
+        let expected_payload_hash = VerifyAttestationHash::from_message(&plaintext);
+        let stale_payload_hash = VerifyAttestationHash::from_message("stale proposal payload");
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request.clone())),
+        );
+        let proposal = SingleSessionProposal {
+            pairing_topic: topic.clone(),
+            request,
+            verify_context: VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL),
+            message,
+        };
+        let wrong_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionProposalApproval,
+            topic.clone(),
+            proposal.proposal_id(),
+            Some(stale_payload_hash.clone()),
+            proposal.verify_context().clone(),
+        );
+        let approval = SessionProposalApproval::new(
+            BTreeMap::new(),
+            test_metadata("Wallet"),
+            FUTURE_SESSION_EXPIRY,
+        );
+
+        let error = client
+            .approve_session(&proposal, &wrong_review, approval)
+            .await
+            .expect_err("proposal approval must carry the proposal verify review");
+
+        match error {
+            SingleSessionClientError::VerifyRiskReviewMismatch {
+                expected_surface,
+                expected_topic,
+                expected_request_id,
+                expected_payload_hash: mismatch_expected_payload_hash,
+                actual_surface,
+                actual_topic,
+                actual_request_id,
+                actual_payload_hash: mismatch_actual_payload_hash,
+            } => {
+                assert_eq!(expected_surface, VerifyRiskSurface::SessionProposalApproval);
+                assert_eq!(expected_topic, topic);
+                assert_eq!(expected_request_id, 41);
+                assert_eq!(
+                    mismatch_expected_payload_hash.as_ref(),
+                    Some(&expected_payload_hash)
+                );
+                assert_eq!(actual_surface, VerifyRiskSurface::SessionProposalApproval);
+                assert_eq!(actual_topic, expected_topic);
+                assert_eq!(actual_request_id, expected_request_id);
+                assert_eq!(
+                    mismatch_actual_payload_hash.as_ref(),
+                    Some(&stale_payload_hash)
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_authenticate_approval_requires_matching_verify_risk_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x7a; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x7b; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let request = auth_request()?;
+        let plaintext = serde_json::to_string(&request)?;
+        let expected_payload_hash = VerifyAttestationHash::from_message(&plaintext);
+        let stale_payload_hash = VerifyAttestationHash::from_message("stale auth payload");
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionAuthenticate(Box::new(request.clone())),
+        );
+        let verify_context = VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL);
+        let authenticate = SingleSessionAuthenticate {
+            pairing_topic: topic.clone(),
+            request,
+            verify_context: verify_context.clone(),
+            message,
+        };
+        let wrong_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionAuthenticateApproval,
+            topic.clone(),
+            authenticate.request_id(),
+            Some(stale_payload_hash.clone()),
+            verify_context,
+        );
+        let approval =
+            SessionAuthenticateApproval::new(test_metadata("Wallet"), vec![test_cacao()?])?;
+
+        let error = client
+            .approve_session_authenticate(&authenticate, &wrong_review, approval)
+            .await
+            .expect_err("auth approval must carry the auth verify review");
+
+        match error {
+            SingleSessionClientError::VerifyRiskReviewMismatch {
+                expected_surface,
+                expected_topic,
+                expected_request_id,
+                expected_payload_hash: mismatch_expected_payload_hash,
+                actual_surface,
+                actual_topic,
+                actual_request_id,
+                actual_payload_hash: mismatch_actual_payload_hash,
+            } => {
+                assert_eq!(
+                    expected_surface,
+                    VerifyRiskSurface::SessionAuthenticateApproval
+                );
+                assert_eq!(expected_topic, topic);
+                assert_eq!(expected_request_id, 42);
+                assert_eq!(
+                    mismatch_expected_payload_hash.as_ref(),
+                    Some(&expected_payload_hash)
+                );
+                assert_eq!(
+                    actual_surface,
+                    VerifyRiskSurface::SessionAuthenticateApproval
+                );
+                assert_eq!(actual_topic, expected_topic);
+                assert_eq!(actual_request_id, expected_request_id);
+                assert_eq!(
+                    mismatch_actual_payload_hash.as_ref(),
+                    Some(&stale_payload_hash)
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_request_success_requires_matching_verify_risk_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x7c; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x7d; 32]);
+        let request = session_request(83, Some(FUTURE_SESSION_EXPIRY))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_request_pending(83);
+        let stale_payload_hash = VerifyAttestationHash::from_message("stale session payload");
+        let wrong_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionRequestSigning,
+            topic.clone(),
+            83,
+            Some(stale_payload_hash.clone()),
+            VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL),
+        );
+
+        let error = client
+            .respond_session_request_success(&message, &wrong_review, json!("0xsignature"))
+            .await
+            .expect_err("success response must carry the request verify review");
+
+        match error {
+            SingleSessionClientError::VerifyRiskReviewMismatch {
+                expected_surface,
+                expected_topic,
+                expected_request_id,
+                expected_payload_hash: mismatch_expected_payload_hash,
+                actual_surface,
+                actual_topic,
+                actual_request_id,
+                actual_payload_hash: mismatch_actual_payload_hash,
+            } => {
+                assert_eq!(expected_surface, VerifyRiskSurface::SessionRequestSigning);
+                assert_eq!(expected_topic, topic);
+                assert_eq!(expected_request_id, 83);
+                assert_eq!(
+                    mismatch_expected_payload_hash.as_ref(),
+                    Some(message.verify_attestation_hash())
+                );
+                assert_eq!(actual_surface, VerifyRiskSurface::SessionRequestSigning);
+                assert_eq!(actual_topic, expected_topic);
+                assert_eq!(actual_request_id, expected_request_id);
+                assert_eq!(
+                    mismatch_actual_payload_hash.as_ref(),
+                    Some(&stale_payload_hash)
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn expired_session_request_success_is_rejected_and_pruned_without_publish()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, server) = connect_idle_test_client().await;
@@ -2702,10 +3031,11 @@ mod tests {
         client
             .client_session_mut(&topic)?
             .mark_session_request_pending(77);
+        let verify_review = SessionRequestReview::from_message(&message)?.verify_risk_review();
 
         let error = tokio::time::timeout(
             Duration::from_millis(100),
-            client.respond_session_request_success(&message, json!("0xsignature")),
+            client.respond_session_request_success(&message, &verify_review, json!("0xsignature")),
         )
         .await
         .expect("expired request guard returns before relay publish")
