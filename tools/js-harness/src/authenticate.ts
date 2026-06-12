@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { SignClient } from "@walletconnect/sign-client";
 
 const projectId = process.env.REOWN_PROJECT_ID ?? process.env.WALLETCONNECT_PROJECT_ID;
@@ -12,6 +13,23 @@ const holdMs = Number.parseInt(process.env.WC_JS_HARNESS_HOLD_MS ?? "120000", 10
 const uriFile = process.env.WC_JS_URI_FILE;
 const resultFile = process.env.WC_JS_RESULT_FILE;
 const printUri = process.env.WC_JS_PRINT_URI === "1";
+const logDecryptedPayloads = matchesEnvFlag(process.env.WC_JS_LOG_DECRYPTED_PAYLOADS);
+const sensitiveKeys = new Set([
+  "accounts",
+  "address",
+  "auths",
+  "authentication",
+  "cacao",
+  "cacaos",
+  "data",
+  "iss",
+  "namespaces",
+  "params",
+  "request",
+  "s",
+  "signature",
+  "signatures",
+]);
 
 if (!uriFile && !printUri) {
   console.error("set WC_JS_URI_FILE or set WC_JS_PRINT_URI=1 to print the full pairing URI");
@@ -100,16 +118,154 @@ async function writeResult(result: Record<string, unknown>): Promise<void> {
   if (!resultFile) {
     return;
   }
-  await Bun.write(resultFile, JSON.stringify(result, null, 2));
+  await Bun.write(resultFile, JSON.stringify(resultForFile(result), null, 2));
 }
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) {
-    return error.message;
+    return stringForLog(error.message);
   }
-  return String(error);
+  if (typeof error === "object" && error !== null) {
+    return stringifyForLog(error);
+  }
+  return stringForLog(String(error));
+}
+
+function stringForLog(value: string): string {
+  try {
+    return stringifyForLog(JSON.parse(value) as unknown);
+  } catch {
+    return value;
+  }
 }
 
 function stringifyForLog(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
+  return JSON.stringify(valueForLog(value));
+}
+
+function resultForFile(result: Record<string, unknown>): unknown {
+  const normalized = normalizeJson(result) as Record<string, unknown>;
+  if (logDecryptedPayloads) {
+    return normalized;
+  }
+
+  if (normalized.outcome === "authenticate_response" && normalized.result) {
+    return {
+      ...normalized,
+      result: authenticateResultSummary(normalized.result),
+    };
+  }
+
+  return redactHarnessValue(normalized);
+}
+
+function authenticateResultSummary(result: unknown): Record<string, unknown> {
+  const normalized = normalizeJson(result);
+  const object =
+    normalized && typeof normalized === "object" && !Array.isArray(normalized)
+      ? (normalized as Record<string, unknown>)
+      : {};
+  const session =
+    object.session && typeof object.session === "object" && !Array.isArray(object.session)
+      ? (object.session as Record<string, unknown>)
+      : undefined;
+  const namespaces =
+    session?.namespaces && typeof session.namespaces === "object" && !Array.isArray(session.namespaces)
+      ? (session.namespaces as Record<string, unknown>)
+      : undefined;
+
+  return {
+    ...redactedSummary(normalized),
+    session: session
+      ? {
+          topic: session.topic,
+          acknowledged: session.acknowledged,
+          expiry: session.expiry,
+          namespacesCount: namespaces ? Object.keys(namespaces).length : undefined,
+        }
+      : undefined,
+  };
+}
+
+function valueForLog(value: unknown): unknown {
+  const normalized = normalizeJson(value);
+  return logDecryptedPayloads ? normalized : redactHarnessValue(normalized);
+}
+
+function redactHarnessValue(value: unknown, key?: string): unknown {
+  if (key && sensitiveKeys.has(key)) {
+    return redactedSummary(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactHarnessValue(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        redactHarnessValue(entryValue, entryKey),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function redactedSummary(value: unknown): Record<string, unknown> {
+  const normalized = normalizeJson(value);
+  const text = JSON.stringify(normalized);
+  const summary: Record<string, unknown> = {
+    redacted: true,
+    type: valueKind(normalized),
+    hash: createHash("sha256").update(text).digest("hex"),
+  };
+
+  if (typeof normalized === "string") {
+    summary.len = normalized.length;
+  } else if (Array.isArray(normalized)) {
+    summary.len = normalized.length;
+  } else if (normalized && typeof normalized === "object") {
+    const keys = Object.keys(normalized as Record<string, unknown>);
+    summary.keys = keys;
+    summary.len = keys.length;
+  }
+
+  return summary;
+}
+
+function normalizeJson(value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeJson(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        normalizeJson(entryValue),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function valueKind(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  return typeof value;
+}
+
+function matchesEnvFlag(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "yes";
 }

@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use tokio::time::timeout;
 use wc_protocol::{
@@ -56,6 +59,45 @@ use super::{
 /// finite while still accepting the common request-echo then response sequence.
 const MAX_SESSION_LIFECYCLE_RESPONSE_DELIVERIES: usize = 4;
 
+/// Ed25519 seed used to sign Relay Auth JWTs.
+///
+/// The seed is intentionally wrapped so config `Debug` output cannot print
+/// signing material.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct RelayAuthSeed([u8; 32]);
+
+impl RelayAuthSeed {
+    /// Wraps raw Relay Auth seed bytes.
+    #[must_use]
+    pub const fn new(seed: [u8; 32]) -> Self {
+        Self(seed)
+    }
+
+    /// Raw seed bytes for the Relay Auth signer.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Returns the wrapped seed bytes.
+    #[must_use]
+    pub const fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl From<[u8; 32]> for RelayAuthSeed {
+    fn from(seed: [u8; 32]) -> Self {
+        Self::new(seed)
+    }
+}
+
+impl fmt::Debug for RelayAuthSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RelayAuthSeed(<redacted>)")
+    }
+}
+
 /// Configuration for a native pairing-topic relay client.
 ///
 /// The pairing receive path uses Relay Auth query parameters before opening the
@@ -85,7 +127,7 @@ pub struct PairingClientConfig {
     /// User-agent value placed in the relay connection URL.
     pub user_agent: String,
     /// Ed25519 seed used to sign the Relay Auth JWT.
-    pub auth_seed: [u8; 32],
+    pub auth_seed: RelayAuthSeed,
     /// Relay Auth JWT `sub` claim.
     pub auth_subject: String,
     /// Relay Auth JWT lifetime in seconds.
@@ -101,14 +143,14 @@ impl PairingClientConfig {
     #[must_use]
     pub fn new(
         project_id: impl Into<String>,
-        auth_seed: [u8; 32],
+        auth_seed: impl Into<RelayAuthSeed>,
         auth_subject: impl Into<String>,
     ) -> Self {
         Self {
             project_id: project_id.into(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
             user_agent: "wc-2/rust-poc-0.1.0/macos/native".to_owned(),
-            auth_seed,
+            auth_seed: auth_seed.into(),
             auth_subject: auth_subject.into(),
             auth_ttl_seconds: 86_400,
             receive_timeout: DEFAULT_PAIRING_RECEIVE_TIMEOUT,
@@ -1127,7 +1169,7 @@ pub(super) fn relay_connection_url(
 ) -> Result<RelayConnectionUrl, PairingClientError> {
     let audience = relay_auth_audience(&config.relay_url);
     let token = RelayAuthToken::sign_with_seed(
-        &config.auth_seed,
+        config.auth_seed.as_bytes(),
         &config.auth_subject,
         audience,
         issued_at,

@@ -231,6 +231,109 @@ fn optional_chain_with_no_supported_methods_is_not_approved()
 }
 
 #[test]
+fn optional_method_only_namespace_is_approved() -> Result<(), Box<dyn std::error::Error>> {
+    let proposal = proposal(
+        ProposalNamespaces::new(),
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["personal_sign"], [])?,
+        )])?,
+    )?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign"],
+        [],
+    )?])?;
+
+    let approval =
+        capabilities.plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)?;
+
+    let namespace = &approval.namespaces[&NamespaceKey::parse("eip155")?];
+    assert_eq!(namespace.accounts.len(), 1);
+    assert_eq!(namespace.methods, vec!["personal_sign".parse()?]);
+    assert!(namespace.events.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn optional_event_only_namespace_is_approved() -> Result<(), Box<dyn std::error::Error>> {
+    let proposal = proposal(
+        ProposalNamespaces::new(),
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], [], ["accountsChanged"])?,
+        )])?,
+    )?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        [],
+        ["accountsChanged"],
+    )?])?;
+
+    let approval =
+        capabilities.plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)?;
+
+    let namespace = &approval.namespaces[&NamespaceKey::parse("eip155")?];
+    assert_eq!(namespace.accounts.len(), 1);
+    assert!(namespace.methods.is_empty());
+    assert_eq!(namespace.events, vec!["accountsChanged".parse()?]);
+
+    Ok(())
+}
+
+#[test]
+fn optional_chain_with_no_supported_events_is_not_approved()
+-> Result<(), Box<dyn std::error::Error>> {
+    let proposal = proposal(
+        ProposalNamespaces::new(),
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], [], ["chainChanged"])?,
+        )])?,
+    )?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("optional chain with no supported event must not disclose accounts");
+
+    assert_eq!(error, ProposalPlanningError::NoSupportedNamespaces);
+
+    Ok(())
+}
+
+#[test]
+fn optional_chain_with_no_requested_actions_is_not_approved()
+-> Result<(), Box<dyn std::error::Error>> {
+    let proposal = proposal(
+        ProposalNamespaces::new(),
+        namespaces([("eip155", proposal_namespace(["eip155:1"], [], [])?)])?,
+    )?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("optional chain with no usable action must not disclose accounts");
+
+    assert_eq!(error, ProposalPlanningError::NoSupportedNamespaces);
+
+    Ok(())
+}
+
+#[test]
 fn optional_only_unsupported_proposal_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let proposal = proposal(
         ProposalNamespaces::new(),
@@ -415,6 +518,80 @@ fn unsupported_required_scoped_property_is_rejected() -> Result<(), Box<dyn std:
         ProposalPlanningError::UnsupportedScopedProperty {
             scope: "eip155:1".to_owned(),
             property: "paymasterService".to_owned(),
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn non_object_requested_scoped_property_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut proposal = proposal(
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["wallet_sendCalls"], ["accountsChanged"])?,
+        )])?,
+        ProposalNamespaces::new(),
+    )?;
+    proposal.params.scoped_properties =
+        Some(BTreeMap::from([("eip155:1".to_owned(), json!(["atomic"]))]));
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["wallet_sendCalls"],
+        ["accountsChanged"],
+    )?])?
+    .with_scoped_properties(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!({"atomic": {"status": "supported"}}),
+    )]));
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("non-object requested scoped property must reject");
+
+    assert_eq!(
+        error,
+        ProposalPlanningError::UnsupportedScopedPropertyShape {
+            scope: "eip155:1".to_owned(),
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn non_object_supported_scoped_property_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let mut proposal = proposal(
+        namespaces([(
+            "eip155",
+            proposal_namespace(["eip155:1"], ["wallet_sendCalls"], ["accountsChanged"])?,
+        )])?,
+        ProposalNamespaces::new(),
+    )?;
+    proposal.params.scoped_properties = Some(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!({"atomic": {"status": "supported"}}),
+    )]));
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["wallet_sendCalls"],
+        ["accountsChanged"],
+    )?])?
+    .with_scoped_properties(BTreeMap::from([(
+        "eip155:1".to_owned(),
+        json!("wallet-wide-atomic-support"),
+    )]));
+
+    let error = capabilities
+        .plan_session_approval(&proposal, wallet_metadata(), 1_780_000_000)
+        .expect_err("non-object supported scoped property must reject");
+
+    assert_eq!(
+        error,
+        ProposalPlanningError::UnsupportedScopedPropertyShape {
+            scope: "eip155:1".to_owned(),
         }
     );
 

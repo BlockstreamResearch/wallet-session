@@ -619,6 +619,22 @@ impl SessionRequestRejection {
 }
 
 impl SessionReceivedMessage {
+    /// Builds a session-topic message for deterministic core-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(topic: RelayTopic, plaintext: &str, payload: SessionPayload) -> Self {
+        Self {
+            topic,
+            encoded_message_len: plaintext.len(),
+            plaintext_len: plaintext.len(),
+            verify_attestation_hash: VerifyAttestationHash::from_message(plaintext),
+            verify_attestation_jwt: None,
+            verify_encrypted_id: None,
+            published_at: 0,
+            tag: None,
+            payload,
+        }
+    }
+
     /// Relay topic that delivered this message.
     #[must_use]
     pub const fn topic(&self) -> &RelayTopic {
@@ -774,8 +790,11 @@ impl PairingReceivedMessage {
         let envelope = wc_protocol::envelope::Envelope::encrypt_type_0(plaintext, sym_key)
             .expect("test pairing envelope encrypts");
         let encoded_message = envelope.encode(wc_protocol::envelope::EnvelopeEncoding::Base64);
-        let message = PairingMessage::decode_relay_message(&encoded_message, sym_key)
-            .expect("test pairing message decodes");
+        let message = PairingMessage::decode_relay_message(
+            wc_protocol::pairing_message::EncryptedRelayEnvelope::new(&encoded_message),
+            sym_key,
+        )
+        .expect("test pairing message decodes");
 
         Self {
             topic,
@@ -787,6 +806,18 @@ impl PairingReceivedMessage {
             message,
             payload,
         }
+    }
+
+    /// Adds relay-carried Verify v3 metadata for deterministic core-runtime tests.
+    #[cfg(test)]
+    pub(crate) fn with_verify_attestation_for_test(
+        mut self,
+        verify_attestation_jwt: impl Into<String>,
+        verify_encrypted_id: impl Into<String>,
+    ) -> Self {
+        self.verify_attestation_jwt = Some(verify_attestation_jwt.into());
+        self.verify_encrypted_id = Some(verify_encrypted_id.into());
+        self
     }
 
     /// Relay topic that delivered this message.

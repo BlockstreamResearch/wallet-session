@@ -589,8 +589,11 @@ impl SingleSessionClient {
         authenticate: &SingleSessionAuthenticate,
     ) -> Result<SessionAuthenticateReview, SingleSessionClientError> {
         self.active_pairing(authenticate.pairing_topic())?;
-        SessionAuthenticateReview::from_message(authenticate.message())
-            .map_err(|source| SingleSessionClientError::SessionAuthenticateReview { source })
+        SessionAuthenticateReview::from_message_with_verify_context(
+            authenticate.message(),
+            authenticate.verify_context().clone(),
+        )
+        .map_err(|source| SingleSessionClientError::SessionAuthenticateReview { source })
     }
 
     /// Approves a queued `wc_sessionAuthenticate` event with signed CACAOs.
@@ -731,8 +734,11 @@ impl SingleSessionClient {
         result: impl Into<serde_json::Value>,
     ) -> Result<bool, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_request(request_id)?;
+        self.ensure_session_request_fresh(message, request_id, now_unix_seconds)?;
         let subscription = self.session_subscription(message.topic())?.clone();
         let response_ack = self
             .pairing
@@ -754,8 +760,11 @@ impl SingleSessionClient {
         error: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_request(request_id)?;
+        self.ensure_session_request_fresh(message, request_id, now_unix_seconds)?;
         let subscription = self.session_subscription(message.topic())?.clone();
         let response_ack = self
             .pairing
@@ -780,8 +789,11 @@ impl SingleSessionClient {
         message: &SessionReceivedMessage,
     ) -> Result<SessionRequestReview, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh_ref(message.topic(), now_unix_seconds)?;
         let session = self.client_session(message.topic())?;
         session.ensure_pending_session_request(request_id)?;
+        ensure_session_request_message_fresh(message, request_id, now_unix_seconds)?;
         let verify_context =
             VerifyContext::unresolved_from_metadata(&session.session.peer.metadata);
         SessionRequestReview::from_message_with_verify_context(message, verify_context)
@@ -801,15 +813,17 @@ impl SingleSessionClient {
         &mut self,
         message: &SessionReceivedMessage,
     ) -> Result<bool, SingleSessionClientError> {
-        let subscription = self.session_subscription(message.topic())?.clone();
         let SessionPayload::SessionUpdate(request) = message.payload() else {
             return Err(SingleSessionClientError::Pairing {
                 source: PairingClientError::SessionResponseTargetNotUpdate,
             });
         };
         let request_id = request.id;
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_update(request_id)?;
+        let subscription = self.session_subscription(message.topic())?.clone();
         let namespaces = request.params.namespaces.clone();
         let publish_ack = self
             .pairing
@@ -834,6 +848,8 @@ impl SingleSessionClient {
         &self,
         message: &SessionReceivedMessage,
     ) -> Result<SessionNamespacesDiff, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh_ref(message.topic(), now_unix_seconds)?;
         let session = self.client_session(message.topic())?;
         let SessionPayload::SessionUpdate(request) = message.payload() else {
             return Err(SingleSessionClientError::Pairing {
@@ -858,6 +874,8 @@ impl SingleSessionClient {
         error: JsonRpcError,
     ) -> Result<bool, SingleSessionClientError> {
         let request_id = session_update_id(message)?;
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_update(request_id)?;
         let subscription = self.session_subscription(message.topic())?.clone();
@@ -886,6 +904,8 @@ impl SingleSessionClient {
         topic: &RelayTopic,
         namespaces: &SessionNamespaces,
     ) -> Result<SessionLifecycleResponseMessage, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(topic, now_unix_seconds)?;
         let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
@@ -927,6 +947,8 @@ impl SingleSessionClient {
         &mut self,
         topic: &RelayTopic,
     ) -> Result<SessionLifecycleResponseMessage, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(topic, now_unix_seconds)?;
         let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
@@ -967,6 +989,8 @@ impl SingleSessionClient {
         topic: &RelayTopic,
         params: &SessionEventParams,
     ) -> Result<SessionLifecycleRequest, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(topic, now_unix_seconds)?;
         let session = self.client_session(topic)?.clone();
         self.pairing
             .emit_session_event(&session.subscription, &session.session, params)
@@ -989,6 +1013,8 @@ impl SingleSessionClient {
         topic: &RelayTopic,
         reason: SessionDeleteParams,
     ) -> Result<SessionLifecycleRequest, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh(topic, now_unix_seconds)?;
         let session = self.client_session(topic)?.clone();
         let request = self
             .pairing
@@ -1064,6 +1090,70 @@ impl SingleSessionClient {
         if matches!(&self.state, SingleSessionClientState::Session(state) if state.session.topic == *topic)
         {
             self.state = SingleSessionClientState::Idle;
+        }
+    }
+
+    fn ensure_active_session_fresh(
+        &mut self,
+        topic: &RelayTopic,
+        now_unix_seconds: u64,
+    ) -> Result<(), SingleSessionClientError> {
+        let expired_at = self.active_session_expiry(topic, now_unix_seconds)?;
+        if let Some(expiry) = expired_at {
+            self.clear_session(topic);
+            return Err(SingleSessionClientError::ActiveSessionExpired {
+                topic: topic.clone(),
+                expiry,
+                now_unix_seconds,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_active_session_fresh_ref(
+        &self,
+        topic: &RelayTopic,
+        now_unix_seconds: u64,
+    ) -> Result<(), SingleSessionClientError> {
+        if let Some(expiry) = self.active_session_expiry(topic, now_unix_seconds)? {
+            return Err(SingleSessionClientError::ActiveSessionExpired {
+                topic: topic.clone(),
+                expiry,
+                now_unix_seconds,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn active_session_expiry(
+        &self,
+        topic: &RelayTopic,
+        now_unix_seconds: u64,
+    ) -> Result<Option<u64>, SingleSessionClientError> {
+        let session = self.client_session(topic)?;
+        Ok(session
+            .session
+            .is_expired_at(now_unix_seconds)
+            .then_some(session.session.expiry))
+    }
+
+    fn ensure_session_request_fresh(
+        &mut self,
+        message: &SessionReceivedMessage,
+        request_id: u64,
+        now_unix_seconds: u64,
+    ) -> Result<(), SingleSessionClientError> {
+        match ensure_session_request_message_fresh(message, request_id, now_unix_seconds) {
+            Ok(()) => Ok(()),
+            Err(error @ SingleSessionClientError::SessionRequestExpired { .. }) => {
+                if let Ok(session) = self.client_session_mut(message.topic()) {
+                    session.complete_session_request(request_id);
+                }
+                Err(error)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1184,13 +1274,7 @@ impl SingleSessionClient {
                     .map_err(SingleSessionClientError::from)?;
             }
             SessionClientEvent::SessionExtend(message) => {
-                let expiry = match message.payload() {
-                    SessionPayload::SessionExtend(request) => request
-                        .params
-                        .expiry
-                        .map_or_else(session_extended_expiry, Ok)?,
-                    _ => return Ok(Some(SingleSessionClientEvent::Session(event))),
-                };
+                let expiry = inbound_session_extend_expiry(message)?;
                 self.pairing
                     .respond_session_extend(subscription, message)
                     .await
@@ -1941,6 +2025,17 @@ pub enum SingleSessionClientError {
         topic: RelayTopic,
     },
 
+    /// Active session expired before a wallet decision or local mutation.
+    #[error("single-session client active session expired")]
+    ActiveSessionExpired {
+        /// Active session topic.
+        topic: RelayTopic,
+        /// Session expiry timestamp.
+        expiry: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
+    },
+
     /// The peer did not acknowledge the settlement request.
     #[error("single-session client session settle response missing")]
     SessionSettleResponseMissing {
@@ -2029,6 +2124,19 @@ pub enum SingleSessionClientError {
     #[error("single-session client session authenticate request expired")]
     SessionAuthenticateExpired {
         /// JSON-RPC request id from the expired auth request.
+        request_id: u64,
+        /// Request expiry timestamp.
+        expiry: u64,
+        /// Unix timestamp used for the comparison.
+        now_unix_seconds: u64,
+    },
+
+    /// Session request expired before caller approval or rejection.
+    #[error("single-session client session request expired")]
+    SessionRequestExpired {
+        /// Active session topic.
+        topic: RelayTopic,
+        /// JSON-RPC request id from the expired session request.
         request_id: u64,
         /// Request expiry timestamp.
         expiry: u64,
@@ -2125,6 +2233,46 @@ const fn session_update_id(
     }
 }
 
+fn ensure_session_request_message_fresh(
+    message: &SessionReceivedMessage,
+    request_id: u64,
+    now_unix_seconds: u64,
+) -> Result<(), SingleSessionClientError> {
+    let SessionPayload::SessionRequest(request) = message.payload() else {
+        return Err(SingleSessionClientError::Pairing {
+            source: PairingClientError::SessionResponseTargetNotRequest,
+        });
+    };
+
+    if let Some(expiry) = request
+        .params
+        .request
+        .expiry_timestamp
+        .filter(|expiry| *expiry <= now_unix_seconds)
+    {
+        return Err(SingleSessionClientError::SessionRequestExpired {
+            topic: message.topic().clone(),
+            request_id,
+            expiry,
+            now_unix_seconds,
+        });
+    }
+
+    Ok(())
+}
+
+fn inbound_session_extend_expiry(
+    message: &SessionReceivedMessage,
+) -> Result<u64, SingleSessionClientError> {
+    let SessionPayload::SessionExtend(_) = message.payload() else {
+        return Err(SingleSessionClientError::Pairing {
+            source: PairingClientError::SessionResponseTargetNotExtend,
+        });
+    };
+
+    session_extended_expiry()
+}
+
 fn now_unix_seconds() -> Result<u64, SingleSessionClientError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2195,12 +2343,13 @@ mod tests {
     use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
     use super::{
-        ActiveSession, BoundedQueue, DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
+        ActiveSession, BoundedQueue, DEFAULT_SESSION_EXPIRY_SECONDS,
+        DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
         DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
         DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SingleSessionClient,
         SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
         SingleSessionClientEvent, SingleSessionClientState, authenticated_session,
-        take_expired_session_from_state,
+        inbound_session_extend_expiry, now_unix_seconds, take_expired_session_from_state,
     };
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -2221,15 +2370,18 @@ mod tests {
         relay::RelayTopic,
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
-            ProposalNamespaces, Proposer, RelayProtocolOptions, Session, SessionAuthenticateParams,
-            SessionNamespace, SessionParticipant, SessionProposeParams, SessionTransportType,
-            SignMethod,
+            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
+            JsonRpcRequest, ProposalNamespaces, Proposer, RelayProtocolOptions, Session,
+            SessionAuthenticateParams, SessionExtendParams, SessionNamespace, SessionParticipant,
+            SessionProposeParams, SessionRequest, SessionRequestParams, SessionTransportType,
+            SessionUpdateParams, SignMethod,
         },
+        verify::{DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyContext, VerifyValidation},
     };
 
     use crate::{
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
+        SessionPayload, SessionReceivedMessage, SingleSessionAuthenticate,
         SingleSessionRelayConfig,
         low_level::{PairingSubscription, SessionSubscription},
     };
@@ -2480,6 +2632,310 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn session_authenticate_review_preserves_stored_verify_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x5a; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x5b; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let request = auth_request()?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionAuthenticate(Box::new(request.clone())),
+        )
+        .with_verify_attestation_for_test("relay-verify-jwt", "relay-encrypted-id");
+        let verify_context = VerifyContext {
+            verified: VerifiedOrigin {
+                origin: "https://resolved.example".to_owned(),
+                validation: VerifyValidation::Invalid,
+                verify_url: DEFAULT_VERIFY_URL.to_owned(),
+                is_scam: Some(true),
+            },
+        };
+        let authenticate = SingleSessionAuthenticate {
+            pairing_topic: topic,
+            request,
+            verify_context: verify_context.clone(),
+            message,
+        };
+
+        let review = client.session_authenticate_review(&authenticate)?;
+
+        assert_eq!(review.verify_context(), &verify_context);
+        assert_eq!(
+            review.verify_jwt_attestation(),
+            Some(("relay-verify-jwt", "relay-encrypted-id"))
+        );
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_session_request_success_is_rejected_and_pruned_without_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x5c; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x5d; 32]);
+        let request = session_request(77, Some(1))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_request_pending(77);
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.respond_session_request_success(&message, json!("0xsignature")),
+        )
+        .await
+        .expect("expired request guard returns before relay publish")
+        .expect_err("expired session request cannot be answered");
+
+        match error {
+            SingleSessionClientError::SessionRequestExpired {
+                topic: actual_topic,
+                request_id,
+                expiry,
+                ..
+            } => {
+                assert_eq!(actual_topic, topic);
+                assert_eq!(request_id, 77);
+                assert_eq!(expiry, 1);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(matches!(
+            client
+                .client_session(&topic)?
+                .ensure_pending_session_request(77),
+            Err(SingleSessionClientError::SessionRequestDecisionMissing { .. })
+        ));
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_session_request_error_is_rejected_and_pruned_without_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x65; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x66; 32]);
+        let request = session_request(82, Some(1))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_request_pending(82);
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.respond_session_request_error(
+                &message,
+                JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected request."),
+            ),
+        )
+        .await
+        .expect("expired request guard returns before relay publish")
+        .expect_err("expired session request cannot be answered");
+
+        assert!(matches!(
+            error,
+            SingleSessionClientError::SessionRequestExpired {
+                request_id: 82,
+                expiry: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client
+                .client_session(&topic)?
+                .ensure_pending_session_request(82),
+            Err(SingleSessionClientError::SessionRequestDecisionMissing { .. })
+        ));
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_session_request_review_is_rejected() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x5e; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x5f; 32]);
+        let request = session_request(78, Some(1))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_request_pending(78);
+
+        let error = client
+            .session_request_review(&message)
+            .expect_err("expired session request cannot be reviewed");
+
+        assert!(matches!(
+            error,
+            SingleSessionClientError::SessionRequestExpired {
+                request_id: 78,
+                expiry: 1,
+                ..
+            }
+        ));
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_session_update_approval_clears_session_without_mutating()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x60; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x61; 32]);
+        let replacement = test_namespaces()?;
+        let request = session_update_request(79, replacement);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionUpdate(request),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), 1),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_update_pending(79);
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.approve_session_update(&message),
+        )
+        .await
+        .expect("expired session guard returns before relay publish")
+        .expect_err("expired session update cannot be approved");
+
+        assert!(matches!(
+            error,
+            SingleSessionClientError::ActiveSessionExpired { expiry: 1, .. }
+        ));
+        assert!(matches!(client.state, SingleSessionClientState::Idle));
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_session_update_rejection_clears_session_without_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x62; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x63; 32]);
+        let request = session_update_request(80, test_namespaces()?);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionUpdate(request),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), 1),
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_update_pending(80);
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.reject_session_update(
+                &message,
+                JsonRpcError::new(JsonRpcErrorCode::UserRejected, "User rejected update."),
+            ),
+        )
+        .await
+        .expect("expired session guard returns before relay publish")
+        .expect_err("expired session update cannot be rejected");
+
+        assert!(matches!(
+            error,
+            SingleSessionClientError::ActiveSessionExpired { expiry: 1, .. }
+        ));
+        assert!(matches!(client.state, SingleSessionClientState::Idle));
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[test]
+    fn inbound_session_extend_ignores_peer_supplied_expiry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x64; 32]);
+        let request = session_extend_request(81, Some(1));
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic,
+            &plaintext,
+            SessionPayload::SessionExtend(request),
+        );
+        let before = now_unix_seconds()?;
+        let expiry = inbound_session_extend_expiry(&message)?;
+        let after = now_unix_seconds()?;
+
+        assert_ne!(expiry, 1);
+        assert!(expiry >= before + DEFAULT_SESSION_EXPIRY_SECONDS);
+        assert!(expiry <= after + DEFAULT_SESSION_EXPIRY_SECONDS);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -3009,6 +3465,78 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
         ))
+    }
+
+    async fn connect_idle_test_client() -> (SingleSessionClient, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds local websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accepts client");
+            let mut websocket = accept_async(stream).await.expect("accepts websocket");
+            while websocket.next().await.is_some() {}
+        });
+
+        let config = reconnect_test_config(address);
+        let client = SingleSessionClient::connect(&config)
+            .await
+            .expect("connects to relay websocket");
+
+        (client, server)
+    }
+
+    fn session_request(
+        request_id: u64,
+        expiry_timestamp: Option<u64>,
+    ) -> Result<JsonRpcRequest<SessionRequestParams>, Box<dyn std::error::Error>> {
+        Ok(JsonRpcRequest::new(
+            request_id,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "personal_sign".parse()?,
+                    params: json!(["0x68656c6c6f", "0x1111111111111111111111111111111111111111"]),
+                    expiry_timestamp,
+                },
+            },
+        ))
+    }
+
+    fn session_update_request(
+        request_id: u64,
+        namespaces: BTreeMap<NamespaceKey, SessionNamespace>,
+    ) -> JsonRpcRequest<SessionUpdateParams> {
+        JsonRpcRequest::new(
+            request_id,
+            SignMethod::SessionUpdate,
+            SessionUpdateParams { namespaces },
+        )
+    }
+
+    fn session_extend_request(
+        request_id: u64,
+        expiry: Option<u64>,
+    ) -> JsonRpcRequest<SessionExtendParams> {
+        JsonRpcRequest::new(
+            request_id,
+            SignMethod::SessionExtend,
+            SessionExtendParams { expiry },
+        )
+    }
+
+    fn test_namespaces()
+    -> Result<BTreeMap<NamespaceKey, SessionNamespace>, Box<dyn std::error::Error>> {
+        Ok(BTreeMap::from([(
+            NamespaceKey::parse("eip155")?,
+            SessionNamespace {
+                chains: Some(vec!["eip155:1".parse()?]),
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".parse()?],
+                methods: vec!["personal_sign".parse()?],
+                events: vec!["accountsChanged".parse()?],
+            },
+        )]))
     }
 
     fn assert_receive_timed_out(error: SingleSessionClientError) {

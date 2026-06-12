@@ -333,6 +333,9 @@ impl WalletCapabilities {
             .filter(|event| capability.events.contains(event))
             .cloned()
             .collect::<Vec<_>>();
+        if supported_methods.is_empty() && supported_events.is_empty() {
+            return;
+        }
 
         add_optional_approval(
             proposal_key,
@@ -509,6 +512,13 @@ pub enum ProposalPlanningError {
         scope: String,
         /// Unsupported property key within that scope.
         property: String,
+    },
+
+    /// Scoped property reduction requires object-shaped request and support values.
+    #[error("scoped property value for {scope} must be an object")]
+    UnsupportedScopedPropertyShape {
+        /// Top-level scoped property key.
+        scope: String,
     },
 }
 
@@ -693,15 +703,12 @@ fn plan_scoped_property_value(
     requested: &Value,
     supported: &Value,
 ) -> Result<Value, ProposalPlanningError> {
-    let (Value::Object(requested_properties), Value::Object(supported_properties)) =
-        (requested, supported)
-    else {
-        return Ok(supported.clone());
-    };
+    let requested = RequestedScopedPropertyValue::new(scope, requested)?;
+    let supported = SupportedScopedPropertyValue::new(scope, supported)?;
 
     let mut approved = serde_json::Map::new();
-    for (property, requested_value) in requested_properties {
-        if let Some(supported_value) = supported_properties.get(property) {
+    for (property, requested_value) in requested.properties() {
+        if let Some(supported_value) = supported.properties().get(property) {
             approved.insert(property.clone(), supported_value.clone());
         } else if !is_optional_property(requested_value) {
             return Err(ProposalPlanningError::UnsupportedScopedProperty {
@@ -712,9 +719,66 @@ fn plan_scoped_property_value(
     }
 
     if approved.is_empty() {
-        Ok(Value::Null)
+        Ok(ApprovedScopedPropertyValue::empty().into_value())
     } else {
-        Ok(Value::Object(approved))
+        Ok(ApprovedScopedPropertyValue::new(approved).into_value())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestedScopedPropertyValue<'a> {
+    properties: &'a serde_json::Map<String, Value>,
+}
+
+impl<'a> RequestedScopedPropertyValue<'a> {
+    fn new(scope: &str, value: &'a Value) -> Result<Self, ProposalPlanningError> {
+        match value {
+            Value::Object(properties) => Ok(Self { properties }),
+            _ => Err(ProposalPlanningError::UnsupportedScopedPropertyShape {
+                scope: scope.to_owned(),
+            }),
+        }
+    }
+
+    const fn properties(self) -> &'a serde_json::Map<String, Value> {
+        self.properties
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SupportedScopedPropertyValue<'a> {
+    properties: &'a serde_json::Map<String, Value>,
+}
+
+impl<'a> SupportedScopedPropertyValue<'a> {
+    fn new(scope: &str, value: &'a Value) -> Result<Self, ProposalPlanningError> {
+        match value {
+            Value::Object(properties) => Ok(Self { properties }),
+            _ => Err(ProposalPlanningError::UnsupportedScopedPropertyShape {
+                scope: scope.to_owned(),
+            }),
+        }
+    }
+
+    const fn properties(self) -> &'a serde_json::Map<String, Value> {
+        self.properties
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovedScopedPropertyValue(Value);
+
+impl ApprovedScopedPropertyValue {
+    const fn new(properties: serde_json::Map<String, Value>) -> Self {
+        Self(Value::Object(properties))
+    }
+
+    const fn empty() -> Self {
+        Self(Value::Null)
+    }
+
+    fn into_value(self) -> Value {
+        self.0
     }
 }
 

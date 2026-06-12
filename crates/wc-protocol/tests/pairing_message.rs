@@ -1,11 +1,14 @@
 //! Pairing-topic message decode/decrypt/classification tests.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use wc_protocol::{
     dto::pairing::PairingMethod,
     envelope::{Envelope, EnvelopeEncoding},
     pairing::PairingSymKey,
-    pairing_message::{PairingMessage, PairingMessageError, PairingMessageMethod},
+    pairing_message::{
+        EncryptedRelayEnvelope, PairingMessage, PairingMessageError, PairingMessageMethod,
+    },
     session::SignMethod,
 };
 
@@ -46,7 +49,8 @@ fn decrypts_and_classifies_session_proposal_on_pairing_topic() {
     let encoded = encrypted_message(&value, &sym_key);
 
     let message =
-        PairingMessage::decode_relay_message(&encoded, &sym_key).expect("message decrypts");
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&encoded), &sym_key)
+            .expect("message decrypts");
 
     assert_eq!(
         message.envelope_type(),
@@ -72,7 +76,8 @@ fn decrypts_and_classifies_pairing_ping_on_pairing_topic() {
     let encoded = encrypted_message(&value, &sym_key);
 
     let message =
-        PairingMessage::decode_relay_message(&encoded, &sym_key).expect("message decrypts");
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&encoded), &sym_key)
+            .expect("message decrypts");
 
     assert_eq!(
         message.method(),
@@ -90,13 +95,13 @@ fn preserves_unknown_and_missing_methods() {
     let missing = encrypted_message(&json!({"id": 4, "jsonrpc": "2.0", "params": {}}), &sym_key);
 
     assert_eq!(
-        PairingMessage::decode_relay_message(&unknown, &sym_key)
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&unknown), &sym_key)
             .expect("unknown method decrypts")
             .method(),
         &PairingMessageMethod::Unknown("wc_futureMethod".to_owned())
     );
     assert_eq!(
-        PairingMessage::decode_relay_message(&missing, &sym_key)
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&missing), &sym_key)
             .expect("missing method decrypts")
             .method(),
         &PairingMessageMethod::Missing
@@ -115,7 +120,28 @@ fn rejects_wrong_symmetric_key() {
     );
 
     assert!(matches!(
-        PairingMessage::decode_relay_message(&encoded, &wrong_key),
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&encoded), &wrong_key),
         Err(PairingMessageError::Envelope { .. })
+    ));
+}
+
+#[test]
+fn rejects_plaintext_type_two_on_encrypted_pairing_topic() {
+    let sym_key = test_key();
+    let plaintext = serde_json::to_string(&json!({
+        "id": 6,
+        "jsonrpc": "2.0",
+        "method": "wc_pairingPing",
+        "params": {}
+    }))
+    .expect("serializes fixture");
+    let mut envelope_bytes = Vec::with_capacity(plaintext.len() + 1);
+    envelope_bytes.push(2);
+    envelope_bytes.extend_from_slice(plaintext.as_bytes());
+    let encoded = STANDARD.encode(envelope_bytes);
+
+    assert!(matches!(
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&encoded), &sym_key),
+        Err(PairingMessageError::UnexpectedPlaintextEnvelope { .. })
     ));
 }

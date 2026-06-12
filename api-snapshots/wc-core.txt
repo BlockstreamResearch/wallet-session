@@ -85,6 +85,12 @@ enum wc_core::ProposalPlanningError
   variant NoSupportedNamespaces
   variant UnsupportedSessionProperty
   variant UnsupportedScopedProperty
+  variant UnsupportedScopedPropertyShape
+
+struct wc_core::RelayAuthSeed
+  const fn as_bytes
+  const fn into_bytes
+  const fn new
 
 struct wc_core::RelayReconnectConfig
 
@@ -316,6 +322,7 @@ enum wc_core::SingleSessionClientError
   variant ActiveSessionExists
   variant PairingSubscriptionMissing
   variant SessionMissing
+  variant ActiveSessionExpired
   variant SessionSettleResponseMissing
   variant SessionLifecycleResponseMissing
   variant SessionLifecycleRejected
@@ -328,6 +335,7 @@ enum wc_core::SingleSessionClientError
   variant SessionRequestReview
   variant SessionAuthenticateReview
   variant SessionAuthenticateExpired
+  variant SessionRequestExpired
   variant SessionAuthenticateSubscriptionMissing
   variant SessionRequestDecisionMissing
   variant SessionUpdateDecisionMissing
@@ -470,6 +478,11 @@ struct wc_core::low_level::PairingSubscription
   const fn sym_key
   const fn topic
   fn subscription_id
+
+struct wc_core::low_level::RelayAuthSeed
+  const fn as_bytes
+  const fn into_bytes
+  const fn new
 
 const wc_core::low_level::SESSION_AUTHENTICATE_REJECT_TAG
 

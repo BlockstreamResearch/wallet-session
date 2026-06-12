@@ -4,11 +4,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde::Serialize;
+use serde_json::{Value, json};
 use wc_protocol::{
     pairing::PairingSymKey,
     relay::{RelayAuthToken, RelayRpcId, RelayTopic},
     session::Cacao,
+    verify::VerifyAttestationHash,
 };
 
 pub const fn json_kind(value: &Value) -> &'static str {
@@ -29,10 +31,10 @@ pub fn print_cacao_summary(prefix: &str, index: usize, cacao: &Cacao) {
         index,
         cacao.h.kind.as_str(),
         cacao.s.kind.as_str(),
-        cacao.p.iss.as_str(),
-        cacao.p.iss.account_id_str(),
+        sensitive_str_for_log(cacao.p.iss.as_str()),
+        sensitive_str_for_log(cacao.p.iss.account_id_str()),
         cacao.p.iss.chain_id(),
-        cacao.p.iss.address(),
+        sensitive_str_for_log(cacao.p.iss.address()),
         cacao.p.domain,
         cacao.p.aud,
         cacao.p.resources.len()
@@ -103,6 +105,67 @@ pub fn pairing_uri_print_json() -> bool {
         env::var("WC_PAIRING_URI_PRINT_JSON").as_deref(),
         Ok("1" | "true" | "yes")
     )
+}
+
+pub fn log_decrypted_payloads() -> bool {
+    matches!(
+        env::var("WC_LOG_DECRYPTED_PAYLOADS").as_deref(),
+        Ok("1" | "true" | "yes")
+    )
+}
+
+pub fn sensitive_str_for_log(value: &str) -> String {
+    if log_decrypted_payloads() {
+        value.to_owned()
+    } else {
+        redact(value)
+    }
+}
+
+pub fn json_for_log(value: &Value) -> String {
+    if log_decrypted_payloads() {
+        value.to_string()
+    } else {
+        redacted_json_summary(value).to_string()
+    }
+}
+
+pub fn serialize_for_log<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(value) => json_for_log(&value),
+        Err(error) => format!(r#"{{"redacted":true,"type":"unserializable","error":"{error}"}}"#),
+    }
+}
+
+pub fn redacted_json_summary(value: &Value) -> Value {
+    let canonical = value.to_string();
+    let hash = VerifyAttestationHash::from_message(&canonical);
+    match value {
+        Value::Object(object) => json!({
+            "redacted": true,
+            "type": json_kind(value),
+            "keys": object.keys().cloned().collect::<Vec<_>>(),
+            "len": object.len(),
+            "hash": hash.as_str(),
+        }),
+        Value::Array(array) => json!({
+            "redacted": true,
+            "type": json_kind(value),
+            "len": array.len(),
+            "hash": hash.as_str(),
+        }),
+        Value::String(string) => json!({
+            "redacted": true,
+            "type": json_kind(value),
+            "len": string.len(),
+            "hash": hash.as_str(),
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => json!({
+            "redacted": true,
+            "type": json_kind(value),
+            "hash": hash.as_str(),
+        }),
+    }
 }
 
 pub fn redact(value: &str) -> String {

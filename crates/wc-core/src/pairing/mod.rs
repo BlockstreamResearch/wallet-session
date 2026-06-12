@@ -16,7 +16,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use client::{PairingClient, PairingClientConfig};
+pub use client::{PairingClient, PairingClientConfig, RelayAuthSeed};
 pub use error::PairingClientError;
 pub use types::{
     ApprovedSession, PairingPayload, PairingReceivedMessage, PairingSubscription,

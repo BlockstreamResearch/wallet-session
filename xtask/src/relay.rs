@@ -8,8 +8,9 @@ use std::{
 
 use crate::relay_socket::{RawRelaySocket, RelaySocket, SuppressedDelivery};
 use crate::util::{
-    client_auth_jwt, generated_sym_key, generated_topic, pairing_uri_print_json,
-    pairing_uri_wait_timeout, redact, rpc_id, unix_timestamp,
+    client_auth_jwt, generated_sym_key, generated_topic, json_for_log, log_decrypted_payloads,
+    pairing_uri_print_json, pairing_uri_wait_timeout, redact, rpc_id, sensitive_str_for_log,
+    serialize_for_log, unix_timestamp,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -35,7 +36,7 @@ use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding},
     key::{X25519KeyPair, derive_shared_sym_key, derive_topic_from_sym_key},
     pairing::{PairingSymKey, PairingUri},
-    pairing_message::{PairingMessage, PairingMessageMethod},
+    pairing_message::{EncryptedRelayEnvelope, PairingMessage, PairingMessageMethod},
     relay::{
         DEFAULT_RELAY_URL, IrnPublish, IrnSubscription, IrnSubscriptionData, IrnUnsubscribe,
         RelayConnectionUrl, RelayTopic, relay_auth_audience,
@@ -660,7 +661,10 @@ async fn run_core_js_reject_proposal_probe(config: &RelayProbeConfig) -> Result<
     if result.get("outcome").and_then(Value::as_str) != Some("approval_error") {
         bail!("expected JS approval_error result, got {result}");
     }
-    println!("core-js-reject-proposal js_result={result}");
+    println!(
+        "core-js-reject-proposal js_result={}",
+        json_for_log(&result)
+    );
     harness.terminate();
 
     Ok(())
@@ -707,7 +711,10 @@ async fn run_core_js_approve_proposal_probe(config: &RelayProbeConfig) -> Result
     if result.get("outcome").and_then(Value::as_str) != Some("approved") {
         bail!("expected JS approved result, got {result}");
     }
-    println!("core-js-approve-proposal js_result={result}");
+    println!(
+        "core-js-approve-proposal js_result={}",
+        json_for_log(&result)
+    );
 
     let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
     println!("core-pairing-approve unsubscribe_ack={unsubscribe_result}");
@@ -737,7 +744,10 @@ async fn run_core_js_pairing_lifecycle_probe(config: &RelayProbeConfig) -> Resul
                 "core-js-pairing-lifecycle pairing_ping_response_ack={ack} response_tag={PAIRING_PING_RESPONSE_TAG}"
             );
             let result = harness.expect_result(action.expected_result()).await?;
-            println!("core-js-pairing-lifecycle js_result={result}");
+            println!(
+                "core-js-pairing-lifecycle js_result={}",
+                json_for_log(&result)
+            );
             let unsubscribe_result = client.unsubscribe_pairing(&subscription).await?;
             println!("core-js-pairing-lifecycle unsubscribe_ack={unsubscribe_result}");
         }
@@ -747,7 +757,10 @@ async fn run_core_js_pairing_lifecycle_probe(config: &RelayProbeConfig) -> Resul
                 "core-js-pairing-lifecycle delete_cleanup_unsubscribe_ack={unsubscribe_result}"
             );
             let result = harness.expect_result(action.expected_result()).await?;
-            println!("core-js-pairing-lifecycle js_result={result}");
+            println!(
+                "core-js-pairing-lifecycle js_result={}",
+                json_for_log(&result)
+            );
         }
     }
 
@@ -896,7 +909,10 @@ async fn run_core_js_session_request_probe(config: &RelayProbeConfig) -> Result<
         )
         .await?;
         let result = harness.expect_result("approved").await?;
-        println!("core-js-session-request js_result={result}");
+        println!(
+            "core-js-session-request js_result={}",
+            json_for_log(&result)
+        );
     } else {
         run_core_valid_session_request_probe(
             &mut client,
@@ -985,7 +1001,10 @@ async fn run_core_single_session_client_session_request_probe(
         _ => unreachable!("validated response mode"),
     };
     let result = harness.expect_result(expected_outcome).await?;
-    println!("core-single-session-client-session-request js_result={result}");
+    println!(
+        "core-single-session-client-session-request js_result={}",
+        json_for_log(&result)
+    );
     harness.terminate();
 
     Ok(())
@@ -1153,7 +1172,10 @@ async fn run_core_single_session_client_session_authenticate_probe(
     if let Some(topic) = adopted_session_topic {
         validate_authenticate_response_session(&result, &topic)?;
     }
-    println!("core-single-session-client-session-authenticate js_result={result}");
+    println!(
+        "core-single-session-client-session-authenticate js_result={}",
+        json_for_log(&result)
+    );
     harness.terminate();
 
     Ok(())
@@ -1214,7 +1236,10 @@ async fn run_core_single_session_client_disconnect_probe(config: &RelayProbeConf
     );
 
     let result = harness.expect_result("session_delete_received").await?;
-    println!("core-single-session-client-disconnect js_result={result}");
+    println!(
+        "core-single-session-client-disconnect js_result={}",
+        json_for_log(&result)
+    );
     harness.terminate();
 
     Ok(())
@@ -1268,7 +1293,10 @@ async fn run_core_single_session_client_session_lifecycle_probe(
     run_core_single_session_client_session_lifecycle_action(&mut client, action, &session).await?;
 
     let result = harness.expect_result(action.expected_outcome()).await?;
-    println!("core-single-session-client-session-lifecycle js_result={result}");
+    println!(
+        "core-single-session-client-session-lifecycle js_result={}",
+        json_for_log(&result)
+    );
     harness.terminate();
 
     Ok(())
@@ -1556,7 +1584,10 @@ async fn run_core_valid_session_request_probe(
         _ => unreachable!("validated response mode"),
     };
     let result = harness.expect_result(expected_outcome).await?;
-    println!("core-js-session-request js_result={result}");
+    println!(
+        "core-js-session-request js_result={}",
+        json_for_log(&result)
+    );
 
     Ok(())
 }
@@ -1572,7 +1603,10 @@ async fn run_core_js_session_lifecycle_probe(config: &RelayProbeConfig) -> Resul
         .await?;
 
     let result = harness.expect_result(action.expected_outcome()).await?;
-    println!("core-js-session-lifecycle js_result={result}");
+    println!(
+        "core-js-session-lifecycle js_result={}",
+        json_for_log(&result)
+    );
 
     let unsubscribe_result = client.unsubscribe_pairing(&pairing_subscription).await?;
     println!("core-js-session-lifecycle pairing_unsubscribe_ack={unsubscribe_result}");
@@ -2347,11 +2381,50 @@ fn print_ignored_session_request_rejection(rejection: &SessionRequestRejection) 
 
 fn print_ignored_session_message(message: &SessionReceivedMessage) {
     println!(
-        "core-js-session-request ignored_session_message tag_present={} tag={} payload={:?}",
+        "core-js-session-request ignored_session_message tag_present={} tag={} payload={}",
         message.tag().is_some(),
         message.tag().unwrap_or_default(),
-        message.payload()
+        session_payload_for_log(message.payload())
     );
+}
+
+fn session_payload_for_log(payload: &SessionPayload) -> String {
+    match payload {
+        SessionPayload::SessionRequest(request) => format!(
+            "session_request id={} chain_id={} method={} params={}",
+            request.id,
+            request.params.chain_id,
+            request.params.request.method,
+            json_for_log(&request.params.request.params)
+        ),
+        SessionPayload::SessionUpdate(request) => format!(
+            "session_update id={} namespaces={}",
+            request.id,
+            request.params.namespaces.len()
+        ),
+        SessionPayload::SessionExtend(request) => format!(
+            "session_extend id={} params={}",
+            request.id,
+            serialize_for_log(&request.params)
+        ),
+        SessionPayload::SessionEvent(request) => format!(
+            "session_event id={} chain_id={} event_name={} data={}",
+            request.id,
+            request.params.chain_id,
+            request.params.event.name,
+            json_for_log(&request.params.event.data)
+        ),
+        SessionPayload::SessionPing(request) => {
+            format!("session_ping id={} params=empty", request.id)
+        }
+        SessionPayload::SessionDelete(request) => format!(
+            "session_delete id={} code={} message={}",
+            request.id, request.params.code, request.params.message
+        ),
+        SessionPayload::Sign(method) => format!("sign_request method={method}"),
+        SessionPayload::Unknown(method) => format!("unknown_request method={method}"),
+        SessionPayload::Missing => "missing_method=true".to_owned(),
+    }
 }
 
 fn print_session_request_review(review: &SessionRequestReview) {
@@ -2369,13 +2442,13 @@ fn print_session_request_review(review: &SessionRequestReview) {
         review.verify_context().verified.origin.as_str(),
         review.verify_context().verified.validation.as_str(),
         review.verify_risk(),
-        review.params()
+        json_for_log(review.params())
     );
     match review.wallet_call_request() {
         Ok(Some(WalletCallRequest::GetCapabilities(params))) => {
             println!(
                 "core-single-session-client-session-request wallet_call method=wallet_getCapabilities address={} chains={}",
-                params.0,
+                sensitive_str_for_log(&params.0),
                 params
                     .1
                     .as_ref()
@@ -2384,9 +2457,13 @@ fn print_session_request_review(review: &SessionRequestReview) {
         }
         Ok(Some(WalletCallRequest::SendCalls(params))) => {
             println!(
-                "core-single-session-client-session-request wallet_call method=wallet_sendCalls chain_id={} from={:?} atomic_required={} calls={}",
+                "core-single-session-client-session-request wallet_call method=wallet_sendCalls chain_id={} from={} atomic_required={} calls={}",
                 params.0.chain_id,
-                params.0.from,
+                params
+                    .0
+                    .from
+                    .as_deref()
+                    .map_or_else(|| "<none>".to_owned(), sensitive_str_for_log),
                 params.0.atomic_required,
                 params.0.calls.len()
             );
@@ -2598,7 +2675,8 @@ fn signed_auth_cacao_from_review(review: &SessionAuthenticateReview) -> Result<C
         .context("auth signing harness returned invalid JSON")?;
     println!(
         "core-single-session-client-session-authenticate signed_cacao address={} iss={}",
-        signed.address, signed.iss
+        sensitive_str_for_log(&signed.address),
+        sensitive_str_for_log(&signed.iss)
     );
     Ok(signed.cacao)
 }
@@ -2966,7 +3044,7 @@ fn print_session_message(label: &str, message: &SessionReceivedMessage) {
             request.id,
             request.params.chain_id,
             request.params.request.method,
-            request.params.request.params
+            json_for_log(&request.params.request.params)
         ),
         SessionPayload::SessionUpdate(request) => println!(
             "{label} session_update id={} namespaces={}",
@@ -2975,8 +3053,9 @@ fn print_session_message(label: &str, message: &SessionReceivedMessage) {
         ),
         SessionPayload::SessionExtend(request) => {
             println!(
-                "{label} session_extend id={} params={:?}",
-                request.id, request.params
+                "{label} session_extend id={} params={}",
+                request.id,
+                serialize_for_log(&request.params)
             );
         }
         SessionPayload::SessionEvent(request) => {
@@ -2985,7 +3064,7 @@ fn print_session_message(label: &str, message: &SessionReceivedMessage) {
                 request.id,
                 request.params.chain_id,
                 request.params.event.name,
-                request.params.event.data
+                json_for_log(&request.params.event.data)
             );
         }
         SessionPayload::SessionPing(request) => {
@@ -3232,8 +3311,9 @@ fn print_pairing_payload_metadata(
     data: &IrnSubscriptionData,
     sym_key: &PairingSymKey,
 ) -> Result<()> {
-    let payload = PairingMessage::decode_relay_message(&data.message, sym_key)
-        .with_context(|| format!("{label} failed to decode pairing message"))?;
+    let payload =
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&data.message), sym_key)
+            .with_context(|| format!("{label} failed to decode pairing message"))?;
 
     println!(
         "{label} envelope_type={:?} decrypted_len={} jsonrpc={} id={} method={} params_keys={}",
@@ -3267,7 +3347,7 @@ fn print_pairing_payload_metadata(
         }
     }
 
-    if pairing_uri_print_json() {
+    if pairing_uri_print_json() && log_decrypted_payloads() {
         let pretty = serde_json::to_string_pretty(payload.json())
             .with_context(|| format!("{label} failed to format decrypted JSON"))?;
         println!("{label} decrypted_json=\n{pretty}");
@@ -3345,7 +3425,7 @@ fn print_core_pairing_payload_metadata(
         }
     }
 
-    if pairing_uri_print_json() {
+    if pairing_uri_print_json() && log_decrypted_payloads() {
         let pretty = serde_json::to_string_pretty(payload.json())
             .with_context(|| format!("{label} failed to format decrypted JSON"))?;
         println!("{label} decrypted_json=\n{pretty}");

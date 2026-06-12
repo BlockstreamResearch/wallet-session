@@ -74,6 +74,19 @@ fn config_builds_authenticated_relay_url() -> Result<(), Box<dyn std::error::Err
 }
 
 #[test]
+fn pairing_client_config_debug_redacts_auth_seed() {
+    let seed = RelayAuthSeed::new([7; 32]);
+    let config = PairingClientConfig::new("project", seed, "subject");
+
+    let seed_debug = format!("{seed:?}");
+    let config_debug = format!("{config:?}");
+
+    assert_eq!(seed_debug, "RelayAuthSeed(<redacted>)");
+    assert!(config_debug.contains("RelayAuthSeed(<redacted>)"));
+    assert!(!config_debug.contains("[7, 7"));
+}
+
+#[test]
 fn validates_pairing_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let pairing = PairingUri::parse(PAIRING_URI)?;
 
@@ -1071,7 +1084,9 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
         verify_attestation_jwt: Some("relay-verify-jwt".to_owned()),
         verify_encrypted_id: Some("relay-encrypted-id".to_owned()),
         message: PairingMessage::decode_relay_message(
-            &envelope.encode(EnvelopeEncoding::Base64),
+            wc_protocol::pairing_message::EncryptedRelayEnvelope::new(
+                &envelope.encode(EnvelopeEncoding::Base64),
+            ),
             &sym_key,
         )?,
         payload: PairingPayload::SessionProposal(Box::new(request)),
@@ -1119,7 +1134,9 @@ fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::
         verify_attestation_jwt: Some("relay-verify-jwt".to_owned()),
         verify_encrypted_id: Some("relay-encrypted-id".to_owned()),
         message: PairingMessage::decode_relay_message(
-            &envelope.encode(EnvelopeEncoding::Base64),
+            wc_protocol::pairing_message::EncryptedRelayEnvelope::new(
+                &envelope.encode(EnvelopeEncoding::Base64),
+            ),
             &sym_key,
         )?,
         payload: PairingPayload::SessionAuthenticate(Box::new(request)),

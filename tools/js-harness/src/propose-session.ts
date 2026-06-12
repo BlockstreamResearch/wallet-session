@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { SignClient } from "@walletconnect/sign-client";
 
 const projectId = process.env.REOWN_PROJECT_ID ?? process.env.WALLETCONNECT_PROJECT_ID;
@@ -16,6 +17,24 @@ const sessionRequestHoldMs = Number.parseInt(
 const uriFile = process.env.WC_JS_URI_FILE;
 const resultFile = process.env.WC_JS_RESULT_FILE;
 const printUri = process.env.WC_JS_PRINT_URI === "1";
+const logDecryptedPayloads = matchesEnvFlag(process.env.WC_JS_LOG_DECRYPTED_PAYLOADS);
+const sensitiveKeys = new Set([
+  "accounts",
+  "address",
+  "auths",
+  "authentication",
+  "cacao",
+  "cacaos",
+  "data",
+  "iss",
+  "namespaces",
+  "params",
+  "request",
+  "result",
+  "s",
+  "signature",
+  "signatures",
+]);
 const sendSessionRequest = process.env.WC_JS_SEND_SESSION_REQUEST === "1";
 const afterApprovalAction =
   process.env.WC_JS_AFTER_APPROVAL_ACTION ?? (sendSessionRequest ? "session_request" : "approved");
@@ -213,7 +232,7 @@ async function writeResult(result: Record<string, unknown>): Promise<void> {
     return;
   }
 
-  await Bun.write(resultFile, `${JSON.stringify(result)}\n`);
+  await Bun.write(resultFile, `${JSON.stringify(valueForLog(result))}\n`);
 }
 
 async function startSessionPing(topic: string): Promise<void> {
@@ -459,13 +478,13 @@ async function startSessionRequest(topic: string): Promise<void> {
     const response = await Promise.race([
       request.then(
         (result) => {
-          console.error(`js-harness session_request_response=${JSON.stringify(result)}`);
+          console.error(`js-harness session_request_response=${stringifyForLog(result)}`);
           return {
             outcome: "session_request_response",
             topic,
             chainId,
             method,
-            result: JSON.stringify(result),
+            result,
           };
         },
         (error) => {
@@ -493,13 +512,13 @@ async function startSessionRequest(topic: string): Promise<void> {
 
   void request
     .then(async (result) => {
-      console.error(`js-harness session_request_response=${JSON.stringify(result)}`);
+      console.error(`js-harness session_request_response=${stringifyForLog(result)}`);
       await writeResult({
         outcome: "session_request_response",
         topic,
         chainId,
         method,
-        result: JSON.stringify(result),
+        result,
       });
     })
     .catch(async (error) => {
@@ -646,9 +665,90 @@ function stringifyId(id: number | bigint): string {
 }
 
 function stringifyForLog(value: unknown): string {
-  return JSON.stringify(value, (_key, item) =>
-    typeof item === "bigint" ? item.toString() : item,
-  );
+  return JSON.stringify(valueForLog(value));
+}
+
+function valueForLog(value: unknown): unknown {
+  const normalized = normalizeJson(value);
+  return logDecryptedPayloads ? normalized : redactHarnessValue(normalized);
+}
+
+function redactHarnessValue(value: unknown, key?: string): unknown {
+  if (key && sensitiveKeys.has(key)) {
+    return redactedSummary(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redactHarnessValue(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        redactHarnessValue(entryValue, entryKey),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function redactedSummary(value: unknown): Record<string, unknown> {
+  const normalized = normalizeJson(value);
+  const text = JSON.stringify(normalized);
+  const summary: Record<string, unknown> = {
+    redacted: true,
+    type: valueKind(normalized),
+    hash: createHash("sha256").update(text).digest("hex"),
+  };
+
+  if (typeof normalized === "string") {
+    summary.len = normalized.length;
+  } else if (Array.isArray(normalized)) {
+    summary.len = normalized.length;
+  } else if (normalized && typeof normalized === "object") {
+    const keys = Object.keys(normalized as Record<string, unknown>);
+    summary.keys = keys;
+    summary.len = keys.length;
+  }
+
+  return summary;
+}
+
+function normalizeJson(value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeJson(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        normalizeJson(entryValue),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function valueKind(value: unknown): string {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  return typeof value;
+}
+
+function matchesEnvFlag(value: string | undefined): boolean {
+  return value === "1" || value === "true" || value === "yes";
 }
 
 function sessionRequestParams(): unknown {
@@ -674,14 +774,22 @@ function sessionEventData(): unknown {
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) {
-    return error.message;
+    return stringForLog(error.message);
   }
 
   if (typeof error === "object" && error !== null) {
-    return JSON.stringify(error);
+    return stringifyForLog(error);
   }
 
-  return String(error);
+  return stringForLog(String(error));
+}
+
+function stringForLog(value: string): string {
+  try {
+    return stringifyForLog(JSON.parse(value) as unknown);
+  } catch {
+    return value;
+  }
 }
 
 function sleep(milliseconds: number): Promise<void> {

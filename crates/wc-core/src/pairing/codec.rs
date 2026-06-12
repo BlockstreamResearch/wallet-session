@@ -3,7 +3,7 @@ use wc_protocol::{
     envelope::{Envelope, EnvelopeEncoding},
     namespaces::{is_chain_authorized, is_event_authorized, is_method_authorized},
     pairing::PairingSymKey,
-    pairing_message::{PairingMessage, PairingMessageMethod},
+    pairing_message::{EncryptedRelayEnvelope, PairingMessage, PairingMessageMethod},
     relay::{IrnSubscriptionData, RelayTopic},
     session::{
         JsonRpcErrorResponse, Session, SessionAckResponse, SessionSettleResponse, SignMethod,
@@ -31,8 +31,9 @@ pub(super) fn decode_subscription_data(
     let encoded_message_len = data.message.len();
     let verify_attestation_jwt = data.attestation;
     let verify_encrypted_id = data.encrypted_id;
-    let message = PairingMessage::decode_relay_message(&data.message, sym_key)
-        .map_err(|source| PairingClientError::PairingMessage { source })?;
+    let message =
+        PairingMessage::decode_relay_message(EncryptedRelayEnvelope::new(&data.message), sym_key)
+            .map_err(|source| PairingClientError::PairingMessage { source })?;
     let payload = parse_pairing_payload(&message)?;
 
     Ok(PairingReceivedMessage {
