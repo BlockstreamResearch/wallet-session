@@ -51,9 +51,9 @@ cargo +nightly fuzz run pairing_uri
 
 The first target set is intentionally byte-oriented. It covers pairing URIs,
 identifiers, envelope decoding, Sign/Pairing JSON-RPC DTOs, AppKit-style Wallet
-Call request shapes, namespace validation, CACAO auth payload/message
-validation, Verify context/JWT/public-key DTOs, and single-session runtime
-state.
+Call request shapes, wallet-facing auth/request review helpers, namespace
+validation, CACAO auth payload/message validation, Verify context/JWT/public-key
+DTOs, and single-session runtime state.
 
 The `single_session_state` target uses `wc-core`'s non-default `testkit`
 feature. It does not duplicate the one-shot model inside the fuzzer; it calls
@@ -83,6 +83,9 @@ The `session_json_rpc` corpus includes sanitized Sign request variants for:
 
 - session proposal metadata and namespace shapes;
 - AppKit link-mode proposal redirect metadata;
+- `wc_sessionAuthenticate` CAIP-122 auth payload and Recap resource review;
+- common EVM signing review methods such as `personal_sign` and
+  `eth_signTypedData_v4`;
 - Wallet Call request methods observed through live scenarios.
 
 The `verify` corpus includes sanitized live/fixture variants for:

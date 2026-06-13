@@ -2,10 +2,13 @@
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
+use wc_core::{SessionAuthenticateReview, SessionRequestReview};
 use wc_protocol::{
+    caip::Caip10AccountId,
     dto::pairing::{
         PairingDeleteParams, PairingJsonRpcRequest, PairingJsonRpcResponse, PairingPingParams,
     },
+    relay::RelayTopic,
     session::{
         JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, SessionAuthenticateParams,
         SessionAuthenticateResult, SessionDeleteParams, SessionEventParams, SessionExtendParams,
@@ -32,10 +35,16 @@ fuzz_target!(|data: &[u8]| {
 
 fn parse_sign_requests(value: &Value) {
     let _ = serde_json::from_value::<JsonRpcRequest<SessionProposeParams>>(value.clone());
-    let _ = serde_json::from_value::<JsonRpcRequest<SessionAuthenticateParams>>(value.clone());
-    let request = serde_json::from_value::<JsonRpcRequest<SessionRequestParams>>(value.clone());
-    if let Ok(request) = request {
+    let auth_request =
+        serde_json::from_value::<JsonRpcRequest<SessionAuthenticateParams>>(value.clone());
+    if let Ok(request) = auth_request {
+        exercise_authenticate_review(&request);
+    }
+    let session_request =
+        serde_json::from_value::<JsonRpcRequest<SessionRequestParams>>(value.clone());
+    if let Ok(request) = session_request {
         let _ = WalletCallRequest::from_session_request(&request.params.request);
+        exercise_session_request_review(&request);
     }
     let _ = serde_json::from_value::<JsonRpcRequest<SessionSettleParams>>(value.clone());
     let _ = serde_json::from_value::<JsonRpcRequest<SessionUpdateParams>>(value.clone());
@@ -56,4 +65,53 @@ fn parse_pairing_messages(value: &Value) {
     let _ = serde_json::from_value::<PairingJsonRpcRequest<PairingPingParams>>(value.clone());
     let _ = serde_json::from_value::<PairingJsonRpcRequest<PairingDeleteParams>>(value.clone());
     let _ = serde_json::from_value::<PairingJsonRpcResponse<bool>>(value.clone());
+}
+
+fn exercise_authenticate_review(request: &JsonRpcRequest<SessionAuthenticateParams>) {
+    let Ok(review) = SessionAuthenticateReview::from_request(fuzz_topic(), 0, request) else {
+        return;
+    };
+
+    let payload = review.auth_payload_review();
+    let _ = payload.chains();
+    let _ = payload.audience();
+    let _ = payload.domain();
+    let _ = payload.nonce();
+    let _ = payload.statement();
+    let _ = payload.resources();
+    let _ = payload.recap_resources();
+
+    for account in fuzz_accounts() {
+        let account_review = review.account_review(account);
+        let _ = account_review.status();
+        let _ = account_review.is_requested_chain();
+    }
+}
+
+fn exercise_session_request_review(request: &JsonRpcRequest<SessionRequestParams>) {
+    let Ok(review) = SessionRequestReview::from_request(fuzz_topic(), 0, request) else {
+        return;
+    };
+
+    let review = review.with_authorized_accounts(fuzz_accounts());
+    let _ = review.method_review();
+    let _ = review.signing_request_review();
+    let _ = review.transaction_request_review();
+    let _ = review.wallet_call_review();
+    let _ = review.wallet_call_request();
+}
+
+fn fuzz_topic() -> RelayTopic {
+    RelayTopic::from_bytes([0x42; 32])
+}
+
+fn fuzz_accounts() -> Vec<Caip10AccountId> {
+    vec![
+        "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"
+            .parse()
+            .expect("valid fuzz EIP-155 account"),
+        "eip155:137:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"
+            .parse()
+            .expect("valid fuzz Polygon account"),
+    ]
 }
