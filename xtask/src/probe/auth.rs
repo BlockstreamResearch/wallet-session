@@ -5,7 +5,10 @@ use wc_protocol::session::{
     SessionAuthenticateResult,
 };
 
-use crate::{cli::JsonProbeInput, util::print_cacao_summary};
+use crate::{
+    cli::JsonProbeInput,
+    util::{print_cacao_summary, sensitive_str_for_log},
+};
 
 pub fn run(input: JsonProbeInput) -> Result<()> {
     let json = match input {
@@ -30,18 +33,20 @@ pub fn run(input: JsonProbeInput) -> Result<()> {
         println!(
             "auth-probe authenticate_request id={} requester={} expiry={} chains=[{}] domain={} aud={} resources={}",
             request.id,
-            request.params.requester.metadata.name,
+            sensitive_str_for_log(&request.params.requester.metadata.name),
             request.params.expiry_timestamp,
-            request
-                .params
-                .auth_payload
-                .chains
-                .iter()
-                .map(wc_protocol::caip::Caip2ChainId::as_str)
-                .collect::<Vec<_>>()
-                .join(","),
-            request.params.auth_payload.domain,
-            request.params.auth_payload.aud,
+            sensitive_str_for_log(
+                &request
+                    .params
+                    .auth_payload
+                    .chains
+                    .iter()
+                    .map(wc_protocol::caip::Caip2ChainId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            sensitive_str_for_log(&request.params.auth_payload.domain),
+            sensitive_str_for_log(&request.params.auth_payload.aud),
             request.params.auth_payload.resources.len()
         );
         return Ok(());
@@ -58,7 +63,7 @@ pub fn run(input: JsonProbeInput) -> Result<()> {
         println!(
             "auth-probe authenticate_result id={} responder={} cacaos={}",
             response.id,
-            response.result.responder.metadata.name,
+            sensitive_str_for_log(&response.result.responder.metadata.name),
             response.result.cacaos.len()
         );
         for (index, cacao) in response.result.cacaos.iter().enumerate() {

@@ -13,7 +13,7 @@ use wc_protocol::session::{
 
 use crate::{
     cli::JsonProbeInput,
-    util::{json_kind, print_cacao_summary, unix_timestamp},
+    util::{json_kind, print_cacao_summary, sensitive_str_for_log, unix_timestamp},
 };
 
 pub fn run(input: JsonProbeInput) -> Result<()> {
@@ -165,7 +165,7 @@ fn session_probe_authenticate_result(index: usize, value: &Value) -> Result<()> 
     println!(
         "session-probe item={index} authenticate_result id={} responder={} cacaos={}",
         response.id,
-        response.result.responder.metadata.name,
+        sensitive_str_for_log(&response.result.responder.metadata.name),
         response.result.cacaos.len()
     );
     for (cacao_index, cacao) in response.result.cacaos.iter().enumerate() {
@@ -345,19 +345,21 @@ fn print_session_authenticate_request(index: usize, value: &Value) -> Result<()>
         "session-probe item={index} request method={} id={} requester={} expiry={} expired_now={} chains=[{}] domain={} aud={} resources={}",
         request.method,
         request.id,
-        request.params.requester.metadata.name,
+        sensitive_str_for_log(&request.params.requester.metadata.name),
         request.params.expiry_timestamp,
         request.params.is_expired_at(unix_timestamp()),
-        request
-            .params
-            .auth_payload
-            .chains
-            .iter()
-            .map(wc_protocol::caip::Caip2ChainId::as_str)
-            .collect::<Vec<_>>()
-            .join(","),
-        request.params.auth_payload.domain,
-        request.params.auth_payload.aud,
+        sensitive_str_for_log(
+            &request
+                .params
+                .auth_payload
+                .chains
+                .iter()
+                .map(wc_protocol::caip::Caip2ChainId::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        sensitive_str_for_log(&request.params.auth_payload.domain),
+        sensitive_str_for_log(&request.params.auth_payload.aud),
         request.params.auth_payload.resources.len()
     );
     Ok(())

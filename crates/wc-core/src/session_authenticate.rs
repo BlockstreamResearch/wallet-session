@@ -1,6 +1,9 @@
 //! Session-authentication review primitives.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde_json::Value;
 use wc_protocol::{
@@ -71,7 +74,7 @@ use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 /// assert!(!review.is_expired_at(4_000_000_000));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionAuthenticateReview {
     topic: RelayTopic,
     request_id: u64,
@@ -84,6 +87,38 @@ pub struct SessionAuthenticateReview {
     verify_attestation_jwt: Option<String>,
     verify_encrypted_id: Option<String>,
     redirect: WalletRedirectReview,
+}
+
+impl fmt::Debug for SessionAuthenticateReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAuthenticateReview")
+            .field("topic", &self.topic)
+            .field("request_id", &self.request_id)
+            .field(
+                "requester",
+                &RedactedMetadataDebug(&self.requester.metadata),
+            )
+            .field("auth_payload", &AuthPayloadDebug(&self.auth_payload))
+            .field("expiry_timestamp", &self.expiry_timestamp)
+            .field("published_at", &self.published_at)
+            .field("verify_context", &self.verify_context)
+            .field("verify_risk", &self.verify_risk())
+            .field("verify_attestation_hash", &self.verify_attestation_hash)
+            .field(
+                "verify_attestation_jwt",
+                &self
+                    .verify_attestation_jwt
+                    .as_deref()
+                    .map(SensitiveStrDebug),
+            )
+            .field(
+                "verify_encrypted_id",
+                &self.verify_encrypted_id.as_deref().map(SensitiveStrDebug),
+            )
+            .field("redirect", &self.redirect)
+            .finish()
+    }
 }
 
 impl SessionAuthenticateReview {
@@ -535,11 +570,28 @@ impl SessionAuthenticateAccountReview {
 /// > Build the authentication object(s)
 /// > ...
 /// > auths: \[auth],
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionAuthenticateApproval {
     wallet_metadata: DappMetadata,
     cacaos: Vec<Cacao>,
     session_namespaces: Option<SessionNamespaces>,
+}
+
+impl fmt::Debug for SessionAuthenticateApproval {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAuthenticateApproval")
+            .field(
+                "wallet_metadata",
+                &RedactedMetadataDebug(&self.wallet_metadata),
+            )
+            .field("cacao_count", &self.cacaos.len())
+            .field(
+                "session_namespace_count",
+                &self.session_namespaces.as_ref().map(BTreeMap::len),
+            )
+            .finish()
+    }
 }
 
 impl SessionAuthenticateApproval {
@@ -1122,6 +1174,59 @@ fn is_default_auth_session_event(event: &SessionEventName) -> bool {
     matches!(event.as_str(), "chainChanged" | "accountsChanged")
 }
 
+struct AuthPayloadDebug<'a>(&'a AuthPayload);
+
+impl fmt::Debug for AuthPayloadDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthPayload")
+            .field("kind", &self.0.kind)
+            .field("chain_count", &self.0.chains.len())
+            .field("aud", &SensitiveStrDebug(&self.0.aud))
+            .field("domain", &SensitiveStrDebug(&self.0.domain))
+            .field("version", &self.0.version)
+            .field("nonce", &SensitiveStrDebug(&self.0.nonce))
+            .field("iat", &SensitiveStrDebug(&self.0.iat))
+            .field("has_statement", &self.0.statement.is_some())
+            .field("has_exp", &self.0.exp.is_some())
+            .field("has_nbf", &self.0.nbf.is_some())
+            .field("has_request_id", &self.0.request_id.is_some())
+            .field("resource_count", &self.0.resources.len())
+            .finish()
+    }
+}
+
+struct RedactedMetadataDebug<'a>(&'a DappMetadata);
+
+impl fmt::Debug for RedactedMetadataDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DappMetadata")
+            .field("name", &SensitiveStrDebug(&self.0.name))
+            .field("description", &SensitiveStrDebug(&self.0.description))
+            .field("url", &SensitiveStrDebug(&self.0.url))
+            .field("icon_count", &self.0.icons.len())
+            .field(
+                "verify_url",
+                &self.0.verify_url.as_deref().map(SensitiveStrDebug),
+            )
+            .field("has_redirect", &self.0.redirect.is_some())
+            .finish()
+    }
+}
+
+struct SensitiveStrDebug<'a>(&'a str);
+
+impl fmt::Debug for SensitiveStrDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SensitiveStr")
+            .field("len", &self.0.len())
+            .field("hash", &VerifyAttestationHash::from_message(self.0))
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1166,6 +1271,29 @@ mod tests {
         assert!(review.verify_jwt_attestation().is_none());
         assert_eq!(review.verify_risk(), VerifyContextRisk::Unknown);
         assert!(review.is_expired_at(4_102_444_800));
+
+        Ok(())
+    }
+
+    #[test]
+    fn debug_redacts_authenticate_review_and_approval() -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        let review = SessionAuthenticateReview::from_request(
+            RelayTopic::from_bytes([3; 32]),
+            1_779_954_250_000,
+            &request,
+        )?;
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![cacao()?])?;
+
+        let review_debug = format!("{review:?}");
+        let approval_debug = format!("{approval:?}");
+        for debug in [&review_debug, &approval_debug] {
+            assert!(!debug.contains("example.com"));
+            assert!(!debug.contains("https://example.com/login"));
+            assert!(!debug.contains("1234567890"));
+            assert!(!debug.contains("0x00"));
+            assert!(debug.contains("hash"));
+        }
 
         Ok(())
     }

@@ -35,8 +35,8 @@ pub fn print_cacao_summary(prefix: &str, index: usize, cacao: &Cacao) {
         sensitive_str_for_log(cacao.p.iss.account_id_str()),
         cacao.p.iss.chain_id(),
         sensitive_str_for_log(cacao.p.iss.address()),
-        cacao.p.domain,
-        cacao.p.aud,
+        sensitive_str_for_log(&cacao.p.domain),
+        sensitive_str_for_log(&cacao.p.aud),
         cacao.p.resources.len()
     );
 }

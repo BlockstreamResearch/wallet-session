@@ -23,10 +23,15 @@ const sensitiveKeys = new Set([
   "cacaos",
   "data",
   "iss",
+  "metadata",
   "namespaces",
   "params",
+  "peer",
+  "publicKey",
   "request",
+  "responder",
   "s",
+  "self",
   "signature",
   "signatures",
 ]);
@@ -84,7 +89,7 @@ try {
   const result = await Promise.race([response(), timeoutPromise]);
 
   if (result) {
-    console.error(`js-harness authenticate_response=${stringifyForLog(result)}`);
+    console.error(`js-harness authenticate_response=${JSON.stringify(authenticateResultSummary(result))}`);
     await writeResult({
       outcome: "authenticate_response",
       result,

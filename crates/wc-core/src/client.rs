@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    fmt,
     num::NonZeroUsize,
     time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
@@ -1884,13 +1885,37 @@ fn remember_queued_approval_verify_context(
 }
 
 /// Session proposal retained for approval or rejection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SingleSessionProposal {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionProposeParams>,
     verify_context: VerifyContext,
     redirect: WalletRedirectReview,
     message: PairingReceivedMessage,
+}
+
+impl fmt::Debug for SingleSessionProposal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SingleSessionProposal")
+            .field("pairing_topic", &self.pairing_topic)
+            .field("proposal_id", &self.proposal_id())
+            .field("expiry_timestamp", &self.expiry_timestamp())
+            .field("verify_context", &self.verify_context)
+            .field("verify_risk", &self.verify_risk())
+            .field("redirect", &self.redirect)
+            .field(
+                "required_namespace_count",
+                &self.request.params.required_namespaces.len(),
+            )
+            .field(
+                "optional_namespace_count",
+                &self.request.params.optional_namespaces.len(),
+            )
+            .field("auth_request_count", &self.authentication_requests().len())
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 impl SingleSessionProposal {
@@ -2084,13 +2109,36 @@ impl SingleSessionProposal {
 }
 
 /// Session-authenticate request retained for review or rejection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SingleSessionAuthenticate {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionAuthenticateParams>,
     verify_context: VerifyContext,
     redirect: WalletRedirectReview,
     message: PairingReceivedMessage,
+}
+
+impl fmt::Debug for SingleSessionAuthenticate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SingleSessionAuthenticate")
+            .field("pairing_topic", &self.pairing_topic)
+            .field("request_id", &self.request_id())
+            .field("expiry_timestamp", &self.expiry_timestamp())
+            .field("verify_context", &self.verify_context)
+            .field("verify_risk", &self.verify_risk())
+            .field("redirect", &self.redirect)
+            .field(
+                "chain_count",
+                &self.request.params.auth_payload.chains.len(),
+            )
+            .field(
+                "resource_count",
+                &self.request.params.auth_payload.resources.len(),
+            )
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 impl SingleSessionAuthenticate {
@@ -3082,6 +3130,33 @@ mod tests {
             config.receive_timeouts_before_reconnect(),
             DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT
         );
+    }
+
+    #[test]
+    fn single_session_event_debug_redacts_decrypted_pairing_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x34; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x56; 32]);
+        let request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic,
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+        let event = SingleSessionClientEvent::from_pairing_message_with_origin(
+            message.clone(),
+            WalletRedirectOrigin::Unknown,
+        );
+
+        for debug in [format!("{message:?}"), format!("{event:?}")] {
+            assert!(!debug.contains("https://example.com"));
+            assert!(!debug.contains("Dapp"));
+            assert!(debug.contains("hash"));
+        }
+
+        Ok(())
     }
 
     #[test]

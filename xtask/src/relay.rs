@@ -1027,7 +1027,7 @@ fn print_and_assert_single_session_proposal_properties(
         "core-single-session-client-session-request proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?} session_properties={} scoped_properties={}",
         proposal.proposal_id(),
         proposal.pairing_topic(),
-        proposal.verify_context().verified.origin.as_str(),
+        sensitive_str_for_log(proposal.verify_context().verified.origin.as_str()),
         proposal.verify_context().verified.validation.as_str(),
         proposal.verify_risk(),
         proposal
@@ -1220,7 +1220,7 @@ async fn run_core_single_session_client_disconnect_probe(config: &RelayProbeConf
         "core-single-session-client-disconnect proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
         proposal.proposal_id(),
         proposal.pairing_topic(),
-        proposal.verify_context().verified.origin.as_str(),
+        sensitive_str_for_log(proposal.verify_context().verified.origin.as_str()),
         proposal.verify_context().verified.validation.as_str(),
         proposal.verify_risk()
     );
@@ -1290,7 +1290,7 @@ async fn run_core_single_session_client_session_lifecycle_probe(
         "core-single-session-client-session-lifecycle proposal_id={} pairing_topic={} verify_origin={} verify_validation={} verify_risk={:?}",
         proposal.proposal_id(),
         proposal.pairing_topic(),
-        proposal.verify_context().verified.origin.as_str(),
+        sensitive_str_for_log(proposal.verify_context().verified.origin.as_str()),
         proposal.verify_context().verified.validation.as_str(),
         proposal.verify_risk()
     );
@@ -2510,7 +2510,7 @@ fn print_session_request_review(
         review.method(),
         review.expiry_timestamp(),
         verify_hash,
-        review.verify_context().verified.origin.as_str(),
+        sensitive_str_for_log(review.verify_context().verified.origin.as_str()),
         review.verify_context().verified.validation.as_str(),
         review.verify_risk(),
         json_for_log(review.params())
@@ -2729,22 +2729,23 @@ fn optional_sensitive_str_for_log(value: Option<&str>) -> String {
 }
 
 fn print_session_authenticate_review(review: &SessionAuthenticateReview) {
+    let chains = review
+        .auth_payload()
+        .chains
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     println!(
         "core-single-session-client-session-authenticate review topic={} id={} requester_name={} domain={} aud={} chains={} expiry={} verify_origin={} verify_validation={} verify_risk={:?}",
         review.topic(),
         review.request_id(),
-        review.requester().metadata.name,
-        review.auth_payload().domain,
-        review.auth_payload().aud,
-        review
-            .auth_payload()
-            .chains
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(","),
+        sensitive_str_for_log(&review.requester().metadata.name),
+        sensitive_str_for_log(&review.auth_payload().domain),
+        sensitive_str_for_log(&review.auth_payload().aud),
+        sensitive_str_for_log(&chains),
         review.expiry_timestamp(),
-        review.verify_context().verified.origin.as_str(),
+        sensitive_str_for_log(review.verify_context().verified.origin.as_str()),
         review.verify_context().verified.validation.as_str(),
         review.verify_risk()
     );
@@ -2767,17 +2768,20 @@ fn validate_session_authenticate_review(review: &SessionAuthenticateReview) -> R
     if review.auth_payload().domain != expected_domain {
         bail!(
             "session authenticate domain mismatch: expected {expected_domain}, got {}",
-            review.auth_payload().domain
+            sensitive_str_for_log(&review.auth_payload().domain)
         );
     }
     if review.auth_payload().aud != expected_aud {
         bail!(
             "session authenticate audience mismatch: expected {expected_aud}, got {}",
-            review.auth_payload().aud
+            sensitive_str_for_log(&review.auth_payload().aud)
         );
     }
     if chains != expected_chains {
-        bail!("session authenticate chains mismatch: expected {expected_chains}, got {chains}");
+        bail!(
+            "session authenticate chains mismatch: expected {expected_chains}, got {}",
+            sensitive_str_for_log(&chains)
+        );
     }
     if review.is_expired_at(unix_timestamp()) {
         bail!(
@@ -3624,19 +3628,20 @@ fn print_core_pairing_payload_metadata(
             print_session_proposal_request_summary(label, request);
         }
         PairingPayload::SessionAuthenticate(request) => {
+            let chains = request
+                .params
+                .auth_payload
+                .chains
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
             println!(
                 "{label} session_authenticate id={} requester_name={} domain={} chains={} expiry={}",
                 request.id,
-                request.params.requester.metadata.name,
-                request.params.auth_payload.domain,
-                request
-                    .params
-                    .auth_payload
-                    .chains
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                sensitive_str_for_log(&request.params.requester.metadata.name),
+                sensitive_str_for_log(&request.params.auth_payload.domain),
+                sensitive_str_for_log(&chains),
                 request.params.expiry_timestamp
             );
         }

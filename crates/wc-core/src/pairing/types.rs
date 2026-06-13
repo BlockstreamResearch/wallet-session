@@ -1,3 +1,5 @@
+use std::fmt;
+
 use wc_protocol::{
     dto::pairing::{PairingDeleteParams, PairingJsonRpcRequest, PairingPingParams},
     key::X25519PublicKey,
@@ -436,7 +438,7 @@ pub enum SessionLifecycleResponsePayload {
 }
 
 /// Decrypted session-topic message plus relay delivery metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionReceivedMessage {
     pub(super) topic: RelayTopic,
     pub(super) encoded_message_len: usize,
@@ -447,6 +449,32 @@ pub struct SessionReceivedMessage {
     pub(super) published_at: u64,
     pub(super) tag: Option<u64>,
     pub(super) payload: SessionPayload,
+}
+
+impl fmt::Debug for SessionReceivedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionReceivedMessage")
+            .field("topic", &self.topic)
+            .field("encoded_message_len", &self.encoded_message_len)
+            .field("plaintext_len", &self.plaintext_len)
+            .field("verify_attestation_hash", &self.verify_attestation_hash)
+            .field(
+                "verify_attestation_jwt",
+                &self
+                    .verify_attestation_jwt
+                    .as_deref()
+                    .map(SensitiveStrDebug),
+            )
+            .field(
+                "verify_encrypted_id",
+                &self.verify_encrypted_id.as_deref().map(SensitiveStrDebug),
+            )
+            .field("published_at", &self.published_at)
+            .field("tag", &self.tag)
+            .field("payload", &SessionPayloadSummary(&self.payload))
+            .finish()
+    }
 }
 
 /// Result of reading a session-topic message with invalid-request auto-rejection.
@@ -766,7 +794,7 @@ impl PairingSubscription {
 }
 
 /// Decrypted pairing-topic message plus relay delivery metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PairingReceivedMessage {
     pub(super) topic: RelayTopic,
     pub(super) encoded_message_len: usize,
@@ -776,6 +804,35 @@ pub struct PairingReceivedMessage {
     pub(super) verify_encrypted_id: Option<String>,
     pub(super) message: PairingMessage,
     pub(super) payload: PairingPayload,
+}
+
+impl fmt::Debug for PairingReceivedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PairingReceivedMessage")
+            .field("topic", &self.topic)
+            .field("encoded_message_len", &self.encoded_message_len)
+            .field("plaintext_len", &self.message.plaintext().len())
+            .field(
+                "plaintext_hash",
+                &VerifyAttestationHash::from_message(self.message.plaintext()),
+            )
+            .field("published_at", &self.published_at)
+            .field("tag", &self.tag)
+            .field(
+                "verify_attestation_jwt",
+                &self
+                    .verify_attestation_jwt
+                    .as_deref()
+                    .map(SensitiveStrDebug),
+            )
+            .field(
+                "verify_encrypted_id",
+                &self.verify_encrypted_id.as_deref().map(SensitiveStrDebug),
+            )
+            .field("payload", &PairingPayloadSummary(&self.payload))
+            .finish()
+    }
 }
 
 impl PairingReceivedMessage {
@@ -903,4 +960,127 @@ pub enum PairingPayload {
     Unknown(String),
     /// JSON has no string `method` field.
     Missing,
+}
+
+struct SessionPayloadSummary<'a>(&'a SessionPayload);
+
+impl fmt::Debug for SessionPayloadSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            SessionPayload::SessionRequest(request) => formatter
+                .debug_struct("SessionRequest")
+                .field("id", &request.id)
+                .field("chain_id", &request.params.chain_id)
+                .field("method", &request.params.request.method)
+                .field("expiry_timestamp", &request.params.request.expiry_timestamp)
+                .finish(),
+            SessionPayload::SessionUpdate(request) => formatter
+                .debug_struct("SessionUpdate")
+                .field("id", &request.id)
+                .field("namespace_count", &request.params.namespaces.len())
+                .finish(),
+            SessionPayload::SessionExtend(request) => formatter
+                .debug_struct("SessionExtend")
+                .field("id", &request.id)
+                .finish(),
+            SessionPayload::SessionEvent(request) => formatter
+                .debug_struct("SessionEvent")
+                .field("id", &request.id)
+                .field("chain_id", &request.params.chain_id)
+                .field("event", &request.params.event.name)
+                .finish(),
+            SessionPayload::SessionPing(request) => formatter
+                .debug_struct("SessionPing")
+                .field("id", &request.id)
+                .finish(),
+            SessionPayload::SessionDelete(request) => formatter
+                .debug_struct("SessionDelete")
+                .field("id", &request.id)
+                .field("code", &request.params.code)
+                .finish(),
+            SessionPayload::Sign(method) => formatter
+                .debug_struct("Sign")
+                .field("method", method)
+                .finish(),
+            SessionPayload::Unknown(method) => formatter
+                .debug_struct("Unknown")
+                .field("method", method)
+                .finish(),
+            SessionPayload::Missing => formatter.write_str("Missing"),
+        }
+    }
+}
+
+struct PairingPayloadSummary<'a>(&'a PairingPayload);
+
+impl fmt::Debug for PairingPayloadSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            PairingPayload::SessionProposal(request) => formatter
+                .debug_struct("SessionProposal")
+                .field("id", &request.id)
+                .field(
+                    "required_namespace_count",
+                    &request.params.required_namespaces.len(),
+                )
+                .field(
+                    "optional_namespace_count",
+                    &request.params.optional_namespaces.len(),
+                )
+                .field(
+                    "auth_request_count",
+                    &request
+                        .params
+                        .requests
+                        .as_ref()
+                        .and_then(|requests| requests.authentication.as_ref())
+                        .map(Vec::len),
+                )
+                .field(
+                    "expiry_timestamp",
+                    &request.params.effective_expiry_timestamp(),
+                )
+                .finish(),
+            PairingPayload::SessionAuthenticate(request) => formatter
+                .debug_struct("SessionAuthenticate")
+                .field("id", &request.id)
+                .field("chain_count", &request.params.auth_payload.chains.len())
+                .field(
+                    "resource_count",
+                    &request.params.auth_payload.resources.len(),
+                )
+                .field("expiry_timestamp", &request.params.expiry_timestamp)
+                .finish(),
+            PairingPayload::PairingPing(request) => formatter
+                .debug_struct("PairingPing")
+                .field("id", &request.id)
+                .finish(),
+            PairingPayload::PairingDelete(request) => formatter
+                .debug_struct("PairingDelete")
+                .field("id", &request.id)
+                .field("code", &request.params.code)
+                .finish(),
+            PairingPayload::Sign(method) => formatter
+                .debug_struct("Sign")
+                .field("method", method)
+                .finish(),
+            PairingPayload::Unknown(method) => formatter
+                .debug_struct("Unknown")
+                .field("method", method)
+                .finish(),
+            PairingPayload::Missing => formatter.write_str("Missing"),
+        }
+    }
+}
+
+struct SensitiveStrDebug<'a>(&'a str);
+
+impl fmt::Debug for SensitiveStrDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SensitiveStr")
+            .field("len", &self.0.len())
+            .field("hash", &VerifyAttestationHash::from_message(self.0))
+            .finish()
+    }
 }

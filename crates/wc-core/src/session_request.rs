@@ -345,13 +345,16 @@ impl SessionRequestReview {
 
     /// Builds a wallet-policy review for recognized high-risk methods.
     ///
-    /// Unknown methods remain `Raw`, because namespace authorization only says
-    /// the dapp may ask for the method. Wallet code should still decide how to
-    /// render or reject method-specific params before returning a result.
+    /// Unknown methods fail closed. Namespace authorization only says the dapp
+    /// may ask for the method; it does not prove that the wallet can safely
+    /// render or execute opaque params. Use
+    /// [`Self::method_review_with_unknown_policy`] with
+    /// [`UnknownSessionRequestMethodPolicy::AllowRaw`] only when the caller has
+    /// an explicit method-specific raw review path.
     pub fn method_review(
         &self,
     ) -> Result<SessionRequestMethodReview, SessionRequestMethodReviewError> {
-        self.method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::AllowRaw)
+        self.method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::Reject)
     }
 
     /// Builds a wallet-policy review while applying an explicit unknown-method policy.
@@ -3785,7 +3788,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_method_policy_can_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+    fn unknown_method_policy_fails_closed_by_default() -> Result<(), Box<dyn std::error::Error>> {
         let request = JsonRpcRequest::new(
             42,
             SignMethod::SessionRequest,
@@ -3801,9 +3804,8 @@ mod tests {
         let review =
             SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?;
 
-        assert_eq!(review.method_review()?, SessionRequestMethodReview::Raw);
         let error = review
-            .method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::Reject)
+            .method_review()
             .expect_err("unknown method should fail closed");
 
         assert!(matches!(
@@ -3811,6 +3813,11 @@ mod tests {
             SessionRequestMethodReviewError::UnknownMethod { method }
                 if method.as_str() == "wallet_nonstandardSecret"
         ));
+        assert_eq!(
+            review
+                .method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::AllowRaw)?,
+            SessionRequestMethodReview::Raw
+        );
 
         Ok(())
     }

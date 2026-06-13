@@ -77,10 +77,19 @@ pub const ALTERNATE_VERIFY_URL: &str = "https://verify.walletconnect.com";
 /// assert_eq!(context.verified.validation, VerifyValidation::Unknown);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyContext {
     /// Verified origin data returned by or derived from the Verify API.
     pub verified: VerifiedOrigin,
+}
+
+impl fmt::Debug for VerifyContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifyContext")
+            .field("verified", &self.verified)
+            .finish()
+    }
 }
 
 impl VerifyContext {
@@ -150,7 +159,7 @@ impl VerifyContext {
 }
 
 /// Origin verification result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedOrigin {
     /// Origin associated with the dapp after Verify API resolution.
     pub origin: String,
@@ -170,11 +179,35 @@ pub struct VerifiedOrigin {
     pub is_scam: Option<bool>,
 }
 
+impl fmt::Debug for VerifiedOrigin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedOrigin")
+            .field("origin", &RedactedStrSummary(&self.origin))
+            .field("validation", &self.validation)
+            .field("verify_url", &RedactedStrSummary(&self.verify_url))
+            .field("is_scam", &self.is_scam)
+            .finish()
+    }
+}
+
 impl VerifiedOrigin {
     /// Treats absent `isScam` as no scam signal.
     #[must_use]
     pub const fn is_scam(&self) -> bool {
         matches!(self.is_scam, Some(true))
+    }
+}
+
+struct RedactedStrSummary<'a>(&'a str);
+
+impl fmt::Debug for RedactedStrSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedactedStr")
+            .field("len", &self.0.len())
+            .field("hash", &VerifyAttestationHash::from_message(self.0))
+            .finish()
     }
 }
 

@@ -27,10 +27,14 @@ const sensitiveKeys = new Set([
   "cacaos",
   "data",
   "iss",
+  "metadata",
   "namespaces",
   "params",
+  "peer",
+  "publicKey",
   "request",
   "result",
+  "self",
   "s",
   "signature",
   "signatures",
@@ -478,7 +482,7 @@ async function startSessionRequest(topic: string): Promise<void> {
     const response = await Promise.race([
       request.then(
         (result) => {
-          console.error(`js-harness session_request_response=${stringifyForLog(result)}`);
+          console.error(`js-harness session_request_response=${sessionRequestResultForLog(result)}`);
           return {
             outcome: "session_request_response",
             topic,
@@ -512,7 +516,7 @@ async function startSessionRequest(topic: string): Promise<void> {
 
   void request
     .then(async (result) => {
-      console.error(`js-harness session_request_response=${stringifyForLog(result)}`);
+      console.error(`js-harness session_request_response=${sessionRequestResultForLog(result)}`);
       await writeResult({
         outcome: "session_request_response",
         topic,
@@ -666,6 +670,14 @@ function stringifyId(id: number | bigint): string {
 
 function stringifyForLog(value: unknown): string {
   return JSON.stringify(valueForLog(value));
+}
+
+function sessionRequestResultForLog(result: unknown): string {
+  if (logDecryptedPayloads) {
+    return stringifyForLog(result);
+  }
+
+  return JSON.stringify(redactedSummary(result));
 }
 
 function valueForLog(value: unknown): unknown {
