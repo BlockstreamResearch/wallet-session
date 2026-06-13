@@ -21,7 +21,7 @@ use crate::pairing::{
     PairingClientError, PairingPayload, PairingReceivedMessage, PairingSubscription,
     SessionClientEvent, SessionLifecycleRequest, SessionLifecycleResponseMessage,
     SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
-    SessionReceivedMessage, SessionSubscription,
+    SessionReceivedMessage, SessionSubscription, validate_pairing_registered_methods,
 };
 use crate::session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
@@ -42,6 +42,9 @@ pub const DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN: Duration = Duration:
 /// Default receive-timeout count before `next_event` treats the socket as stale.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT: NonZeroUsize =
     NonZeroUsize::new(2).expect("non-zero");
+
+const SINGLE_SESSION_REGISTERED_PAIRING_METHODS: &[&str] =
+    &["wc_sessionPropose", "wc_sessionAuthenticate"];
 
 /// `SingleSessionClient` configuration.
 #[derive(Debug, Clone)]
@@ -299,6 +302,11 @@ impl SingleSessionClient {
                 source: PairingClientError::PairingUri { source },
             }
         })?;
+        validate_pairing_registered_methods(
+            &pairing_uri,
+            SINGLE_SESSION_REGISTERED_PAIRING_METHODS,
+        )
+        .map_err(SingleSessionClientError::from)?;
         let fetched = self
             .pairing
             .fetch_pairing_messages(&pairing_uri)
@@ -316,7 +324,14 @@ impl SingleSessionClient {
         let mut pairing_closed = false;
 
         for message in fetched {
-            let event = self.handle_pairing_message(&subscription, message).await?;
+            let event = match self.handle_pairing_message(&subscription, message).await {
+                Ok(event) => event,
+                Err(error) => {
+                    self.unsubscribe_pairing(&subscription).await?;
+                    self.state = SingleSessionClientState::Idle;
+                    return Err(error);
+                }
+            };
             pairing_closed |= event.closes_pairing_topic();
             fetched_events.push(event);
             if pairing_closed {

@@ -28,6 +28,7 @@ enum wc_core::PairingClientError
   variant UnexpectedTopic
   variant PairingUnsubscribeRejected
   variant PairingMessage
+  variant PairingMethodNotRegistered
   variant ProposalPairingTopicMismatch
   variant Envelope
   variant PairingPayload

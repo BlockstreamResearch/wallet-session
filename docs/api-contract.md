@@ -130,12 +130,21 @@ Session authentication requests are surfaced as `SingleSessionClientEvent::Sessi
 Expired authentication messages are surfaced as
 `SingleSessionClientEvent::SessionAuthenticateExpired` and close the active pairing topic.
 
+If the scanned URI carries a `methods` list, `pair()` checks it against this
+wallet client's registered pairing methods before fetching or subscribing. This
+single-session client registers `wc_sessionPropose` and `wc_sessionAuthenticate`.
+Unsupported URI methods fail closed before an active pairing topic is created.
+Pairing ping and pairing delete remain lifecycle RPCs and are still handled
+deterministically.
+
 Pairing ping is acknowledged automatically. Pairing delete clears the active pairing.
 
 Source:
 
 - [`SingleSessionClient::pair`](../crates/wc-core/src/client.rs)
 - [Pairing API](https://specs.walletconnect.com/2.0/specs/clients/core/pairing)
+- [Pairing URI](https://specs.walletconnect.com/2.0/specs/clients/core/pairing/pairing-uri)
+- [Pairing methods validation](https://specs.walletconnect.com/2.0/specs/clients/core/pairing/pairing-methods)
 - [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry)
 - [Relay fetch messages](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#fetch-messages)
 - [Relay subscribe](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe)

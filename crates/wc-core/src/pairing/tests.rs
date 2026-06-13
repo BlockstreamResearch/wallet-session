@@ -21,7 +21,7 @@ use super::{
         session_request_error_publish, session_request_success_publish,
         session_request_validation_error,
     },
-    *,
+    validate_pairing_registered_methods, *,
 };
 use wc_protocol::{
     did::DidPkh,
@@ -95,6 +95,40 @@ fn validates_pairing_expiry() -> Result<(), Box<dyn std::error::Error>> {
         validate_pairing_not_expired(&pairing, 4_102_444_800).expect_err("expired URI should fail");
 
     assert!(matches!(error, PairingClientError::PairingExpired { .. }));
+
+    Ok(())
+}
+
+#[test]
+fn validates_pairing_registered_methods() -> Result<(), Box<dyn std::error::Error>> {
+    let pairing = PairingUri::parse(&format!("{PAIRING_URI}&methods=wc_sessionAuthenticate"))?;
+    let bracketed = PairingUri::parse(&format!(
+        "{PAIRING_URI}&methods=[wc_sessionPropose],[wc_sessionAuthenticate]"
+    ))?;
+    let registered = ["wc_sessionPropose", "wc_sessionAuthenticate"];
+
+    validate_pairing_registered_methods(&pairing, &registered)?;
+    validate_pairing_registered_methods(&bracketed, &registered)?;
+
+    Ok(())
+}
+
+#[test]
+fn rejects_pairing_uri_with_unregistered_method() -> Result<(), Box<dyn std::error::Error>> {
+    let pairing = PairingUri::parse(&format!("{PAIRING_URI}&methods=wc_authRequest"))?;
+    let registered = ["wc_sessionPropose", "wc_sessionAuthenticate"];
+
+    let error = validate_pairing_registered_methods(&pairing, &registered)
+        .expect_err("unsupported URI method should fail pairing admission");
+
+    assert!(matches!(
+        error,
+        PairingClientError::PairingMethodNotRegistered {
+            method: Some(method),
+            registered_methods
+        } if method == "wc_authRequest"
+            && registered_methods == ["wc_sessionPropose", "wc_sessionAuthenticate"]
+    ));
 
     Ok(())
 }

@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use wc_protocol::pairing::PairingUri;
+
 mod approval;
 mod client;
 mod codec;
@@ -28,6 +30,31 @@ pub use types::{
 
 /// Default wait time for one live pairing-topic message.
 pub const DEFAULT_PAIRING_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Checks that this client can satisfy every method requested by the pairing URI.
+pub fn validate_pairing_registered_methods(
+    pairing: &PairingUri,
+    registered_methods: &[&str],
+) -> Result<(), PairingClientError> {
+    let Some(methods) = pairing.methods() else {
+        return Ok(());
+    };
+
+    for method in methods {
+        let normalized = method.trim_matches(|character| character == '[' || character == ']');
+        if !registered_methods.contains(&normalized) {
+            return Err(PairingClientError::PairingMethodNotRegistered {
+                method: Some(normalized.to_owned()),
+                registered_methods: registered_methods
+                    .iter()
+                    .map(|method| (*method).to_owned())
+                    .collect(),
+            });
+        }
+    }
+
+    Ok(())
+}
 
 /// Relay tag used for `wc_pairingPing` responses.
 ///

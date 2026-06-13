@@ -102,6 +102,17 @@ pub enum PairingClientError {
         source: PairingMessageError,
     },
 
+    /// Pairing URI requested a method this client has not registered.
+    #[error(
+        "pairing URI method {method:?} is not registered by this client; registered methods {registered_methods:?}"
+    )]
+    PairingMethodNotRegistered {
+        /// JSON-RPC method requested by the pairing URI.
+        method: Option<String>,
+        /// Methods registered by this client for pairing admission.
+        registered_methods: Vec<String>,
+    },
+
     /// Proposal params and active subscription disagree on the pairing topic.
     #[error("session proposal pairing topic does not match active subscription")]
     ProposalPairingTopicMismatch {
