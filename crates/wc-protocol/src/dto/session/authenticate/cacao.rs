@@ -4,7 +4,7 @@ use std::fmt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::AuthPayload;
 use crate::{caip::Caip2ChainId, did::DidPkh};
@@ -652,6 +652,31 @@ pub enum RecapParseError {
     AbilityLimitNotObject,
 }
 
+/// Decoded Recap authorization data.
+///
+/// `WalletConnect` carries `Recap` grants in the final `resources` entry as a
+/// `urn:recap:` value. The JSON shape is validated before this wrapper is
+/// constructed: `att` must be a non-empty object whose resource entries contain
+/// non-empty ability arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recap {
+    att: Map<String, Value>,
+}
+
+impl Recap {
+    /// Recap `att` resource map.
+    #[must_use]
+    pub const fn att(&self) -> &Map<String, Value> {
+        &self.att
+    }
+
+    /// Moves the decoded Recap resource map into caller-owned state.
+    #[must_use]
+    pub fn into_att(self) -> Map<String, Value> {
+        self.att
+    }
+}
+
 /// Cloneable source error for Recap JSON decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecapJsonError {
@@ -702,7 +727,12 @@ fn format_resource_lines(resources: &[String]) -> String {
     output
 }
 
-fn recap_from_resources(resources: &[String]) -> Option<&str> {
+/// Returns the final resource when it is a `WalletConnect` Recap URN.
+///
+/// The maintained JavaScript helper treats only the last `resources` entry as a
+/// Recap candidate.
+#[must_use]
+pub fn recap_from_resources(resources: &[String]) -> Option<&str> {
     // WalletConnect treats the last resource as Recap when it contains the
     // `urn:recap:` marker.
     //
@@ -717,7 +747,7 @@ fn format_statement_from_recap(statement: &str, recap: &str) -> Result<String, R
     // mirrors `formatStatementFromRecap` so the signed bytes match the JS SDK.
     //
     // https://github.com/WalletConnect/walletconnect-monorepo/blob/e1491f9e54a6417c9b9742ac0d6fa6d710e81561/packages/utils/src/cacao.ts#L363-L400
-    let recap = decode_recap(recap)?;
+    let recap = decode_recap_att(recap)?;
     if statement.contains(RECAP_STATEMENT_PREFIX) {
         return Ok(statement.to_owned());
     }
@@ -774,7 +804,12 @@ fn format_statement_from_recap(statement: &str, recap: &str) -> Result<String, R
     }
 }
 
-fn decode_recap(recap: &str) -> Result<serde_json::Map<String, Value>, RecapParseError> {
+/// Decodes and validates a `urn:recap:` resource.
+pub fn decode_recap(recap: &str) -> Result<Recap, RecapParseError> {
+    decode_recap_att(recap).map(|att| Recap { att })
+}
+
+fn decode_recap_att(recap: &str) -> Result<Map<String, Value>, RecapParseError> {
     // `encodeRecap` removes standard-base64 padding; the JS decoder restores it
     // before `atob`.
     //
@@ -801,7 +836,7 @@ fn padded_base64(value: &str) -> String {
     padded
 }
 
-fn validate_recap(value: &Value) -> Result<serde_json::Map<String, Value>, RecapParseError> {
+fn validate_recap(value: &Value) -> Result<Map<String, Value>, RecapParseError> {
     // The JS validator only needs enough structure to format abilities:
     // `att` -> resource object -> ability object -> non-empty array of objects.
     //

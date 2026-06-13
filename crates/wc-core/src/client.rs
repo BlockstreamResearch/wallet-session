@@ -2852,10 +2852,10 @@ mod tests {
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
             CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, DappMetadata,
             DappRedirect, JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, ProposalNamespaces,
-            Proposer, RelayProtocolOptions, Session, SessionAuthenticateParams,
-            SessionExtendParams, SessionNamespace, SessionParticipant, SessionProposeParams,
-            SessionRequest, SessionRequestParams, SessionTransportType, SessionUpdateParams,
-            SignMethod,
+            Proposer, RelayProtocolOptions, Session, SessionAuthenticateParams, SessionEventName,
+            SessionExtendParams, SessionMethod, SessionNamespace, SessionParticipant,
+            SessionProposeParams, SessionRequest, SessionRequestParams, SessionTransportType,
+            SessionUpdateParams, SignMethod,
         },
         verify::{
             DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyAttestationHash, VerifyContext,
@@ -3723,6 +3723,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_authenticate_approval_rejects_overbroad_auth_session_namespace_before_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x4e; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x4f; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let recap = recap_personal_sign();
+        let mut request = auth_request()?;
+        request.params.auth_payload.resources = vec![recap.clone()];
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionAuthenticate(Box::new(request.clone())),
+        );
+        let verify_context = VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL);
+        let authenticate = SingleSessionAuthenticate {
+            pairing_topic: topic.clone(),
+            request,
+            verify_context: verify_context.clone(),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
+            message,
+        };
+        let verify_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionAuthenticateApproval,
+            topic.clone(),
+            authenticate.request_id(),
+            Some(VerifyAttestationHash::from_message(
+                authenticate.message().message().plaintext(),
+            )),
+            verify_context,
+        );
+        let mut cacao = test_cacao()?;
+        cacao.p.resources = vec![recap];
+        let namespaces = BTreeMap::from([(
+            NamespaceKey::parse("eip155")?,
+            SessionNamespace {
+                chains: Some(vec!["eip155:1".parse()?]),
+                accounts: vec!["eip155:1:0x1111111111111111111111111111111111111111".parse()?],
+                methods: vec![SessionMethod::parse("eth_sign")?],
+                events: vec![
+                    SessionEventName::parse("chainChanged")?,
+                    SessionEventName::parse("accountsChanged")?,
+                ],
+            },
+        )]);
+        let approval = SessionAuthenticateApproval::new(test_metadata("Wallet"), vec![cacao])?
+            .with_session_namespaces(namespaces);
+
+        let error = client
+            .approve_session_authenticate(&authenticate, &verify_review, approval)
+            .await
+            .expect_err("auth-created session namespaces must be bounded by signed Recap methods");
+
+        match error {
+            SingleSessionClientError::SessionAuthenticateApproval {
+                source:
+                    SessionAuthenticateApprovalError::SessionNamespaceMethodUnauthorized {
+                        namespace,
+                        chain_id,
+                        method,
+                    },
+            } => {
+                assert_eq!(namespace, NamespaceKey::parse("eip155")?);
+                assert_eq!(chain_id, "eip155:1".parse()?);
+                assert_eq!(method, SessionMethod::parse("eth_sign")?);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        match &client.state {
+            SingleSessionClientState::Pairing(subscription) => {
+                assert_eq!(subscription.topic(), &topic);
+            }
+            other => panic!("overbroad auth namespace should not advance wallet state: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_request_success_requires_matching_verify_risk_review()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, server) = connect_idle_test_client().await;
@@ -4553,6 +4641,10 @@ mod tests {
                 meta: None,
             },
         })
+    }
+
+    fn recap_personal_sign() -> String {
+        "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ".to_owned()
     }
 
     fn test_metadata(name: &str) -> DappMetadata {

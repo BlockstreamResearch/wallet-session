@@ -19,7 +19,8 @@ pub use action::{SessionEventName, SessionEventNameError, SessionMethod, Session
 pub use authenticate::{
     AuthPayload, Cacao, CacaoBuildError, CacaoHeader, CacaoHeaderType, CacaoMessageError,
     CacaoPayload, CacaoSignature, CacaoSignatureType, CacaoSignatureValue, CacaoValidationError,
-    RecapParseError, SessionAuthenticateParams, SessionAuthenticateResult,
+    Recap, RecapParseError, SessionAuthenticateParams, SessionAuthenticateResult, decode_recap,
+    recap_from_resources,
 };
 pub use delete::SessionDeleteParams;
 pub use event::{SessionEvent, SessionEventParams};

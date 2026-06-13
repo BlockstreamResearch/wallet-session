@@ -9,7 +9,8 @@ use crate::{caip::Caip2ChainId, did::DidPkh};
 
 pub use cacao::{
     Cacao, CacaoBuildError, CacaoHeader, CacaoHeaderType, CacaoMessageError, CacaoPayload,
-    CacaoSignature, CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, RecapParseError,
+    CacaoSignature, CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, Recap,
+    RecapParseError, decode_recap, recap_from_resources,
 };
 
 /// Decrypted `wc_sessionAuthenticate` params.

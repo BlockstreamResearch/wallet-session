@@ -1,11 +1,16 @@
 //! Session-authentication review primitives.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
 use wc_protocol::{
-    caip::{Caip2ChainId, Caip10AccountId},
+    caip::{Caip2ChainId, Caip10AccountId, CaipNamespace, NamespaceKey},
     relay::RelayTopic,
     session::{
-        AuthPayload, Cacao, CacaoValidationError, DappMetadata, JsonRpcRequest,
-        SessionAuthenticateParams, SessionNamespaces, SessionParticipant, SignMethod,
+        AuthPayload, Cacao, CacaoValidationError, DappMetadata, JsonRpcRequest, Recap,
+        RecapParseError, SessionAuthenticateParams, SessionEventName, SessionMethod,
+        SessionNamespace, SessionNamespaces, SessionParticipant, SignMethod, decode_recap,
+        recap_from_resources,
     },
     verify::{VerifyAttestationHash, VerifyContext},
 };
@@ -603,6 +608,11 @@ impl SessionAuthenticateApproval {
                 )?;
         }
 
+        if let Some(namespaces) = &self.session_namespaces {
+            AuthSessionGrant::from_signed_cacaos(auth_payload, &self.cacaos)?
+                .validate_namespaces(namespaces)?;
+        }
+
         Ok(())
     }
 
@@ -642,6 +652,474 @@ pub enum SessionAuthenticateApprovalError {
         #[source]
         source: CacaoValidationError,
     },
+
+    /// A signed CACAO Recap could not be decoded for auth-session bounding.
+    #[error("session authenticate approval CACAO {index} Recap is invalid")]
+    InvalidRecap {
+        /// Zero-based index in the approval CACAO list.
+        index: usize,
+        /// Recap decode failure.
+        #[source]
+        source: RecapParseError,
+    },
+
+    /// Auth-created session namespace has no usable request methods.
+    #[error("auth session namespace {namespace} has no methods")]
+    SessionNamespaceMethodsEmpty {
+        /// Namespace that would disclose accounts without request permissions.
+        namespace: NamespaceKey,
+    },
+
+    /// Auth-created session namespace has no accounts.
+    #[error("auth session namespace {namespace} has no accounts")]
+    SessionNamespaceAccountsEmpty {
+        /// Namespace with no account grant.
+        namespace: NamespaceKey,
+    },
+
+    /// A namespace key, chain entry, or account chain crosses CAIP namespaces.
+    #[error("auth session namespace {namespace} cannot include chain {chain_id}")]
+    SessionNamespaceChainMismatch {
+        /// Namespace being validated.
+        namespace: NamespaceKey,
+        /// Chain that does not belong under the namespace key.
+        chain_id: Caip2ChainId,
+    },
+
+    /// A namespace account is outside the signed CACAO/Recap grant.
+    #[error("auth session namespace {namespace} account {account} is not signed")]
+    SessionNamespaceAccountUnauthorized {
+        /// Namespace being validated.
+        namespace: NamespaceKey,
+        /// Account not authorized by signed CACAO issuers.
+        account: Caip10AccountId,
+    },
+
+    /// A namespace chain is outside the signed CACAO/Recap grant.
+    #[error("auth session namespace {namespace} chain {chain_id} is not authorized")]
+    SessionNamespaceChainUnauthorized {
+        /// Namespace being validated.
+        namespace: NamespaceKey,
+        /// Chain not authorized by the signed authentication grant.
+        chain_id: Caip2ChainId,
+    },
+
+    /// A namespace method is outside the signed CACAO/Recap grant.
+    #[error("auth session namespace {namespace} method {method} is not authorized for {chain_id}")]
+    SessionNamespaceMethodUnauthorized {
+        /// Namespace being validated.
+        namespace: NamespaceKey,
+        /// Chain where the method would be authorized by the session.
+        chain_id: Caip2ChainId,
+        /// Method not authorized by a signed Recap request ability.
+        method: SessionMethod,
+    },
+
+    /// A namespace event is outside the auth-session event allow-list.
+    #[error("auth session namespace {namespace} event {event} is not authorized for {chain_id}")]
+    SessionNamespaceEventUnauthorized {
+        /// Namespace being validated.
+        namespace: NamespaceKey,
+        /// Chain where the event would be authorized by the session.
+        chain_id: Caip2ChainId,
+        /// Event not authorized for an auth-created session.
+        event: SessionEventName,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct AuthSessionGrant(BTreeMap<String, AuthNamespaceGrant>);
+
+#[derive(Debug, Clone, Default)]
+struct AuthNamespaceGrant {
+    chains: BTreeSet<Caip2ChainId>,
+    accounts: BTreeSet<Caip10AccountId>,
+    request_methods_by_chain: BTreeMap<Caip2ChainId, BTreeSet<SessionMethod>>,
+    events_by_chain: BTreeMap<Caip2ChainId, BTreeSet<SessionEventName>>,
+}
+
+impl AuthSessionGrant {
+    fn from_signed_cacaos(
+        auth_payload: &AuthPayload,
+        cacaos: &[Cacao],
+    ) -> Result<Self, SessionAuthenticateApprovalError> {
+        let requested_chains = auth_payload.chains.iter().cloned().collect::<BTreeSet<_>>();
+        let mut grant = Self::default();
+
+        for (index, cacao) in cacaos.iter().enumerate() {
+            let issuer_account = cacao.p.iss.account_id();
+            let issuer_chain = issuer_account.chain_id();
+            let issuer_namespace = issuer_account.namespace().to_owned();
+            let mut cacao_chains = BTreeSet::from([issuer_chain.clone()]);
+            let mut request_methods_by_chain = BTreeMap::new();
+            let mut events_by_chain = BTreeMap::new();
+
+            if let Some(recap_resource) = recap_from_resources(&cacao.p.resources) {
+                let recap = decode_recap(recap_resource).map_err(|source| {
+                    SessionAuthenticateApprovalError::InvalidRecap { index, source }
+                })?;
+                collect_recap_permissions(
+                    &recap,
+                    &issuer_namespace,
+                    &issuer_chain,
+                    &requested_chains,
+                    &mut cacao_chains,
+                    &mut request_methods_by_chain,
+                    &mut events_by_chain,
+                );
+            }
+
+            let namespace_grant = grant.0.entry(issuer_namespace).or_default();
+            for chain_id in cacao_chains {
+                if !requested_chains.contains(&chain_id) {
+                    continue;
+                }
+                if chain_id.namespace() != issuer_account.namespace() {
+                    continue;
+                }
+                namespace_grant.chains.insert(chain_id.clone());
+                namespace_grant.accounts.insert(
+                    Caip10AccountId::from_parts(&chain_id, issuer_account.address())
+                        .expect("issuer address is already a valid CAIP-10 address"),
+                );
+            }
+            merge_chain_permissions(
+                &mut namespace_grant.request_methods_by_chain,
+                request_methods_by_chain,
+            );
+            merge_chain_permissions(&mut namespace_grant.events_by_chain, events_by_chain);
+        }
+
+        Ok(grant)
+    }
+
+    fn validate_namespaces(
+        &self,
+        namespaces: &SessionNamespaces,
+    ) -> Result<(), SessionAuthenticateApprovalError> {
+        for (namespace_key, namespace) in namespaces {
+            validate_auth_session_namespace(
+                namespace_key,
+                namespace,
+                self.0.get(namespace_key.namespace()),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_auth_session_namespace(
+    namespace_key: &NamespaceKey,
+    namespace: &SessionNamespace,
+    namespace_grant: Option<&AuthNamespaceGrant>,
+) -> Result<(), SessionAuthenticateApprovalError> {
+    if namespace.methods.is_empty() {
+        return Err(
+            SessionAuthenticateApprovalError::SessionNamespaceMethodsEmpty {
+                namespace: namespace_key.clone(),
+            },
+        );
+    }
+    if namespace.accounts.is_empty() {
+        return Err(
+            SessionAuthenticateApprovalError::SessionNamespaceAccountsEmpty {
+                namespace: namespace_key.clone(),
+            },
+        );
+    }
+
+    let namespace_chains =
+        validate_auth_session_namespace_chains(namespace_key, namespace, namespace_grant)?;
+    validate_auth_session_namespace_methods(
+        namespace_key,
+        &namespace_chains,
+        &namespace.methods,
+        namespace_grant,
+    )?;
+    validate_auth_session_namespace_events(
+        namespace_key,
+        &namespace_chains,
+        &namespace.events,
+        namespace_grant,
+    )
+}
+
+fn validate_auth_session_namespace_chains(
+    namespace_key: &NamespaceKey,
+    namespace: &SessionNamespace,
+    namespace_grant: Option<&AuthNamespaceGrant>,
+) -> Result<BTreeSet<Caip2ChainId>, SessionAuthenticateApprovalError> {
+    let mut namespace_chains = BTreeSet::new();
+    let key_chain = namespace_key.chain_id();
+    if let Some(chain_id) = key_chain {
+        validate_namespace_chain_shape(namespace_key, chain_id)?;
+        validate_granted_chain(namespace_key, namespace_grant, chain_id)?;
+        namespace_chains.insert(chain_id.clone());
+    }
+    if let Some(chains) = &namespace.chains {
+        for chain_id in chains {
+            if key_chain.is_some_and(|key_chain| key_chain != chain_id) {
+                return Err(
+                    SessionAuthenticateApprovalError::SessionNamespaceChainMismatch {
+                        namespace: namespace_key.clone(),
+                        chain_id: chain_id.clone(),
+                    },
+                );
+            }
+            validate_namespace_chain_shape(namespace_key, chain_id)?;
+            validate_granted_chain(namespace_key, namespace_grant, chain_id)?;
+            namespace_chains.insert(chain_id.clone());
+        }
+    }
+
+    for account in &namespace.accounts {
+        let chain_id = account.chain_id();
+        validate_namespace_chain_shape(namespace_key, &chain_id)?;
+        if key_chain.is_some_and(|key_chain| key_chain != &chain_id) {
+            return Err(
+                SessionAuthenticateApprovalError::SessionNamespaceAccountUnauthorized {
+                    namespace: namespace_key.clone(),
+                    account: account.clone(),
+                },
+            );
+        }
+        if !namespace_grant.is_some_and(|grant| grant.accounts.contains(account)) {
+            return Err(
+                SessionAuthenticateApprovalError::SessionNamespaceAccountUnauthorized {
+                    namespace: namespace_key.clone(),
+                    account: account.clone(),
+                },
+            );
+        }
+        validate_granted_chain(namespace_key, namespace_grant, &chain_id)?;
+        namespace_chains.insert(chain_id);
+    }
+
+    Ok(namespace_chains)
+}
+
+fn validate_auth_session_namespace_methods(
+    namespace_key: &NamespaceKey,
+    namespace_chains: &BTreeSet<Caip2ChainId>,
+    methods: &[SessionMethod],
+    namespace_grant: Option<&AuthNamespaceGrant>,
+) -> Result<(), SessionAuthenticateApprovalError> {
+    for method in methods {
+        for chain_id in namespace_chains {
+            let authorized = namespace_grant.is_some_and(|grant| {
+                grant
+                    .request_methods_by_chain
+                    .get(chain_id)
+                    .is_some_and(|methods| methods.contains(method))
+            });
+            if !authorized {
+                return Err(
+                    SessionAuthenticateApprovalError::SessionNamespaceMethodUnauthorized {
+                        namespace: namespace_key.clone(),
+                        chain_id: chain_id.clone(),
+                        method: method.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_auth_session_namespace_events(
+    namespace_key: &NamespaceKey,
+    namespace_chains: &BTreeSet<Caip2ChainId>,
+    events: &[SessionEventName],
+    namespace_grant: Option<&AuthNamespaceGrant>,
+) -> Result<(), SessionAuthenticateApprovalError> {
+    for event in events {
+        for chain_id in namespace_chains {
+            let authorized = is_default_auth_session_event(event)
+                || namespace_grant.is_some_and(|grant| {
+                    grant
+                        .events_by_chain
+                        .get(chain_id)
+                        .is_some_and(|events| events.contains(event))
+                });
+            if !authorized {
+                return Err(
+                    SessionAuthenticateApprovalError::SessionNamespaceEventUnauthorized {
+                        namespace: namespace_key.clone(),
+                        chain_id: chain_id.clone(),
+                        event: event.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_recap_permissions(
+    recap: &Recap,
+    issuer_namespace: &str,
+    issuer_chain: &Caip2ChainId,
+    requested_chains: &BTreeSet<Caip2ChainId>,
+    chains: &mut BTreeSet<Caip2ChainId>,
+    request_methods_by_chain: &mut BTreeMap<Caip2ChainId, BTreeSet<SessionMethod>>,
+    events_by_chain: &mut BTreeMap<Caip2ChainId, BTreeSet<SessionEventName>>,
+) {
+    for (resource, abilities) in recap.att() {
+        let Some(resource_namespace) = recap_resource_namespace(resource) else {
+            continue;
+        };
+        if resource_namespace.as_str() != issuer_namespace {
+            continue;
+        }
+
+        let resource_chain = Caip2ChainId::parse(resource).ok();
+        let Some(abilities) = abilities.as_object() else {
+            continue;
+        };
+        for (ability, limits) in abilities {
+            let Some((ability_kind, action)) = ability.split_once('/') else {
+                continue;
+            };
+            match ability_kind {
+                "request" => {
+                    if let Ok(method) = SessionMethod::parse(action) {
+                        let ability_chains = recap_ability_chains(
+                            resource_chain.as_ref(),
+                            limits,
+                            issuer_chain,
+                            requested_chains,
+                        );
+                        chains.extend(ability_chains.iter().cloned());
+                        for chain_id in ability_chains {
+                            request_methods_by_chain
+                                .entry(chain_id)
+                                .or_default()
+                                .insert(method.clone());
+                        }
+                    }
+                }
+                "event" => {
+                    if let Ok(event) = SessionEventName::parse(action) {
+                        let ability_chains = recap_ability_chains(
+                            resource_chain.as_ref(),
+                            limits,
+                            issuer_chain,
+                            requested_chains,
+                        );
+                        chains.extend(ability_chains.iter().cloned());
+                        for chain_id in ability_chains {
+                            events_by_chain
+                                .entry(chain_id)
+                                .or_default()
+                                .insert(event.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn recap_ability_chains(
+    resource_chain: Option<&Caip2ChainId>,
+    limits: &Value,
+    default_chain: &Caip2ChainId,
+    requested_chains: &BTreeSet<Caip2ChainId>,
+) -> BTreeSet<Caip2ChainId> {
+    let mut chains = BTreeSet::new();
+    let mut found_limited_chain = false;
+    if let Some(limits) = limits.as_array() {
+        for limit in limits {
+            let Some(limit_chains) = limit.get("chains") else {
+                continue;
+            };
+            found_limited_chain = true;
+            let Some(limit_chains) = limit_chains.as_array() else {
+                continue;
+            };
+            for chain in limit_chains {
+                let Some(chain) = chain.as_str() else {
+                    continue;
+                };
+                let Ok(chain_id) = Caip2ChainId::parse(chain) else {
+                    continue;
+                };
+                if requested_chains.contains(&chain_id) {
+                    chains.insert(chain_id);
+                }
+            }
+        }
+    }
+
+    if !found_limited_chain
+        && let Some(resource_chain) = resource_chain
+        && requested_chains.contains(resource_chain)
+    {
+        chains.insert(resource_chain.clone());
+    }
+    if !found_limited_chain && resource_chain.is_none() && requested_chains.contains(default_chain)
+    {
+        chains.insert(default_chain.clone());
+    }
+
+    chains
+}
+
+fn merge_chain_permissions<T: Ord>(
+    target: &mut BTreeMap<Caip2ChainId, BTreeSet<T>>,
+    source: BTreeMap<Caip2ChainId, BTreeSet<T>>,
+) {
+    for (chain_id, values) in source {
+        target.entry(chain_id).or_default().extend(values);
+    }
+}
+
+fn recap_resource_namespace(resource: &str) -> Option<CaipNamespace> {
+    if let Ok(chain_id) = Caip2ChainId::parse(resource) {
+        return CaipNamespace::parse(chain_id.namespace()).ok();
+    }
+    CaipNamespace::parse(resource).ok()
+}
+
+fn validate_namespace_chain_shape(
+    namespace: &NamespaceKey,
+    chain_id: &Caip2ChainId,
+) -> Result<(), SessionAuthenticateApprovalError> {
+    if chain_id.namespace() == namespace.namespace() {
+        Ok(())
+    } else {
+        Err(
+            SessionAuthenticateApprovalError::SessionNamespaceChainMismatch {
+                namespace: namespace.clone(),
+                chain_id: chain_id.clone(),
+            },
+        )
+    }
+}
+
+fn validate_granted_chain(
+    namespace: &NamespaceKey,
+    grant: Option<&AuthNamespaceGrant>,
+    chain_id: &Caip2ChainId,
+) -> Result<(), SessionAuthenticateApprovalError> {
+    if grant.is_some_and(|grant| grant.chains.contains(chain_id)) {
+        Ok(())
+    } else {
+        Err(
+            SessionAuthenticateApprovalError::SessionNamespaceChainUnauthorized {
+                namespace: namespace.clone(),
+                chain_id: chain_id.clone(),
+            },
+        )
+    }
+}
+
+fn is_default_auth_session_event(event: &SessionEventName) -> bool {
+    matches!(event.as_str(), "chainChanged" | "accountsChanged")
 }
 
 #[cfg(test)]
@@ -833,6 +1311,217 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn approval_accepts_auth_session_namespaces_bounded_by_recap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_resources(vec![recap_personal_sign()]);
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign()])?],
+        )?
+        .with_session_namespaces(session_namespaces()?);
+
+        approval.validate_against_auth_payload(&request.params.auth_payload)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespaces_without_recap_methods()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![cacao()?])?
+            .with_session_namespaces(session_namespaces()?);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("auth-created session methods must be signed in Recap");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceMethodUnauthorized {
+                namespace: NamespaceKey::parse("eip155")?,
+                chain_id: "eip155:1".parse()?,
+                method: SessionMethod::parse("personal_sign")?,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespace_unsigned_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_resources(vec![recap_personal_sign()]);
+        let mut namespaces = session_namespaces()?;
+        namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists")
+            .accounts = vec!["eip155:1:0x9999999999999999999999999999999999999999".parse()?];
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign()])?],
+        )?
+        .with_session_namespaces(namespaces);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("auth-created session account must come from signed CACAO");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceAccountUnauthorized {
+                namespace: NamespaceKey::parse("eip155")?,
+                account: "eip155:1:0x9999999999999999999999999999999999999999".parse()?,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespace_unsigned_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_resources(vec![recap_personal_sign()]);
+        let mut namespaces = session_namespaces()?;
+        let namespace = namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists");
+        namespace.chains = Some(vec!["eip155:2".parse()?]);
+        namespace.accounts = vec!["eip155:2:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".parse()?];
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign()])?],
+        )?
+        .with_session_namespaces(namespaces);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("auth-created session chain must be signed in Recap");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceChainUnauthorized {
+                namespace: NamespaceKey::parse("eip155")?,
+                chain_id: "eip155:2".parse()?,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_accepts_auth_session_namespace_recap_limited_additional_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_chains_and_resources(
+            vec!["eip155:1".parse()?, "eip155:2".parse()?],
+            vec![recap_personal_sign_eip155_2()],
+        );
+        let mut namespaces = session_namespaces()?;
+        let namespace = namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists");
+        namespace.chains = Some(vec!["eip155:2".parse()?]);
+        namespace.accounts = vec!["eip155:2:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".parse()?];
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign_eip155_2()])?],
+        )?
+        .with_session_namespaces(namespaces);
+
+        approval.validate_against_auth_payload(&request.params.auth_payload)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespace_without_methods()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_resources(vec![recap_personal_sign()]);
+        let mut namespaces = session_namespaces()?;
+        namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists")
+            .methods = Vec::new();
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign()])?],
+        )?
+        .with_session_namespaces(namespaces);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("auth-created session must not disclose accounts without methods");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceMethodsEmpty {
+                namespace: NamespaceKey::parse("eip155")?,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespace_malformed_recap_chain_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let malformed_recap = recap_personal_sign_malformed_chain_limit();
+        let request = authenticate_request_with_resources(vec![malformed_recap.clone()]);
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![malformed_recap])?],
+        )?
+        .with_session_namespaces(session_namespaces()?);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("malformed Recap chain limits must fail closed");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceMethodUnauthorized {
+                namespace: NamespaceKey::parse("eip155")?,
+                chain_id: "eip155:1".parse()?,
+                method: SessionMethod::parse("personal_sign")?,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_auth_session_namespace_non_default_event()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request_with_resources(vec![recap_personal_sign()]);
+        let mut namespaces = session_namespaces()?;
+        namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists")
+            .events
+            .push(SessionEventName::parse("message")?);
+        let approval = SessionAuthenticateApproval::new(
+            wallet_metadata(),
+            vec![cacao_with_resources(vec![recap_personal_sign()])?],
+        )?
+        .with_session_namespaces(namespaces);
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("auth-created session event must be default or signed in Recap");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::SessionNamespaceEventUnauthorized {
+                namespace: NamespaceKey::parse("eip155")?,
+                chain_id: "eip155:1".parse()?,
+                event: SessionEventName::parse("message")?,
+            }
+        );
+
+        Ok(())
+    }
+
     fn authenticate_request(
         method: SignMethod,
     ) -> Result<JsonRpcRequest<SessionAuthenticateParams>, Box<dyn std::error::Error>> {
@@ -872,6 +1561,26 @@ mod tests {
         ))
     }
 
+    fn authenticate_request_with_resources(
+        resources: Vec<String>,
+    ) -> JsonRpcRequest<SessionAuthenticateParams> {
+        authenticate_request_with_chains_and_resources(
+            vec!["eip155:1".parse().expect("test chain is valid")],
+            resources,
+        )
+    }
+
+    fn authenticate_request_with_chains_and_resources(
+        chains: Vec<wc_protocol::caip::Caip2ChainId>,
+        resources: Vec<String>,
+    ) -> JsonRpcRequest<SessionAuthenticateParams> {
+        let mut request = authenticate_request(SignMethod::SessionAuthenticate)
+            .expect("test auth request is valid");
+        request.params.auth_payload.chains = chains;
+        request.params.auth_payload.resources = resources;
+        request
+    }
+
     fn wallet_metadata() -> DappMetadata {
         DappMetadata {
             name: "Wallet".to_owned(),
@@ -884,6 +1593,10 @@ mod tests {
     }
 
     fn cacao() -> Result<Cacao, Box<dyn std::error::Error>> {
+        cacao_with_resources(Vec::new())
+    }
+
+    fn cacao_with_resources(resources: Vec<String>) -> Result<Cacao, Box<dyn std::error::Error>> {
         Ok(Cacao {
             h: CacaoHeader {
                 kind: CacaoHeaderType::Caip122,
@@ -899,7 +1612,7 @@ mod tests {
                 exp: None,
                 nbf: None,
                 request_id: None,
-                resources: Vec::new(),
+                resources,
             },
             s: CacaoSignature {
                 kind: CacaoSignatureType::Eip191,
@@ -907,6 +1620,20 @@ mod tests {
                 meta: None,
             },
         })
+    }
+
+    fn recap_personal_sign() -> String {
+        "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3t9XX19fQ".to_owned()
+    }
+
+    fn recap_personal_sign_eip155_2() -> String {
+        "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3siY2hhaW5zIjpbImVpcDE1NToyIl19XX19fQ"
+            .to_owned()
+    }
+
+    fn recap_personal_sign_malformed_chain_limit() -> String {
+        "urn:recap:eyJhdHQiOnsiZWlwMTU1Ijp7InJlcXVlc3QvcGVyc29uYWxfc2lnbiI6W3siY2hhaW5zIjoiZWlwMTU1OjEifV19fX0"
+            .to_owned()
     }
 
     fn session_namespaces()
