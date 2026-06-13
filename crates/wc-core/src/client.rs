@@ -7,7 +7,7 @@ use std::{
 use wc_protocol::{
     relay::RelayTopic,
     session::{
-        JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, ProposalAuthRequest,
+        DappMetadata, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, ProposalAuthRequest,
         RelayProtocolOptions, Session, SessionAuthenticateParams, SessionDeleteParams,
         SessionEventParams, SessionNamespaces, SessionParticipant, SessionProposeParams,
         SessionTransportType,
@@ -23,6 +23,7 @@ use crate::pairing::{
     SessionLifecycleResponsePayload, SessionPayload, SessionProposalApproval,
     SessionReceivedMessage, SessionSubscription, validate_pairing_registered_methods,
 };
+use crate::redirect::{WalletRedirectOrigin, WalletRedirectReview};
 use crate::session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
 };
@@ -174,6 +175,7 @@ pub struct SingleSessionClient {
     consecutive_receive_timeouts: usize,
     queued_events: BoundedQueue<SingleSessionClientEvent>,
     pending_pairing_approval: Option<SingleSessionPendingApproval>,
+    active_pairing_origin: Option<WalletRedirectOrigin>,
 }
 
 impl SingleSessionClient {
@@ -194,6 +196,7 @@ impl SingleSessionClient {
             consecutive_receive_timeouts: 0,
             queued_events: BoundedQueue::new(config.max_queued_events()),
             pending_pairing_approval: None,
+            active_pairing_origin: None,
         })
     }
 
@@ -217,6 +220,7 @@ impl SingleSessionClient {
         self.state = SingleSessionClientState::Idle;
         self.queued_events.clear();
         self.pending_pairing_approval = None;
+        self.active_pairing_origin = None;
         self.connection_state = SingleSessionClientConnectionState::DisconnectedByUser;
         self.consecutive_receive_timeouts = 0;
         close_result.map_err(SingleSessionClientError::from)
@@ -250,6 +254,7 @@ impl SingleSessionClient {
         match previous_state {
             SingleSessionClientState::Idle => {
                 self.state = SingleSessionClientState::Idle;
+                self.active_pairing_origin = None;
                 Ok(())
             }
             SingleSessionClientState::Pairing(subscription) => {
@@ -262,6 +267,7 @@ impl SingleSessionClient {
                         self.state = SingleSessionClientState::Idle;
                         self.queued_events.clear();
                         self.pending_pairing_approval = None;
+                        self.active_pairing_origin = None;
                         Err(SingleSessionClientError::from(source))
                     }
                 }
@@ -281,6 +287,7 @@ impl SingleSessionClient {
                         self.state = SingleSessionClientState::Idle;
                         self.queued_events.clear();
                         self.pending_pairing_approval = None;
+                        self.active_pairing_origin = None;
                         Err(SingleSessionClientError::from(source))
                     }
                 }
@@ -290,8 +297,23 @@ impl SingleSessionClient {
 
     /// Subscribes to a `WalletConnect` pairing URI and queues retained proposals.
     ///
+    /// This QR-safe entry point preserves dapp redirect metadata but never
+    /// recommends automatic return to the dapp. Wallets opened by a dapp link
+    /// should call `pair_with_origin` with `WalletRedirectOrigin::DeepLink`.
+    pub async fn pair(&mut self, uri: &str) -> Result<RelayTopic, SingleSessionClientError> {
+        self.pair_with_origin(uri, WalletRedirectOrigin::QrCode)
+            .await
+    }
+
+    /// Subscribes to a pairing URI with the wallet's launch origin.
+    ///
     /// Relay clients fetch retained messages before subscribing so proposals
     /// published while the wallet was offline are not skipped.
+    ///
+    /// Use `WalletRedirectOrigin::DeepLink` only when the wallet process was
+    /// opened from the dapp's native or universal link. This lets later review
+    /// objects surface validated automatic-return targets. QR and unknown
+    /// origins fail closed and expose metadata only for manual UI.
     ///
     /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#fetch-messages>
     ///
@@ -300,7 +322,11 @@ impl SingleSessionClient {
     /// <https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe>
     ///
     /// > Used when a client subscribes a given topic.
-    pub async fn pair(&mut self, uri: &str) -> Result<RelayTopic, SingleSessionClientError> {
+    pub async fn pair_with_origin(
+        &mut self,
+        uri: &str,
+        origin: WalletRedirectOrigin,
+    ) -> Result<RelayTopic, SingleSessionClientError> {
         self.ensure_idle_for_pairing()?;
         let pairing_uri = wc_protocol::pairing::PairingUri::parse(uri).map_err(|source| {
             SingleSessionClientError::Pairing {
@@ -329,12 +355,16 @@ impl SingleSessionClient {
         let mut pairing_closed = false;
 
         for message in fetched {
-            let event = match self.handle_pairing_message(&subscription, message).await {
+            let event = match self
+                .handle_pairing_message(&subscription, message, origin)
+                .await
+            {
                 Ok(event) => event,
                 Err(error) => {
                     self.unsubscribe_pairing(&subscription).await?;
                     self.state = SingleSessionClientState::Idle;
                     self.pending_pairing_approval = None;
+                    self.active_pairing_origin = None;
                     return Err(error);
                 }
             };
@@ -349,8 +379,10 @@ impl SingleSessionClient {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
             self.pending_pairing_approval = None;
+            self.active_pairing_origin = None;
         } else {
             self.state = SingleSessionClientState::Pairing(subscription);
+            self.active_pairing_origin = Some(origin);
         }
         self.queued_events.extend_within_capacity(fetched_events);
         Ok(topic)
@@ -446,17 +478,23 @@ impl SingleSessionClient {
 
         if let SingleSessionClientState::Pairing(subscription) = &self.state {
             let subscription = subscription.clone();
+            let origin = self
+                .active_pairing_origin
+                .unwrap_or(WalletRedirectOrigin::Unknown);
             let message = self
                 .pairing
                 .next_pairing_message(&subscription)
                 .await
                 .map_err(SingleSessionClientError::from)?;
             if let Some(message) = message {
-                let event = self.handle_pairing_message(&subscription, message).await?;
+                let event = self
+                    .handle_pairing_message(&subscription, message, origin)
+                    .await?;
                 if event.closes_pairing_topic() {
                     self.unsubscribe_pairing(&subscription).await?;
                     self.state = SingleSessionClientState::Idle;
                     self.pending_pairing_approval = None;
+                    self.active_pairing_origin = None;
                 } else {
                     self.record_returned_event(&event);
                 }
@@ -553,6 +591,7 @@ impl SingleSessionClient {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
             self.pending_pairing_approval = None;
+            self.active_pairing_origin = None;
             return Err(SingleSessionClientError::SessionProposalExpired {
                 proposal_id: expired.proposal_id,
                 expiry: expired.expiry,
@@ -565,11 +604,17 @@ impl SingleSessionClient {
             .await
             .map_err(SingleSessionClientError::from)?;
         let session_topic = approved.session_topic().clone();
+        let redirect_origin = self
+            .active_pairing_origin
+            .unwrap_or(WalletRedirectOrigin::Unknown);
         self.pending_pairing_approval = None;
-        self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
-            approved.subscription().clone(),
-            approved.pending_session().clone(),
-        )));
+        self.active_pairing_origin = None;
+        self.state =
+            SingleSessionClientState::Session(Box::new(ActiveSession::new_with_redirect_origin(
+                approved.subscription().clone(),
+                approved.pending_session().clone(),
+                redirect_origin,
+            )));
 
         let settle_response = match self.pairing.next_session_settle_response(&approved).await {
             Ok(Some(response)) => response,
@@ -607,6 +652,7 @@ impl SingleSessionClient {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
             self.pending_pairing_approval = None;
+            self.active_pairing_origin = None;
             return Err(SingleSessionClientError::SessionProposalExpired {
                 proposal_id: expired.proposal_id,
                 expiry: expired.expiry,
@@ -621,6 +667,7 @@ impl SingleSessionClient {
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
         self.pending_pairing_approval = None;
+        self.active_pairing_origin = None;
 
         Ok(ack)
     }
@@ -639,6 +686,7 @@ impl SingleSessionClient {
             authenticate.message(),
             authenticate.verify_context().clone(),
         )
+        .map(|review| review.with_redirect_review(authenticate.redirect().clone()))
         .map_err(|source| SingleSessionClientError::SessionAuthenticateReview { source })
     }
 
@@ -674,8 +722,7 @@ impl SingleSessionClient {
         let now_unix_seconds = now_unix_seconds()?;
         if request.params.is_expired_at(now_unix_seconds) {
             self.unsubscribe_pairing(&subscription).await?;
-            self.state = SingleSessionClientState::Idle;
-            self.pending_pairing_approval = None;
+            self.clear_pairing_state();
             return Err(SingleSessionClientError::SessionAuthenticateExpired {
                 request_id: request.id,
                 expiry: request.params.expiry_timestamp,
@@ -685,6 +732,9 @@ impl SingleSessionClient {
 
         let (wallet_metadata, cacaos, session_namespaces) = approval.into_parts();
         let adopt_session = session_namespaces.is_some();
+        let redirect_origin = self
+            .active_pairing_origin
+            .unwrap_or(WalletRedirectOrigin::Unknown);
         if adopt_session {
             self.unsubscribe_pairing(&subscription).await?;
         }
@@ -700,17 +750,13 @@ impl SingleSessionClient {
             .await
             .map_err(|source| {
                 if adopt_session {
-                    self.state = SingleSessionClientState::Idle;
-                    self.queued_events.clear();
-                    self.pending_pairing_approval = None;
+                    self.clear_pairing_state_and_queue();
                 }
                 SingleSessionClientError::from(source)
             })?;
         if let Some(namespaces) = session_namespaces {
             let Some(session_subscription) = approved.session_subscription().cloned() else {
-                self.state = SingleSessionClientState::Idle;
-                self.queued_events.clear();
-                self.pending_pairing_approval = None;
+                self.clear_pairing_state_and_queue();
                 return Err(
                     SingleSessionClientError::SessionAuthenticateSubscriptionMissing {
                         topic: approved.session_topic().clone(),
@@ -728,17 +774,19 @@ impl SingleSessionClient {
             ) {
                 Ok(session) => session,
                 Err(error) => {
-                    self.state = SingleSessionClientState::Idle;
-                    self.queued_events.clear();
-                    self.pending_pairing_approval = None;
+                    self.clear_pairing_state_and_queue();
                     return Err(error);
                 }
             };
             self.pending_pairing_approval = None;
-            self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
-                session_subscription,
-                session.clone(),
-            )));
+            self.active_pairing_origin = None;
+            self.state = SingleSessionClientState::Session(Box::new(
+                ActiveSession::new_with_redirect_origin(
+                    session_subscription,
+                    session.clone(),
+                    redirect_origin,
+                ),
+            ));
 
             return Ok(SessionAuthenticateApprovalOutcome {
                 response_ack: approved.response_ack(),
@@ -747,8 +795,7 @@ impl SingleSessionClient {
         }
 
         self.unsubscribe_pairing(&subscription).await?;
-        self.state = SingleSessionClientState::Idle;
-        self.pending_pairing_approval = None;
+        self.clear_pairing_state();
 
         Ok(SessionAuthenticateApprovalOutcome {
             response_ack: approved.response_ack(),
@@ -773,6 +820,7 @@ impl SingleSessionClient {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
             self.pending_pairing_approval = None;
+            self.active_pairing_origin = None;
             return Err(SingleSessionClientError::SessionAuthenticateExpired {
                 request_id: request.id,
                 expiry: request.params.expiry_timestamp,
@@ -787,6 +835,7 @@ impl SingleSessionClient {
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
         self.pending_pairing_approval = None;
+        self.active_pairing_origin = None;
 
         Ok(ack)
     }
@@ -869,6 +918,7 @@ impl SingleSessionClient {
         let verify_context =
             VerifyContext::unresolved_from_metadata(&session.session.peer.metadata);
         SessionRequestReview::from_message_with_verify_context(message, verify_context)
+            .map(|review| review.with_redirect_review(session.redirect_review()))
             .map_err(|source| SingleSessionClientError::SessionRequestReview { source })
     }
 
@@ -1193,11 +1243,12 @@ impl SingleSessionClient {
         };
         session.ensure_pending_session_update(request.id)?;
 
-        Ok(SessionUpdateReview::new(
+        Ok(SessionUpdateReview::new_with_redirect_review(
             message.topic().clone(),
             request.id,
             session.session.namespaces.clone(),
             request.params.namespaces.clone(),
+            session.redirect_review(),
         ))
     }
 
@@ -1258,6 +1309,17 @@ impl SingleSessionClient {
         {
             self.state = SingleSessionClientState::Idle;
         }
+    }
+
+    fn clear_pairing_state(&mut self) {
+        self.state = SingleSessionClientState::Idle;
+        self.pending_pairing_approval = None;
+        self.active_pairing_origin = None;
+    }
+
+    fn clear_pairing_state_and_queue(&mut self) {
+        self.clear_pairing_state();
+        self.queued_events.clear();
     }
 
     fn record_returned_event(&mut self, event: &SingleSessionClientEvent) {
@@ -1385,6 +1447,7 @@ impl SingleSessionClient {
         &mut self,
         subscription: &PairingSubscription,
         message: PairingReceivedMessage,
+        origin: WalletRedirectOrigin,
     ) -> Result<SingleSessionClientEvent, SingleSessionClientError> {
         match message.payload() {
             PairingPayload::PairingPing(_) => {
@@ -1404,6 +1467,7 @@ impl SingleSessionClient {
         Ok(SingleSessionClientEvent::from_pairing_message_at(
             message,
             now_unix_seconds()?,
+            origin,
         ))
     }
 
@@ -1493,6 +1557,13 @@ impl SingleSessionClient {
     }
 }
 
+fn redirect_review_for_metadata(
+    metadata: &DappMetadata,
+    origin: WalletRedirectOrigin,
+) -> WalletRedirectReview {
+    WalletRedirectReview::from_redirect(metadata.redirect.as_ref(), origin)
+}
+
 fn take_expired_session_from_state(
     state: &mut SingleSessionClientState,
     now_unix_seconds: u64,
@@ -1534,6 +1605,7 @@ impl SingleSessionClientEvent {
     pub(crate) fn from_pairing_message_at(
         message: PairingReceivedMessage,
         now_unix_seconds: u64,
+        origin: WalletRedirectOrigin,
     ) -> Self {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
@@ -1566,19 +1638,25 @@ impl SingleSessionClientEvent {
             | PairingPayload::Missing => {}
         }
 
-        Self::from_pairing_message(message)
+        Self::from_pairing_message_with_origin(message, origin)
     }
 
-    pub(crate) fn from_pairing_message(message: PairingReceivedMessage) -> Self {
+    pub(crate) fn from_pairing_message_with_origin(
+        message: PairingReceivedMessage,
+        origin: WalletRedirectOrigin,
+    ) -> Self {
         match message.payload() {
             PairingPayload::SessionProposal(request) => {
                 let request = (**request).clone();
                 let verify_context =
                     VerifyContext::unresolved_from_metadata(&request.params.proposer.metadata);
+                let redirect =
+                    redirect_review_for_metadata(&request.params.proposer.metadata, origin);
                 Self::SessionProposal(Box::new(SingleSessionProposal {
                     pairing_topic: message.topic().clone(),
                     request,
                     verify_context,
+                    redirect,
                     message,
                 }))
             }
@@ -1586,10 +1664,13 @@ impl SingleSessionClientEvent {
                 let request = (**request).clone();
                 let verify_context =
                     VerifyContext::unresolved_from_metadata(&request.params.requester.metadata);
+                let redirect =
+                    redirect_review_for_metadata(&request.params.requester.metadata, origin);
                 Self::SessionAuthenticate(Box::new(SingleSessionAuthenticate {
                     pairing_topic: message.topic().clone(),
                     request,
                     verify_context,
+                    redirect,
                     message,
                 }))
             }
@@ -1674,6 +1755,7 @@ pub struct SingleSessionProposal {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionProposeParams>,
     verify_context: VerifyContext,
+    redirect: WalletRedirectReview,
     message: PairingReceivedMessage,
 }
 
@@ -1739,6 +1821,12 @@ impl SingleSessionProposal {
     #[must_use]
     pub const fn verify_context(&self) -> &VerifyContext {
         &self.verify_context
+    }
+
+    /// Redirect metadata and automatic-return recommendation for this proposal.
+    #[must_use]
+    pub const fn redirect(&self) -> &WalletRedirectReview {
+        &self.redirect
     }
 
     /// Relay- or proposal-carried Verify v3 JWT and encrypted identifier.
@@ -1867,6 +1955,7 @@ pub struct SingleSessionAuthenticate {
     pairing_topic: RelayTopic,
     request: JsonRpcRequest<SessionAuthenticateParams>,
     verify_context: VerifyContext,
+    redirect: WalletRedirectReview,
     message: PairingReceivedMessage,
 }
 
@@ -1913,6 +2002,12 @@ impl SingleSessionAuthenticate {
     #[must_use]
     pub const fn verify_context(&self) -> &VerifyContext {
         &self.verify_context
+    }
+
+    /// Redirect metadata and automatic-return recommendation for this request.
+    #[must_use]
+    pub const fn redirect(&self) -> &WalletRedirectReview {
+        &self.redirect
     }
 
     /// Relay-carried Verify v3 JWT and encrypted identifier, when present.
@@ -2114,18 +2209,33 @@ impl SessionAuthenticateApprovalOutcome {
 struct ActiveSession {
     subscription: SessionSubscription,
     session: Session,
+    redirect_origin: WalletRedirectOrigin,
     pending_session_requests: BTreeMap<u64, Option<SessionReceivedMessage>>,
     pending_session_updates: BTreeMap<u64, Option<SessionReceivedMessage>>,
 }
 
 impl ActiveSession {
+    #[cfg(any(test, feature = "testkit"))]
     const fn new(subscription: SessionSubscription, session: Session) -> Self {
+        Self::new_with_redirect_origin(subscription, session, WalletRedirectOrigin::Unknown)
+    }
+
+    const fn new_with_redirect_origin(
+        subscription: SessionSubscription,
+        session: Session,
+        redirect_origin: WalletRedirectOrigin,
+    ) -> Self {
         Self {
             subscription,
             session,
+            redirect_origin,
             pending_session_requests: BTreeMap::new(),
             pending_session_updates: BTreeMap::new(),
         }
+    }
+
+    fn redirect_review(&self) -> WalletRedirectReview {
+        redirect_review_for_metadata(&self.session.peer.metadata, self.redirect_origin)
     }
 
     #[cfg(any(test, feature = "testkit"))]
@@ -2639,7 +2749,7 @@ fn authenticated_session(
     request: &JsonRpcRequest<SessionAuthenticateParams>,
     session_topic: RelayTopic,
     responder_public_key: wc_protocol::key::X25519PublicKey,
-    wallet_metadata: wc_protocol::session::DappMetadata,
+    wallet_metadata: DappMetadata,
     cacaos: Vec<wc_protocol::session::Cacao>,
     namespaces: SessionNamespaces,
 ) -> Result<Session, SingleSessionClientError> {
@@ -2686,6 +2796,7 @@ mod tests {
         SingleSessionClientEvent, SingleSessionClientState, authenticated_session,
         inbound_session_extend_expiry, now_unix_seconds, take_expired_session_from_state,
     };
+    use crate::{WalletRedirectOrigin, WalletRedirectReview, WalletRedirectTargetKind};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
@@ -2705,11 +2816,11 @@ mod tests {
         relay::RelayTopic,
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
-            JsonRpcRequest, ProposalNamespaces, Proposer, RelayProtocolOptions, Session,
-            SessionAuthenticateParams, SessionExtendParams, SessionNamespace, SessionParticipant,
-            SessionProposeParams, SessionRequest, SessionRequestParams, SessionTransportType,
-            SessionUpdateParams, SignMethod,
+            CacaoSignatureType, CacaoSignatureValue, DappMetadata, DappRedirect, JsonRpcError,
+            JsonRpcErrorCode, JsonRpcRequest, ProposalNamespaces, Proposer, RelayProtocolOptions,
+            Session, SessionAuthenticateParams, SessionExtendParams, SessionNamespace,
+            SessionParticipant, SessionProposeParams, SessionRequest, SessionRequestParams,
+            SessionTransportType, SessionUpdateParams, SignMethod,
         },
         verify::{
             DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyAttestationHash, VerifyContext,
@@ -2827,7 +2938,11 @@ mod tests {
             PairingPayload::SessionProposal(Box::new(request)),
         );
 
-        let event = SingleSessionClientEvent::from_pairing_message_at(message, 100);
+        let event = SingleSessionClientEvent::from_pairing_message_at(
+            message,
+            100,
+            WalletRedirectOrigin::QrCode,
+        );
         assert!(event.closes_pairing_topic());
         match event {
             SingleSessionClientEvent::SessionProposalExpired(expired) => {
@@ -2857,7 +2972,11 @@ mod tests {
             PairingPayload::SessionAuthenticate(Box::new(request)),
         );
 
-        let event = SingleSessionClientEvent::from_pairing_message_at(message, 100);
+        let event = SingleSessionClientEvent::from_pairing_message_at(
+            message,
+            100,
+            WalletRedirectOrigin::QrCode,
+        );
         assert!(event.closes_pairing_topic());
         match event {
             SingleSessionClientEvent::SessionAuthenticateExpired(expired) => {
@@ -2868,6 +2987,79 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_redirect_review_is_qr_safe_by_default() -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x6c; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x6d; 32]);
+        let mut request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        request.params.proposer.metadata.redirect = Some(test_redirect());
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic,
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+
+        let event = SingleSessionClientEvent::from_pairing_message_with_origin(
+            message,
+            WalletRedirectOrigin::QrCode,
+        );
+        let SingleSessionClientEvent::SessionProposal(proposal) = event else {
+            panic!("expected session proposal");
+        };
+
+        assert_eq!(proposal.redirect().native(), Some("examplewallet://wc"));
+        assert_eq!(
+            proposal.redirect().universal(),
+            Some("https://example.com/wc")
+        );
+        assert!(proposal.redirect().link_mode_requested());
+        assert!(proposal.redirect().automatic_target().is_none());
+        assert!(proposal.redirect().link_mode_target().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_redirect_review_allows_deep_link_return_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0x6e; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x6f; 32]);
+        let mut request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        request.params.proposer.metadata.redirect = Some(test_redirect());
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic,
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+
+        let event = SingleSessionClientEvent::from_pairing_message_with_origin(
+            message,
+            WalletRedirectOrigin::DeepLink,
+        );
+        let SingleSessionClientEvent::SessionProposal(proposal) = event else {
+            panic!("expected session proposal");
+        };
+
+        let automatic = proposal
+            .redirect()
+            .automatic_target()
+            .expect("validated automatic target");
+        assert_eq!(automatic.kind(), WalletRedirectTargetKind::Native);
+        assert_eq!(automatic.uri(), "examplewallet://wc");
+        let link_mode = proposal
+            .redirect()
+            .link_mode_target()
+            .expect("validated link-mode target");
+        assert_eq!(link_mode.kind(), WalletRedirectTargetKind::Universal);
+        assert_eq!(link_mode.uri(), "https://example.com/wc");
 
         Ok(())
     }
@@ -2972,6 +3164,63 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn active_session_reviews_inherit_deep_link_redirect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x70; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x71; 32]);
+        let mut session = test_session(topic.clone(), FUTURE_SESSION_EXPIRY);
+        session.peer.metadata.redirect = Some(test_redirect());
+        client.state =
+            SingleSessionClientState::Session(Box::new(ActiveSession::new_with_redirect_origin(
+                SessionSubscription::for_test(topic.clone(), sym_key),
+                session,
+                WalletRedirectOrigin::DeepLink,
+            )));
+
+        let request = session_request(91, Some(FUTURE_SESSION_EXPIRY))?;
+        let request_plaintext = serde_json::to_string(&request)?;
+        let request_message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &request_plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client
+            .client_session_mut(&topic)?
+            .mark_session_request_message_pending(request_message.clone());
+        let request_review = client.session_request_review(&request_message)?;
+        let request_target = request_review
+            .redirect()
+            .automatic_target()
+            .expect("session request return target");
+        assert_eq!(request_target.kind(), WalletRedirectTargetKind::Native);
+        assert_eq!(request_target.uri(), "examplewallet://wc");
+
+        let update = session_update_request(92, test_namespaces()?);
+        let update_plaintext = serde_json::to_string(&update)?;
+        let update_message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &update_plaintext,
+            SessionPayload::SessionUpdate(update),
+        );
+        client
+            .client_session_mut(&topic)?
+            .mark_session_update_message_pending(update_message.clone());
+        let update_review = client.session_update_review(&update_message)?;
+        let link_mode_target = update_review
+            .redirect()
+            .link_mode_target()
+            .expect("session update link-mode target");
+        assert_eq!(link_mode_target.kind(), WalletRedirectTargetKind::Universal);
+        assert_eq!(link_mode_target.uri(), "https://example.com/wc");
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -3117,7 +3366,10 @@ mod tests {
             &plaintext,
             PairingPayload::SessionProposal(Box::new(request)),
         );
-        let event = SingleSessionClientEvent::from_pairing_message(message);
+        let event = SingleSessionClientEvent::from_pairing_message_with_origin(
+            message,
+            WalletRedirectOrigin::QrCode,
+        );
         client.record_returned_event(&event);
 
         let next = client
@@ -3174,6 +3426,7 @@ mod tests {
             pairing_topic: topic,
             request,
             verify_context: verify_context.clone(),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
             message,
         };
 
@@ -3215,6 +3468,7 @@ mod tests {
             pairing_topic: topic.clone(),
             request,
             verify_context: VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
             message,
         };
         let wrong_review = VerifyRiskReview::new(
@@ -3296,6 +3550,7 @@ mod tests {
             pairing_topic: topic.clone(),
             request,
             verify_context: verify_context.clone(),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
             message,
         };
         let wrong_review = VerifyRiskReview::new(
@@ -4195,6 +4450,14 @@ mod tests {
             icons: Vec::new(),
             verify_url: None,
             redirect: None,
+        }
+    }
+
+    fn test_redirect() -> DappRedirect {
+        DappRedirect {
+            native: Some("examplewallet://wc".to_owned()),
+            universal: Some("https://example.com/wc".to_owned()),
+            link_mode: Some(true),
         }
     }
 

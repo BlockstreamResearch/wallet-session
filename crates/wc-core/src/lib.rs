@@ -3,6 +3,7 @@
 mod capabilities;
 mod client;
 mod pairing;
+mod redirect;
 mod session_authenticate;
 mod session_request;
 mod session_update;
@@ -38,6 +39,9 @@ pub use pairing::{
     PairingReceivedMessage, RelayAuthSeed, SessionClientEvent, SessionLifecycleRequest,
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
     SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection,
+};
+pub use redirect::{
+    WalletRedirectOrigin, WalletRedirectReview, WalletRedirectTarget, WalletRedirectTargetKind,
 };
 pub use session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,

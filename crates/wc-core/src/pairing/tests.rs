@@ -1126,7 +1126,10 @@ fn classifies_pairing_proposal_as_client_event() -> Result<(), Box<dyn std::erro
         payload: PairingPayload::SessionProposal(Box::new(request)),
     };
 
-    let event = crate::SingleSessionClientEvent::from_pairing_message(message);
+    let event = crate::SingleSessionClientEvent::from_pairing_message_with_origin(
+        message,
+        crate::WalletRedirectOrigin::Unknown,
+    );
 
     match event {
         crate::SingleSessionClientEvent::SessionProposal(proposal) => {
@@ -1176,7 +1179,10 @@ fn classifies_pairing_authenticate_as_client_event() -> Result<(), Box<dyn std::
         payload: PairingPayload::SessionAuthenticate(Box::new(request)),
     };
 
-    let event = crate::SingleSessionClientEvent::from_pairing_message(message);
+    let event = crate::SingleSessionClientEvent::from_pairing_message_with_origin(
+        message,
+        crate::WalletRedirectOrigin::Unknown,
+    );
 
     match event {
         crate::SingleSessionClientEvent::SessionAuthenticate(authenticate) => {

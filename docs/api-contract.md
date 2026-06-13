@@ -17,6 +17,8 @@ The recommended wallet-facing surface is:
 - `SingleSessionAuthenticate`
 - `SessionExpired`
 - `WalletCapabilities`
+- `WalletRedirectOrigin`
+- `WalletRedirectReview`
 - `SessionAuthenticateReview`
 - `SessionRequestReview`
 - `VerifyRiskReview`
@@ -148,6 +150,48 @@ Source:
 - [Best practices, session proposal expiry](https://docs.walletconnect.network/wallet-sdk/best-practices#session-proposal-expiry)
 - [Relay fetch messages](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#fetch-messages)
 - [Relay subscribe](https://specs.walletconnect.com/2.0/specs/servers/relay/relay-server-rpc#subscribe)
+
+## Redirect And Link Mode UX
+
+Dapp metadata can include `redirect.native`, `redirect.universal`, and
+`redirect.linkMode`. Core preserves these raw values on wallet review objects,
+but it only recommends an automatic return target when the wallet records that
+the pairing was opened from a dapp link.
+
+The default `SingleSessionClient::pair(uri)` path is QR-safe:
+
+- raw redirect metadata remains available through `WalletRedirectReview`;
+- `automatic_target()` returns `None`;
+- `link_mode_target()` returns `None`.
+
+Wallets that were opened by a dapp native or universal link may call
+`SingleSessionClient::pair_with_origin(uri, WalletRedirectOrigin::DeepLink)`.
+For those flows, review objects expose validated targets:
+
+- native custom-scheme redirects are preferred for automatic return;
+- HTTPS universal links can be used when no valid native target exists;
+- link-mode target is exposed only when `linkMode` is true and the universal
+  link is valid HTTPS.
+
+The redirect review is attached to:
+
+- `SingleSessionProposal`;
+- `SingleSessionAuthenticate`;
+- `SessionAuthenticateReview`;
+- `SessionRequestReview`;
+- `SessionUpdateReview`.
+
+Core does not open platform URLs and does not dispatch plaintext link-mode
+envelopes. The consuming wallet owns any actual app switch after displaying the
+wallet approval/result state.
+
+Source:
+
+- [`WalletRedirectReview`](../crates/wc-core/src/redirect.rs)
+- [`SingleSessionClient::pair_with_origin`](../crates/wc-core/src/client.rs)
+- [Android mobile linking](https://docs.walletconnect.network/wallet-sdk/android/mobile-linking)
+- [iOS mobile linking](https://docs.walletconnect.network/wallet-sdk/ios/mobile-linking)
+- [Reown Link Mode](https://docs.reown.com/appkit/react-native/core/link-mode)
 
 ## Session Proposal Decisions
 

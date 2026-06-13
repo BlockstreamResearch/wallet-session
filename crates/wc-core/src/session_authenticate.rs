@@ -10,6 +10,7 @@ use wc_protocol::{
 };
 
 use crate::pairing::{PairingPayload, PairingReceivedMessage};
+use crate::redirect::{WalletRedirectOrigin, WalletRedirectReview};
 use crate::verify_policy::{
     VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
 };
@@ -76,6 +77,7 @@ pub struct SessionAuthenticateReview {
     verify_attestation_hash: Option<VerifyAttestationHash>,
     verify_attestation_jwt: Option<String>,
     verify_encrypted_id: Option<String>,
+    redirect: WalletRedirectReview,
 }
 
 impl SessionAuthenticateReview {
@@ -200,7 +202,15 @@ impl SessionAuthenticateReview {
             verify_attestation_hash: None,
             verify_attestation_jwt: None,
             verify_encrypted_id: None,
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
         }
+    }
+
+    /// Replaces the redirect review associated with this authentication request.
+    #[must_use]
+    pub fn with_redirect_review(mut self, redirect: WalletRedirectReview) -> Self {
+        self.redirect = redirect;
+        self
     }
 
     /// Pairing topic that delivered the request.
@@ -243,6 +253,12 @@ impl SessionAuthenticateReview {
     #[must_use]
     pub const fn verify_context(&self) -> &VerifyContext {
         &self.verify_context
+    }
+
+    /// Redirect metadata and automatic-return recommendation for this request.
+    #[must_use]
+    pub const fn redirect(&self) -> &WalletRedirectReview {
+        &self.redirect
     }
 
     /// Relay-carried Verify v3 JWT and encrypted identifier, when retained.

@@ -12,6 +12,7 @@ use wc_protocol::{
 };
 
 use crate::pairing::{SessionPayload, SessionReceivedMessage};
+use crate::redirect::{WalletRedirectOrigin, WalletRedirectReview};
 use crate::verify_policy::{
     VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
 };
@@ -79,6 +80,7 @@ pub struct SessionRequestReview {
     verify_attestation_hash: Option<VerifyAttestationHash>,
     verify_attestation_jwt: Option<String>,
     verify_encrypted_id: Option<String>,
+    redirect: WalletRedirectReview,
 }
 
 impl SessionRequestReview {
@@ -189,7 +191,15 @@ impl SessionRequestReview {
             verify_attestation_hash,
             verify_attestation_jwt,
             verify_encrypted_id,
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
         })
+    }
+
+    /// Replaces the redirect review associated with this request.
+    #[must_use]
+    pub fn with_redirect_review(mut self, redirect: WalletRedirectReview) -> Self {
+        self.redirect = redirect;
+        self
     }
 
     /// Session topic that delivered the request.
@@ -260,6 +270,12 @@ impl SessionRequestReview {
     #[must_use]
     pub const fn verify_context(&self) -> &VerifyContext {
         &self.verify_context
+    }
+
+    /// Redirect metadata and automatic-return recommendation for the active session.
+    #[must_use]
+    pub const fn redirect(&self) -> &WalletRedirectReview {
+        &self.redirect
     }
 
     /// Retained Verify hash for reviews built from decrypted relay messages.

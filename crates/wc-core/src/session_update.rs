@@ -10,6 +10,8 @@ use wc_protocol::{
     },
 };
 
+use crate::redirect::{WalletRedirectOrigin, WalletRedirectReview};
+
 /// Permission-level diff between current and requested session namespaces.
 ///
 /// `wc_sessionUpdate` replaces namespaces, which can add accounts, chains,
@@ -118,6 +120,7 @@ pub struct SessionUpdateReview {
     current_namespaces: SessionNamespaces,
     requested_namespaces: SessionNamespaces,
     diff: SessionNamespacesDiff,
+    redirect: WalletRedirectReview,
 }
 
 impl SessionUpdateReview {
@@ -129,6 +132,24 @@ impl SessionUpdateReview {
         current_namespaces: SessionNamespaces,
         requested_namespaces: SessionNamespaces,
     ) -> Self {
+        Self::new_with_redirect_review(
+            topic,
+            request_id,
+            current_namespaces,
+            requested_namespaces,
+            WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
+        )
+    }
+
+    /// Builds review data with caller-provided redirect review context.
+    #[must_use]
+    pub fn new_with_redirect_review(
+        topic: RelayTopic,
+        request_id: u64,
+        current_namespaces: SessionNamespaces,
+        requested_namespaces: SessionNamespaces,
+        redirect: WalletRedirectReview,
+    ) -> Self {
         let diff = diff_session_namespaces(&current_namespaces, &requested_namespaces);
         Self {
             topic,
@@ -136,6 +157,7 @@ impl SessionUpdateReview {
             current_namespaces,
             requested_namespaces,
             diff,
+            redirect,
         }
     }
 
@@ -167,6 +189,12 @@ impl SessionUpdateReview {
     #[must_use]
     pub const fn diff(&self) -> &SessionNamespacesDiff {
         &self.diff
+    }
+
+    /// Redirect metadata and automatic-return recommendation for the active session.
+    #[must_use]
+    pub const fn redirect(&self) -> &WalletRedirectReview {
+        &self.redirect
     }
 
     /// Typed params that would be acknowledged if this update is approved.

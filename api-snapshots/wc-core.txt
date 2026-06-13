@@ -123,6 +123,7 @@ struct wc_core::SessionAuthenticateReview
   const fn expiry_timestamp
   const fn is_expired_at
   const fn published_at
+  const fn redirect
   const fn request_id
   const fn requester
   const fn topic
@@ -137,6 +138,7 @@ struct wc_core::SessionAuthenticateReview
   fn from_request_with_verify_context
   fn verify_jwt_attestation
   fn verify_risk_review
+  fn with_redirect_review
 
 enum wc_core::SessionAuthenticateReviewError
   variant NotSessionAuthenticate
@@ -242,6 +244,7 @@ struct wc_core::SessionRequestReview
   const fn method
   const fn params
   const fn published_at
+  const fn redirect
   const fn request_id
   const fn topic
   const fn verify_attestation_hash
@@ -255,6 +258,7 @@ struct wc_core::SessionRequestReview
   fn verify_jwt_attestation
   fn verify_risk_review
   fn wallet_call_request
+  fn with_redirect_review
 
 enum wc_core::SessionRequestReviewError
   variant NotSessionRequest
@@ -267,10 +271,12 @@ enum wc_core::SessionRequestVerifyResolutionError
 struct wc_core::SessionUpdateReview
   const fn current_namespaces
   const fn diff
+  const fn redirect
   const fn request_id
   const fn requested_namespaces
   const fn topic
   fn new
+  fn new_with_redirect_review
   fn requested_params
 
 struct wc_core::SingleSessionAuthenticate
@@ -280,6 +286,7 @@ struct wc_core::SingleSessionAuthenticate
   const fn is_expired_at
   const fn message
   const fn pairing_topic
+  const fn redirect
   const fn request
   const fn request_id
   const fn verify_context
@@ -296,6 +303,7 @@ struct wc_core::SingleSessionClient
   async fn extend_session
   async fn next_event
   async fn pair
+  async fn pair_with_origin
   async fn reconnect
   async fn reject_session
   async fn reject_session_authenticate
@@ -383,6 +391,7 @@ struct wc_core::SingleSessionProposal
   const fn message
   const fn pairing_topic
   const fn proposal_id
+  const fn redirect
   const fn request
   const fn verify_context
   const fn verify_risk
@@ -459,6 +468,32 @@ struct wc_core::WalletChainCapability
   fn events
   fn methods
   fn new
+
+enum wc_core::WalletRedirectOrigin
+  variant Unknown
+  variant QrCode
+  variant DeepLink
+  const fn allows_automatic_redirect
+
+struct wc_core::WalletRedirectReview
+  const fn allows_automatic_redirect
+  const fn empty
+  const fn has_metadata
+  const fn link_mode_requested
+  const fn origin
+  fn automatic_target
+  fn from_redirect
+  fn link_mode_target
+  fn native
+  fn universal
+
+struct wc_core::WalletRedirectTarget
+  const fn kind
+  fn uri
+
+enum wc_core::WalletRedirectTargetKind
+  variant Native
+  variant Universal
 
 fn wc_core::classify_verify_context
 
