@@ -22,7 +22,8 @@ pub mod testkit {
 }
 
 pub use capabilities::{
-    ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
+    ProposalPlanningError, SessionUpdateApprovalError, WalletCapabilities, WalletCapabilityError,
+    WalletChainCapability,
 };
 pub use client::{
     DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,

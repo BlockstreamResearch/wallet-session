@@ -234,6 +234,70 @@ impl WalletCapabilities {
         Ok(approval)
     }
 
+    /// Validates a `wc_sessionUpdate` namespace replacement against wallet capabilities.
+    ///
+    /// Session updates replace the active namespace set. A wallet should only
+    /// acknowledge a replacement whose chains, accounts, methods, and events
+    /// are all currently supported by the wallet.
+    pub fn validate_session_update_namespaces(
+        &self,
+        namespaces: &SessionNamespaces,
+    ) -> Result<(), SessionUpdateApprovalError> {
+        validate_session_namespace_shape(namespaces)?;
+
+        for (key, namespace) in namespaces {
+            let chains = session_namespace_chains(key, namespace)?;
+            for chain_id in chains {
+                let capability = self.chains.get(&chain_id).ok_or_else(|| {
+                    SessionUpdateApprovalError::MissingChain {
+                        chain_id: chain_id.clone(),
+                    }
+                })?;
+
+                let accounts = namespace
+                    .accounts
+                    .iter()
+                    .filter(|account| account.chain_id() == chain_id)
+                    .collect::<Vec<_>>();
+                if accounts.is_empty() {
+                    return Err(SessionUpdateApprovalError::Namespaces {
+                        source: NamespaceValidationError::MissingAccountForChain {
+                            chain_id: chain_id.clone(),
+                        },
+                    });
+                }
+                for account in accounts {
+                    if !capability.accounts.contains(account) {
+                        return Err(SessionUpdateApprovalError::UnsupportedAccount {
+                            chain_id: chain_id.clone(),
+                            account: account.clone(),
+                        });
+                    }
+                }
+
+                for method in &namespace.methods {
+                    if !capability.methods.contains(method) {
+                        return Err(SessionUpdateApprovalError::UnsupportedMethod {
+                            chain_id: chain_id.clone(),
+                            method: method.clone(),
+                        });
+                    }
+                }
+
+                for event in &namespace.events {
+                    if !capability.events.contains(event) {
+                        return Err(SessionUpdateApprovalError::UnsupportedEvent {
+                            chain_id: chain_id.clone(),
+                            event: event.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn add_proposal_namespaces(
         &self,
         proposal_namespaces: &ProposalNamespaces,
@@ -522,6 +586,52 @@ pub enum ProposalPlanningError {
     },
 }
 
+/// Session update approval validation error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionUpdateApprovalError {
+    /// Requested replacement namespaces failed protocol shape validation.
+    #[error("session update namespaces are invalid")]
+    Namespaces {
+        /// Source namespace validation error.
+        #[source]
+        source: NamespaceValidationError,
+    },
+
+    /// Wallet has no capability for a requested CAIP-2 chain.
+    #[error("wallet has no capability for session update chain {chain_id}")]
+    MissingChain {
+        /// Requested chain.
+        chain_id: Caip2ChainId,
+    },
+
+    /// Requested account is not wallet-owned for the chain.
+    #[error("wallet does not support session update account {account} for chain {chain_id}")]
+    UnsupportedAccount {
+        /// Requested chain.
+        chain_id: Caip2ChainId,
+        /// Unsupported account.
+        account: Caip10AccountId,
+    },
+
+    /// Requested method is not supported by the wallet for the chain.
+    #[error("wallet does not support session update method {method} for chain {chain_id}")]
+    UnsupportedMethod {
+        /// Requested chain.
+        chain_id: Caip2ChainId,
+        /// Unsupported method.
+        method: SessionMethod,
+    },
+
+    /// Requested event is not supported by the wallet for the chain.
+    #[error("wallet does not support session update event {event} for chain {chain_id}")]
+    UnsupportedEvent {
+        /// Requested chain.
+        chain_id: Caip2ChainId,
+        /// Unsupported event.
+        event: SessionEventName,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalRequirement {
     Required,
@@ -560,6 +670,41 @@ fn validate_proposal_namespaces(
         | NamespaceValidationError::MissingAccountForChain { .. } => Ok(()),
         source => Err(ProposalPlanningError::ProposalNamespaces { source }),
     })
+}
+
+fn validate_session_namespace_shape(
+    namespaces: &SessionNamespaces,
+) -> Result<(), SessionUpdateApprovalError> {
+    validate_approved_namespaces(&ProposalNamespaces::new(), namespaces)
+        .map_err(|source| SessionUpdateApprovalError::Namespaces { source })
+}
+
+fn session_namespace_chains(
+    key: &NamespaceKey,
+    namespace: &SessionNamespace,
+) -> Result<Vec<Caip2ChainId>, SessionUpdateApprovalError> {
+    let mut chains = Vec::new();
+    if let Some(chain_id) = key.chain_id() {
+        insert_unique(&mut chains, chain_id.clone());
+    }
+
+    for chain_id in namespace.chains.iter().flatten() {
+        if chain_id.namespace() != key.namespace() {
+            return Err(SessionUpdateApprovalError::Namespaces {
+                source: NamespaceValidationError::ChainNamespaceMismatch {
+                    namespace: namespace_component(key),
+                    chain_id: chain_id.clone(),
+                },
+            });
+        }
+        insert_unique(&mut chains, chain_id.clone());
+    }
+
+    for account in &namespace.accounts {
+        insert_unique(&mut chains, account.chain_id());
+    }
+
+    Ok(chains)
 }
 
 /// Adds a required chain after `satisfied_chain` has checked all permissions.

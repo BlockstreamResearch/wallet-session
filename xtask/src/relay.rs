@@ -1430,7 +1430,10 @@ async fn handle_incoming_single_session_client_session_update(
         }
         CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateApprove
         | CoreSingleSessionClientSessionLifecycleAction::IncomingUpdateAddPermissionsApprove => {
-            let response_ack = client.approve_session_update(message).await?;
+            let capabilities = probe_wallet_capabilities()?;
+            let response_ack = client
+                .approve_session_update(message, &capabilities)
+                .await?;
             println!(
                 "core-single-session-client-session-lifecycle update_approval_ack={response_ack}"
             );

@@ -10,6 +10,7 @@ use super::{
     ActiveSession, SessionExpired, SingleSessionClientError, SingleSessionClientState,
     take_expired_session_from_state,
 };
+use crate::capabilities::WalletCapabilities;
 use crate::low_level::{PairingSubscription, SessionSubscription};
 
 /// Coarse state held by `SingleSessionStateHarness`.
@@ -337,9 +338,13 @@ impl SingleSessionStateHarness {
         topic: &RelayTopic,
         request_id: u64,
         namespaces: SessionNamespaces,
+        capabilities: &WalletCapabilities,
     ) -> Result<(), SingleSessionClientError> {
         let session = self.client_session_mut(topic)?;
         session.ensure_pending_session_update(request_id)?;
+        capabilities
+            .validate_session_update_namespaces(&namespaces)
+            .map_err(|source| SingleSessionClientError::SessionUpdateApproval { source })?;
         session.session.namespaces = namespaces;
         session.complete_session_update(request_id);
         Ok(())
@@ -444,7 +449,13 @@ impl SingleSessionStateHarness {
 #[cfg(test)]
 mod tests {
     use super::{SingleSessionHarnessState, SingleSessionStateHarness};
-    use wc_protocol::{pairing::PairingSymKey, relay::RelayTopic, session::Session};
+    use crate::{WalletCapabilities, WalletChainCapability};
+    use wc_protocol::{
+        caip::{Caip2ChainId, Caip10AccountId},
+        pairing::PairingSymKey,
+        relay::RelayTopic,
+        session::{Session, SessionEventName, SessionMethod},
+    };
 
     #[test]
     fn pairing_adoption_replaces_pairing_with_one_session() -> Result<(), Box<dyn std::error::Error>>
@@ -482,10 +493,11 @@ mod tests {
         let topic = session.topic.clone();
         let namespaces = session.namespaces.clone();
         let mut harness = SingleSessionStateHarness::new_session(session, sym_key());
+        let capabilities = test_capabilities()?;
 
         assert!(harness.mark_session_update_pending_on(&topic, 7)?);
         assert_eq!(harness.pending_session_update_count(), 1);
-        harness.approve_session_update_on(&topic, 7, namespaces)?;
+        harness.approve_session_update_on(&topic, 7, namespaces, &capabilities)?;
         assert_eq!(harness.pending_session_update_count(), 0);
         assert!(harness.complete_session_update_on(&topic, 7).is_err());
 
@@ -541,6 +553,20 @@ mod tests {
               "transportType": "relay"
             }"#,
         )
+    }
+
+    fn test_capabilities() -> Result<WalletCapabilities, Box<dyn std::error::Error>> {
+        Ok(WalletCapabilities::new([WalletChainCapability::new(
+            Caip2ChainId::parse("eip155:1")?,
+            vec![Caip10AccountId::parse(
+                "eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87",
+            )?],
+            vec![SessionMethod::parse("personal_sign")?],
+            vec![
+                SessionEventName::parse("chainChanged")?,
+                SessionEventName::parse("accountsChanged")?,
+            ],
+        )?])?)
     }
 
     fn sym_key() -> PairingSymKey {

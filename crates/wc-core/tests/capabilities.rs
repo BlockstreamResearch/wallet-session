@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 use wc_core::{
-    ProposalPlanningError, WalletCapabilities, WalletCapabilityError, WalletChainCapability,
+    ProposalPlanningError, SessionUpdateApprovalError, WalletCapabilities, WalletCapabilityError,
+    WalletChainCapability,
 };
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
@@ -12,7 +13,8 @@ use wc_protocol::{
     namespaces::{NamespaceValidationError, is_method_authorized},
     session::{
         DappMetadata, JsonRpcRequest, ProposalNamespace, ProposalNamespaces, RelayProtocolOptions,
-        SessionEventName, SessionMethod, SessionProposeParams, SignMethod,
+        SessionEventName, SessionMethod, SessionNamespace, SessionNamespaces, SessionProposeParams,
+        SignMethod,
     },
 };
 
@@ -632,6 +634,98 @@ fn malformed_proposal_namespace_is_rejected() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[test]
+fn session_update_replacement_is_valid_when_within_wallet_capabilities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let update = session_namespaces([(
+        "eip155",
+        session_namespace(
+            ["eip155:1"],
+            ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+            ["personal_sign"],
+            ["accountsChanged"],
+        )?,
+    )])?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign", "eth_signTypedData_v4"],
+        ["accountsChanged"],
+    )?])?;
+
+    capabilities.validate_session_update_namespaces(&update)?;
+
+    Ok(())
+}
+
+#[test]
+fn session_update_replacement_rejects_unsupported_method() -> Result<(), Box<dyn std::error::Error>>
+{
+    let update = session_namespaces([(
+        "eip155",
+        session_namespace(
+            ["eip155:1"],
+            ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+            ["personal_sign", "eth_sendTransaction"],
+            ["accountsChanged"],
+        )?,
+    )])?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .validate_session_update_namespaces(&update)
+        .expect_err("unsupported update method must be rejected");
+
+    assert_eq!(
+        error,
+        SessionUpdateApprovalError::UnsupportedMethod {
+            chain_id: Caip2ChainId::parse("eip155:1")?,
+            method: SessionMethod::parse("eth_sendTransaction")?,
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn session_update_replacement_rejects_unsupported_account() -> Result<(), Box<dyn std::error::Error>>
+{
+    let update = session_namespaces([(
+        "eip155",
+        session_namespace(
+            ["eip155:1"],
+            ["eip155:1:0x2222222222222222222222222222222222222222"],
+            ["personal_sign"],
+            ["accountsChanged"],
+        )?,
+    )])?;
+    let capabilities = capabilities([chain_capability(
+        "eip155:1",
+        ["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"],
+        ["personal_sign"],
+        ["accountsChanged"],
+    )?])?;
+
+    let error = capabilities
+        .validate_session_update_namespaces(&update)
+        .expect_err("unsupported update account must be rejected");
+
+    assert_eq!(
+        error,
+        SessionUpdateApprovalError::UnsupportedAccount {
+            chain_id: Caip2ChainId::parse("eip155:1")?,
+            account: Caip10AccountId::parse("eip155:1:0x2222222222222222222222222222222222222222",)?,
+        }
+    );
+
+    Ok(())
+}
+
 fn proposal(
     required_namespaces: ProposalNamespaces,
     optional_namespaces: ProposalNamespaces,
@@ -682,6 +776,16 @@ fn namespaces(
     Ok(namespaces)
 }
 
+fn session_namespaces(
+    values: impl IntoIterator<Item = (&'static str, SessionNamespace)>,
+) -> Result<SessionNamespaces, Box<dyn std::error::Error>> {
+    let mut namespaces = BTreeMap::new();
+    for (key, namespace) in values {
+        namespaces.insert(NamespaceKey::parse(key)?, namespace);
+    }
+    Ok(namespaces)
+}
+
 fn proposal_namespace<
     const CHAIN_COUNT: usize,
     const METHOD_COUNT: usize,
@@ -698,6 +802,39 @@ fn proposal_namespace<
                 .map(Caip2ChainId::parse)
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        methods: methods
+            .into_iter()
+            .map(str::parse::<SessionMethod>)
+            .collect::<Result<Vec<_>, _>>()?,
+        events: events
+            .into_iter()
+            .map(str::parse::<SessionEventName>)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn session_namespace<
+    const CHAIN_COUNT: usize,
+    const ACCOUNT_COUNT: usize,
+    const METHOD_COUNT: usize,
+    const EVENT_COUNT: usize,
+>(
+    chains: [&str; CHAIN_COUNT],
+    accounts: [&str; ACCOUNT_COUNT],
+    methods: [&str; METHOD_COUNT],
+    events: [&str; EVENT_COUNT],
+) -> Result<SessionNamespace, Box<dyn std::error::Error>> {
+    Ok(SessionNamespace {
+        chains: Some(
+            chains
+                .into_iter()
+                .map(Caip2ChainId::parse)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        accounts: accounts
+            .into_iter()
+            .map(Caip10AccountId::parse)
+            .collect::<Result<Vec<_>, _>>()?,
         methods: methods
             .into_iter()
             .map(str::parse::<SessionMethod>)

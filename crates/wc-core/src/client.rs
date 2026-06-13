@@ -17,6 +17,7 @@ use wc_protocol::{
 };
 use wc_transport::{RelayClientError, RelayReconnectConfig};
 
+use crate::capabilities::{SessionUpdateApprovalError, WalletCapabilities};
 use crate::pairing::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingClient, PairingClientConfig as SingleSessionRelayConfig,
     PairingClientError, PairingPayload, PairingReceivedMessage, PairingSubscription,
@@ -955,6 +956,7 @@ impl SingleSessionClient {
     pub async fn approve_session_update(
         &mut self,
         message: &SessionReceivedMessage,
+        capabilities: &WalletCapabilities,
     ) -> Result<bool, SingleSessionClientError> {
         let SessionPayload::SessionUpdate(request) = message.payload() else {
             return Err(SingleSessionClientError::Pairing {
@@ -966,6 +968,9 @@ impl SingleSessionClient {
         self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_update(request_id)?;
+        capabilities
+            .validate_session_update_namespaces(&request.params.namespaces)
+            .map_err(|source| SingleSessionClientError::SessionUpdateApproval { source })?;
         let subscription = self.session_subscription(message.topic())?.clone();
         let namespaces = request.params.namespaces.clone();
         let publish_ack = self
@@ -2674,6 +2679,14 @@ pub enum SingleSessionClientError {
         source: SessionAuthenticateApprovalError,
     },
 
+    /// A caller-approved session update is outside wallet capabilities.
+    #[error("single-session client session update approval failed")]
+    SessionUpdateApproval {
+        /// Source update validation error.
+        #[source]
+        source: SessionUpdateApprovalError,
+    },
+
     /// Verify risk review does not match the approval or signing operation.
     #[error("single-session client verify risk review mismatch")]
     VerifyRiskReviewMismatch {
@@ -3017,7 +3030,7 @@ mod tests {
         },
     };
     use wc_protocol::{
-        caip::NamespaceKey,
+        caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
         did::DidPkh,
         key::X25519PublicKey,
         pairing::PairingSymKey,
@@ -3041,8 +3054,9 @@ mod tests {
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
         SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionPayload,
         SessionProposalApproval, SessionReceivedMessage, SessionRequestReview,
-        SingleSessionAuthenticate, SingleSessionPendingApproval, SingleSessionProposal,
-        SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
+        SessionUpdateApprovalError, SingleSessionAuthenticate, SingleSessionPendingApproval,
+        SingleSessionProposal, SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
+        WalletCapabilities, WalletChainCapability,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -4455,6 +4469,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_session_update_approval_is_rejected_without_publish_or_mutation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x8f; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x90; 32]);
+        let current = test_namespaces()?;
+        let mut replacement = current.clone();
+        replacement
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("test namespace exists")
+            .methods
+            .push(SessionMethod::parse("eth_sendTransaction")?);
+        let request = session_update_request(88, replacement);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionUpdate(request),
+        );
+        let mut session = test_session(topic.clone(), FUTURE_SESSION_EXPIRY);
+        session.namespaces = current.clone();
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            session,
+        )));
+        client
+            .client_session_mut(&topic)?
+            .mark_session_update_pending(88);
+        let capabilities = test_wallet_capabilities()?;
+
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.approve_session_update(&message, &capabilities),
+        )
+        .await
+        .expect("capability guard returns before relay publish")
+        .expect_err("unsupported session update must not be approved");
+
+        match error {
+            SingleSessionClientError::SessionUpdateApproval {
+                source: SessionUpdateApprovalError::UnsupportedMethod { chain_id, method },
+            } => {
+                assert_eq!(chain_id, Caip2ChainId::parse("eip155:1")?);
+                assert_eq!(method, SessionMethod::parse("eth_sendTransaction")?);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            client.active_session().expect("session remains").namespaces,
+            current
+        );
+        assert!(
+            client
+                .client_session(&topic)?
+                .ensure_pending_session_update(88)
+                .is_ok()
+        );
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn expired_session_update_approval_clears_session_without_mutating()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, server) = connect_idle_test_client().await;
@@ -4475,10 +4554,11 @@ mod tests {
         client
             .client_session_mut(&topic)?
             .mark_session_update_pending(79);
+        let capabilities = test_wallet_capabilities()?;
 
         let error = tokio::time::timeout(
             Duration::from_millis(100),
-            client.approve_session_update(&message),
+            client.approve_session_update(&message, &capabilities),
         )
         .await
         .expect("expired session guard returns before relay publish")
@@ -5184,6 +5264,17 @@ mod tests {
                 events: vec!["accountsChanged".parse()?],
             },
         )]))
+    }
+
+    fn test_wallet_capabilities() -> Result<WalletCapabilities, Box<dyn std::error::Error>> {
+        Ok(WalletCapabilities::new([WalletChainCapability::new(
+            Caip2ChainId::parse("eip155:1")?,
+            vec![Caip10AccountId::parse(
+                "eip155:1:0x1111111111111111111111111111111111111111",
+            )?],
+            vec![SessionMethod::parse("personal_sign")?],
+            vec![SessionEventName::parse("accountsChanged")?],
+        )?])?)
     }
 
     fn assert_receive_timed_out(error: SingleSessionClientError) {

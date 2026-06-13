@@ -2,8 +2,16 @@
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
-use wc_core::testkit::{SingleSessionHarnessState, SingleSessionStateHarness};
-use wc_protocol::{pairing::PairingSymKey, relay::RelayTopic, session::Session};
+use wc_core::{
+    WalletCapabilities, WalletChainCapability,
+    testkit::{SingleSessionHarnessState, SingleSessionStateHarness},
+};
+use wc_protocol::{
+    caip::{Caip10AccountId, Caip2ChainId},
+    pairing::PairingSymKey,
+    relay::RelayTopic,
+    session::{Session, SessionNamespaces},
+};
 
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 const MAX_IDS: usize = 32;
@@ -83,6 +91,7 @@ fn exercise_pending_update_state(
     update_namespaces: wc_protocol::session::SessionNamespaces,
 ) {
     let topic = session.topic.clone();
+    let capabilities = capabilities_for_update_namespaces(&update_namespaces);
     let mut harness = SingleSessionStateHarness::new_session(session, harness_sym_key());
 
     for request_id in ids.into_iter().take(MAX_IDS) {
@@ -97,9 +106,33 @@ fn exercise_pending_update_state(
                 .mark_session_update_pending(request_id)
                 .expect("duplicate update id should be checked on active session")
         );
-        harness
-            .approve_session_update_on(&topic, request_id, update_namespaces.clone())
-            .expect("pending update should approve once");
+        if let Some(capabilities) = &capabilities {
+            harness
+                .approve_session_update_on(
+                    &topic,
+                    request_id,
+                    update_namespaces.clone(),
+                    capabilities,
+                )
+                .expect("capability-supported pending update should approve once");
+        } else {
+            let empty_capabilities =
+                WalletCapabilities::new(Vec::<WalletChainCapability>::new())
+                    .expect("empty capabilities build");
+            assert!(
+                harness
+                    .approve_session_update_on(
+                        &topic,
+                        request_id,
+                        update_namespaces.clone(),
+                        &empty_capabilities,
+                    )
+                    .is_err()
+            );
+            harness
+                .complete_session_update(request_id)
+                .expect("rejected pending update can still be completed once");
+        }
         assert!(harness.complete_session_update(request_id).is_err());
     }
 }
@@ -231,6 +264,60 @@ fn ids_from(value: &Value, key: &str) -> Vec<u64> {
         vec![0, 1, u64::MAX]
     } else {
         ids
+    }
+}
+
+fn capabilities_for_update_namespaces(namespaces: &SessionNamespaces) -> Option<WalletCapabilities> {
+    let mut capabilities = Vec::new();
+    for (key, namespace) in namespaces {
+        let mut chains = Vec::<Caip2ChainId>::new();
+        if let Some(chain_id) = key.chain_id() {
+            insert_unique(&mut chains, chain_id.clone());
+        }
+        for chain_id in namespace.chains.iter().flatten() {
+            if chain_id.namespace() != key.namespace() {
+                return None;
+            }
+            insert_unique(&mut chains, chain_id.clone());
+        }
+        for account in &namespace.accounts {
+            if account.namespace() != key.namespace() {
+                return None;
+            }
+            insert_unique(&mut chains, account.chain_id());
+        }
+
+        for chain_id in chains {
+            let accounts = namespace
+                .accounts
+                .iter()
+                .filter(|account| account.chain_id() == chain_id)
+                .cloned()
+                .collect::<Vec<Caip10AccountId>>();
+            if accounts.is_empty() {
+                return None;
+            }
+            capabilities.push(
+                WalletChainCapability::new(
+                    chain_id,
+                    accounts,
+                    namespace.methods.clone(),
+                    namespace.events.clone(),
+                )
+                .ok()?,
+            );
+        }
+    }
+
+    WalletCapabilities::new(capabilities).ok()
+}
+
+fn insert_unique<T>(items: &mut Vec<T>, value: T)
+where
+    T: Eq,
+{
+    if !items.contains(&value) {
+        items.push(value);
     }
 }
 
