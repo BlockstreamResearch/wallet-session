@@ -20,9 +20,13 @@ use wc_core::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage,
     SessionAuthenticateApproval, SessionAuthenticateReview, SessionClientEvent,
     SessionLifecycleResponseMessage, SessionLifecycleResponsePayload, SessionPayload,
-    SessionProposalApproval, SessionReceivedMessage, SessionRequestRejection, SessionRequestReview,
-    SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
-    SingleSessionClientEvent, SingleSessionProposal, WalletCapabilities, WalletChainCapability,
+    SessionProposalApproval, SessionReceivedMessage, SessionRequestApproval,
+    SessionRequestMethodReview, SessionRequestRejection, SessionRequestReview, SigningRequestKind,
+    SigningRequestReview, SingleSessionAuthenticate, SingleSessionClient,
+    SingleSessionClientConfig, SingleSessionClientEvent, SingleSessionProposal,
+    TransactionRequestReview, UnknownSessionRequestMethodPolicy, WalletCallReview,
+    WalletCallStatusRegistry, WalletCallStatusRegistryEntry, WalletCallStatusReview,
+    WalletCapabilities, WalletChainCapability, WalletGetCapabilitiesReview, WalletSendCallsReview,
     low_level::{
         ApprovedSession, PAIRING_PING_RESPONSE_TAG, PairingClient, PairingClientConfig,
         PairingSubscription, SESSION_AUTHENTICATE_REJECT_TAG, SESSION_AUTHENTICATE_RESPONSE_TAG,
@@ -43,7 +47,7 @@ use wc_protocol::{
     },
     session::{
         Cacao, DappMetadata, Session, SessionDeleteParams, SessionEvent, SessionEventName,
-        SessionEventParams, SessionMethod, SessionNamespace, SessionNamespaces, WalletCallRequest,
+        SessionEventParams, SessionMethod, SessionNamespace, SessionNamespaces,
     },
     session::{
         JsonRpcError, JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, SessionProposeParams,
@@ -970,9 +974,11 @@ async fn run_core_single_session_client_session_request_probe(
         &session_message,
     );
     let review = client.session_request_review(&session_message)?;
-    print_session_request_review(&review);
+    let wallet_call_status_registry = wallet_call_status_registry_for_probe(&review)?;
+    print_session_request_review(&review, wallet_call_status_registry.as_ref());
     validate_session_request_review(&review)?;
-    let request_verify_review = review.verify_risk_review();
+    let request_approval =
+        session_request_approval_for_probe(&review, wallet_call_status_registry.as_ref())?;
     let response_ack = match response_mode.as_str() {
         "success" => {
             let result = env::var("WC_CORE_SESSION_REQUEST_RESULT_JSON").map_or_else(
@@ -980,7 +986,7 @@ async fn run_core_single_session_client_session_request_probe(
                 |value| parse_json_env(&value),
             )?;
             client
-                .respond_session_request_success(&session_message, &request_verify_review, result)
+                .respond_session_request_success(&session_message, &request_approval, result)
                 .await?
         }
         "error" => {
@@ -2441,7 +2447,58 @@ fn session_payload_for_log(payload: &SessionPayload) -> String {
     }
 }
 
-fn print_session_request_review(review: &SessionRequestReview) {
+fn wallet_call_status_registry_for_probe(
+    review: &SessionRequestReview,
+) -> Result<Option<WalletCallStatusRegistry>> {
+    let Some(wallet_call) = review.wallet_call_review()? else {
+        return Ok(None);
+    };
+    let status = match wallet_call {
+        WalletCallReview::GetCallsStatus(status) | WalletCallReview::ShowCallsStatus(status) => {
+            status
+        }
+        WalletCallReview::GetCapabilities(_) | WalletCallReview::SendCalls(_) => return Ok(None),
+    };
+
+    let owned_id = env::var("WC_CORE_WALLET_CALL_STATUS_OWNED_ID").with_context(|| {
+        format!(
+            "wallet call status approval for id {} requires WC_CORE_WALLET_CALL_STATUS_OWNED_ID",
+            sensitive_str_for_log(status.id())
+        )
+    })?;
+    let mut registry = WalletCallStatusRegistry::new();
+    registry.insert(WalletCallStatusRegistryEntry::new(
+        owned_id,
+        review.topic().clone(),
+        review.chain_id().clone(),
+    ));
+    Ok(Some(registry))
+}
+
+fn session_request_approval_for_probe(
+    review: &SessionRequestReview,
+    wallet_call_status_registry: Option<&WalletCallStatusRegistry>,
+) -> Result<SessionRequestApproval> {
+    wallet_call_status_registry.map_or_else(
+        || {
+            SessionRequestApproval::new(review, UnknownSessionRequestMethodPolicy::Reject)
+                .map_err(Into::into)
+        },
+        |registry| {
+            SessionRequestApproval::with_wallet_call_status_registry(
+                review,
+                UnknownSessionRequestMethodPolicy::Reject,
+                registry,
+            )
+            .map_err(Into::into)
+        },
+    )
+}
+
+fn print_session_request_review(
+    review: &SessionRequestReview,
+    wallet_call_status_registry: Option<&WalletCallStatusRegistry>,
+) {
     let verify_hash = review
         .verify_attestation_hash()
         .map_or("missing", |hash| hash.as_str());
@@ -2458,50 +2515,217 @@ fn print_session_request_review(review: &SessionRequestReview) {
         review.verify_risk(),
         json_for_log(review.params())
     );
-    match review.wallet_call_request() {
-        Ok(Some(WalletCallRequest::GetCapabilities(params))) => {
+    print_session_request_method_review(review, wallet_call_status_registry);
+}
+
+fn print_session_request_method_review(
+    review: &SessionRequestReview,
+    wallet_call_status_registry: Option<&WalletCallStatusRegistry>,
+) {
+    let method_review = wallet_call_status_registry.map_or_else(
+        || review.method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::AllowRaw),
+        |registry| {
+            review.method_review_with_wallet_call_status_registry(
+                UnknownSessionRequestMethodPolicy::AllowRaw,
+                registry,
+            )
+        },
+    );
+    match method_review {
+        Ok(SessionRequestMethodReview::Signing(signing)) => print_signing_review(&signing),
+        Ok(SessionRequestMethodReview::Transaction(transaction)) => {
+            print_transaction_review(&transaction);
+        }
+        Ok(SessionRequestMethodReview::WalletCall(wallet_call)) => {
+            print_wallet_call_review(&wallet_call);
+        }
+        Ok(SessionRequestMethodReview::Raw) => {
             println!(
-                "core-single-session-client-session-request wallet_call method=wallet_getCapabilities address={} chains={}",
-                sensitive_str_for_log(&params.0),
-                params
-                    .1
-                    .as_ref()
-                    .map_or_else(|| "<all>".to_owned(), |chains| chains.join(","))
+                "core-single-session-client-session-request unknown_request method={} policy=raw",
+                review.method()
             );
         }
-        Ok(Some(WalletCallRequest::SendCalls(params))) => {
-            println!(
-                "core-single-session-client-session-request wallet_call method=wallet_sendCalls chain_id={} from={} atomic_required={} calls={}",
-                params.0.chain_id,
-                params
-                    .0
-                    .from
-                    .as_deref()
-                    .map_or_else(|| "<none>".to_owned(), sensitive_str_for_log),
-                params.0.atomic_required,
-                params.0.calls.len()
-            );
-        }
-        Ok(Some(WalletCallRequest::GetCallsStatus(params))) => {
-            println!(
-                "core-single-session-client-session-request wallet_call method=wallet_getCallsStatus id={}",
-                params.0
-            );
-        }
-        Ok(Some(WalletCallRequest::ShowCallsStatus(params))) => {
-            println!(
-                "core-single-session-client-session-request wallet_call method=wallet_showCallsStatus id={}",
-                params.0
-            );
-        }
-        Ok(None) => {}
         Err(error) => {
             println!(
-                "core-single-session-client-session-request wallet_call_parse_error method={} error={error}",
+                "core-single-session-client-session-request method_review_error method={} error={error}",
                 review.method()
             );
         }
     }
+}
+
+fn print_signing_review(signing: &SigningRequestReview) {
+    println!(
+        "core-single-session-client-session-request signing_review kind={} account_status={:?} chain_status={} typed_data={} message_status={} message_len={} message_hash={} unsafe_raw_signing_warning={}",
+        signing.kind().method_name(),
+        signing.account().status(),
+        signing.chain().map_or_else(
+            || "missing".to_owned(),
+            |chain| format!("{:?}", chain.status())
+        ),
+        signing_typed_data_state(signing),
+        signing.message().map_or_else(
+            || "missing".to_owned(),
+            |message| format!("{:?}", message.status())
+        ),
+        signing
+            .message()
+            .and_then(wc_core::SigningMessageSummary::byte_len)
+            .map_or_else(|| "missing".to_owned(), |len| len.to_string()),
+        signing.message().map_or_else(
+            || "missing".to_owned(),
+            |message| message.payload_hash().as_str().to_owned()
+        ),
+        signing.requires_unsafe_raw_signing_warning()
+    );
+    if let Some(summary) = signing.typed_data() {
+        println!(
+            "core-single-session-client-session-request typed_data status={:?} primary_type={} domain_keys={} message_keys={} type_count={} verifying_contract_status={} domain_chain_status={}",
+            summary.status(),
+            optional_sensitive_str_for_log(summary.primary_type()),
+            summary.domain().keys().len(),
+            summary.message_keys().len(),
+            summary.type_names().len(),
+            summary.domain().verifying_contract().map_or_else(
+                || "missing".to_owned(),
+                |address| format!("{:?}", address.status())
+            ),
+            summary.domain().chain().map_or_else(
+                || "missing".to_owned(),
+                |chain| format!("{:?}", chain.status())
+            )
+        );
+    }
+}
+
+fn signing_typed_data_state(signing: &SigningRequestReview) -> &'static str {
+    signing
+        .typed_data()
+        .map_or("none", |summary| match signing.kind() {
+            SigningRequestKind::EthSignTypedData
+            | SigningRequestKind::EthSignTypedDataV3
+            | SigningRequestKind::EthSignTypedDataV4 => {
+                if summary.status() == wc_core::Eip712TypedDataPayloadStatus::Object
+                    || summary.status() == wc_core::Eip712TypedDataPayloadStatus::JsonStringObject
+                {
+                    "summary"
+                } else {
+                    "malformed"
+                }
+            }
+            SigningRequestKind::PersonalSign
+            | SigningRequestKind::EthSign
+            | SigningRequestKind::EthSignTransaction => "none",
+        })
+}
+
+fn print_transaction_review(transaction: &TransactionRequestReview) {
+    let summary = transaction.summary();
+    println!(
+        "core-single-session-client-session-request transaction_review account_status={:?} chain_status={} to_status={} value_status={} data_status={} data_len={} selector={}",
+        transaction.account().status(),
+        transaction.chain().map_or_else(
+            || "missing".to_owned(),
+            |chain| format!("{:?}", chain.status())
+        ),
+        summary.to().map_or_else(
+            || "missing".to_owned(),
+            |address| format!("{:?}", address.status())
+        ),
+        summary.value().map_or_else(
+            || "missing".to_owned(),
+            |value| format!("{:?}", value.status())
+        ),
+        summary.data().map_or_else(
+            || "missing".to_owned(),
+            |data| format!("{:?}", data.status())
+        ),
+        summary
+            .data()
+            .and_then(wc_core::EvmCalldataSummary::byte_len)
+            .map_or_else(|| "missing".to_owned(), |len| len.to_string()),
+        redacted_selector(
+            summary
+                .data()
+                .and_then(wc_core::EvmCalldataSummary::function_selector)
+        )
+    );
+}
+
+fn print_wallet_call_review(wallet_call: &WalletCallReview) {
+    match wallet_call {
+        WalletCallReview::GetCapabilities(capabilities) => {
+            print_wallet_get_capabilities_review(capabilities);
+        }
+        WalletCallReview::SendCalls(send_calls) => print_wallet_send_calls_review(send_calls),
+        WalletCallReview::GetCallsStatus(status) => {
+            print_wallet_call_status_review("wallet_getCallsStatus", status);
+        }
+        WalletCallReview::ShowCallsStatus(status) => {
+            print_wallet_call_status_review("wallet_showCallsStatus", status);
+        }
+    }
+}
+
+fn print_wallet_get_capabilities_review(capabilities: &WalletGetCapabilitiesReview) {
+    println!(
+        "core-single-session-client-session-request wallet_call method=wallet_getCapabilities address_status={:?} requested_chains={}",
+        capabilities.address().status(),
+        capabilities.requested_chains().len()
+    );
+}
+
+fn print_wallet_send_calls_review(send_calls: &WalletSendCallsReview) {
+    println!(
+        "core-single-session-client-session-request wallet_call method=wallet_sendCalls chain_status={:?} from_status={:?} atomic_required={} calls={} capability_keys={}",
+        send_calls.requested_chain().status(),
+        send_calls.from().status(),
+        send_calls.atomic_required(),
+        send_calls.call_count(),
+        send_calls.capability_keys().len()
+    );
+    for (index, call) in send_calls.calls().iter().enumerate() {
+        println!(
+            "core-single-session-client-session-request wallet_call_call index={} to_status={} value_status={} data_status={} data_len={}",
+            index,
+            call.to().map_or_else(
+                || "missing".to_owned(),
+                |address| format!("{:?}", address.status())
+            ),
+            call.value().map_or_else(
+                || "missing".to_owned(),
+                |value| format!("{:?}", value.status())
+            ),
+            call.data().map_or_else(
+                || "missing".to_owned(),
+                |data| format!("{:?}", data.status())
+            ),
+            call.data()
+                .and_then(wc_core::EvmCalldataSummary::byte_len)
+                .map_or_else(|| "missing".to_owned(), |len| len.to_string())
+        );
+    }
+}
+
+fn print_wallet_call_status_review(method: &str, status: &WalletCallStatusReview) {
+    println!(
+        "core-single-session-client-session-request wallet_call method={} id={} binding={:?}",
+        method,
+        sensitive_str_for_log(status.id()),
+        status.binding().status()
+    );
+}
+
+fn redacted_selector(selector: Option<&str>) -> &str {
+    if log_decrypted_payloads() {
+        selector.unwrap_or("<missing>")
+    } else {
+        "<redacted>"
+    }
+}
+
+fn optional_sensitive_str_for_log(value: Option<&str>) -> String {
+    value.map_or_else(|| "<missing>".to_owned(), sensitive_str_for_log)
 }
 
 fn print_session_authenticate_review(review: &SessionAuthenticateReview) {

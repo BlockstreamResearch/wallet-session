@@ -16,6 +16,85 @@ const wc_core::DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN
 
 const wc_core::DEFAULT_VERIFY_RESOLVER_TIMEOUT
 
+struct wc_core::Eip712DomainSummary
+  const fn chain
+  const fn verifying_contract
+  fn keys
+  fn name
+  fn version
+
+enum wc_core::Eip712TypedDataDisplayStatus
+  variant Displayable
+  variant MissingPrimaryType
+  variant MissingPrimaryTypeDefinition
+  variant MissingMessageFields
+
+enum wc_core::Eip712TypedDataPayloadStatus
+  variant Object
+  variant JsonStringObject
+  variant InvalidJsonString
+  variant UnsupportedPayload
+
+struct wc_core::Eip712TypedDataSummary
+  const fn display_status
+  const fn domain
+  const fn status
+  fn message_keys
+  fn primary_type
+  fn type_names
+
+enum wc_core::EvmAddressStatus
+  variant Valid
+  variant Invalid
+  variant UnsupportedType
+
+struct wc_core::EvmAddressSummary
+  const fn raw
+  const fn status
+  fn address
+
+struct wc_core::EvmCallSummary
+  const fn data
+  const fn display_field_count
+  const fn to
+  const fn value
+
+enum wc_core::EvmCalldataStatus
+  variant Decoded
+  variant MissingPrefix
+  variant OddLength
+  variant InvalidHex
+  variant UnsupportedType
+
+struct wc_core::EvmCalldataSummary
+  const fn byte_len
+  const fn raw
+  const fn status
+  fn function_selector
+
+struct wc_core::EvmHexQuantity
+  const fn raw
+  const fn status
+  fn decimal
+
+enum wc_core::EvmHexQuantityStatus
+  variant Decoded
+  variant MissingPrefix
+  variant Empty
+  variant InvalidHex
+  variant UnsupportedType
+
+enum wc_core::EvmTransactionPayloadStatus
+  variant Object
+  variant UnsupportedPayload
+
+struct wc_core::EvmTransactionSummary
+  const fn data
+  const fn display_field_count
+  const fn status
+  const fn to
+  const fn value
+
 enum wc_core::PairingClientError
   variant PairingUri
   variant PairingExpired
@@ -276,6 +355,26 @@ enum wc_core::SessionRequestAccountConstraintStatus
   variant NoAuthorizedAccounts
   variant Unauthorized
 
+struct wc_core::SessionRequestApproval
+  const fn method_review
+  const fn request_id
+  const fn topic
+  const fn verify_risk_review
+  fn new
+  fn with_wallet_call_status_registry
+
+enum wc_core::SessionRequestApprovalError
+  variant MethodReview
+  variant Account
+  variant Chain
+  variant TransactionDisplay
+  variant TypedData
+  variant TypedDataDisplay
+  variant SigningMessage
+  variant TransactionPayload
+  variant WalletCallChain
+  variant WalletCallStatusId
+
 struct wc_core::SessionRequestChainConstraint
   const fn caip2_chain_id
   const fn raw_chain_id
@@ -295,6 +394,7 @@ enum wc_core::SessionRequestMethodReview
 enum wc_core::SessionRequestMethodReviewError
   variant MalformedParams
   variant WalletCall
+  variant UnknownMethod
 
 struct wc_core::SessionRequestRejection
   const fn error
@@ -324,12 +424,15 @@ struct wc_core::SessionRequestReview
   fn from_request_with_verify_context
   fn is_expired_at
   fn method_review
+  fn method_review_with_unknown_policy
+  fn method_review_with_wallet_call_status_registry
   fn signing_request_review
   fn transaction_request_review
   fn verify_jwt_attestation
   fn verify_risk_review
   fn wallet_call_request
   fn wallet_call_review
+  fn wallet_call_review_for_registry
   fn with_authorized_accounts
   fn with_redirect_review
 
@@ -359,6 +462,21 @@ struct wc_core::SessionUpdateReview
   fn new_with_redirect_review
   fn requested_params
 
+enum wc_core::SigningMessagePayloadStatus
+  variant Utf8String
+  variant HexBytes
+  variant Empty
+  variant OddLengthHex
+  variant InvalidHex
+  variant UnsupportedPayload
+
+struct wc_core::SigningMessageSummary
+  const fn byte_len
+  const fn character_len
+  const fn payload_hash
+  const fn requires_unsafe_raw_signing_warning
+  const fn status
+
 enum wc_core::SigningRequestKind
   variant PersonalSign
   variant EthSign
@@ -367,12 +485,17 @@ enum wc_core::SigningRequestKind
   variant EthSignTypedDataV4
   variant EthSignTransaction
   const fn method_name
+  const fn requires_unsafe_raw_signing_warning
 
 struct wc_core::SigningRequestReview
   const fn account
   const fn chain
   const fn kind
+  const fn message
   const fn payload
+  const fn requires_unsafe_raw_signing_warning
+  const fn transaction
+  const fn typed_data
 
 struct wc_core::SingleSessionAuthenticate
   async fn resolve_verify_context
@@ -506,7 +629,12 @@ struct wc_core::SingleSessionRelayConfig
 struct wc_core::TransactionRequestReview
   const fn account
   const fn chain
+  const fn summary
   const fn transaction
+
+enum wc_core::UnknownSessionRequestMethodPolicy
+  variant AllowRaw
+  variant Reject
 
 struct wc_core::VerifyAttestation
 
@@ -571,7 +699,35 @@ enum wc_core::WalletCallReview
   variant GetCallsStatus
   variant ShowCallsStatus
 
+struct wc_core::WalletCallStatusIdBinding
+  const fn matched_entry
+  const fn status
+
+enum wc_core::WalletCallStatusIdBindingStatus
+  variant Unchecked
+  variant Owned
+  variant Unknown
+  variant TopicMismatch
+  variant ChainMismatch
+
+struct wc_core::WalletCallStatusRegistry
+  fn insert
+  fn insert_send_calls_result
+  fn new
+
+struct wc_core::WalletCallStatusRegistryEntry
+  const fn chain_id
+  const fn topic
+  fn id
+  fn new
+
+enum wc_core::WalletCallStatusRegistryError
+  variant NotSendCalls
+  variant UnsupportedChain
+  variant Review
+
 struct wc_core::WalletCallStatusReview
+  const fn binding
   fn id
 
 struct wc_core::WalletCapabilities
@@ -629,6 +785,7 @@ struct wc_core::WalletSendCallsReview
   const fn call_count
   const fn from
   const fn requested_chain
+  fn calls
   fn capability_keys
 
 fn wc_core::classify_verify_context

@@ -2,7 +2,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use serde_json::Value;
-use wc_core::{SessionAuthenticateReview, SessionRequestReview};
+use wc_core::{
+    SessionAuthenticateReview, SessionRequestApproval, SessionRequestReview,
+    UnknownSessionRequestMethodPolicy, WalletCallStatusRegistry,
+};
 use wc_protocol::{
     caip::Caip10AccountId,
     dto::pairing::{
@@ -95,9 +98,18 @@ fn exercise_session_request_review(request: &JsonRpcRequest<SessionRequestParams
 
     let review = review.with_authorized_accounts(fuzz_accounts());
     let _ = review.method_review();
+    let _ = review.method_review_with_unknown_policy(UnknownSessionRequestMethodPolicy::Reject);
     let _ = review.signing_request_review();
     let _ = review.transaction_request_review();
     let _ = review.wallet_call_review();
+    let registry = WalletCallStatusRegistry::new();
+    let _ = review.wallet_call_review_for_registry(&registry);
+    let _ = SessionRequestApproval::new(&review, UnknownSessionRequestMethodPolicy::Reject);
+    let _ = SessionRequestApproval::with_wallet_call_status_registry(
+        &review,
+        UnknownSessionRequestMethodPolicy::Reject,
+        &registry,
+    );
     let _ = review.wallet_call_request();
 }
 

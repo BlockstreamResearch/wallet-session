@@ -50,12 +50,19 @@ pub use session_authenticate::{
     SessionAuthenticatePayloadReview, SessionAuthenticateReview, SessionAuthenticateReviewError,
 };
 pub use session_request::{
-    SessionRequestAccountConstraint, SessionRequestAccountConstraintStatus,
-    SessionRequestChainConstraint, SessionRequestChainConstraintStatus, SessionRequestMethodReview,
+    Eip712DomainSummary, Eip712TypedDataDisplayStatus, Eip712TypedDataPayloadStatus,
+    Eip712TypedDataSummary, EvmAddressStatus, EvmAddressSummary, EvmCallSummary, EvmCalldataStatus,
+    EvmCalldataSummary, EvmHexQuantity, EvmHexQuantityStatus, EvmTransactionPayloadStatus,
+    EvmTransactionSummary, SessionRequestAccountConstraint, SessionRequestAccountConstraintStatus,
+    SessionRequestApproval, SessionRequestApprovalError, SessionRequestChainConstraint,
+    SessionRequestChainConstraintStatus, SessionRequestMethodReview,
     SessionRequestMethodReviewError, SessionRequestReview, SessionRequestReviewError,
-    SessionRequestVerifyResolutionError, SigningRequestKind, SigningRequestReview,
-    TransactionRequestReview, WalletCallChainConstraint, WalletCallChainConstraintStatus,
-    WalletCallReview, WalletCallStatusReview, WalletGetCapabilitiesReview, WalletSendCallsReview,
+    SessionRequestVerifyResolutionError, SigningMessagePayloadStatus, SigningMessageSummary,
+    SigningRequestKind, SigningRequestReview, TransactionRequestReview,
+    UnknownSessionRequestMethodPolicy, WalletCallChainConstraint, WalletCallChainConstraintStatus,
+    WalletCallReview, WalletCallStatusIdBinding, WalletCallStatusIdBindingStatus,
+    WalletCallStatusRegistry, WalletCallStatusRegistryEntry, WalletCallStatusRegistryError,
+    WalletCallStatusReview, WalletGetCapabilitiesReview, WalletSendCallsReview,
 };
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,

@@ -1,5 +1,7 @@
 //! Verify context policy helpers.
 
+use std::fmt;
+
 use wc_protocol::{
     relay::RelayTopic,
     verify::{VerifyAttestationHash, VerifyContext, VerifyValidation},
@@ -23,7 +25,7 @@ pub enum VerifyRiskSurface {
 /// then pass the same value into the approval or success-response method. That
 /// keeps the `VALID`/`UNKNOWN`/`INVALID`/scam signal visible in the type-level
 /// workflow instead of leaving it as an optional side lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VerifyRiskReview {
     surface: VerifyRiskSurface,
     topic: RelayTopic,
@@ -31,6 +33,34 @@ pub struct VerifyRiskReview {
     payload_hash: Option<VerifyAttestationHash>,
     verify_context: VerifyContext,
     risk: VerifyContextRisk,
+}
+
+impl fmt::Debug for VerifyRiskReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifyRiskReview")
+            .field("surface", &self.surface)
+            .field("topic", &self.topic)
+            .field("request_id", &self.request_id)
+            .field("payload_hash", &self.payload_hash)
+            .field(
+                "verify_context",
+                &RedactedVerifyContextDebug(&self.verify_context),
+            )
+            .field("risk", &self.risk)
+            .finish()
+    }
+}
+
+struct RedactedVerifyContextDebug<'a>(&'a VerifyContext);
+
+impl fmt::Debug for RedactedVerifyContextDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifyContext")
+            .field("risk", &classify_verify_context(self.0))
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifyRiskReview {

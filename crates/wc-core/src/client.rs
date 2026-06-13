@@ -30,7 +30,9 @@ use crate::session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,
     SessionAuthenticateReviewError,
 };
-use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
+use crate::session_request::{
+    SessionRequestApproval, SessionRequestReview, SessionRequestReviewError,
+};
 use crate::session_update::{SessionNamespacesDiff, SessionUpdateReview, diff_session_namespaces};
 use crate::verify_policy::{
     VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
@@ -852,7 +854,7 @@ impl SingleSessionClient {
     pub async fn respond_session_request_success(
         &mut self,
         message: &SessionReceivedMessage,
-        verify_review: &VerifyRiskReview,
+        approval: &SessionRequestApproval,
         result: impl Into<serde_json::Value>,
     ) -> Result<bool, SingleSessionClientError> {
         let request_id = session_request_id(message)?;
@@ -864,7 +866,7 @@ impl SingleSessionClient {
             .client_session(message.topic())?
             .pending_session_request_verify_context(request_id);
         ensure_verify_risk_review(
-            verify_review,
+            approval.verify_risk_review(),
             VerifyRiskSurface::SessionRequestSigning,
             message.topic(),
             request_id,
@@ -3053,10 +3055,11 @@ mod tests {
     use crate::{
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
         SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionPayload,
-        SessionProposalApproval, SessionReceivedMessage, SessionRequestReview,
-        SessionUpdateApprovalError, SingleSessionAuthenticate, SingleSessionPendingApproval,
-        SingleSessionProposal, SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
-        WalletCapabilities, WalletChainCapability,
+        SessionProposalApproval, SessionReceivedMessage, SessionRequestApproval,
+        SessionRequestReview, SessionUpdateApprovalError, SingleSessionAuthenticate,
+        SingleSessionPendingApproval, SingleSessionProposal, SingleSessionRelayConfig,
+        UnknownSessionRequestMethodPolicy, VerifyRiskReview, VerifyRiskSurface, WalletCapabilities,
+        WalletChainCapability,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -4195,26 +4198,27 @@ mod tests {
         let message = SessionReceivedMessage::for_test(
             topic.clone(),
             &plaintext,
+            SessionPayload::SessionRequest(Box::new(request.clone())),
+        );
+        let wrong_message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            "stale session payload",
             SessionPayload::SessionRequest(Box::new(request)),
         );
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), sym_key),
-            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+            test_session_with_namespaces(topic.clone(), FUTURE_SESSION_EXPIRY)?,
         )));
         client
             .client_session_mut(&topic)?
             .mark_session_request_pending(83);
-        let stale_payload_hash = VerifyAttestationHash::from_message("stale session payload");
-        let wrong_review = VerifyRiskReview::new(
-            VerifyRiskSurface::SessionRequestSigning,
-            topic.clone(),
-            83,
-            Some(stale_payload_hash.clone()),
-            VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL),
-        );
+        let stale_payload_hash = wrong_message.verify_attestation_hash().clone();
+        let wrong_review = client.session_request_review(&wrong_message)?;
+        let wrong_approval =
+            SessionRequestApproval::new(&wrong_review, UnknownSessionRequestMethodPolicy::Reject)?;
 
         let error = client
-            .respond_session_request_success(&message, &wrong_review, json!("0xsignature"))
+            .respond_session_request_success(&message, &wrong_approval, json!("0xsignature"))
             .await
             .expect_err("success response must carry the request verify review");
 
@@ -4268,7 +4272,7 @@ mod tests {
         );
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), sym_key),
-            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+            test_session_with_namespaces(topic.clone(), FUTURE_SESSION_EXPIRY)?,
         )));
         assert!(
             client
@@ -4276,14 +4280,14 @@ mod tests {
                 .mark_session_request_message_pending(message.clone())
         );
 
-        let stale_review = client
-            .session_request_review(&message)?
-            .verify_risk_review();
+        let stale_review = client.session_request_review(&message)?;
+        let stale_approval =
+            SessionRequestApproval::new(&stale_review, UnknownSessionRequestMethodPolicy::Reject)?;
         let expected_context = invalid_verify_context();
         client.remember_pending_approval_verify_context(&topic, 87, expected_context.clone())?;
 
         let error = client
-            .respond_session_request_success(&message, &stale_review, json!("0xsignature"))
+            .respond_session_request_success(&message, &stale_approval, json!("0xsignature"))
             .await
             .expect_err("stale Verify review context must not approve a signing response");
 
@@ -4334,16 +4338,21 @@ mod tests {
         );
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), sym_key),
-            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+            test_session_with_namespaces(topic.clone(), FUTURE_SESSION_EXPIRY)?,
         )));
         client
             .client_session_mut(&topic)?
             .mark_session_request_pending(77);
-        let verify_review = SessionRequestReview::from_message(&message)?.verify_risk_review();
+        let approval = SessionRequestApproval::new(
+            &SessionRequestReview::from_message(&message)?.with_authorized_accounts(vec![
+                "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+            ]),
+            UnknownSessionRequestMethodPolicy::Reject,
+        )?;
 
         let error = tokio::time::timeout(
             Duration::from_millis(100),
-            client.respond_session_request_success(&message, &verify_review, json!("0xsignature")),
+            client.respond_session_request_success(&message, &approval, json!("0xsignature")),
         )
         .await
         .expect("expired request guard returns before relay publish")
@@ -5064,6 +5073,15 @@ mod tests {
             wallet_pay_result: None,
             transport_type: Some(SessionTransportType::Relay),
         }
+    }
+
+    fn test_session_with_namespaces(
+        topic: RelayTopic,
+        expiry: u64,
+    ) -> Result<Session, Box<dyn std::error::Error>> {
+        let mut session = test_session(topic, expiry);
+        session.namespaces = test_namespaces()?;
+        Ok(session)
     }
 
     fn auth_request()

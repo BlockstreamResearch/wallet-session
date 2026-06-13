@@ -302,7 +302,6 @@ const WALLET_GET_CAPABILITIES_RESULT: &str = r#"{"eip155:1":{"atomic":{"status":
 const WALLET_SEND_CALLS_PARAMS: &str = r#"[{"version":"2.0.0","from":"0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb","chainId":"0x1","atomicRequired":true,"calls":[{"to":"0xd46e8dd67c5d32be8058bb8eb970870f07244567","value":"0x0","data":"0x"}],"capabilities":{"paymasterService":{"url":"https://example.com/paymaster","optional":true}}}]"#;
 const WALLET_SEND_CALLS_RESULT: &str =
     r#"{"id":"0x0000000000000000000000000000000000000000000000000000000000000001"}"#;
-#[cfg(test)]
 const WALLET_CALL_ID: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
 const WALLET_GET_CALLS_STATUS_PARAMS: &str =
     r#"["0x0000000000000000000000000000000000000000000000000000000000000001"]"#;
@@ -383,6 +382,7 @@ const WALLET_GET_CALLS_STATUS: ScenarioStep = ScenarioStep {
             "WC_JS_SESSION_REQUEST_PARAMS_JSON",
             WALLET_GET_CALLS_STATUS_PARAMS,
         ),
+        ("WC_CORE_WALLET_CALL_STATUS_OWNED_ID", WALLET_CALL_ID),
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_GET_CALLS_STATUS_RESULT,
@@ -406,6 +406,7 @@ const WALLET_SHOW_CALLS_STATUS: ScenarioStep = ScenarioStep {
             "WC_JS_SESSION_REQUEST_PARAMS_JSON",
             WALLET_SHOW_CALLS_STATUS_PARAMS,
         ),
+        ("WC_CORE_WALLET_CALL_STATUS_OWNED_ID", WALLET_CALL_ID),
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_SHOW_CALLS_STATUS_RESULT,
@@ -507,6 +508,7 @@ const APPKIT_WALLET_GET_CALLS_STATUS: ScenarioStep = ScenarioStep {
             "WC_JS_SESSION_REQUEST_PARAMS_JSON",
             WALLET_GET_CALLS_STATUS_PARAMS,
         ),
+        ("WC_CORE_WALLET_CALL_STATUS_OWNED_ID", WALLET_CALL_ID),
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_GET_CALLS_STATUS_RESULT,
@@ -546,6 +548,7 @@ const APPKIT_WALLET_SHOW_CALLS_STATUS: ScenarioStep = ScenarioStep {
             "WC_JS_SESSION_REQUEST_PARAMS_JSON",
             WALLET_SHOW_CALLS_STATUS_PARAMS,
         ),
+        ("WC_CORE_WALLET_CALL_STATUS_OWNED_ID", WALLET_CALL_ID),
         (
             "WC_CORE_SESSION_REQUEST_RESULT_JSON",
             WALLET_SHOW_CALLS_STATUS_RESULT,

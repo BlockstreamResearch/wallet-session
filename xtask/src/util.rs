@@ -169,9 +169,6 @@ pub fn redacted_json_summary(value: &Value) -> Value {
 }
 
 pub fn redact(value: &str) -> String {
-    if value.len() <= 8 {
-        return "<redacted>".to_owned();
-    }
-
-    format!("{}...{}", &value[..4], &value[value.len() - 4..])
+    let hash = VerifyAttestationHash::from_message(value);
+    format!("<redacted len={} hash={}>", value.len(), hash.as_str())
 }

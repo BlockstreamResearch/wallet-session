@@ -286,18 +286,21 @@ For a surfaced request, the caller should:
 
 1. call `session_request_review`;
 2. obtain and surface `review.verify_risk_review()`;
-3. show the request to policy/UI;
-4. call exactly one of:
-   - `respond_session_request_success` with the matching `VerifyRiskReview`;
+3. inspect `review.method_review_with_unknown_policy(...)` or the registry-aware Wallet Call helper;
+4. show the origin, account, chain, method, and display summaries to policy/UI;
+5. build a `SessionRequestApproval`;
+6. call exactly one of:
+   - `respond_session_request_success` with the matching `SessionRequestApproval`;
    - `respond_session_request_error`.
 
 The client tracks surfaced request IDs as one-shot pending decisions. Once a response is acknowledged, the request is removed from the pending set. A second response attempt returns `SessionRequestDecisionMissing`.
 While the process is running, the client also retains the exact decrypted request messages for pending decisions. `pending_session_request_reviews()` rebuilds wallet-facing `SessionRequestReview` values from those retained messages so UI can re-render the pending method, params, Verify risk review, topic, request ID, redirect policy, and active-session accounts for the request chain without relying on disk restore or a separately held event object.
-The success path requires the matching Verify review because it can carry a signature, submitted transaction, or other wallet-side result. The review is bound to the exact reviewed payload hash, so a stale review for the same topic and request ID cannot authorize a different payload. The error path remains available for rejection without a Verify token.
+The success path requires `SessionRequestApproval` because it can carry a signature, submitted transaction, capability disclosure, or Wallet Call status result. The approval token contains the matching Verify review and a validated method-specific review. It rejects unknown methods under strict policy, malformed or non-displayable signing and transaction payloads, mismatched accounts or chains, and Wallet Call status IDs that are not bound to a caller-owned registry entry. The Verify review remains bound to the exact reviewed payload hash, so a stale review for the same topic and request ID cannot authorize a different payload. The error path remains available for rejection without an approval token.
 
-`SessionRequestReview::method_review()` is a wallet-policy helper, not an executor. It recognizes common EVM signing methods, `eth_sendTransaction`, and EIP-5792 Wallet Call methods. The derived reviews expose requested signer/from accounts, case-insensitive EVM authorization status against the active session's CAIP-10 accounts, payload-level chain IDs for EIP-712 and transaction-shaped requests, Wallet Call hex-chain comparisons, call counts, `atomicRequired`, and requested capability keys. Unknown namespace-authorized methods remain raw so wallets can reject or render them with app-specific policy.
+`SessionRequestReview::method_review()` is a wallet-policy helper, not an executor. It recognizes common EVM signing methods, `eth_sendTransaction`, and EIP-5792 Wallet Call methods. The derived reviews expose requested signer/from accounts, case-insensitive EVM authorization status against the active session's CAIP-10 accounts, signing-message lengths and hashes, EIP-712 displayability, transaction display fields, payload-level chain IDs for EIP-712 and transaction-shaped requests, Wallet Call chain comparisons, call counts, `atomicRequired`, and requested capability keys. Unknown namespace-authorized methods remain raw only when the caller explicitly allows raw review; strict approval rejects them.
 
 For `wallet_getCapabilities`, the review summarizes the requested address and optional chain filter before any wallet-owned capability data is disclosed. Core does not synthesize a capabilities response and does not decide whether unsupported capability keys are acceptable.
+For `wallet_getCallsStatus` and `wallet_showCallsStatus`, approval requires a `WalletCallStatusRegistry` entry that was inserted from a wallet-returned `wallet_sendCalls` result for the same session topic and chain.
 
 Source:
 
