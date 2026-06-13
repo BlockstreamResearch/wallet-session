@@ -208,8 +208,8 @@ Current session request flow:
 5. caller invokes `SingleSessionClient::respond_session_request_success` or `SingleSessionClient::respond_session_request_error`.
 
 Rationale: the protocol can decide whether a request is authorized by namespace, but only the wallet/user can decide whether to sign or submit it.
-The review primitive keeps request id, topic, chain, method, params, and expiry available without requiring application code to downcast raw session payloads.
-For EIP-5792 Wallet Call methods, `SessionRequestReview::wallet_call_request` parses the method-specific params for review but still does not execute transactions or disclose capabilities on its own.
+The review primitive keeps request id, topic, chain, method, params, expiry, Verify context, redirect policy, and active-session accounts for the request chain available without requiring application code to downcast raw session payloads.
+`SessionRequestReview::method_review()` adds method-specific summaries for common EVM signing methods, `eth_sendTransaction`, and EIP-5792 Wallet Call methods. These summaries expose account and chain mismatches, call counts, atomic execution requirements, and requested capability keys, but still do not sign, submit transactions, disclose capabilities, or decide wallet policy on their own.
 
 Reference:
 
@@ -234,6 +234,7 @@ Current session authentication flow:
 8. if approval has no session namespaces, core drops the pairing topic and returns to idle.
 
 Rationale: authentication is a wallet identity decision. CACAO signing, Verify context, and origin policy are security-sensitive primitives and must be explicit API steps rather than side effects of polling.
+`SessionAuthenticateReview::auth_payload_review()` summarizes the CAIP-122 payload, while `account_review(account)` checks a wallet-selected CAIP-10 issuer against the requested auth chains before the caller formats and signs CACAO.
 
 The maintained SDK derives the authenticated session topic from requester and responder keys, subscribes that topic, stores an acknowledged session when approved methods exist, then publishes the auth success response. `SingleSessionClient` mirrors that shape, but requires the caller to pass the approved session namespaces explicitly so session creation remains a wallet policy decision.
 

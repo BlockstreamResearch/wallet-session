@@ -5,6 +5,7 @@ use std::{
 };
 
 use wc_protocol::{
+    caip::{Caip2ChainId, Caip10AccountId},
     relay::RelayTopic,
     session::{
         DappMetadata, JsonRpcError, JsonRpcErrorResponse, JsonRpcRequest, ProposalAuthRequest,
@@ -918,7 +919,13 @@ impl SingleSessionClient {
         let verify_context =
             VerifyContext::unresolved_from_metadata(&session.session.peer.metadata);
         SessionRequestReview::from_message_with_verify_context(message, verify_context)
-            .map(|review| review.with_redirect_review(session.redirect_review()))
+            .map(|review| {
+                let authorized_accounts =
+                    authorized_accounts_for_chain(&session.session.namespaces, review.chain_id());
+                review
+                    .with_redirect_review(session.redirect_review())
+                    .with_authorized_accounts(authorized_accounts)
+            })
             .map_err(|source| SingleSessionClientError::SessionRequestReview { source })
     }
 
@@ -2651,6 +2658,21 @@ const fn session_update_id(
     }
 }
 
+fn authorized_accounts_for_chain(
+    namespaces: &SessionNamespaces,
+    chain_id: &Caip2ChainId,
+) -> Vec<Caip10AccountId> {
+    let mut accounts = Vec::new();
+    for namespace in namespaces.values() {
+        for account in &namespace.accounts {
+            if account.chain_id() == *chain_id && !accounts.contains(account) {
+                accounts.push(account.clone());
+            }
+        }
+    }
+    accounts
+}
+
 fn ensure_session_request_message_fresh(
     message: &SessionReceivedMessage,
     request_id: u64,
@@ -3236,9 +3258,11 @@ mod tests {
             &plaintext,
             SessionPayload::SessionRequest(Box::new(request)),
         );
+        let mut session = test_session(topic.clone(), FUTURE_SESSION_EXPIRY);
+        session.namespaces = test_namespaces()?;
         client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             SessionSubscription::for_test(topic.clone(), sym_key),
-            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+            session,
         )));
         assert_eq!(
             client.active_session().expect("active session").topic,
@@ -3255,6 +3279,14 @@ mod tests {
         assert_eq!(reviews[0].topic(), &topic);
         assert_eq!(reviews[0].request_id(), 84);
         assert_eq!(reviews[0].method().as_str(), "personal_sign");
+        assert_eq!(
+            reviews[0]
+                .signing_request_review()?
+                .expect("personal_sign review")
+                .account()
+                .status(),
+            crate::SessionRequestAccountConstraintStatus::Authorized
+        );
 
         let next = client
             .next_pending_approval()?
@@ -3263,6 +3295,7 @@ mod tests {
             SingleSessionPendingApproval::SessionRequest(review) => {
                 assert_eq!(review.request_id(), 84);
                 assert_eq!(review.method().as_str(), "personal_sign");
+                assert_eq!(review.authorized_accounts().len(), 1);
             }
             other => panic!("unexpected pending approval: {other:?}"),
         }

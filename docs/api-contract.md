@@ -248,6 +248,8 @@ Supported paths:
 Core does not sign authentication payloads and does not auto-approve authentication. 
 Auth-created sessions are explicit: the caller opts in by passing namespaces through `SessionAuthenticateApproval::with_session_namespaces`.
 
+`SessionAuthenticateReview::auth_payload_review()` summarizes requested chains, audience, domain, statement, resources, and Recap URNs. Because the request does not name a wallet account, `SessionAuthenticateReview::account_review(account)` lets the wallet check a chosen CAIP-10 issuer account against the requested auth chains before formatting or signing CACAO.
+
 Source:
 
 - [`SingleSessionClient::session_authenticate_review`](../crates/wc-core/src/client.rs)
@@ -256,6 +258,8 @@ Source:
 - [`SessionAuthenticateApprovalOutcome`](../crates/wc-core/src/client.rs)
 - [`SessionAuthenticateApproval`](../crates/wc-core/src/session_authenticate.rs)
 - [`SessionAuthenticateReview`](../crates/wc-core/src/session_authenticate.rs)
+- [`SessionAuthenticatePayloadReview`](../crates/wc-core/src/session_authenticate.rs)
+- [`SessionAuthenticateAccountReview`](../crates/wc-core/src/session_authenticate.rs)
 - [One-click Auth approval](https://docs.walletconnect.network/wallet-sdk/web/one-click-auth#approving-authentication-requests)
 - [Maintained Sign Client authentication request handling](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L2568-L2605)
 - [Maintained Sign Client authenticated session creation](https://github.com/WalletConnect/walletconnect-monorepo/blob/a451d9fb3982b3ad0f1ad09d0bcfb3565cf99ab7/packages/sign-client/src/controllers/engine.ts#L1350-L1375)
@@ -288,8 +292,12 @@ For a surfaced request, the caller should:
    - `respond_session_request_error`.
 
 The client tracks surfaced request IDs as one-shot pending decisions. Once a response is acknowledged, the request is removed from the pending set. A second response attempt returns `SessionRequestDecisionMissing`.
-While the process is running, the client also retains the exact decrypted request messages for pending decisions. `pending_session_request_reviews()` rebuilds wallet-facing `SessionRequestReview` values from those retained messages so UI can re-render the pending method, params, Verify risk review, topic, and request ID without relying on disk restore or a separately held event object.
+While the process is running, the client also retains the exact decrypted request messages for pending decisions. `pending_session_request_reviews()` rebuilds wallet-facing `SessionRequestReview` values from those retained messages so UI can re-render the pending method, params, Verify risk review, topic, request ID, redirect policy, and active-session accounts for the request chain without relying on disk restore or a separately held event object.
 The success path requires the matching Verify review because it can carry a signature, submitted transaction, or other wallet-side result. The review is bound to the exact reviewed payload hash, so a stale review for the same topic and request ID cannot authorize a different payload. The error path remains available for rejection without a Verify token.
+
+`SessionRequestReview::method_review()` is a wallet-policy helper, not an executor. It recognizes common EVM signing methods, `eth_sendTransaction`, and EIP-5792 Wallet Call methods. The derived reviews expose requested signer/from accounts, case-insensitive EVM authorization status against the active session's CAIP-10 accounts, payload-level chain IDs for EIP-712 and transaction-shaped requests, Wallet Call hex-chain comparisons, call counts, `atomicRequired`, and requested capability keys. Unknown namespace-authorized methods remain raw so wallets can reject or render them with app-specific policy.
+
+For `wallet_getCapabilities`, the review summarizes the requested address and optional chain filter before any wallet-owned capability data is disclosed. Core does not synthesize a capabilities response and does not decide whether unsupported capability keys are acceptable.
 
 Source:
 
@@ -297,6 +305,9 @@ Source:
 - [`SingleSessionClient::pending_session_request_reviews`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::respond_session_request_success`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::respond_session_request_error`](../crates/wc-core/src/client.rs)
+- [`SessionRequestMethodReview`](../crates/wc-core/src/session_request.rs)
+- [`SessionRequestAccountConstraint`](../crates/wc-core/src/session_request.rs)
+- [`WalletCallReview`](../crates/wc-core/src/session_request.rs)
 - [Session request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
 - [Session request RPC](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionrequest)
 

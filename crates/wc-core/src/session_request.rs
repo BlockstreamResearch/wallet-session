@@ -1,8 +1,10 @@
 //! Session request review primitives.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde_json::Value;
 use wc_protocol::{
-    caip::Caip2ChainId,
+    caip::{Caip2ChainId, Caip10AccountId},
     relay::RelayTopic,
     session::{
         JsonRpcRequest, SessionMethod, SessionRequest, SessionRequestParams, SignMethod,
@@ -81,6 +83,7 @@ pub struct SessionRequestReview {
     verify_attestation_jwt: Option<String>,
     verify_encrypted_id: Option<String>,
     redirect: WalletRedirectReview,
+    authorized_accounts: Vec<Caip10AccountId>,
 }
 
 impl SessionRequestReview {
@@ -192,6 +195,7 @@ impl SessionRequestReview {
             verify_attestation_jwt,
             verify_encrypted_id,
             redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
+            authorized_accounts: Vec::new(),
         })
     }
 
@@ -199,6 +203,21 @@ impl SessionRequestReview {
     #[must_use]
     pub fn with_redirect_review(mut self, redirect: WalletRedirectReview) -> Self {
         self.redirect = redirect;
+        self
+    }
+
+    /// Replaces the authorized accounts attached to this review.
+    ///
+    /// The list is filtered to accounts on the request chain and deduplicated.
+    /// Lower-level constructors cannot infer this without the active session;
+    /// `SingleSessionClient::session_request_review` fills it from the active
+    /// namespace set.
+    #[must_use]
+    pub fn with_authorized_accounts<I>(mut self, accounts: I) -> Self
+    where
+        I: IntoIterator<Item = Caip10AccountId>,
+    {
+        self.authorized_accounts = filter_accounts_for_chain(&self.chain_id, accounts);
         self
     }
 
@@ -276,6 +295,174 @@ impl SessionRequestReview {
     #[must_use]
     pub const fn redirect(&self) -> &WalletRedirectReview {
         &self.redirect
+    }
+
+    /// CAIP-10 accounts authorized for the request chain.
+    ///
+    /// An empty list means this review was built without active-session
+    /// context, not that the peer is allowed to choose any account.
+    #[must_use]
+    pub fn authorized_accounts(&self) -> &[Caip10AccountId] {
+        &self.authorized_accounts
+    }
+
+    /// Builds a wallet-policy review for recognized high-risk methods.
+    ///
+    /// Unknown methods remain `Raw`, because namespace authorization only says
+    /// the dapp may ask for the method. Wallet code should still decide how to
+    /// render or reject method-specific params before returning a result.
+    pub fn method_review(
+        &self,
+    ) -> Result<SessionRequestMethodReview, SessionRequestMethodReviewError> {
+        if let Some(wallet_call) = self.wallet_call_review()? {
+            return Ok(SessionRequestMethodReview::WalletCall(wallet_call));
+        }
+        if let Some(signing) = self.signing_request_review()? {
+            return Ok(SessionRequestMethodReview::Signing(signing));
+        }
+        if let Some(transaction) = self.transaction_request_review()? {
+            return Ok(SessionRequestMethodReview::Transaction(transaction));
+        }
+        Ok(SessionRequestMethodReview::Raw)
+    }
+
+    /// Builds a typed review for common EVM signing methods.
+    pub fn signing_request_review(
+        &self,
+    ) -> Result<Option<SigningRequestReview>, SessionRequestMethodReviewError> {
+        let Some(kind) = SigningRequestKind::from_method(self.method.as_str()) else {
+            return Ok(None);
+        };
+
+        let params = self.params_array(kind.method_name())?;
+        let (account_index, payload_index) = kind.param_indexes();
+        let payload = params.get(payload_index).cloned().ok_or_else(|| {
+            SessionRequestMethodReviewError::MalformedParams {
+                method: kind.method_name(),
+                reason: "missing signing payload",
+            }
+        })?;
+        let requested_address = if kind == SigningRequestKind::EthSignTransaction {
+            payload
+                .get("from")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        } else {
+            params
+                .get(account_index)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        };
+        let chain = match kind {
+            SigningRequestKind::EthSignTypedData
+            | SigningRequestKind::EthSignTypedDataV3
+            | SigningRequestKind::EthSignTypedDataV4 => {
+                eip712_domain_chain_id(&payload).map(|raw_chain_id| {
+                    SessionRequestChainConstraint::new(&self.chain_id, raw_chain_id)
+                })
+            }
+            SigningRequestKind::EthSignTransaction => {
+                payload.get("chainId").cloned().map(|raw_chain_id| {
+                    SessionRequestChainConstraint::new(&self.chain_id, raw_chain_id)
+                })
+            }
+            SigningRequestKind::PersonalSign | SigningRequestKind::EthSign => None,
+        };
+
+        Ok(Some(SigningRequestReview {
+            kind,
+            account: self.account_constraint(requested_address),
+            chain,
+            payload,
+        }))
+    }
+
+    /// Builds a typed review for `eth_sendTransaction`.
+    ///
+    /// This is not treated as signing, but it carries the same account
+    /// constraint risk and should not be blindly executed.
+    pub fn transaction_request_review(
+        &self,
+    ) -> Result<Option<TransactionRequestReview>, SessionRequestMethodReviewError> {
+        if self.method.as_str() != "eth_sendTransaction" {
+            return Ok(None);
+        }
+
+        let params = self.params_array("eth_sendTransaction")?;
+        let transaction =
+            params
+                .first()
+                .cloned()
+                .ok_or(SessionRequestMethodReviewError::MalformedParams {
+                    method: "eth_sendTransaction",
+                    reason: "missing transaction object",
+                })?;
+        let requested_address = transaction
+            .get("from")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let chain = transaction
+            .get("chainId")
+            .cloned()
+            .map(|raw_chain_id| SessionRequestChainConstraint::new(&self.chain_id, raw_chain_id));
+
+        Ok(Some(TransactionRequestReview {
+            account: self.account_constraint(requested_address),
+            chain,
+            transaction,
+        }))
+    }
+
+    /// Builds a Wallet Call review that summarizes account, chain, and
+    /// capability-disclosure constraints without returning capabilities or
+    /// executing calls.
+    pub fn wallet_call_review(
+        &self,
+    ) -> Result<Option<WalletCallReview>, SessionRequestMethodReviewError> {
+        let Some(wallet_call) = self.wallet_call_request()? else {
+            return Ok(None);
+        };
+
+        let review = match wallet_call {
+            WalletCallRequest::GetCapabilities(params) => {
+                let requested_chains = params
+                    .1
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|chain_id| self.wallet_call_chain_constraint(chain_id))
+                    .collect();
+                WalletCallReview::GetCapabilities(WalletGetCapabilitiesReview {
+                    address: self.account_constraint(Some(params.0)),
+                    requested_chains,
+                })
+            }
+            WalletCallRequest::SendCalls(params) => {
+                let request = params.0;
+                let capability_keys =
+                    wallet_call_capability_keys(request.capabilities.as_ref())
+                        .chain(request.calls.iter().flat_map(|call| {
+                            wallet_call_capability_keys(call.capabilities.as_ref())
+                        }))
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                WalletCallReview::SendCalls(WalletSendCallsReview {
+                    from: self.account_constraint(request.from),
+                    requested_chain: self.wallet_call_chain_constraint(request.chain_id),
+                    call_count: request.calls.len(),
+                    atomic_required: request.atomic_required,
+                    capability_keys,
+                })
+            }
+            WalletCallRequest::GetCallsStatus(params) => {
+                WalletCallReview::GetCallsStatus(WalletCallStatusReview { id: params.0 })
+            }
+            WalletCallRequest::ShowCallsStatus(params) => {
+                WalletCallReview::ShowCallsStatus(WalletCallStatusReview { id: params.0 })
+            }
+        };
+
+        Ok(Some(review))
     }
 
     /// Retained Verify hash for reviews built from decrypted relay messages.
@@ -407,6 +594,565 @@ impl SessionRequestReview {
         self.expiry_timestamp
             .is_some_and(|expiry| expiry <= now_unix_seconds)
     }
+
+    fn params_array(
+        &self,
+        method: &'static str,
+    ) -> Result<&[Value], SessionRequestMethodReviewError> {
+        self.params.as_array().map(Vec::as_slice).ok_or(
+            SessionRequestMethodReviewError::MalformedParams {
+                method,
+                reason: "params must be an array",
+            },
+        )
+    }
+
+    fn account_constraint(
+        &self,
+        requested_address: Option<String>,
+    ) -> SessionRequestAccountConstraint {
+        SessionRequestAccountConstraint::new(
+            &self.chain_id,
+            self.authorized_accounts.clone(),
+            requested_address,
+        )
+    }
+
+    fn wallet_call_chain_constraint(&self, raw_chain_id: String) -> WalletCallChainConstraint {
+        WalletCallChainConstraint::new(&self.chain_id, raw_chain_id)
+    }
+}
+
+/// Wallet-facing method-specific review for high-risk session requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRequestMethodReview {
+    /// Recognized EVM signing request.
+    Signing(SigningRequestReview),
+    /// Recognized EVM transaction submission request.
+    Transaction(TransactionRequestReview),
+    /// Recognized EIP-5792 Wallet Call request.
+    WalletCall(WalletCallReview),
+    /// Namespace-authorized method without a built-in method-specific parser.
+    Raw,
+}
+
+/// Review error for method-specific session request helpers.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRequestMethodReviewError {
+    /// Params for a recognized method were malformed.
+    #[error("{method} session request params are malformed: {reason}")]
+    MalformedParams {
+        /// Session request method being reviewed.
+        method: &'static str,
+        /// Stable reason suitable for logging or tests.
+        reason: &'static str,
+    },
+
+    /// Wallet Call params failed the EIP-5792 DTO parser.
+    #[error(transparent)]
+    WalletCall(#[from] WalletCallRequestError),
+}
+
+/// Account-authorization status for a method-specific request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRequestAccountConstraintStatus {
+    /// The request shape did not name an account.
+    NoAccountRequested,
+    /// The requested account matches an authorized CAIP-10 account.
+    Authorized,
+    /// The request names an account, but the review has no active-session accounts.
+    NoAuthorizedAccounts,
+    /// The requested account is not among authorized accounts for the request chain.
+    Unauthorized,
+}
+
+/// Requested account matched against authorized session accounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequestAccountConstraint {
+    requested_address: Option<String>,
+    authorized_accounts: Vec<Caip10AccountId>,
+    matched_account: Option<Caip10AccountId>,
+    status: SessionRequestAccountConstraintStatus,
+}
+
+impl SessionRequestAccountConstraint {
+    fn new(
+        chain_id: &Caip2ChainId,
+        authorized_accounts: Vec<Caip10AccountId>,
+        requested_address: Option<String>,
+    ) -> Self {
+        let Some(address) = requested_address else {
+            return Self {
+                requested_address: None,
+                authorized_accounts,
+                matched_account: None,
+                status: SessionRequestAccountConstraintStatus::NoAccountRequested,
+            };
+        };
+
+        if authorized_accounts.is_empty() {
+            return Self {
+                requested_address: Some(address),
+                authorized_accounts,
+                matched_account: None,
+                status: SessionRequestAccountConstraintStatus::NoAuthorizedAccounts,
+            };
+        }
+
+        let matched_account = authorized_accounts
+            .iter()
+            .find(|account| account_matches_requested_address(chain_id, account, &address))
+            .cloned();
+        let status = if matched_account.is_some() {
+            SessionRequestAccountConstraintStatus::Authorized
+        } else {
+            SessionRequestAccountConstraintStatus::Unauthorized
+        };
+
+        Self {
+            requested_address: Some(address),
+            authorized_accounts,
+            matched_account,
+            status,
+        }
+    }
+
+    /// Address carried by the method params, when present.
+    #[must_use]
+    pub fn requested_address(&self) -> Option<&str> {
+        self.requested_address.as_deref()
+    }
+
+    /// Authorized CAIP-10 accounts considered for this request chain.
+    #[must_use]
+    pub fn authorized_accounts(&self) -> &[Caip10AccountId] {
+        &self.authorized_accounts
+    }
+
+    /// Authorized account that matched the requested address.
+    #[must_use]
+    pub const fn matched_account(&self) -> Option<&Caip10AccountId> {
+        self.matched_account.as_ref()
+    }
+
+    /// Constraint status.
+    #[must_use]
+    pub const fn status(&self) -> SessionRequestAccountConstraintStatus {
+        self.status
+    }
+
+    /// Whether the request named an account authorized for this chain.
+    #[must_use]
+    pub const fn is_authorized(&self) -> bool {
+        matches!(
+            self.status,
+            SessionRequestAccountConstraintStatus::Authorized
+        )
+    }
+}
+
+/// Common EVM signing method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningRequestKind {
+    /// `personal_sign`, usually `[message, address]`.
+    PersonalSign,
+    /// `eth_sign`, `[address, message]`.
+    EthSign,
+    /// `eth_signTypedData`, `[address, typedData]`.
+    EthSignTypedData,
+    /// `eth_signTypedData_v3`, `[address, typedData]`.
+    EthSignTypedDataV3,
+    /// `eth_signTypedData_v4`, `[address, typedData]`.
+    EthSignTypedDataV4,
+    /// `eth_signTransaction`, `[transaction]`.
+    EthSignTransaction,
+}
+
+impl SigningRequestKind {
+    fn from_method(method: &str) -> Option<Self> {
+        match method {
+            "personal_sign" => Some(Self::PersonalSign),
+            "eth_sign" => Some(Self::EthSign),
+            "eth_signTypedData" => Some(Self::EthSignTypedData),
+            "eth_signTypedData_v3" => Some(Self::EthSignTypedDataV3),
+            "eth_signTypedData_v4" => Some(Self::EthSignTypedDataV4),
+            "eth_signTransaction" => Some(Self::EthSignTransaction),
+            _ => None,
+        }
+    }
+
+    /// JSON-RPC method name.
+    #[must_use]
+    pub const fn method_name(self) -> &'static str {
+        match self {
+            Self::PersonalSign => "personal_sign",
+            Self::EthSign => "eth_sign",
+            Self::EthSignTypedData => "eth_signTypedData",
+            Self::EthSignTypedDataV3 => "eth_signTypedData_v3",
+            Self::EthSignTypedDataV4 => "eth_signTypedData_v4",
+            Self::EthSignTransaction => "eth_signTransaction",
+        }
+    }
+
+    const fn param_indexes(self) -> (usize, usize) {
+        match self {
+            Self::PersonalSign => (1, 0),
+            Self::EthSign
+            | Self::EthSignTypedData
+            | Self::EthSignTypedDataV3
+            | Self::EthSignTypedDataV4 => (0, 1),
+            Self::EthSignTransaction => (0, 0),
+        }
+    }
+}
+
+/// Parsed signing request review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningRequestReview {
+    kind: SigningRequestKind,
+    account: SessionRequestAccountConstraint,
+    chain: Option<SessionRequestChainConstraint>,
+    payload: Value,
+}
+
+impl SigningRequestReview {
+    /// Signing method kind.
+    #[must_use]
+    pub const fn kind(&self) -> SigningRequestKind {
+        self.kind
+    }
+
+    /// Requested account matched against authorized accounts.
+    #[must_use]
+    pub const fn account(&self) -> &SessionRequestAccountConstraint {
+        &self.account
+    }
+
+    /// Payload-level chain constraint, when the signing payload names one.
+    #[must_use]
+    pub const fn chain(&self) -> Option<&SessionRequestChainConstraint> {
+        self.chain.as_ref()
+    }
+
+    /// Raw message, typed data, or transaction payload that would be signed.
+    #[must_use]
+    pub const fn payload(&self) -> &Value {
+        &self.payload
+    }
+}
+
+/// Parsed `eth_sendTransaction` review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionRequestReview {
+    account: SessionRequestAccountConstraint,
+    chain: Option<SessionRequestChainConstraint>,
+    transaction: Value,
+}
+
+impl TransactionRequestReview {
+    /// Requested `from` account matched against authorized accounts.
+    #[must_use]
+    pub const fn account(&self) -> &SessionRequestAccountConstraint {
+        &self.account
+    }
+
+    /// Transaction `chainId` matched against the enclosing request chain.
+    #[must_use]
+    pub const fn chain(&self) -> Option<&SessionRequestChainConstraint> {
+        self.chain.as_ref()
+    }
+
+    /// Raw transaction object.
+    #[must_use]
+    pub const fn transaction(&self) -> &Value {
+        &self.transaction
+    }
+}
+
+/// Chain comparison status for method payload chain IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRequestChainConstraintStatus {
+    /// Payload chain parses to the enclosing `wc_sessionRequest` chain.
+    MatchesRequestChain,
+    /// Payload chain parses but differs from the enclosing request chain.
+    DiffersFromRequestChain,
+    /// Payload chain is not an EIP-155 decimal or hexadecimal chain ID.
+    UnsupportedChainIdFormat,
+}
+
+/// Method payload chain ID matched against the enclosing request chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequestChainConstraint {
+    raw_chain_id: Value,
+    caip2_chain_id: Option<Caip2ChainId>,
+    status: SessionRequestChainConstraintStatus,
+}
+
+impl SessionRequestChainConstraint {
+    fn new(request_chain_id: &Caip2ChainId, raw_chain_id: Value) -> Self {
+        let caip2_chain_id = eip155_value_to_caip2(&raw_chain_id);
+        let status = match caip2_chain_id.as_ref() {
+            Some(chain_id) if chain_id == request_chain_id => {
+                SessionRequestChainConstraintStatus::MatchesRequestChain
+            }
+            Some(_) => SessionRequestChainConstraintStatus::DiffersFromRequestChain,
+            None => SessionRequestChainConstraintStatus::UnsupportedChainIdFormat,
+        };
+
+        Self {
+            raw_chain_id,
+            caip2_chain_id,
+            status,
+        }
+    }
+
+    /// Raw payload chain value.
+    #[must_use]
+    pub const fn raw_chain_id(&self) -> &Value {
+        &self.raw_chain_id
+    }
+
+    /// Parsed CAIP-2 `eip155:<decimal>` chain, when valid.
+    #[must_use]
+    pub const fn caip2_chain_id(&self) -> Option<&Caip2ChainId> {
+        self.caip2_chain_id.as_ref()
+    }
+
+    /// Chain comparison status.
+    #[must_use]
+    pub const fn status(&self) -> SessionRequestChainConstraintStatus {
+        self.status
+    }
+}
+
+/// EIP-5792 Wallet Call method review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletCallReview {
+    /// `wallet_getCapabilities` disclosure request.
+    GetCapabilities(WalletGetCapabilitiesReview),
+    /// `wallet_sendCalls` batch submission request.
+    SendCalls(WalletSendCallsReview),
+    /// `wallet_getCallsStatus` status lookup request.
+    GetCallsStatus(WalletCallStatusReview),
+    /// `wallet_showCallsStatus` display request.
+    ShowCallsStatus(WalletCallStatusReview),
+}
+
+/// Review for `wallet_getCapabilities`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletGetCapabilitiesReview {
+    address: SessionRequestAccountConstraint,
+    requested_chains: Vec<WalletCallChainConstraint>,
+}
+
+impl WalletGetCapabilitiesReview {
+    /// Address whose capabilities would be disclosed.
+    #[must_use]
+    pub const fn address(&self) -> &SessionRequestAccountConstraint {
+        &self.address
+    }
+
+    /// Requested EIP-155 chains, when the dapp supplied the optional list.
+    #[must_use]
+    pub fn requested_chains(&self) -> &[WalletCallChainConstraint] {
+        &self.requested_chains
+    }
+}
+
+/// Review for `wallet_sendCalls`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletSendCallsReview {
+    from: SessionRequestAccountConstraint,
+    requested_chain: WalletCallChainConstraint,
+    call_count: usize,
+    atomic_required: bool,
+    capability_keys: Vec<String>,
+}
+
+impl WalletSendCallsReview {
+    /// Sender account matched against authorized accounts.
+    #[must_use]
+    pub const fn from(&self) -> &SessionRequestAccountConstraint {
+        &self.from
+    }
+
+    /// EIP-5792 hex chain ID matched against the enclosing CAIP-2 request chain.
+    #[must_use]
+    pub const fn requested_chain(&self) -> &WalletCallChainConstraint {
+        &self.requested_chain
+    }
+
+    /// Number of calls in the requested batch.
+    #[must_use]
+    pub const fn call_count(&self) -> usize {
+        self.call_count
+    }
+
+    /// Whether the dapp requires atomic execution.
+    #[must_use]
+    pub const fn atomic_required(&self) -> bool {
+        self.atomic_required
+    }
+
+    /// Capability keys requested at top level or per call.
+    #[must_use]
+    pub fn capability_keys(&self) -> &[String] {
+        &self.capability_keys
+    }
+}
+
+/// Status identifier review for Wallet Call status methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCallStatusReview {
+    id: String,
+}
+
+impl WalletCallStatusReview {
+    /// Wallet Call bundle identifier.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Chain comparison status for EIP-5792 hex chain IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletCallChainConstraintStatus {
+    /// Hex chain ID parses to the enclosing `wc_sessionRequest` chain.
+    MatchesRequestChain,
+    /// Hex chain ID parses but differs from the enclosing request chain.
+    DiffersFromRequestChain,
+    /// Hex chain ID is not an EIP-155 hexadecimal chain ID.
+    UnsupportedChainIdFormat,
+}
+
+/// EIP-5792 hex chain ID matched against the enclosing CAIP-2 request chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCallChainConstraint {
+    raw_chain_id: String,
+    caip2_chain_id: Option<Caip2ChainId>,
+    status: WalletCallChainConstraintStatus,
+}
+
+impl WalletCallChainConstraint {
+    fn new(request_chain_id: &Caip2ChainId, raw_chain_id: String) -> Self {
+        let caip2_chain_id = eip155_hex_to_caip2(&raw_chain_id);
+        let status = match caip2_chain_id.as_ref() {
+            Some(chain_id) if chain_id == request_chain_id => {
+                WalletCallChainConstraintStatus::MatchesRequestChain
+            }
+            Some(_) => WalletCallChainConstraintStatus::DiffersFromRequestChain,
+            None => WalletCallChainConstraintStatus::UnsupportedChainIdFormat,
+        };
+
+        Self {
+            raw_chain_id,
+            caip2_chain_id,
+            status,
+        }
+    }
+
+    /// Raw hex chain ID from the Wallet Call params.
+    #[must_use]
+    pub fn raw_chain_id(&self) -> &str {
+        &self.raw_chain_id
+    }
+
+    /// Parsed CAIP-2 `eip155:<decimal>` chain, when valid.
+    #[must_use]
+    pub const fn caip2_chain_id(&self) -> Option<&Caip2ChainId> {
+        self.caip2_chain_id.as_ref()
+    }
+
+    /// Chain comparison status.
+    #[must_use]
+    pub const fn status(&self) -> WalletCallChainConstraintStatus {
+        self.status
+    }
+}
+
+fn filter_accounts_for_chain<I>(chain_id: &Caip2ChainId, accounts: I) -> Vec<Caip10AccountId>
+where
+    I: IntoIterator<Item = Caip10AccountId>,
+{
+    let mut seen = BTreeSet::new();
+    let mut filtered = Vec::new();
+    for account in accounts {
+        if account.chain_id() == *chain_id && seen.insert(account.clone()) {
+            filtered.push(account);
+        }
+    }
+    filtered
+}
+
+fn account_matches_requested_address(
+    chain_id: &Caip2ChainId,
+    account: &Caip10AccountId,
+    requested_address: &str,
+) -> bool {
+    if account.chain_id() != *chain_id {
+        return false;
+    }
+    if chain_id.namespace() == "eip155" {
+        account.address().eq_ignore_ascii_case(requested_address)
+    } else {
+        account.address() == requested_address
+    }
+}
+
+fn eip155_hex_to_caip2(raw_chain_id: &str) -> Option<Caip2ChainId> {
+    raw_chain_id
+        .strip_prefix("0x")
+        .or_else(|| raw_chain_id.strip_prefix("0X"))?;
+    eip155_string_to_caip2(raw_chain_id)
+}
+
+fn wallet_call_capability_keys<T>(
+    capabilities: Option<&BTreeMap<String, T>>,
+) -> impl Iterator<Item = String> + '_ {
+    capabilities
+        .into_iter()
+        .flat_map(|capabilities| capabilities.keys().cloned())
+}
+
+fn eip712_domain_chain_id(payload: &Value) -> Option<Value> {
+    let parsed;
+    let value = if let Some(payload) = payload.as_str() {
+        parsed = serde_json::from_str::<Value>(payload).ok()?;
+        &parsed
+    } else {
+        payload
+    };
+    value.get("domain")?.get("chainId").cloned()
+}
+
+fn eip155_value_to_caip2(raw_chain_id: &Value) -> Option<Caip2ChainId> {
+    match raw_chain_id {
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|chain_id| Caip2ChainId::from_parts("eip155", &chain_id.to_string()).ok()),
+        Value::String(value) => eip155_string_to_caip2(value),
+        _ => None,
+    }
+}
+
+fn eip155_string_to_caip2(raw_chain_id: &str) -> Option<Caip2ChainId> {
+    if let Some(hex) = raw_chain_id
+        .strip_prefix("0x")
+        .or_else(|| raw_chain_id.strip_prefix("0X"))
+    {
+        if hex.is_empty() {
+            return None;
+        }
+        return u64::from_str_radix(hex, 16)
+            .ok()
+            .and_then(|chain_id| Caip2ChainId::from_parts("eip155", &chain_id.to_string()).ok());
+    }
+
+    raw_chain_id
+        .parse::<u64>()
+        .ok()
+        .and_then(|chain_id| Caip2ChainId::from_parts("eip155", &chain_id.to_string()).ok())
 }
 
 /// Session request review construction error.
@@ -452,7 +1198,11 @@ mod tests {
         verify::{VerifyContext, VerifyValidation},
     };
 
-    use super::SessionRequestReview;
+    use super::{
+        SessionRequestAccountConstraintStatus, SessionRequestChainConstraintStatus,
+        SessionRequestMethodReview, SessionRequestReview, SigningRequestKind,
+        WalletCallChainConstraintStatus, WalletCallReview,
+    };
     use crate::VerifyContextRisk;
 
     #[test]
@@ -624,6 +1374,229 @@ mod tests {
         assert_eq!(
             send_calls.calls[0].to.as_deref(),
             Some("0xd46e8dd67c5d32be8058bb8eb970870f07244567")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn signing_review_matches_personal_sign_account_case_insensitively()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "personal_sign".parse()?,
+                    params: json!(["0x68656c6c6f", "0xab16a96d359ec26a11e2c2b3d8f8b8942d5bfcdb"]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?,
+                    "eip155:137:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".parse()?,
+                ]);
+
+        let signing = review
+            .signing_request_review()?
+            .expect("personal_sign review");
+
+        assert_eq!(signing.kind(), SigningRequestKind::PersonalSign);
+        assert_eq!(signing.payload(), &json!("0x68656c6c6f"));
+        assert_eq!(
+            signing.account().status(),
+            SessionRequestAccountConstraintStatus::Authorized
+        );
+        assert_eq!(signing.account().authorized_accounts().len(), 1);
+        assert_eq!(
+            signing.account().matched_account().map(ToString::to_string),
+            Some("eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb".to_owned())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn signing_review_flags_unauthorized_account() -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "eth_sign".parse()?,
+                    params: json!(["0x2222222222222222222222222222222222222222", "0x68656c6c6f"]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let signing = review.signing_request_review()?.expect("eth_sign review");
+
+        assert_eq!(signing.kind(), SigningRequestKind::EthSign);
+        assert_eq!(
+            signing.account().status(),
+            SessionRequestAccountConstraintStatus::Unauthorized
+        );
+        assert!(signing.account().matched_account().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn typed_data_review_flags_domain_chain_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "eth_signTypedData_v4".parse()?,
+                    params: json!([
+                        "0x1111111111111111111111111111111111111111",
+                        {
+                            "types": {},
+                            "primaryType": "Mail",
+                            "domain": {"name": "Example", "chainId": 137},
+                            "message": {}
+                        }
+                    ]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let signing = review.signing_request_review()?.expect("typed data review");
+        let chain = signing.chain().expect("typed data domain chain");
+
+        assert_eq!(signing.kind(), SigningRequestKind::EthSignTypedDataV4);
+        assert_eq!(
+            chain.status(),
+            SessionRequestChainConstraintStatus::DiffersFromRequestChain
+        );
+        assert_eq!(
+            chain.caip2_chain_id().map(ToString::to_string),
+            Some("eip155:137".to_owned())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_get_capabilities_review_summarizes_disclosure_constraints()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "wallet_getCapabilities".parse()?,
+                    params: json!([
+                        "0x1111111111111111111111111111111111111111",
+                        ["0x1", "0x89", "not-hex"]
+                    ]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let Some(WalletCallReview::GetCapabilities(capabilities)) = review.wallet_call_review()?
+        else {
+            panic!("expected getCapabilities review");
+        };
+
+        assert_eq!(
+            capabilities.address().status(),
+            SessionRequestAccountConstraintStatus::Authorized
+        );
+        let statuses = capabilities
+            .requested_chains()
+            .iter()
+            .map(super::WalletCallChainConstraint::status)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                WalletCallChainConstraintStatus::MatchesRequestChain,
+                WalletCallChainConstraintStatus::DiffersFromRequestChain,
+                WalletCallChainConstraintStatus::UnsupportedChainIdFormat,
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_send_calls_review_summarizes_chain_and_capability_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "wallet_sendCalls".parse()?,
+                    params: json!([{
+                        "version": "2.0.0",
+                        "from": "0x1111111111111111111111111111111111111111",
+                        "chainId": "0x89",
+                        "atomicRequired": true,
+                        "capabilities": {"paymasterService": {}},
+                        "calls": [{
+                            "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+                            "value": "0x0",
+                            "capabilities": {"sessionKey": {}}
+                        }]
+                    }]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let SessionRequestMethodReview::WalletCall(WalletCallReview::SendCalls(send_calls)) =
+            review.method_review()?
+        else {
+            panic!("expected sendCalls method review");
+        };
+
+        assert_eq!(send_calls.call_count(), 1);
+        assert!(send_calls.atomic_required());
+        assert_eq!(
+            send_calls.from().status(),
+            SessionRequestAccountConstraintStatus::Authorized
+        );
+        assert_eq!(
+            send_calls.requested_chain().status(),
+            WalletCallChainConstraintStatus::DiffersFromRequestChain
+        );
+        assert_eq!(
+            send_calls.capability_keys(),
+            &["paymasterService".to_owned(), "sessionKey".to_owned()]
         );
 
         Ok(())

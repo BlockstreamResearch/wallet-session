@@ -95,6 +95,17 @@ struct wc_core::RelayAuthSeed
 
 struct wc_core::RelayReconnectConfig
 
+struct wc_core::SessionAuthenticateAccountReview
+  const fn account
+  const fn is_requested_chain
+  const fn status
+  fn requested_chains
+
+enum wc_core::SessionAuthenticateAccountStatus
+  variant RequestedChain
+  variant NoRequestedChains
+  variant UnrequestedChain
+
 struct wc_core::SessionAuthenticateApproval
   const fn session_namespaces
   const fn wallet_metadata
@@ -109,6 +120,15 @@ struct wc_core::SessionAuthenticateApprovalOutcome
   const fn response_ack
   const fn session
   fn into_session
+
+struct wc_core::SessionAuthenticatePayloadReview
+  fn audience
+  fn chains
+  fn domain
+  fn nonce
+  fn recap_resources
+  fn resources
+  fn statement
 
 struct wc_core::SessionAuthenticateRequestExpired
   const fn expiry
@@ -130,6 +150,8 @@ struct wc_core::SessionAuthenticateReview
   const fn verify_attestation_hash
   const fn verify_context
   const fn verify_risk
+  fn account_review
+  fn auth_payload_review
   fn from_message
   fn from_message_with_verify_context
   fn from_params
@@ -229,6 +251,39 @@ struct wc_core::SessionReceivedMessage
   const fn verify_attestation_hash
   fn verify_jwt_attestation
 
+struct wc_core::SessionRequestAccountConstraint
+  const fn is_authorized
+  const fn matched_account
+  const fn status
+  fn authorized_accounts
+  fn requested_address
+
+enum wc_core::SessionRequestAccountConstraintStatus
+  variant NoAccountRequested
+  variant Authorized
+  variant NoAuthorizedAccounts
+  variant Unauthorized
+
+struct wc_core::SessionRequestChainConstraint
+  const fn caip2_chain_id
+  const fn raw_chain_id
+  const fn status
+
+enum wc_core::SessionRequestChainConstraintStatus
+  variant MatchesRequestChain
+  variant DiffersFromRequestChain
+  variant UnsupportedChainIdFormat
+
+enum wc_core::SessionRequestMethodReview
+  variant Signing
+  variant Transaction
+  variant WalletCall
+  variant Raw
+
+enum wc_core::SessionRequestMethodReviewError
+  variant MalformedParams
+  variant WalletCall
+
 struct wc_core::SessionRequestRejection
   const fn error
   const fn request_id
@@ -250,14 +305,20 @@ struct wc_core::SessionRequestReview
   const fn verify_attestation_hash
   const fn verify_context
   const fn verify_risk
+  fn authorized_accounts
   fn from_message
   fn from_message_with_verify_context
   fn from_request
   fn from_request_with_verify_context
   fn is_expired_at
+  fn method_review
+  fn signing_request_review
+  fn transaction_request_review
   fn verify_jwt_attestation
   fn verify_risk_review
   fn wallet_call_request
+  fn wallet_call_review
+  fn with_authorized_accounts
   fn with_redirect_review
 
 enum wc_core::SessionRequestReviewError
@@ -278,6 +339,21 @@ struct wc_core::SessionUpdateReview
   fn new
   fn new_with_redirect_review
   fn requested_params
+
+enum wc_core::SigningRequestKind
+  variant PersonalSign
+  variant EthSign
+  variant EthSignTypedData
+  variant EthSignTypedDataV3
+  variant EthSignTypedDataV4
+  variant EthSignTransaction
+  const fn method_name
+
+struct wc_core::SigningRequestReview
+  const fn account
+  const fn chain
+  const fn kind
+  const fn payload
 
 struct wc_core::SingleSessionAuthenticate
   async fn resolve_verify_context
@@ -403,6 +479,11 @@ struct wc_core::SingleSessionProposal
 struct wc_core::SingleSessionRelayConfig
   fn new
 
+struct wc_core::TransactionRequestReview
+  const fn account
+  const fn chain
+  const fn transaction
+
 struct wc_core::VerifyAttestation
 
 enum wc_core::VerifyContextRisk
@@ -450,6 +531,25 @@ enum wc_core::VerifyRiskSurface
   variant SessionAuthenticateApproval
   variant SessionRequestSigning
 
+struct wc_core::WalletCallChainConstraint
+  const fn caip2_chain_id
+  const fn status
+  fn raw_chain_id
+
+enum wc_core::WalletCallChainConstraintStatus
+  variant MatchesRequestChain
+  variant DiffersFromRequestChain
+  variant UnsupportedChainIdFormat
+
+enum wc_core::WalletCallReview
+  variant GetCapabilities
+  variant SendCalls
+  variant GetCallsStatus
+  variant ShowCallsStatus
+
+struct wc_core::WalletCallStatusReview
+  fn id
+
 struct wc_core::WalletCapabilities
   fn chain
   fn insert
@@ -468,6 +568,10 @@ struct wc_core::WalletChainCapability
   fn events
   fn methods
   fn new
+
+struct wc_core::WalletGetCapabilitiesReview
+  const fn address
+  fn requested_chains
 
 enum wc_core::WalletRedirectOrigin
   variant Unknown
@@ -494,6 +598,13 @@ struct wc_core::WalletRedirectTarget
 enum wc_core::WalletRedirectTargetKind
   variant Native
   variant Universal
+
+struct wc_core::WalletSendCallsReview
+  const fn atomic_required
+  const fn call_count
+  const fn from
+  const fn requested_chain
+  fn capability_keys
 
 fn wc_core::classify_verify_context
 

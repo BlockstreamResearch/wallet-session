@@ -44,11 +44,17 @@ pub use redirect::{
     WalletRedirectOrigin, WalletRedirectReview, WalletRedirectTarget, WalletRedirectTargetKind,
 };
 pub use session_authenticate::{
-    SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,
-    SessionAuthenticateReviewError,
+    SessionAuthenticateAccountReview, SessionAuthenticateAccountStatus,
+    SessionAuthenticateApproval, SessionAuthenticateApprovalError,
+    SessionAuthenticatePayloadReview, SessionAuthenticateReview, SessionAuthenticateReviewError,
 };
 pub use session_request::{
-    SessionRequestReview, SessionRequestReviewError, SessionRequestVerifyResolutionError,
+    SessionRequestAccountConstraint, SessionRequestAccountConstraintStatus,
+    SessionRequestChainConstraint, SessionRequestChainConstraintStatus, SessionRequestMethodReview,
+    SessionRequestMethodReviewError, SessionRequestReview, SessionRequestReviewError,
+    SessionRequestVerifyResolutionError, SigningRequestKind, SigningRequestReview,
+    TransactionRequestReview, WalletCallChainConstraint, WalletCallChainConstraintStatus,
+    WalletCallReview, WalletCallStatusReview, WalletGetCapabilitiesReview, WalletSendCallsReview,
 };
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,

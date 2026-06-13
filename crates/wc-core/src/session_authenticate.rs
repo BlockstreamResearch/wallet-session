@@ -1,6 +1,7 @@
 //! Session-authentication review primitives.
 
 use wc_protocol::{
+    caip::{Caip2ChainId, Caip10AccountId},
     relay::RelayTopic,
     session::{
         AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
@@ -237,6 +238,22 @@ impl SessionAuthenticateReview {
         &self.auth_payload
     }
 
+    /// Summarizes the CAIP-122 payload before a wallet formats or signs CACAO.
+    #[must_use]
+    pub fn auth_payload_review(&self) -> SessionAuthenticatePayloadReview {
+        SessionAuthenticatePayloadReview::new(&self.auth_payload)
+    }
+
+    /// Reviews a wallet-selected issuer account against the requested auth chains.
+    ///
+    /// The auth request does not carry the wallet account. Wallets should call
+    /// this before formatting the CACAO message for a selected account, so a
+    /// dapp cannot silently authenticate an account on an unrequested chain.
+    #[must_use]
+    pub fn account_review(&self, account: Caip10AccountId) -> SessionAuthenticateAccountReview {
+        SessionAuthenticateAccountReview::new(account, self.auth_payload.chains.clone())
+    }
+
     /// Request expiry timestamp in unix seconds.
     #[must_use]
     pub const fn expiry_timestamp(&self) -> u64 {
@@ -365,6 +382,143 @@ impl SessionAuthenticateReview {
     }
 }
 
+/// Wallet-facing summary of a `wc_sessionAuthenticate` CAIP-122 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthenticatePayloadReview {
+    chains: Vec<Caip2ChainId>,
+    audience: String,
+    domain: String,
+    nonce: String,
+    statement: Option<String>,
+    resources: Vec<String>,
+    recap_resources: Vec<String>,
+}
+
+impl SessionAuthenticatePayloadReview {
+    fn new(payload: &AuthPayload) -> Self {
+        let recap_resources = payload
+            .resources
+            .iter()
+            .filter(|resource| resource.starts_with("urn:recap:"))
+            .cloned()
+            .collect();
+        Self {
+            chains: payload.chains.clone(),
+            audience: payload.aud.clone(),
+            domain: payload.domain.clone(),
+            nonce: payload.nonce.clone(),
+            statement: payload.statement.clone(),
+            resources: payload.resources.clone(),
+            recap_resources,
+        }
+    }
+
+    /// Requested CAIP-2 chains.
+    #[must_use]
+    pub fn chains(&self) -> &[Caip2ChainId] {
+        &self.chains
+    }
+
+    /// Audience URI.
+    #[must_use]
+    pub fn audience(&self) -> &str {
+        &self.audience
+    }
+
+    /// Domain that will appear in the CAIP-122 message.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Request nonce.
+    #[must_use]
+    pub fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    /// Human-readable statement, when present.
+    #[must_use]
+    pub fn statement(&self) -> Option<&str> {
+        self.statement.as_deref()
+    }
+
+    /// Resource URIs requested by the dapp.
+    #[must_use]
+    pub fn resources(&self) -> &[String] {
+        &self.resources
+    }
+
+    /// Recap resource URNs that may imply method/capability grants.
+    #[must_use]
+    pub fn recap_resources(&self) -> &[String] {
+        &self.recap_resources
+    }
+}
+
+/// Wallet-selected auth account status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAuthenticateAccountStatus {
+    /// The account chain is one of the requested auth chains.
+    RequestedChain,
+    /// The request contains no auth chains.
+    NoRequestedChains,
+    /// The account chain is not requested by the auth payload.
+    UnrequestedChain,
+}
+
+/// Wallet-selected auth account checked against requested auth chains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuthenticateAccountReview {
+    account: Caip10AccountId,
+    requested_chains: Vec<Caip2ChainId>,
+    status: SessionAuthenticateAccountStatus,
+}
+
+impl SessionAuthenticateAccountReview {
+    fn new(account: Caip10AccountId, requested_chains: Vec<Caip2ChainId>) -> Self {
+        let status = if requested_chains.is_empty() {
+            SessionAuthenticateAccountStatus::NoRequestedChains
+        } else if requested_chains.contains(&account.chain_id()) {
+            SessionAuthenticateAccountStatus::RequestedChain
+        } else {
+            SessionAuthenticateAccountStatus::UnrequestedChain
+        };
+        Self {
+            account,
+            requested_chains,
+            status,
+        }
+    }
+
+    /// Wallet-selected account.
+    #[must_use]
+    pub const fn account(&self) -> &Caip10AccountId {
+        &self.account
+    }
+
+    /// Requested CAIP-2 auth chains.
+    #[must_use]
+    pub fn requested_chains(&self) -> &[Caip2ChainId] {
+        &self.requested_chains
+    }
+
+    /// Chain status for the selected account.
+    #[must_use]
+    pub const fn status(&self) -> SessionAuthenticateAccountStatus {
+        self.status
+    }
+
+    /// Whether the account is on a requested auth chain.
+    #[must_use]
+    pub const fn is_requested_chain(&self) -> bool {
+        matches!(
+            self.status,
+            SessionAuthenticateAccountStatus::RequestedChain
+        )
+    }
+}
+
 /// Caller-provided approval data for a `wc_sessionAuthenticate` request.
 ///
 /// Core does not sign authentication messages. The caller formats the message,
@@ -480,7 +634,8 @@ mod tests {
     };
 
     use super::{
-        SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
+        SessionAuthenticateAccountStatus, SessionAuthenticateApproval, SessionAuthenticateReview,
+        SessionAuthenticateReviewError,
     };
 
     #[test]
@@ -521,6 +676,65 @@ mod tests {
                 method: SignMethod::SessionPropose
             }
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn auth_payload_review_summarizes_chains_and_recap_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        request.params.auth_payload.resources = vec![
+            "urn:recap:eyJhdHQiOnt9fQ".to_owned(),
+            "https://example.com/terms".to_owned(),
+        ];
+        let review = SessionAuthenticateReview::from_request(
+            RelayTopic::from_bytes([3; 32]),
+            1_779_954_250_000,
+            &request,
+        )?;
+
+        let payload = review.auth_payload_review();
+
+        assert_eq!(payload.chains()[0].as_str(), "eip155:1");
+        assert_eq!(payload.audience(), "https://example.com/login");
+        assert_eq!(payload.domain(), "example.com");
+        assert_eq!(payload.nonce(), "1234567890");
+        assert_eq!(payload.statement(), Some("Sign in to Example"));
+        assert_eq!(payload.resources().len(), 2);
+        assert_eq!(
+            payload.recap_resources(),
+            &["urn:recap:eyJhdHQiOnt9fQ".to_owned()]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn auth_account_review_checks_wallet_selected_chain() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        let review = SessionAuthenticateReview::from_request(
+            RelayTopic::from_bytes([3; 32]),
+            1_779_954_250_000,
+            &request,
+        )?;
+
+        let approved =
+            review.account_review("eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".parse()?);
+        let unrequested =
+            review.account_review("eip155:137:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87".parse()?);
+
+        assert_eq!(
+            approved.status(),
+            SessionAuthenticateAccountStatus::RequestedChain
+        );
+        assert!(approved.is_requested_chain());
+        assert_eq!(
+            unrequested.status(),
+            SessionAuthenticateAccountStatus::UnrequestedChain
+        );
+        assert!(!unrequested.is_requested_chain());
 
         Ok(())
     }
