@@ -588,6 +588,7 @@ impl SingleSessionClient {
             Some(&VerifyAttestationHash::from_message(
                 proposal.message().message().plaintext(),
             )),
+            Some(proposal.verify_context()),
         )?;
         if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
             self.unsubscribe_pairing(&subscription).await?;
@@ -720,6 +721,7 @@ impl SingleSessionClient {
             Some(&VerifyAttestationHash::from_message(
                 authenticate.message().message().plaintext(),
             )),
+            Some(authenticate.verify_context()),
         )?;
         let now_unix_seconds = now_unix_seconds()?;
         if request.params.is_expired_at(now_unix_seconds) {
@@ -857,12 +859,16 @@ impl SingleSessionClient {
         self.ensure_active_session_fresh(message.topic(), now_unix_seconds)?;
         self.client_session(message.topic())?
             .ensure_pending_session_request(request_id)?;
+        let expected_verify_context = self
+            .client_session(message.topic())?
+            .pending_session_request_verify_context(request_id);
         ensure_verify_risk_review(
             verify_review,
             VerifyRiskSurface::SessionRequestSigning,
             message.topic(),
             request_id,
             Some(message.verify_attestation_hash()),
+            expected_verify_context,
         )?;
         self.ensure_session_request_fresh(message, request_id, now_unix_seconds)?;
         let subscription = self.session_subscription(message.topic())?.clone();
@@ -920,8 +926,12 @@ impl SingleSessionClient {
         let session = self.client_session(message.topic())?;
         session.ensure_pending_session_request(request_id)?;
         ensure_session_request_message_fresh(message, request_id, now_unix_seconds)?;
-        let verify_context =
-            VerifyContext::unresolved_from_metadata(&session.session.peer.metadata);
+        let verify_context = session
+            .pending_session_request_verify_context(request_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                VerifyContext::unresolved_from_metadata(&session.session.peer.metadata)
+            });
         SessionRequestReview::from_message_with_verify_context(message, verify_context)
             .map(|review| {
                 let authorized_accounts =
@@ -1237,6 +1247,49 @@ impl SingleSessionClient {
         &self,
     ) -> Result<Option<SingleSessionPendingApproval>, SingleSessionClientError> {
         Ok(self.pending_approvals()?.into_iter().next())
+    }
+
+    /// Remembers a resolved Verify context for a pending approval.
+    ///
+    /// Verify resolution remains app-orchestrated: the client does not call the
+    /// resolver by itself. After the app resolves a proposal, authentication
+    /// request, or session request review, pass the resolved context here so
+    /// later `pending_approvals` re-renders and approval/signing guards keep
+    /// using the same Verify risk state.
+    pub fn remember_pending_approval_verify_context(
+        &mut self,
+        topic: &RelayTopic,
+        request_id: u64,
+        verify_context: VerifyContext,
+    ) -> Result<(), SingleSessionClientError> {
+        if remember_pairing_approval_verify_context(
+            self.pending_pairing_approval.as_mut(),
+            topic,
+            request_id,
+            verify_context.clone(),
+        ) {
+            return Ok(());
+        }
+
+        if remember_queued_approval_verify_context(
+            self.queued_events.items_mut(),
+            topic,
+            request_id,
+            verify_context.clone(),
+        ) {
+            return Ok(());
+        }
+
+        if let Ok(session) = self.client_session_mut(topic) {
+            session.ensure_pending_session_request(request_id)?;
+            session.remember_session_request_verify_context(request_id, verify_context);
+            return Ok(());
+        }
+
+        Err(SingleSessionClientError::PendingApprovalMissing {
+            topic: topic.clone(),
+            request_id,
+        })
     }
 
     /// Describes a pending `wc_sessionUpdate` without acknowledging or mutating.
@@ -1760,6 +1813,69 @@ impl SingleSessionPendingApproval {
     }
 }
 
+fn remember_pairing_approval_verify_context(
+    approval: Option<&mut SingleSessionPendingApproval>,
+    topic: &RelayTopic,
+    request_id: u64,
+    verify_context: VerifyContext,
+) -> bool {
+    let Some(approval) = approval else {
+        return false;
+    };
+    match approval {
+        SingleSessionPendingApproval::SessionProposal(proposal)
+            if proposal.pairing_topic() == topic && proposal.proposal_id() == request_id =>
+        {
+            proposal.verify_context = verify_context;
+            true
+        }
+        SingleSessionPendingApproval::SessionAuthenticate(authenticate)
+            if authenticate.pairing_topic() == topic && authenticate.request_id() == request_id =>
+        {
+            authenticate.verify_context = verify_context;
+            true
+        }
+        SingleSessionPendingApproval::SessionProposal(_)
+        | SingleSessionPendingApproval::SessionAuthenticate(_)
+        | SingleSessionPendingApproval::SessionRequest(_)
+        | SingleSessionPendingApproval::SessionUpdate(_) => false,
+    }
+}
+
+fn remember_queued_approval_verify_context(
+    events: &mut VecDeque<SingleSessionClientEvent>,
+    topic: &RelayTopic,
+    request_id: u64,
+    verify_context: VerifyContext,
+) -> bool {
+    for event in events {
+        match event {
+            SingleSessionClientEvent::SessionProposal(proposal)
+                if proposal.pairing_topic() == topic && proposal.proposal_id() == request_id =>
+            {
+                proposal.verify_context = verify_context;
+                return true;
+            }
+            SingleSessionClientEvent::SessionAuthenticate(authenticate)
+                if authenticate.pairing_topic() == topic
+                    && authenticate.request_id() == request_id =>
+            {
+                authenticate.verify_context = verify_context;
+                return true;
+            }
+            SingleSessionClientEvent::SessionProposal(_)
+            | SingleSessionClientEvent::SessionAuthenticate(_)
+            | SingleSessionClientEvent::PairingMessage(_)
+            | SingleSessionClientEvent::SessionProposalExpired(_)
+            | SingleSessionClientEvent::SessionAuthenticateExpired(_)
+            | SingleSessionClientEvent::Session(_)
+            | SingleSessionClientEvent::SessionExpired(_) => {}
+        }
+    }
+
+    false
+}
+
 /// Session proposal retained for approval or rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleSessionProposal {
@@ -2222,6 +2338,7 @@ struct ActiveSession {
     session: Session,
     redirect_origin: WalletRedirectOrigin,
     pending_session_requests: BTreeMap<u64, Option<SessionReceivedMessage>>,
+    pending_session_request_verify_contexts: BTreeMap<u64, VerifyContext>,
     pending_session_updates: BTreeMap<u64, Option<SessionReceivedMessage>>,
 }
 
@@ -2241,6 +2358,7 @@ impl ActiveSession {
             session,
             redirect_origin,
             pending_session_requests: BTreeMap::new(),
+            pending_session_request_verify_contexts: BTreeMap::new(),
             pending_session_updates: BTreeMap::new(),
         }
     }
@@ -2281,6 +2399,8 @@ impl ActiveSession {
 
     fn complete_session_request(&mut self, request_id: u64) {
         self.pending_session_requests.remove(&request_id);
+        self.pending_session_request_verify_contexts
+            .remove(&request_id);
     }
 
     fn pending_session_request_messages(&self) -> Vec<SessionReceivedMessage> {
@@ -2288,6 +2408,20 @@ impl ActiveSession {
             .values()
             .filter_map(Clone::clone)
             .collect()
+    }
+
+    fn remember_session_request_verify_context(
+        &mut self,
+        request_id: u64,
+        verify_context: VerifyContext,
+    ) {
+        self.pending_session_request_verify_contexts
+            .insert(request_id, verify_context);
+    }
+
+    fn pending_session_request_verify_context(&self, request_id: u64) -> Option<&VerifyContext> {
+        self.pending_session_request_verify_contexts
+            .get(&request_id)
     }
 
     #[cfg(any(test, feature = "testkit"))]
@@ -2363,6 +2497,10 @@ impl<T> BoundedQueue<T> {
 
     const fn items(&self) -> &VecDeque<T> {
         &self.items
+    }
+
+    const fn items_mut(&mut self) -> &mut VecDeque<T> {
+        &mut self.items
     }
 
     fn ensure_capacity_for(&self, incoming: usize) -> Result<(), SingleSessionClientError> {
@@ -2557,6 +2695,21 @@ pub enum SingleSessionClientError {
         actual_payload_hash: Option<VerifyAttestationHash>,
     },
 
+    /// Verify risk review was built from a different Verify context.
+    #[error("single-session client verify risk review context mismatch")]
+    VerifyRiskReviewContextMismatch {
+        /// Approval/signing surface under review.
+        surface: VerifyRiskSurface,
+        /// Pairing or session topic associated with the reviewed request.
+        topic: RelayTopic,
+        /// JSON-RPC request id associated with the reviewed request.
+        request_id: u64,
+        /// Verify context currently attached to the pending approval.
+        expected_verify_context: Box<VerifyContext>,
+        /// Verify context carried by the caller's review.
+        actual_verify_context: Box<VerifyContext>,
+    },
+
     /// Authentication request expired before caller approval.
     #[error("single-session client session authenticate request expired")]
     SessionAuthenticateExpired {
@@ -2601,6 +2754,15 @@ pub enum SingleSessionClientError {
     #[error("single-session client session update decision is not pending")]
     SessionUpdateDecisionMissing {
         /// Active session topic.
+        topic: RelayTopic,
+        /// JSON-RPC request id.
+        request_id: u64,
+    },
+
+    /// No pending approval exists for the requested topic and request id.
+    #[error("single-session client pending approval is missing")]
+    PendingApprovalMissing {
+        /// Pairing or session topic.
         topic: RelayTopic,
         /// JSON-RPC request id.
         request_id: u64,
@@ -2719,12 +2881,24 @@ fn ensure_verify_risk_review(
     expected_topic: &RelayTopic,
     expected_request_id: u64,
     expected_payload_hash: Option<&VerifyAttestationHash>,
+    expected_verify_context: Option<&VerifyContext>,
 ) -> Result<(), SingleSessionClientError> {
     if review.surface() == expected_surface
         && review.topic() == expected_topic
         && review.request_id() == expected_request_id
         && review.payload_hash() == expected_payload_hash
     {
+        if let Some(expected_verify_context) = expected_verify_context {
+            if review.verify_context() != expected_verify_context {
+                return Err(SingleSessionClientError::VerifyRiskReviewContextMismatch {
+                    surface: expected_surface,
+                    topic: expected_topic.clone(),
+                    request_id: expected_request_id,
+                    expected_verify_context: Box::new(expected_verify_context.clone()),
+                    actual_verify_context: Box::new(review.verify_context().clone()),
+                });
+            }
+        }
         return Ok(());
     }
 
@@ -3326,6 +3500,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_session_request_rerender_preserves_remembered_verify_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x87; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x88; 32]);
+        let request = session_request(86, Some(FUTURE_SESSION_EXPIRY))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        let mut session = test_session(topic.clone(), FUTURE_SESSION_EXPIRY);
+        session.namespaces = test_namespaces()?;
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            session,
+        )));
+        assert!(
+            client
+                .client_session_mut(&topic)?
+                .mark_session_request_message_pending(message)
+        );
+
+        let unresolved = client.pending_session_request_reviews()?;
+        assert_eq!(
+            unresolved[0].verify_context().verified.validation,
+            VerifyValidation::Unknown
+        );
+
+        let verify_context = invalid_verify_context();
+        client.remember_pending_approval_verify_context(&topic, 86, verify_context.clone())?;
+
+        let reviews = client.pending_session_request_reviews()?;
+        assert_eq!(reviews[0].verify_context(), &verify_context);
+
+        let next = client
+            .next_pending_approval()?
+            .expect("pending request approval");
+        match next {
+            SingleSessionPendingApproval::SessionRequest(review) => {
+                assert_eq!(review.verify_context(), &verify_context);
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        client
+            .client_session_mut(&topic)?
+            .complete_session_request(86);
+        assert!(client.pending_session_request_reviews()?.is_empty());
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pending_session_update_inspection_preserves_diff()
     -> Result<(), Box<dyn std::error::Error>> {
         let (mut client, server) = connect_idle_test_client().await;
@@ -3430,6 +3662,62 @@ mod tests {
                     "Dapp",
                     "inspection exposes what dapp is asking for approval"
                 );
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_pairing_approval_rerender_preserves_remembered_verify_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x89; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x8a; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+        let request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+        let event = SingleSessionClientEvent::from_pairing_message_with_origin(
+            message,
+            WalletRedirectOrigin::QrCode,
+        );
+        client.record_returned_event(&event);
+
+        let unresolved = client
+            .next_pending_approval()?
+            .expect("pending proposal approval");
+        match unresolved {
+            SingleSessionPendingApproval::SessionProposal(proposal) => {
+                assert_eq!(
+                    proposal.verify_context().verified.validation,
+                    VerifyValidation::Unknown
+                );
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        let verify_context = invalid_verify_context();
+        client.remember_pending_approval_verify_context(&topic, 41, verify_context.clone())?;
+
+        let next = client
+            .next_pending_approval()?
+            .expect("pending proposal approval");
+        match next {
+            SingleSessionPendingApproval::SessionProposal(proposal) => {
+                assert_eq!(proposal.verify_context(), &verify_context);
             }
             other => panic!("unexpected pending approval: {other:?}"),
         }
@@ -3559,6 +3847,78 @@ mod tests {
                 assert_eq!(
                     mismatch_actual_payload_hash.as_ref(),
                     Some(&stale_payload_hash)
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proposal_approval_rejects_stale_verify_risk_review_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x8b; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x8c; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request.clone())),
+        );
+        let proposal = SingleSessionProposal {
+            pairing_topic: topic.clone(),
+            request,
+            verify_context: invalid_verify_context(),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
+            message,
+        };
+        let stale_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionProposalApproval,
+            topic.clone(),
+            proposal.proposal_id(),
+            Some(VerifyAttestationHash::from_message(
+                proposal.message().message().plaintext(),
+            )),
+            VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL),
+        );
+        let approval = SessionProposalApproval::new(
+            test_namespaces()?,
+            test_metadata("Wallet"),
+            FUTURE_SESSION_EXPIRY,
+        );
+
+        let error = client
+            .approve_session(&proposal, &stale_review, approval)
+            .await
+            .expect_err("stale Verify review context must not approve a resolved-risk proposal");
+
+        match error {
+            SingleSessionClientError::VerifyRiskReviewContextMismatch {
+                surface,
+                topic: actual_topic,
+                request_id,
+                expected_verify_context,
+                actual_verify_context,
+            } => {
+                assert_eq!(surface, VerifyRiskSurface::SessionProposalApproval);
+                assert_eq!(actual_topic, topic);
+                assert_eq!(request_id, 41);
+                assert_eq!(expected_verify_context.as_ref(), &invalid_verify_context());
+                assert_eq!(
+                    actual_verify_context.as_ref().verified.validation,
+                    VerifyValidation::Unknown
                 );
             }
             other => panic!("unexpected error: {other:?}"),
@@ -3872,6 +4232,72 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_request_success_rejects_stale_remembered_verify_risk_review_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x8d; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x8e; 32]);
+        let request = session_request(87, Some(FUTURE_SESSION_EXPIRY))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        assert!(
+            client
+                .client_session_mut(&topic)?
+                .mark_session_request_message_pending(message.clone())
+        );
+
+        let stale_review = client
+            .session_request_review(&message)?
+            .verify_risk_review();
+        let expected_context = invalid_verify_context();
+        client.remember_pending_approval_verify_context(&topic, 87, expected_context.clone())?;
+
+        let error = client
+            .respond_session_request_success(&message, &stale_review, json!("0xsignature"))
+            .await
+            .expect_err("stale Verify review context must not approve a signing response");
+
+        match error {
+            SingleSessionClientError::VerifyRiskReviewContextMismatch {
+                surface,
+                topic: actual_topic,
+                request_id,
+                expected_verify_context,
+                actual_verify_context,
+            } => {
+                assert_eq!(surface, VerifyRiskSurface::SessionRequestSigning);
+                assert_eq!(actual_topic, topic);
+                assert_eq!(request_id, 87);
+                assert_eq!(expected_verify_context.as_ref(), &expected_context);
+                assert_eq!(
+                    actual_verify_context.as_ref().verified.validation,
+                    VerifyValidation::Unknown
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(
+            client
+                .client_session(&topic)?
+                .ensure_pending_session_request(87)
+                .is_ok()
+        );
 
         client.shutdown().await?;
         server.await.expect("server task joins");
@@ -4655,6 +5081,17 @@ mod tests {
             icons: Vec::new(),
             verify_url: None,
             redirect: None,
+        }
+    }
+
+    fn invalid_verify_context() -> VerifyContext {
+        VerifyContext {
+            verified: VerifiedOrigin {
+                origin: "https://resolved.example".to_owned(),
+                validation: VerifyValidation::Invalid,
+                verify_url: DEFAULT_VERIFY_URL.to_owned(),
+                is_scam: Some(true),
+            },
         }
     }
 

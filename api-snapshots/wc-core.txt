@@ -407,6 +407,7 @@ struct wc_core::SingleSessionClient
   fn pending_approvals
   fn pending_session_request_reviews
   fn pending_session_update_reviews
+  fn remember_pending_approval_verify_context
   fn session_authenticate_review
   fn session_request_review
   fn session_update_diff
@@ -450,11 +451,13 @@ enum wc_core::SingleSessionClientError
   variant SessionAuthenticateReview
   variant SessionAuthenticateApproval
   variant VerifyRiskReviewMismatch
+  variant VerifyRiskReviewContextMismatch
   variant SessionAuthenticateExpired
   variant SessionRequestExpired
   variant SessionAuthenticateSubscriptionMissing
   variant SessionRequestDecisionMissing
   variant SessionUpdateDecisionMissing
+  variant PendingApprovalMissing
 
 enum wc_core::SingleSessionClientEvent
   variant SessionProposal
