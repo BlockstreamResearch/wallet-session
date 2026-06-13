@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     num::NonZeroUsize,
     time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
@@ -27,7 +27,7 @@ use crate::session_authenticate::{
     SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
 };
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
-use crate::session_update::{SessionNamespacesDiff, diff_session_namespaces};
+use crate::session_update::{SessionNamespacesDiff, SessionUpdateReview, diff_session_namespaces};
 use crate::verify_policy::{
     VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,
 };
@@ -173,6 +173,7 @@ pub struct SingleSessionClient {
     last_automatic_reconnect: Option<Instant>,
     consecutive_receive_timeouts: usize,
     queued_events: BoundedQueue<SingleSessionClientEvent>,
+    pending_pairing_approval: Option<SingleSessionPendingApproval>,
 }
 
 impl SingleSessionClient {
@@ -192,6 +193,7 @@ impl SingleSessionClient {
             last_automatic_reconnect: None,
             consecutive_receive_timeouts: 0,
             queued_events: BoundedQueue::new(config.max_queued_events()),
+            pending_pairing_approval: None,
         })
     }
 
@@ -214,6 +216,7 @@ impl SingleSessionClient {
         let close_result = self.pairing.close().await;
         self.state = SingleSessionClientState::Idle;
         self.queued_events.clear();
+        self.pending_pairing_approval = None;
         self.connection_state = SingleSessionClientConnectionState::DisconnectedByUser;
         self.consecutive_receive_timeouts = 0;
         close_result.map_err(SingleSessionClientError::from)
@@ -258,6 +261,7 @@ impl SingleSessionClient {
                     Err(source) => {
                         self.state = SingleSessionClientState::Idle;
                         self.queued_events.clear();
+                        self.pending_pairing_approval = None;
                         Err(SingleSessionClientError::from(source))
                     }
                 }
@@ -276,6 +280,7 @@ impl SingleSessionClient {
                     Err(source) => {
                         self.state = SingleSessionClientState::Idle;
                         self.queued_events.clear();
+                        self.pending_pairing_approval = None;
                         Err(SingleSessionClientError::from(source))
                     }
                 }
@@ -329,6 +334,7 @@ impl SingleSessionClient {
                 Err(error) => {
                     self.unsubscribe_pairing(&subscription).await?;
                     self.state = SingleSessionClientState::Idle;
+                    self.pending_pairing_approval = None;
                     return Err(error);
                 }
             };
@@ -342,6 +348,7 @@ impl SingleSessionClient {
         if pairing_closed {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
+            self.pending_pairing_approval = None;
         } else {
             self.state = SingleSessionClientState::Pairing(subscription);
         }
@@ -416,6 +423,7 @@ impl SingleSessionClient {
         }
 
         if let Some(event) = self.queued_events.pop_front() {
+            self.record_returned_event(&event);
             return Ok(Some(event));
         }
 
@@ -426,9 +434,13 @@ impl SingleSessionClient {
                 .await
                 .map_err(SingleSessionClientError::from)?;
             if let Some(event) = event {
-                return self
+                let event = self
                     .handle_session_event(&session.subscription, event)
-                    .await;
+                    .await?;
+                if let Some(event) = &event {
+                    self.record_returned_event(event);
+                }
+                return Ok(event);
             }
         }
 
@@ -444,6 +456,9 @@ impl SingleSessionClient {
                 if event.closes_pairing_topic() {
                     self.unsubscribe_pairing(&subscription).await?;
                     self.state = SingleSessionClientState::Idle;
+                    self.pending_pairing_approval = None;
+                } else {
+                    self.record_returned_event(&event);
                 }
                 return Ok(Some(event));
             }
@@ -537,6 +552,7 @@ impl SingleSessionClient {
         if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
+            self.pending_pairing_approval = None;
             return Err(SingleSessionClientError::SessionProposalExpired {
                 proposal_id: expired.proposal_id,
                 expiry: expired.expiry,
@@ -549,6 +565,7 @@ impl SingleSessionClient {
             .await
             .map_err(SingleSessionClientError::from)?;
         let session_topic = approved.session_topic().clone();
+        self.pending_pairing_approval = None;
         self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
             approved.subscription().clone(),
             approved.pending_session().clone(),
@@ -589,6 +606,7 @@ impl SingleSessionClient {
         if let Some(expired) = proposal.expired_at(now_unix_seconds()?) {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
+            self.pending_pairing_approval = None;
             return Err(SingleSessionClientError::SessionProposalExpired {
                 proposal_id: expired.proposal_id,
                 expiry: expired.expiry,
@@ -602,6 +620,7 @@ impl SingleSessionClient {
             .map_err(SingleSessionClientError::from)?;
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
+        self.pending_pairing_approval = None;
 
         Ok(ack)
     }
@@ -656,6 +675,7 @@ impl SingleSessionClient {
         if request.params.is_expired_at(now_unix_seconds) {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
+            self.pending_pairing_approval = None;
             return Err(SingleSessionClientError::SessionAuthenticateExpired {
                 request_id: request.id,
                 expiry: request.params.expiry_timestamp,
@@ -682,6 +702,7 @@ impl SingleSessionClient {
                 if adopt_session {
                     self.state = SingleSessionClientState::Idle;
                     self.queued_events.clear();
+                    self.pending_pairing_approval = None;
                 }
                 SingleSessionClientError::from(source)
             })?;
@@ -689,6 +710,7 @@ impl SingleSessionClient {
             let Some(session_subscription) = approved.session_subscription().cloned() else {
                 self.state = SingleSessionClientState::Idle;
                 self.queued_events.clear();
+                self.pending_pairing_approval = None;
                 return Err(
                     SingleSessionClientError::SessionAuthenticateSubscriptionMissing {
                         topic: approved.session_topic().clone(),
@@ -708,9 +730,11 @@ impl SingleSessionClient {
                 Err(error) => {
                     self.state = SingleSessionClientState::Idle;
                     self.queued_events.clear();
+                    self.pending_pairing_approval = None;
                     return Err(error);
                 }
             };
+            self.pending_pairing_approval = None;
             self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
                 session_subscription,
                 session.clone(),
@@ -724,6 +748,7 @@ impl SingleSessionClient {
 
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
+        self.pending_pairing_approval = None;
 
         Ok(SessionAuthenticateApprovalOutcome {
             response_ack: approved.response_ack(),
@@ -747,6 +772,7 @@ impl SingleSessionClient {
         if request.params.is_expired_at(now_unix_seconds) {
             self.unsubscribe_pairing(&subscription).await?;
             self.state = SingleSessionClientState::Idle;
+            self.pending_pairing_approval = None;
             return Err(SingleSessionClientError::SessionAuthenticateExpired {
                 request_id: request.id,
                 expiry: request.params.expiry_timestamp,
@@ -760,6 +786,7 @@ impl SingleSessionClient {
             .map_err(SingleSessionClientError::from)?;
         self.unsubscribe_pairing(&subscription).await?;
         self.state = SingleSessionClientState::Idle;
+        self.pending_pairing_approval = None;
 
         Ok(ack)
     }
@@ -1079,6 +1106,101 @@ impl SingleSessionClient {
         self.active_client_session().map(|state| &state.session)
     }
 
+    /// Pending session requests still awaiting wallet approval or rejection.
+    ///
+    /// The reviews are derived from the exact decrypted messages retained by
+    /// this current process. They are not restored from disk and disappear when
+    /// the request is answered or the session is cleared.
+    pub fn pending_session_request_reviews(
+        &self,
+    ) -> Result<Vec<SessionRequestReview>, SingleSessionClientError> {
+        let messages = self
+            .active_client_session()
+            .map_or_else(Vec::new, ActiveSession::pending_session_request_messages);
+        messages
+            .iter()
+            .map(|message| self.session_request_review(message))
+            .collect()
+    }
+
+    /// Pending session namespace updates still awaiting wallet approval or rejection.
+    ///
+    /// Each review includes the active namespaces, requested replacement, and a
+    /// permission-level diff suitable for rendering an approval prompt.
+    pub fn pending_session_update_reviews(
+        &self,
+    ) -> Result<Vec<SessionUpdateReview>, SingleSessionClientError> {
+        let messages = self
+            .active_client_session()
+            .map_or_else(Vec::new, ActiveSession::pending_session_update_messages);
+        messages
+            .iter()
+            .map(|message| self.session_update_review(message))
+            .collect()
+    }
+
+    /// User-visible approvals currently pending in this process.
+    ///
+    /// Pairing approvals are retained after `next_event` returns them so a UI
+    /// can re-render without holding the original event value. Session requests
+    /// and updates are derived from the active session's pending message store.
+    pub fn pending_approvals(
+        &self,
+    ) -> Result<Vec<SingleSessionPendingApproval>, SingleSessionClientError> {
+        let mut approvals = Vec::new();
+        if let Some(approval) = &self.pending_pairing_approval {
+            approvals.push(approval.clone());
+        }
+        approvals.extend(
+            self.queued_events
+                .items()
+                .iter()
+                .filter_map(SingleSessionPendingApproval::from_event),
+        );
+        approvals.extend(
+            self.pending_session_request_reviews()?
+                .into_iter()
+                .map(|review| SingleSessionPendingApproval::SessionRequest(Box::new(review))),
+        );
+        approvals.extend(
+            self.pending_session_update_reviews()?
+                .into_iter()
+                .map(|review| SingleSessionPendingApproval::SessionUpdate(Box::new(review))),
+        );
+
+        Ok(approvals)
+    }
+
+    /// First pending approval in runtime order, if any.
+    pub fn next_pending_approval(
+        &self,
+    ) -> Result<Option<SingleSessionPendingApproval>, SingleSessionClientError> {
+        Ok(self.pending_approvals()?.into_iter().next())
+    }
+
+    /// Describes a pending `wc_sessionUpdate` without acknowledging or mutating.
+    pub fn session_update_review(
+        &self,
+        message: &SessionReceivedMessage,
+    ) -> Result<SessionUpdateReview, SingleSessionClientError> {
+        let now_unix_seconds = now_unix_seconds()?;
+        self.ensure_active_session_fresh_ref(message.topic(), now_unix_seconds)?;
+        let session = self.client_session(message.topic())?;
+        let SessionPayload::SessionUpdate(request) = message.payload() else {
+            return Err(SingleSessionClientError::Pairing {
+                source: PairingClientError::SessionResponseTargetNotUpdate,
+            });
+        };
+        session.ensure_pending_session_update(request.id)?;
+
+        Ok(SessionUpdateReview::new(
+            message.topic().clone(),
+            request.id,
+            session.session.namespaces.clone(),
+            request.params.namespaces.clone(),
+        ))
+    }
+
     fn session_subscription(
         &self,
         topic: &RelayTopic,
@@ -1135,6 +1257,19 @@ impl SingleSessionClient {
         if matches!(&self.state, SingleSessionClientState::Session(state) if state.session.topic == *topic)
         {
             self.state = SingleSessionClientState::Idle;
+        }
+    }
+
+    fn record_returned_event(&mut self, event: &SingleSessionClientEvent) {
+        if let Some(approval) = SingleSessionPendingApproval::from_event(event) {
+            match approval {
+                SingleSessionPendingApproval::SessionProposal(_)
+                | SingleSessionPendingApproval::SessionAuthenticate(_) => {
+                    self.pending_pairing_approval = Some(approval);
+                }
+                SingleSessionPendingApproval::SessionRequest(_)
+                | SingleSessionPendingApproval::SessionUpdate(_) => {}
+            }
         }
     }
 
@@ -1334,19 +1469,17 @@ impl SingleSessionClient {
                 self.clear_session(message.topic());
             }
             SessionClientEvent::SessionRequest(message) => {
-                let request_id = session_request_id(message)?;
                 if !self
                     .client_session_mut(message.topic())?
-                    .mark_session_request_pending(request_id)
+                    .mark_session_request_message_pending(message.clone())
                 {
                     return Ok(None);
                 }
             }
             SessionClientEvent::SessionUpdate(message) => {
-                let request_id = session_update_id(message)?;
                 if !self
                     .client_session_mut(message.topic())?
-                    .mark_session_update_pending(request_id)
+                    .mark_session_update_message_pending(message.clone())
                 {
                     return Ok(None);
                 }
@@ -1478,6 +1611,59 @@ impl SingleSessionClientEvent {
             | Self::SessionAuthenticate(_)
             | Self::Session(_)
             | Self::SessionExpired(_) => false,
+        }
+    }
+}
+
+/// Approval surface currently pending in the single-session runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleSessionPendingApproval {
+    /// A dapp session proposal awaiting approval or rejection.
+    SessionProposal(Box<SingleSessionProposal>),
+    /// A CAIP-122/CACAO authentication request awaiting approval or rejection.
+    SessionAuthenticate(Box<SingleSessionAuthenticate>),
+    /// A session request awaiting a wallet result or error response.
+    SessionRequest(Box<SessionRequestReview>),
+    /// A session namespace update awaiting approval or rejection.
+    SessionUpdate(Box<SessionUpdateReview>),
+}
+
+impl SingleSessionPendingApproval {
+    fn from_event(event: &SingleSessionClientEvent) -> Option<Self> {
+        match event {
+            SingleSessionClientEvent::SessionProposal(proposal) => {
+                Some(Self::SessionProposal(proposal.clone()))
+            }
+            SingleSessionClientEvent::SessionAuthenticate(authenticate) => {
+                Some(Self::SessionAuthenticate(authenticate.clone()))
+            }
+            SingleSessionClientEvent::PairingMessage(_)
+            | SingleSessionClientEvent::SessionProposalExpired(_)
+            | SingleSessionClientEvent::SessionAuthenticateExpired(_)
+            | SingleSessionClientEvent::Session(_)
+            | SingleSessionClientEvent::SessionExpired(_) => None,
+        }
+    }
+
+    /// Pairing or session topic associated with the pending approval.
+    #[must_use]
+    pub fn topic(&self) -> &RelayTopic {
+        match self {
+            Self::SessionProposal(proposal) => proposal.pairing_topic(),
+            Self::SessionAuthenticate(authenticate) => authenticate.pairing_topic(),
+            Self::SessionRequest(review) => review.topic(),
+            Self::SessionUpdate(review) => review.topic(),
+        }
+    }
+
+    /// JSON-RPC request id associated with the pending approval.
+    #[must_use]
+    pub fn request_id(&self) -> u64 {
+        match self {
+            Self::SessionProposal(proposal) => proposal.proposal_id(),
+            Self::SessionAuthenticate(authenticate) => authenticate.request_id(),
+            Self::SessionRequest(review) => review.request_id(),
+            Self::SessionUpdate(review) => review.request_id(),
         }
     }
 }
@@ -1928,29 +2114,41 @@ impl SessionAuthenticateApprovalOutcome {
 struct ActiveSession {
     subscription: SessionSubscription,
     session: Session,
-    pending_session_requests: HashSet<u64>,
-    pending_session_updates: HashSet<u64>,
+    pending_session_requests: BTreeMap<u64, Option<SessionReceivedMessage>>,
+    pending_session_updates: BTreeMap<u64, Option<SessionReceivedMessage>>,
 }
 
 impl ActiveSession {
-    fn new(subscription: SessionSubscription, session: Session) -> Self {
+    const fn new(subscription: SessionSubscription, session: Session) -> Self {
         Self {
             subscription,
             session,
-            pending_session_requests: HashSet::new(),
-            pending_session_updates: HashSet::new(),
+            pending_session_requests: BTreeMap::new(),
+            pending_session_updates: BTreeMap::new(),
         }
     }
 
+    #[cfg(any(test, feature = "testkit"))]
     fn mark_session_request_pending(&mut self, request_id: u64) -> bool {
-        self.pending_session_requests.insert(request_id)
+        self.pending_session_requests
+            .insert(request_id, None)
+            .is_none()
+    }
+
+    fn mark_session_request_message_pending(&mut self, message: SessionReceivedMessage) -> bool {
+        let Ok(request_id) = session_request_id(&message) else {
+            return false;
+        };
+        self.pending_session_requests
+            .insert(request_id, Some(message))
+            .is_none()
     }
 
     fn ensure_pending_session_request(
         &self,
         request_id: u64,
     ) -> Result<(), SingleSessionClientError> {
-        if self.pending_session_requests.contains(&request_id) {
+        if self.pending_session_requests.contains_key(&request_id) {
             return Ok(());
         }
 
@@ -1964,15 +2162,34 @@ impl ActiveSession {
         self.pending_session_requests.remove(&request_id);
     }
 
+    fn pending_session_request_messages(&self) -> Vec<SessionReceivedMessage> {
+        self.pending_session_requests
+            .values()
+            .filter_map(Clone::clone)
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "testkit"))]
     fn mark_session_update_pending(&mut self, request_id: u64) -> bool {
-        self.pending_session_updates.insert(request_id)
+        self.pending_session_updates
+            .insert(request_id, None)
+            .is_none()
+    }
+
+    fn mark_session_update_message_pending(&mut self, message: SessionReceivedMessage) -> bool {
+        let Ok(request_id) = session_update_id(&message) else {
+            return false;
+        };
+        self.pending_session_updates
+            .insert(request_id, Some(message))
+            .is_none()
     }
 
     fn ensure_pending_session_update(
         &self,
         request_id: u64,
     ) -> Result<(), SingleSessionClientError> {
-        if self.pending_session_updates.contains(&request_id) {
+        if self.pending_session_updates.contains_key(&request_id) {
             return Ok(());
         }
 
@@ -1984,6 +2201,13 @@ impl ActiveSession {
 
     fn complete_session_update(&mut self, request_id: u64) {
         self.pending_session_updates.remove(&request_id);
+    }
+
+    fn pending_session_update_messages(&self) -> Vec<SessionReceivedMessage> {
+        self.pending_session_updates
+            .values()
+            .filter_map(Clone::clone)
+            .collect()
     }
 }
 
@@ -2014,6 +2238,10 @@ impl<T> BoundedQueue<T> {
 
     fn pop_front(&mut self) -> Option<T> {
         self.items.pop_front()
+    }
+
+    const fn items(&self) -> &VecDeque<T> {
+        &self.items
     }
 
     fn ensure_capacity_for(&self, incoming: usize) -> Result<(), SingleSessionClientError> {
@@ -2426,8 +2654,8 @@ fn authenticated_session(
         acknowledged: true,
         controller: responder_public_key.clone(),
         namespaces,
-        required_namespaces: std::collections::BTreeMap::default(),
-        optional_namespaces: std::collections::BTreeMap::default(),
+        required_namespaces: BTreeMap::default(),
+        optional_namespaces: BTreeMap::default(),
         session_properties: None,
         scoped_properties: None,
         session_config: None,
@@ -2493,7 +2721,8 @@ mod tests {
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
         SessionAuthenticateApproval, SessionPayload, SessionProposalApproval,
         SessionReceivedMessage, SessionRequestReview, SingleSessionAuthenticate,
-        SingleSessionProposal, SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
+        SingleSessionPendingApproval, SingleSessionProposal, SingleSessionRelayConfig,
+        VerifyRiskReview, VerifyRiskSurface,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -2743,6 +2972,174 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_session_request_inspection_preserves_review_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x81; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x82; 32]);
+        let request = session_request(84, Some(FUTURE_SESSION_EXPIRY))?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionRequest(Box::new(request)),
+        );
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )));
+        assert_eq!(
+            client.active_session().expect("active session").topic,
+            topic
+        );
+        assert!(
+            client
+                .client_session_mut(&topic)?
+                .mark_session_request_message_pending(message)
+        );
+
+        let reviews = client.pending_session_request_reviews()?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].topic(), &topic);
+        assert_eq!(reviews[0].request_id(), 84);
+        assert_eq!(reviews[0].method().as_str(), "personal_sign");
+
+        let next = client
+            .next_pending_approval()?
+            .expect("pending request approval");
+        match next {
+            SingleSessionPendingApproval::SessionRequest(review) => {
+                assert_eq!(review.request_id(), 84);
+                assert_eq!(review.method().as_str(), "personal_sign");
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        client
+            .client_session_mut(&topic)?
+            .complete_session_request(84);
+        assert!(client.pending_session_request_reviews()?.is_empty());
+        assert!(client.pending_approvals()?.is_empty());
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_session_update_inspection_preserves_diff()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x83; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x84; 32]);
+        let key = NamespaceKey::parse("eip155")?;
+        let current = test_namespaces()?;
+        let mut requested = current.clone();
+        requested
+            .get_mut(&key)
+            .expect("namespace exists")
+            .methods
+            .push("eth_sendTransaction".parse()?);
+        let request = session_update_request(85, requested.clone());
+        let plaintext = serde_json::to_string(&request)?;
+        let message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &plaintext,
+            SessionPayload::SessionUpdate(request),
+        );
+        let mut session = test_session(topic.clone(), FUTURE_SESSION_EXPIRY);
+        session.namespaces = current.clone();
+        client.state = SingleSessionClientState::Session(Box::new(ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), sym_key),
+            session,
+        )));
+        assert!(
+            client
+                .client_session_mut(&topic)?
+                .mark_session_update_message_pending(message)
+        );
+
+        let reviews = client.pending_session_update_reviews()?;
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review.topic(), &topic);
+        assert_eq!(review.request_id(), 85);
+        assert_eq!(review.current_namespaces(), &current);
+        assert_eq!(review.requested_namespaces(), &requested);
+        assert_eq!(
+            review.diff().added().namespaces()[&key].methods()[0].as_str(),
+            "eth_sendTransaction"
+        );
+        assert!(review.diff().removed().is_empty());
+
+        let next = client
+            .next_pending_approval()?
+            .expect("pending update approval");
+        match next {
+            SingleSessionPendingApproval::SessionUpdate(review) => {
+                assert_eq!(review.request_id(), 85);
+                assert!(review.diff().has_additions());
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        client
+            .client_session_mut(&topic)?
+            .complete_session_update(85);
+        assert!(client.pending_session_update_reviews()?.is_empty());
+        assert!(client.pending_approvals()?.is_empty());
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn returned_pairing_approval_remains_inspectable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x85; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x86; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+        let request = session_proposal_request(FUTURE_SESSION_EXPIRY);
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionProposal(Box::new(request)),
+        );
+        let event = SingleSessionClientEvent::from_pairing_message(message);
+        client.record_returned_event(&event);
+
+        let next = client
+            .next_pending_approval()?
+            .expect("pending proposal approval");
+        match next {
+            SingleSessionPendingApproval::SessionProposal(proposal) => {
+                assert_eq!(proposal.pairing_topic(), &topic);
+                assert_eq!(proposal.proposal_id(), 41);
+                assert_eq!(
+                    proposal.request().params.proposer.metadata.name,
+                    "Dapp",
+                    "inspection exposes what dapp is asking for approval"
+                );
+            }
+            other => panic!("unexpected pending approval: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@ pub use client::{
     SessionAuthenticateRequestExpired, SessionExpired, SessionProposalExpired,
     SingleSessionAuthenticate, SingleSessionClient, SingleSessionClientConfig,
     SingleSessionClientConnectionState, SingleSessionClientError, SingleSessionClientEvent,
-    SingleSessionProposal,
+    SingleSessionPendingApproval, SingleSessionProposal,
 };
 pub use pairing::{
     DEFAULT_PAIRING_RECEIVE_TIMEOUT, DEFAULT_SESSION_EXPIRY_SECONDS,
@@ -48,7 +48,7 @@ pub use session_request::{
 };
 pub use session_update::{
     SessionNamespacePermissionSet, SessionNamespacePermissions, SessionNamespacesDiff,
-    diff_session_namespaces,
+    SessionUpdateReview, diff_session_namespaces,
 };
 pub use verify_policy::{
     VerifyContextRisk, VerifyRiskReview, VerifyRiskSurface, classify_verify_context,

@@ -264,6 +264,15 @@ enum wc_core::SessionRequestVerifyResolutionError
   variant MissingHash
   variant Resolver
 
+struct wc_core::SessionUpdateReview
+  const fn current_namespaces
+  const fn diff
+  const fn request_id
+  const fn requested_namespaces
+  const fn topic
+  fn new
+  fn requested_params
+
 struct wc_core::SingleSessionAuthenticate
   async fn resolve_verify_context
   async fn resolve_verify_context_at
@@ -298,9 +307,14 @@ struct wc_core::SingleSessionClient
   const fn connection_state
   const fn status
   fn active_session
+  fn next_pending_approval
+  fn pending_approvals
+  fn pending_session_request_reviews
+  fn pending_session_update_reviews
   fn session_authenticate_review
   fn session_request_review
   fn session_update_diff
+  fn session_update_review
 
 struct wc_core::SingleSessionClientConfig
   const fn automatic_reconnect_cooldown
@@ -353,6 +367,14 @@ enum wc_core::SingleSessionClientEvent
   variant SessionAuthenticateExpired
   variant Session
   variant SessionExpired
+
+enum wc_core::SingleSessionPendingApproval
+  variant SessionProposal
+  variant SessionAuthenticate
+  variant SessionRequest
+  variant SessionUpdate
+  fn request_id
+  fn topic
 
 struct wc_core::SingleSessionProposal
   async fn resolve_verify_context

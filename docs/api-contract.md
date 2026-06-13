@@ -244,11 +244,13 @@ For a surfaced request, the caller should:
    - `respond_session_request_error`.
 
 The client tracks surfaced request IDs as one-shot pending decisions. Once a response is acknowledged, the request is removed from the pending set. A second response attempt returns `SessionRequestDecisionMissing`.
+While the process is running, the client also retains the exact decrypted request messages for pending decisions. `pending_session_request_reviews()` rebuilds wallet-facing `SessionRequestReview` values from those retained messages so UI can re-render the pending method, params, Verify risk review, topic, and request ID without relying on disk restore or a separately held event object.
 The success path requires the matching Verify review because it can carry a signature, submitted transaction, or other wallet-side result. The review is bound to the exact reviewed payload hash, so a stale review for the same topic and request ID cannot authorize a different payload. The error path remains available for rejection without a Verify token.
 
 Source:
 
 - [`SingleSessionClient::session_request_review`](../crates/wc-core/src/client.rs)
+- [`SingleSessionClient::pending_session_request_reviews`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::respond_session_request_success`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::respond_session_request_error`](../crates/wc-core/src/client.rs)
 - [Session request event](https://specs.walletconnect.com/2.0/specs/clients/sign/session-events#session_request)
@@ -276,14 +278,37 @@ The client tracks surfaced update IDs as one-shot pending decisions. Once approv
 
 Local namespaces are mutated only after an approval acknowledgement.
 
+While the process is running, the client retains the exact decrypted update messages for pending decisions. `session_update_review()` and `pending_session_update_reviews()` expose the current active namespaces, requested replacement namespaces, and `SessionNamespacesDiff`. This is intentionally current-process wallet UX only; it does not restore pending updates after restart.
+
 Source:
 
+- [`SingleSessionClient::session_update_review`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::session_update_diff`](../crates/wc-core/src/client.rs)
+- [`SingleSessionClient::pending_session_update_reviews`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::approve_session_update`](../crates/wc-core/src/client.rs)
 - [`SingleSessionClient::reject_session_update`](../crates/wc-core/src/client.rs)
+- [`SessionUpdateReview`](../crates/wc-core/src/session_update.rs)
 - [`SessionNamespacesDiff`](../crates/wc-core/src/session_update.rs)
 - [Session update RPC](https://specs.walletconnect.com/2.0/specs/clients/sign/rpc-methods#wc_sessionupdate)
 - [Updating a session](https://docs.walletconnect.network/wallet-sdk/web/usage#updating-a-session)
+
+## Current-Process Inspection
+
+`SingleSessionClient` exposes inspection helpers for wallet UI state that exists in the current process:
+
+- `active_session()` returns the one active acknowledged session, if any.
+- `pending_session_request_reviews()` returns retained pending session requests.
+- `pending_session_update_reviews()` returns retained pending namespace updates.
+- `pending_approvals()` returns the user-visible approval surfaces currently known to the runtime: returned pairing proposal/auth approvals, queued pairing approvals, pending session requests, and pending session updates.
+- `next_pending_approval()` returns the first approval from that list.
+
+These helpers do not add persistence, restore, multi-session state, or multi-pairing state. They are a rendering aid for "what is the user about to approve?" while the wallet process is alive.
+
+Source:
+
+- [`SingleSessionClient::active_session`](../crates/wc-core/src/client.rs)
+- [`SingleSessionClient::pending_approvals`](../crates/wc-core/src/client.rs)
+- [`SingleSessionPendingApproval`](../crates/wc-core/src/client.rs)
 
 ## Deterministic Session Lifecycle Messages
 

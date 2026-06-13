@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId, NamespaceKey},
-    session::{SessionEventName, SessionMethod, SessionNamespace, SessionNamespaces},
+    relay::RelayTopic,
+    session::{
+        SessionEventName, SessionMethod, SessionNamespace, SessionNamespaces, SessionUpdateParams,
+    },
 };
 
 /// Permission-level diff between current and requested session namespaces.
@@ -100,6 +103,78 @@ impl SessionNamespacesDiff {
     #[must_use]
     pub fn has_removals(&self) -> bool {
         !self.removed.is_empty()
+    }
+}
+
+/// Wallet-facing review data for a pending `wc_sessionUpdate`.
+///
+/// `wc_sessionUpdate` replaces the active namespace set. This review keeps the
+/// current namespaces, requested replacement, and computed diff together so a
+/// wallet UI can show exactly what approval would change before acknowledging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUpdateReview {
+    topic: RelayTopic,
+    request_id: u64,
+    current_namespaces: SessionNamespaces,
+    requested_namespaces: SessionNamespaces,
+    diff: SessionNamespacesDiff,
+}
+
+impl SessionUpdateReview {
+    /// Builds review data from active and requested namespaces.
+    #[must_use]
+    pub fn new(
+        topic: RelayTopic,
+        request_id: u64,
+        current_namespaces: SessionNamespaces,
+        requested_namespaces: SessionNamespaces,
+    ) -> Self {
+        let diff = diff_session_namespaces(&current_namespaces, &requested_namespaces);
+        Self {
+            topic,
+            request_id,
+            current_namespaces,
+            requested_namespaces,
+            diff,
+        }
+    }
+
+    /// Active session topic receiving the update.
+    #[must_use]
+    pub const fn topic(&self) -> &RelayTopic {
+        &self.topic
+    }
+
+    /// JSON-RPC request id from `wc_sessionUpdate`.
+    #[must_use]
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    /// Namespaces currently stored on the active session.
+    #[must_use]
+    pub const fn current_namespaces(&self) -> &SessionNamespaces {
+        &self.current_namespaces
+    }
+
+    /// Replacement namespaces requested by the peer.
+    #[must_use]
+    pub const fn requested_namespaces(&self) -> &SessionNamespaces {
+        &self.requested_namespaces
+    }
+
+    /// Permission-level diff from current to requested namespaces.
+    #[must_use]
+    pub const fn diff(&self) -> &SessionNamespacesDiff {
+        &self.diff
+    }
+
+    /// Typed params that would be acknowledged if this update is approved.
+    #[must_use]
+    pub fn requested_params(&self) -> SessionUpdateParams {
+        SessionUpdateParams {
+            namespaces: self.requested_namespaces.clone(),
+        }
     }
 }
 
