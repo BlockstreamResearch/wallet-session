@@ -42,6 +42,8 @@ enum wc_core::PairingClientError
   variant SessionLifecycleResponseNotReceived
   variant SessionResponseTargetNotRequest
   variant SessionAuthenticateResponseTargetNotAuthenticate
+  variant SessionAuthenticateCacaoMissing
+  variant SessionAuthenticateCacaoAuthPayloadMismatch
   variant SessionResponseTargetNotPing
   variant SessionResponseTargetNotUpdate
   variant SessionResponseTargetNotExtend
@@ -111,10 +113,12 @@ struct wc_core::SessionAuthenticateApproval
   const fn wallet_metadata
   fn cacaos
   fn new
+  fn validate_against_auth_payload
   fn with_session_namespaces
 
 enum wc_core::SessionAuthenticateApprovalError
   variant EmptyCacaos
+  variant CacaoAuthPayloadMismatch
 
 struct wc_core::SessionAuthenticateApprovalOutcome
   const fn response_ack
@@ -436,6 +440,7 @@ enum wc_core::SingleSessionClientError
   variant DisconnectedByUser
   variant SessionRequestReview
   variant SessionAuthenticateReview
+  variant SessionAuthenticateApproval
   variant VerifyRiskReviewMismatch
   variant SessionAuthenticateExpired
   variant SessionRequestExpired

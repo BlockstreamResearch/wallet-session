@@ -31,6 +31,7 @@ use super::{
     pairing_lifecycle::pairing_ping_response_publish,
     session_authenticate::{
         session_authenticate_error_publish, session_authenticate_success_publish,
+        validate_session_authenticate_cacaos,
     },
     session_lifecycle::{
         session_delete_request_publish, session_delete_response_publish,
@@ -1123,6 +1124,7 @@ impl PairingClient {
         let PairingPayload::SessionAuthenticate(request) = message.payload() else {
             return Err(PairingClientError::SessionAuthenticateResponseTargetNotAuthenticate);
         };
+        validate_session_authenticate_cacaos(request, &cacaos)?;
         let session_sym_key = derive_shared_sym_key(
             responder.private_key(),
             &request.params.requester.public_key,

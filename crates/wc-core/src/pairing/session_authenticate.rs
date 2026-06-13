@@ -72,6 +72,7 @@ pub(super) fn session_authenticate_success_publish(
     responder: &X25519KeyPair,
 ) -> Result<IrnPublish, PairingClientError> {
     let request = session_authenticate_from_message(subscription, message)?;
+    validate_session_authenticate_cacaos(request, &cacaos)?;
     let sym_key = derive_shared_sym_key(
         responder.private_key(),
         &request.params.requester.public_key,
@@ -96,6 +97,28 @@ pub(super) fn session_authenticate_success_publish(
         SESSION_AUTHENTICATE_RESPONSE_TTL_SECONDS,
         SESSION_AUTHENTICATE_RESPONSE_TAG,
     )
+}
+
+pub(super) fn validate_session_authenticate_cacaos(
+    request: &wc_protocol::session::JsonRpcRequest<SessionAuthenticateParams>,
+    cacaos: &[Cacao],
+) -> Result<(), PairingClientError> {
+    if cacaos.is_empty() {
+        return Err(PairingClientError::SessionAuthenticateCacaoMissing);
+    }
+
+    for (index, cacao) in cacaos.iter().enumerate() {
+        cacao
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .map_err(
+                |source| PairingClientError::SessionAuthenticateCacaoAuthPayloadMismatch {
+                    index,
+                    source,
+                },
+            )?;
+    }
+
+    Ok(())
 }
 
 /// Extracts the typed authenticate request and checks the active pairing topic.

@@ -7,7 +7,7 @@ use wc_protocol::{
     pairing::{PairingUri, PairingUriError},
     pairing_message::PairingMessageError,
     relay::{RelayAuthError, RelayTopic},
-    session::{JsonRpcErrorResponse, SessionMethod},
+    session::{CacaoValidationError, JsonRpcErrorResponse, SessionMethod},
 };
 use wc_transport::RelayClientError;
 
@@ -199,6 +199,20 @@ pub enum PairingClientError {
     /// A `wc_sessionAuthenticate` response was built from a different pairing message.
     #[error("session authenticate response target is not a session authenticate request")]
     SessionAuthenticateResponseTargetNotAuthenticate,
+
+    /// A `wc_sessionAuthenticate` success response must include at least one CACAO.
+    #[error("session authenticate success requires at least one CACAO")]
+    SessionAuthenticateCacaoMissing,
+
+    /// A `wc_sessionAuthenticate` success response included a CACAO for a different auth payload.
+    #[error("session authenticate CACAO {index} does not match auth payload")]
+    SessionAuthenticateCacaoAuthPayloadMismatch {
+        /// Zero-based index in the approval CACAO list.
+        index: usize,
+        /// CACAO/auth-payload mismatch.
+        #[source]
+        source: CacaoValidationError,
+    },
 
     /// A `wc_sessionPing` response was built from a different session message.
     #[error("session response target is not a session ping")]

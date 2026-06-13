@@ -4,8 +4,8 @@ use wc_protocol::{
     caip::{Caip2ChainId, Caip10AccountId},
     relay::RelayTopic,
     session::{
-        AuthPayload, Cacao, DappMetadata, JsonRpcRequest, SessionAuthenticateParams,
-        SessionNamespaces, SessionParticipant, SignMethod,
+        AuthPayload, Cacao, CacaoValidationError, DappMetadata, JsonRpcRequest,
+        SessionAuthenticateParams, SessionNamespaces, SessionParticipant, SignMethod,
     },
     verify::{VerifyAttestationHash, VerifyContext},
 };
@@ -587,6 +587,25 @@ impl SessionAuthenticateApproval {
         self.session_namespaces.as_ref()
     }
 
+    /// Verifies every signed CACAO mirrors the exact authentication payload.
+    pub fn validate_against_auth_payload(
+        &self,
+        auth_payload: &AuthPayload,
+    ) -> Result<(), SessionAuthenticateApprovalError> {
+        for (index, cacao) in self.cacaos.iter().enumerate() {
+            cacao
+                .validate_against_auth_payload(auth_payload)
+                .map_err(
+                    |source| SessionAuthenticateApprovalError::CacaoAuthPayloadMismatch {
+                        index,
+                        source,
+                    },
+                )?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn into_parts(self) -> (DappMetadata, Vec<Cacao>, Option<SessionNamespaces>) {
         (self.wallet_metadata, self.cacaos, self.session_namespaces)
     }
@@ -613,6 +632,16 @@ pub enum SessionAuthenticateApprovalError {
     /// Approval must include at least one signed CACAO.
     #[error("session authenticate approval requires at least one CACAO")]
     EmptyCacaos,
+
+    /// A signed CACAO did not mirror the exact auth payload under review.
+    #[error("session authenticate approval CACAO {index} does not match auth payload")]
+    CacaoAuthPayloadMismatch {
+        /// Zero-based index in the approval CACAO list.
+        index: usize,
+        /// CACAO/auth-payload mismatch.
+        #[source]
+        source: CacaoValidationError,
+    },
 }
 
 #[cfg(test)]
@@ -627,9 +656,9 @@ mod tests {
         relay::RelayTopic,
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-            CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcRequest,
-            SessionAuthenticateParams, SessionEventName, SessionMethod, SessionNamespace,
-            SessionParticipant, SignMethod,
+            CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, DappMetadata,
+            JsonRpcRequest, SessionAuthenticateParams, SessionEventName, SessionMethod,
+            SessionNamespace, SessionParticipant, SignMethod,
         },
     };
 
@@ -768,6 +797,38 @@ mod tests {
             .with_session_namespaces(namespaces.clone());
 
         assert_eq!(approval.session_namespaces(), Some(&namespaces));
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_validates_cacaos_against_auth_payload() -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![cacao()?])?;
+
+        approval.validate_against_auth_payload(&request.params.auth_payload)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn approval_rejects_mismatched_cacao_auth_payload() -> Result<(), Box<dyn std::error::Error>> {
+        let request = authenticate_request(SignMethod::SessionAuthenticate)?;
+        let mut bad_cacao = cacao()?;
+        bad_cacao.p.nonce = "stale-nonce".to_owned();
+        let approval = SessionAuthenticateApproval::new(wallet_metadata(), vec![bad_cacao])?;
+
+        let error = approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .expect_err("mismatched CACAO must not validate");
+
+        assert_eq!(
+            error,
+            SessionAuthenticateApprovalError::CacaoAuthPayloadMismatch {
+                index: 0,
+                source: CacaoValidationError::NonceMismatch,
+            }
+        );
 
         Ok(())
     }

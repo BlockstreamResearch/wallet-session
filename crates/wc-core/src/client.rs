@@ -26,7 +26,8 @@ use crate::pairing::{
 };
 use crate::redirect::{WalletRedirectOrigin, WalletRedirectReview};
 use crate::session_authenticate::{
-    SessionAuthenticateApproval, SessionAuthenticateReview, SessionAuthenticateReviewError,
+    SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionAuthenticateReview,
+    SessionAuthenticateReviewError,
 };
 use crate::session_request::{SessionRequestReview, SessionRequestReviewError};
 use crate::session_update::{SessionNamespacesDiff, SessionUpdateReview, diff_session_namespaces};
@@ -730,6 +731,9 @@ impl SingleSessionClient {
                 now_unix_seconds,
             });
         }
+        approval
+            .validate_against_auth_payload(&request.params.auth_payload)
+            .map_err(|source| SingleSessionClientError::SessionAuthenticateApproval { source })?;
 
         let (wallet_metadata, cacaos, session_namespaces) = approval.into_parts();
         let adopt_session = session_namespaces.is_some();
@@ -2524,6 +2528,14 @@ pub enum SingleSessionClientError {
         source: SessionAuthenticateReviewError,
     },
 
+    /// A caller-provided authentication approval could not be sent safely.
+    #[error("single-session client session authenticate approval failed")]
+    SessionAuthenticateApproval {
+        /// Source approval validation error.
+        #[source]
+        source: SessionAuthenticateApprovalError,
+    },
+
     /// Verify risk review does not match the approval or signing operation.
     #[error("single-session client verify risk review mismatch")]
     VerifyRiskReviewMismatch {
@@ -2838,11 +2850,12 @@ mod tests {
         relay::RelayTopic,
         session::{
             AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-            CacaoSignatureType, CacaoSignatureValue, DappMetadata, DappRedirect, JsonRpcError,
-            JsonRpcErrorCode, JsonRpcRequest, ProposalNamespaces, Proposer, RelayProtocolOptions,
-            Session, SessionAuthenticateParams, SessionExtendParams, SessionNamespace,
-            SessionParticipant, SessionProposeParams, SessionRequest, SessionRequestParams,
-            SessionTransportType, SessionUpdateParams, SignMethod,
+            CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, DappMetadata,
+            DappRedirect, JsonRpcError, JsonRpcErrorCode, JsonRpcRequest, ProposalNamespaces,
+            Proposer, RelayProtocolOptions, Session, SessionAuthenticateParams,
+            SessionExtendParams, SessionNamespace, SessionParticipant, SessionProposeParams,
+            SessionRequest, SessionRequestParams, SessionTransportType, SessionUpdateParams,
+            SignMethod,
         },
         verify::{
             DEFAULT_VERIFY_URL, VerifiedOrigin, VerifyAttestationHash, VerifyContext,
@@ -2852,10 +2865,10 @@ mod tests {
 
     use crate::{
         PairingClientError, PairingPayload, PairingReceivedMessage, RelayReconnectConfig,
-        SessionAuthenticateApproval, SessionPayload, SessionProposalApproval,
-        SessionReceivedMessage, SessionRequestReview, SingleSessionAuthenticate,
-        SingleSessionPendingApproval, SingleSessionProposal, SingleSessionRelayConfig,
-        VerifyRiskReview, VerifyRiskSurface,
+        SessionAuthenticateApproval, SessionAuthenticateApprovalError, SessionPayload,
+        SessionProposalApproval, SessionReceivedMessage, SessionRequestReview,
+        SingleSessionAuthenticate, SingleSessionPendingApproval, SingleSessionProposal,
+        SingleSessionRelayConfig, VerifyRiskReview, VerifyRiskSurface,
         low_level::{PairingSubscription, SessionSubscription},
     };
 
@@ -3634,6 +3647,73 @@ mod tests {
                 );
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+
+        client.shutdown().await?;
+        server.await.expect("server task joins");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_authenticate_approval_rejects_mismatched_cacao_before_publish()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut client, server) = connect_idle_test_client().await;
+        let topic = RelayTopic::from_bytes([0x7e; 32]);
+        let sym_key = PairingSymKey::from_bytes([0x7f; 32]);
+        client.state = SingleSessionClientState::Pairing(PairingSubscription::for_test(
+            topic.clone(),
+            sym_key.clone(),
+        ));
+
+        let request = auth_request()?;
+        let plaintext = serde_json::to_string(&request)?;
+        let message = PairingReceivedMessage::for_test(
+            topic.clone(),
+            &sym_key,
+            &plaintext,
+            PairingPayload::SessionAuthenticate(Box::new(request.clone())),
+        );
+        let verify_context = VerifyContext::unknown("https://example.com", DEFAULT_VERIFY_URL);
+        let authenticate = SingleSessionAuthenticate {
+            pairing_topic: topic.clone(),
+            request,
+            verify_context: verify_context.clone(),
+            redirect: WalletRedirectReview::empty(WalletRedirectOrigin::Unknown),
+            message,
+        };
+        let verify_review = VerifyRiskReview::new(
+            VerifyRiskSurface::SessionAuthenticateApproval,
+            topic.clone(),
+            authenticate.request_id(),
+            Some(VerifyAttestationHash::from_message(
+                authenticate.message().message().plaintext(),
+            )),
+            verify_context,
+        );
+        let mut bad_cacao = test_cacao()?;
+        bad_cacao.p.nonce = "stale-nonce".to_owned();
+        let approval = SessionAuthenticateApproval::new(test_metadata("Wallet"), vec![bad_cacao])?;
+
+        let error = client
+            .approve_session_authenticate(&authenticate, &verify_review, approval)
+            .await
+            .expect_err("auth approval must validate CACAOs against the reviewed payload");
+
+        match error {
+            SingleSessionClientError::SessionAuthenticateApproval {
+                source: SessionAuthenticateApprovalError::CacaoAuthPayloadMismatch { index, source },
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(source, CacaoValidationError::NonceMismatch);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        match &client.state {
+            SingleSessionClientState::Pairing(subscription) => {
+                assert_eq!(subscription.topic(), &topic);
+            }
+            other => panic!("bad CACAO should not advance wallet state: {other:?}"),
         }
 
         client.shutdown().await?;

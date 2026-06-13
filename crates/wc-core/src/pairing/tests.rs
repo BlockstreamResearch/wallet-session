@@ -37,15 +37,15 @@ use wc_protocol::{
     relay::{IrnPublish, IrnSubscriptionData, RelayTopic},
     session::{
         AuthPayload, Cacao, CacaoHeader, CacaoHeaderType, CacaoPayload, CacaoSignature,
-        CacaoSignatureType, CacaoSignatureValue, DappMetadata, JsonRpcError, JsonRpcErrorCode,
-        JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, ProposalRequestsResponses,
-        RelayProtocolOptions, Session, SessionAuthenticateParams, SessionAuthenticateResult,
-        SessionDeleteParams, SessionDeleteResponse, SessionEvent, SessionEventName,
-        SessionEventParams, SessionExtendParams, SessionExtendResponse, SessionNamespace,
-        SessionParticipant, SessionPingParams, SessionPingResponse, SessionProposeErrorResponse,
-        SessionProposeParams, SessionProposeResult, SessionRequestParams, SessionSettleParams,
-        SessionTransportType, SessionUpdateParams, SessionUpdateResponse, SignMethod,
-        session_ack_response,
+        CacaoSignatureType, CacaoSignatureValue, CacaoValidationError, DappMetadata, JsonRpcError,
+        JsonRpcErrorCode, JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse,
+        ProposalRequestsResponses, RelayProtocolOptions, Session, SessionAuthenticateParams,
+        SessionAuthenticateResult, SessionDeleteParams, SessionDeleteResponse, SessionEvent,
+        SessionEventName, SessionEventParams, SessionExtendParams, SessionExtendResponse,
+        SessionNamespace, SessionParticipant, SessionPingParams, SessionPingResponse,
+        SessionProposeErrorResponse, SessionProposeParams, SessionProposeResult,
+        SessionRequestParams, SessionSettleParams, SessionTransportType, SessionUpdateParams,
+        SessionUpdateResponse, SignMethod, session_ack_response,
     },
     verify::VerifyAttestationHash,
 };
@@ -283,6 +283,83 @@ fn builds_session_authenticate_success_publish() -> Result<(), Box<dyn std::erro
         response.result.cacaos[0].p.iss.as_str(),
         "did:pkh:eip155:1:0xA6872b85a289A6D2c8AD72bb246F6c5CcE37Fc87"
     );
+
+    Ok(())
+}
+
+#[test]
+fn rejects_session_authenticate_success_publish_with_mismatched_cacao()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pairing_sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(pairing_sym_key.clone())?;
+    let request = session_authenticate_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &pairing_sym_key,
+        subscription.topic().clone(),
+        Some(1116),
+    )?;
+    let received = decode_subscription_data(data, &pairing_sym_key)?;
+    let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
+        "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+    )?);
+    let mut bad_cacao = auth_cacao()?;
+    bad_cacao.p.nonce = "stale-nonce".to_owned();
+
+    let error = session_authenticate_success_publish(
+        &subscription,
+        &received,
+        wallet_metadata(),
+        vec![bad_cacao],
+        &responder,
+    )
+    .expect_err("mismatched CACAO must not produce an auth success response");
+
+    match error {
+        PairingClientError::SessionAuthenticateCacaoAuthPayloadMismatch { index, source } => {
+            assert_eq!(index, 0);
+            assert_eq!(source, CacaoValidationError::NonceMismatch);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn rejects_session_authenticate_success_publish_without_cacaos()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pairing_sym_key = PairingSymKey::from_hex(
+        "2222222222222222222222222222222222222222222222222222222222222222",
+    )?;
+    let subscription = pairing_subscription(pairing_sym_key.clone())?;
+    let request = session_authenticate_request()?;
+    let data = encrypted_subscription_data_for_topic(
+        &request,
+        &pairing_sym_key,
+        subscription.topic().clone(),
+        Some(1116),
+    )?;
+    let received = decode_subscription_data(data, &pairing_sym_key)?;
+    let responder = X25519KeyPair::from_private_key(X25519PrivateKey::from_hex(
+        "3afc2a18c0b229afd47e0509fc6543c1c547ba3f93da0cb9a8d3f4e7cee4e7ce",
+    )?);
+
+    let error = session_authenticate_success_publish(
+        &subscription,
+        &received,
+        wallet_metadata(),
+        Vec::new(),
+        &responder,
+    )
+    .expect_err("empty CACAO list must not produce an auth success response");
+
+    assert!(matches!(
+        error,
+        PairingClientError::SessionAuthenticateCacaoMissing
+    ));
 
     Ok(())
 }
