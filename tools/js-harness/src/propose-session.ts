@@ -45,6 +45,7 @@ const afterApprovalAction =
 const waitForSessionRequestResponse =
   process.env.WC_JS_SESSION_REQUEST_WAIT_FOR_RESPONSE === "1";
 const proposalChains = envList("WC_JS_PROPOSAL_CHAINS", ["eip155:1"]);
+const proposalNamespace = process.env.WC_JS_PROPOSAL_NAMESPACE ?? "eip155";
 const proposalMethods = envList("WC_JS_PROPOSAL_METHODS", [
   "personal_sign",
   "eth_signTypedData_v4",
@@ -86,7 +87,7 @@ const scopedProperties = jsonEnv("WC_JS_SCOPED_PROPERTIES_JSON") as
   | undefined;
 const connectParams: ConnectParams = {
   requiredNamespaces: {
-    eip155: {
+    [proposalNamespace]: {
       chains: proposalChains,
       methods: proposalMethods,
       events: proposalEvents,

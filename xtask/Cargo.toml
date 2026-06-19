@@ -22,4 +22,5 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 wc-protocol = { path = "../crates/wc-protocol" }
 wc-core = { path = "../crates/wc-core" }
+wc-bitcoin = { path = "../crates/wc-bitcoin" }
 wc-transport = { path = "../crates/wc-transport" }

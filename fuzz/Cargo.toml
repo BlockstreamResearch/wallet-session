@@ -25,6 +25,7 @@ serde_json = "=1.0.150"
 # Stateful runtime fuzzing uses the non-default test harness feature so it can
 # exercise production in-memory state primitives without opening relay sockets.
 wc-core = { path = "../crates/wc-core", features = ["testkit"] }
+wc-bitcoin = { path = "../crates/wc-bitcoin" }
 wc-protocol = { path = "../crates/wc-protocol" }
 
 [[bin]]
@@ -79,6 +80,13 @@ bench = false
 [[bin]]
 name = "single_session_state"
 path = "fuzz_targets/single_session_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bitcoin"
+path = "fuzz_targets/bitcoin.rs"
 test = false
 doc = false
 bench = false

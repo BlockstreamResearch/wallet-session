@@ -61,6 +61,7 @@ fuzz_smoke:
     just _fuzz_with_corpus_copy cacao 1
     just _fuzz_with_corpus_copy verify 1
     just _fuzz_with_corpus_copy single_session_state 1
+    just _fuzz_with_corpus_copy bitcoin 1
 
 # Run a bounded regression fuzz pass over every target.
 fuzz_regression runs="1000":
@@ -72,6 +73,7 @@ fuzz_regression runs="1000":
     just _fuzz_with_corpus_copy cacao {{runs}}
     just _fuzz_with_corpus_copy verify {{runs}}
     just _fuzz_with_corpus_copy single_session_state {{runs}}
+    just _fuzz_with_corpus_copy bitcoin {{runs}}
 
 # Run one fuzz target against a copied corpus so smoke/regression runs do not mutate checked-in seeds.
 _fuzz_with_corpus_copy fuzz_target runs:
@@ -83,9 +85,14 @@ _fuzz_with_corpus_copy fuzz_target runs:
 lab_catalog_check:
     cargo run -p xtask -- lab catalog --validate --timeout-ms 15000
 
+# Capture a WalletConnect URI from the public Reown Lab Bitcoin AppKit route.
+lab_bitcoin_check:
+    cargo run -p xtask -- lab capture-uri --scenario bitcoin --timeout-ms 30000 --json
+
 # Run non-secret online checks suitable for CI.
 ci_online_checks:
     just lab_catalog_check
+    just lab_bitcoin_check
 
 # Run live WalletConnect interop scenarios when CI has a Reown/WalletConnect project ID.
 ci_live_scenarios:
@@ -95,7 +102,8 @@ ci_live_scenarios:
     fi; \
     just js_harness_check; \
     cargo run -p xtask -- scenario default-live; \
-    cargo run -p xtask -- scenario interop-live
+    cargo run -p xtask -- scenario interop-live; \
+    cargo run -p xtask -- scenario bitcoin-live
 
 # Generate rustdoc JSON used by API snapshot recipes.
 api_snapshot_json:

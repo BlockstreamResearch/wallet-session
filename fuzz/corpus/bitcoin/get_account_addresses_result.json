@@ -1,0 +1,12 @@
+[
+  {
+    "address": "bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw",
+    "publicKey": "0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c",
+    "path": "m/84'/0'/0'/0/0"
+  },
+  {
+    "address": "3KHhcgwPgYF9hE77zaKy2G36dpkcNtvQ33",
+    "publicKey": "03b90230ca20150142bc2849a3df4517073978f32466214a0ebc00cac52f996989",
+    "path": "m/49'/0'/0'/0/7"
+  }
+]

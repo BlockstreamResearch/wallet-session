@@ -44,6 +44,10 @@ pub enum ScenarioName {
     AppkitWalletCallLive,
     /// AppKit-style proposal carrying redirect and link-mode metadata.
     AppkitLinkModeProposal,
+    /// Bitcoin BIP-122 request review and response matrix.
+    BitcoinLive,
+    /// Bitcoin BIP-122 `getAccountAddresses` request review and response.
+    BitcoinGetAccountAddresses,
     /// Verify public-key and JS SDK Verify context scenarios.
     VerifyLive,
     /// Auth, Verify, and Wallet Call SDK interop scenarios.
@@ -70,6 +74,8 @@ impl ScenarioName {
             Self::AppkitCapabilityProposal => "appkit-capability-proposal",
             Self::AppkitWalletCallLive => "appkit-wallet-call-live",
             Self::AppkitLinkModeProposal => "appkit-link-mode-proposal",
+            Self::BitcoinLive => "bitcoin-live",
+            Self::BitcoinGetAccountAddresses => "bitcoin-get-account-addresses",
             Self::VerifyLive => "verify-live",
             Self::InteropLive => "interop-live",
         }
@@ -105,6 +111,8 @@ impl ScenarioName {
             Self::AppkitLinkModeProposal => {
                 "AppKit-style proposal with redirect/link-mode metadata"
             }
+            Self::BitcoinLive => "Bitcoin BIP-122 request matrix",
+            Self::BitcoinGetAccountAddresses => "Bitcoin BIP-122 getAccountAddresses request",
             Self::VerifyLive => "Verify public key and JS SDK verifyContext",
             Self::InteropLive => "auth approval/rejection, Verify, and Wallet Call interop",
         }
@@ -151,6 +159,14 @@ impl ScenarioName {
                 APPKIT_WALLET_SHOW_CALLS_STATUS,
             ],
             Self::AppkitLinkModeProposal => &[APPKIT_LINK_MODE_PROPOSAL],
+            Self::BitcoinLive => &[
+                BITCOIN_GET_ACCOUNT_ADDRESSES,
+                BITCOIN_ADDRESSES_CHANGED_EVENT,
+                BITCOIN_SEND_TRANSFER,
+                BITCOIN_SIGN_PSBT,
+                BITCOIN_SIGN_MESSAGE,
+            ],
+            Self::BitcoinGetAccountAddresses => &[BITCOIN_GET_ACCOUNT_ADDRESSES],
             Self::VerifyLive => &[VERIFY_PUBLIC_KEY, VERIFY_CONTEXT],
             Self::InteropLive => &[
                 SINGLE_SESSION_AUTH_REJECT,
@@ -319,6 +335,20 @@ const APPKIT_PROPOSAL_SCOPED_PROPERTIES: &str =
 const APPKIT_APPROVAL_SCOPED_PROPERTIES: &str = r#"{"eip155:1":{"atomic":{"status":"supported"}}}"#;
 const APPKIT_LINK_MODE_REDIRECT: &str =
     r#"{"native":"appkit-lab://","universal":"https://appkit-lab.reown.com","linkMode":true}"#;
+const BITCOIN_MAINNET_CHAIN_ID: &str = "bip122:000000000019d6689c085ae165831e93";
+const BITCOIN_ACCOUNT: &str = "bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw";
+const BITCOIN_SECONDARY_ADDRESS: &str =
+    "bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e";
+const BITCOIN_GET_ACCOUNT_ADDRESSES_PARAMS: &str =
+    r#"{"account":"bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw"}"#;
+const BITCOIN_GET_ACCOUNT_ADDRESSES_RESULT: &str = r#"[{"address":"bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw","publicKey":"0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c","path":"m/84'/0'/0'/0/0"}]"#;
+const BITCOIN_SEND_TRANSFER_PARAMS: &str = r#"{"account":"bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw","recipientAddress":"bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e","amount":"123000000","changeAddress":"bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e","memo":"636861726c6579206c6f766573206865"}"#;
+const BITCOIN_SEND_TRANSFER_RESULT: &str =
+    r#"{"txid":"f007551f169722ce74104d6673bd46ce193c624b8550889526d1b93820d725f7"}"#;
+const BITCOIN_SIGN_PSBT_PARAMS: &str = r#"{"account":"bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw","psbt":"cHNidP8BAAoCAAAAAAAAAAAAAA==","signInputs":[{"address":"bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e","index":0,"sighashTypes":[1]}],"broadcast":false}"#;
+const BITCOIN_SIGN_PSBT_RESULT: &str = r#"{"psbt":"cHNidP8BAAoCAAAAAAAAAAAAAA=="}"#;
+const BITCOIN_SIGN_MESSAGE_PARAMS: &str = r#"{"account":"bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw","message":"hello from walletconnect bitcoin","address":"bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e","protocol":"bip322"}"#;
+const BITCOIN_SIGN_MESSAGE_RESULT: &str = r#"{"address":"bc1pgllnmtxs0g058qz7c6qgaqq4qknwrqj9z7rqn9e2dzhmcfmhlu4sfadf5e","signature":"abcd"}"#;
 
 const WALLET_GET_CAPABILITIES: ScenarioStep = ScenarioStep {
     label: "wallet-call-get-capabilities",
@@ -587,6 +617,165 @@ const APPKIT_LINK_MODE_PROPOSAL: ScenarioStep = ScenarioStep {
     ],
 };
 
+const BITCOIN_GET_ACCOUNT_ADDRESSES: ScenarioStep = ScenarioStep {
+    label: "bitcoin-get-account-addresses",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_NAMESPACE", "bip122"),
+        ("WC_JS_PROPOSAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_PROPOSAL_METHODS", "getAccountAddresses"),
+        ("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_APPROVAL_METHODS", "getAccountAddresses"),
+        ("WC_APPROVAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_ACCOUNT_ADDRESS", BITCOIN_ACCOUNT),
+        ("WC_JS_SESSION_REQUEST_CHAIN_ID", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_SESSION_REQUEST_METHOD", "getAccountAddresses"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            BITCOIN_GET_ACCOUNT_ADDRESSES_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            BITCOIN_GET_ACCOUNT_ADDRESSES_RESULT,
+        ),
+    ],
+};
+
+const BITCOIN_ADDRESSES_CHANGED_EVENT: ScenarioStep = ScenarioStep {
+    label: "bitcoin-addresses-changed-event",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-lifecycle",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_CORE_SESSION_LIFECYCLE_ACTION", "event"),
+        ("WC_JS_PROPOSAL_NAMESPACE", "bip122"),
+        ("WC_JS_PROPOSAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_PROPOSAL_METHODS", "getAccountAddresses"),
+        ("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_APPROVAL_METHODS", "getAccountAddresses"),
+        ("WC_APPROVAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_ACCOUNT_ADDRESS", BITCOIN_ACCOUNT),
+        ("WC_JS_SESSION_EVENT_CHAIN_ID", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_SESSION_EVENT_NAME", "bip122_addressesChanged"),
+        (
+            "WC_JS_SESSION_EVENT_DATA_JSON",
+            BITCOIN_GET_ACCOUNT_ADDRESSES_RESULT,
+        ),
+    ],
+};
+
+const BITCOIN_SEND_TRANSFER: ScenarioStep = ScenarioStep {
+    label: "bitcoin-send-transfer",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_NAMESPACE", "bip122"),
+        ("WC_JS_PROPOSAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_PROPOSAL_METHODS", "sendTransfer"),
+        ("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_APPROVAL_METHODS", "sendTransfer"),
+        ("WC_APPROVAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_ACCOUNT_ADDRESS", BITCOIN_ACCOUNT),
+        (
+            "WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES",
+            BITCOIN_SECONDARY_ADDRESS,
+        ),
+        ("WC_JS_SESSION_REQUEST_CHAIN_ID", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_SESSION_REQUEST_METHOD", "sendTransfer"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            BITCOIN_SEND_TRANSFER_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            BITCOIN_SEND_TRANSFER_RESULT,
+        ),
+    ],
+};
+
+const BITCOIN_SIGN_PSBT: ScenarioStep = ScenarioStep {
+    label: "bitcoin-sign-psbt",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_NAMESPACE", "bip122"),
+        ("WC_JS_PROPOSAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_PROPOSAL_METHODS", "signPsbt"),
+        ("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_APPROVAL_METHODS", "signPsbt"),
+        ("WC_APPROVAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_ACCOUNT_ADDRESS", BITCOIN_ACCOUNT),
+        (
+            "WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES",
+            BITCOIN_SECONDARY_ADDRESS,
+        ),
+        ("WC_JS_SESSION_REQUEST_CHAIN_ID", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_SESSION_REQUEST_METHOD", "signPsbt"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            BITCOIN_SIGN_PSBT_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            BITCOIN_SIGN_PSBT_RESULT,
+        ),
+    ],
+};
+
+const BITCOIN_SIGN_MESSAGE: ScenarioStep = ScenarioStep {
+    label: "bitcoin-sign-message",
+    command: ScenarioCommand::Xtask(&[
+        "relay-probe",
+        "--core-single-session-client-session-request",
+    ]),
+    env: &[
+        ("WC_JS_HARNESS_HOLD_MS", "60000"),
+        ("WC_JS_SESSION_REQUEST_HOLD_MS", "30000"),
+        ("WC_JS_PROPOSAL_NAMESPACE", "bip122"),
+        ("WC_JS_PROPOSAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_PROPOSAL_METHODS", "signMessage"),
+        ("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_CHAINS", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_APPROVAL_METHODS", "signMessage"),
+        ("WC_APPROVAL_EVENTS", "bip122_addressesChanged"),
+        ("WC_APPROVAL_ACCOUNT_ADDRESS", BITCOIN_ACCOUNT),
+        (
+            "WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES",
+            BITCOIN_SECONDARY_ADDRESS,
+        ),
+        ("WC_JS_SESSION_REQUEST_CHAIN_ID", BITCOIN_MAINNET_CHAIN_ID),
+        ("WC_JS_SESSION_REQUEST_METHOD", "signMessage"),
+        (
+            "WC_JS_SESSION_REQUEST_PARAMS_JSON",
+            BITCOIN_SIGN_MESSAGE_PARAMS,
+        ),
+        (
+            "WC_CORE_SESSION_REQUEST_RESULT_JSON",
+            BITCOIN_SIGN_MESSAGE_RESULT,
+        ),
+    ],
+};
+
 const VERIFY_PUBLIC_KEY: ScenarioStep = ScenarioStep {
     label: "verify-public-key",
     command: ScenarioCommand::Xtask(&["verify-probe", "--public-key"]),
@@ -626,7 +815,7 @@ fn ensure_success(label: &str, status: ExitStatus) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScenarioCommand, ScenarioName, WALLET_CALL_ID};
+    use super::{BITCOIN_SECONDARY_ADDRESS, ScenarioCommand, ScenarioName, WALLET_CALL_ID};
 
     #[test]
     fn interop_live_covers_auth_verify_and_wallet_call_steps() {
@@ -784,6 +973,82 @@ mod tests {
                 .any(|(key, value)| *key == "WC_JS_METADATA_REDIRECT_JSON"
                     && value.contains("\"linkMode\":true"))
         );
+    }
+
+    #[test]
+    fn bitcoin_get_account_addresses_step_pins_bip122_request() {
+        let step = ScenarioName::BitcoinGetAccountAddresses.steps()[0];
+
+        assert_eq!(step.label, "bitcoin-get-account-addresses");
+        assert!(step.env.contains(&("WC_JS_PROPOSAL_NAMESPACE", "bip122")));
+        assert!(
+            step.env
+                .iter()
+                .any(|(key, value)| *key == "WC_JS_PROPOSAL_CHAINS"
+                    && value.starts_with("bip122:000000000019d6689c085ae165831e93"))
+        );
+        assert!(
+            step.env
+                .contains(&("WC_JS_PROPOSAL_METHODS", "getAccountAddresses"))
+        );
+        assert!(
+            step.env
+                .contains(&("WC_JS_PROPOSAL_EVENTS", "bip122_addressesChanged"))
+        );
+        assert!(
+            step.env
+                .contains(&("WC_APPROVAL_METHODS", "getAccountAddresses"))
+        );
+        assert!(
+            step.env
+                .iter()
+                .any(|(key, value)| *key == "WC_CORE_SESSION_REQUEST_RESULT_JSON"
+                    && value.contains("m/84'/0'/0'/0/0"))
+        );
+    }
+
+    #[test]
+    fn bitcoin_live_covers_all_walletconnect_bitcoin_methods() {
+        let steps = ScenarioName::BitcoinLive.steps();
+
+        assert_eq!(steps.len(), 5);
+        assert!(
+            steps[0]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "getAccountAddresses"))
+        );
+        assert_eq!(steps[1].label, "bitcoin-addresses-changed-event");
+        assert!(
+            steps[1]
+                .env
+                .contains(&("WC_JS_SESSION_EVENT_NAME", "bip122_addressesChanged"))
+        );
+        assert!(
+            steps[2]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "sendTransfer"))
+        );
+        assert!(
+            steps[3]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "signPsbt"))
+        );
+        assert!(
+            steps[4]
+                .env
+                .contains(&("WC_JS_SESSION_REQUEST_METHOD", "signMessage"))
+        );
+
+        for step in &steps[2..] {
+            assert!(
+                step.env.contains(&(
+                    "WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES",
+                    BITCOIN_SECONDARY_ADDRESS
+                )),
+                "{} should provide the secondary wallet address scope",
+                step.label
+            );
+        }
     }
 
     #[test]

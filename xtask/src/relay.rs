@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -16,6 +16,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::sleep;
+use wc_bitcoin::{
+    BitcoinAccountAuthorization, BitcoinAccountScope, BitcoinAddress, BitcoinConnectedAccount,
+    BitcoinRequest, BitcoinRequestError, BitcoinRequestReview,
+};
 use wc_core::{
     DEFAULT_SESSION_EXPIRY_SECONDS, PairingPayload, PairingReceivedMessage,
     SessionAuthenticateApproval, SessionAuthenticateReview, SessionClientEvent,
@@ -1310,6 +1314,9 @@ async fn run_core_single_session_client_session_lifecycle_probe(
     run_core_single_session_client_session_lifecycle_action(&mut client, action, &session).await?;
 
     let result = harness.expect_result(action.expected_outcome()).await?;
+    if action == CoreSingleSessionClientSessionLifecycleAction::Event {
+        validate_session_event_result(&result)?;
+    }
     println!(
         "core-single-session-client-session-lifecycle js_result={}",
         json_for_log(&result)
@@ -1559,6 +1566,32 @@ fn validate_incoming_session_event(message: &SessionReceivedMessage) -> Result<(
         }
     }
 
+    Ok(())
+}
+
+fn validate_session_event_result(result: &Value) -> Result<()> {
+    let expected_chain =
+        env::var("WC_JS_SESSION_EVENT_CHAIN_ID").unwrap_or_else(|_| "eip155:1".to_owned());
+    let expected_event =
+        env::var("WC_JS_SESSION_EVENT_NAME").unwrap_or_else(|_| "accountsChanged".to_owned());
+    if result.get("chainId").and_then(Value::as_str) != Some(expected_chain.as_str()) {
+        bail!(
+            "session event result chain mismatch: expected {expected_chain}, got {}",
+            result
+                .get("chainId")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+        );
+    }
+    if result.get("eventName").and_then(Value::as_str) != Some(expected_event.as_str()) {
+        bail!(
+            "session event result name mismatch: expected {expected_event}, got {}",
+            result
+                .get("eventName")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+        );
+    }
     Ok(())
 }
 
@@ -1974,12 +2007,29 @@ async fn wait_for_session_lifecycle_message(
 }
 
 fn session_event_params() -> Result<SessionEventParams> {
+    let event_name = env::var("WC_CORE_SESSION_EVENT_NAME")
+        .or_else(|_| env::var("WC_JS_SESSION_EVENT_NAME"))
+        .unwrap_or_else(|_| "accountsChanged".to_owned());
+    let event_data = env::var("WC_CORE_SESSION_EVENT_DATA_JSON")
+        .or_else(|_| env::var("WC_JS_SESSION_EVENT_DATA_JSON"))
+        .map_or_else(
+            |_| {
+                Ok(json!([
+                    "eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"
+                ]))
+            },
+            |value| parse_json_env(&value),
+        )?;
+    let chain_id = env::var("WC_CORE_SESSION_EVENT_CHAIN_ID")
+        .or_else(|_| env::var("WC_JS_SESSION_EVENT_CHAIN_ID"))
+        .unwrap_or_else(|_| "eip155:1".to_owned());
+
     Ok(SessionEventParams {
         event: SessionEvent {
-            name: SessionEventName::parse("accountsChanged")?,
-            data: json!(["eip155:1:0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb"]),
+            name: SessionEventName::parse(&event_name)?,
+            data: event_data,
         },
-        chain_id: "eip155:1".parse()?,
+        chain_id: chain_id.parse()?,
     })
 }
 
@@ -2479,6 +2529,13 @@ fn session_request_approval_for_probe(
     review: &SessionRequestReview,
     wallet_call_status_registry: Option<&WalletCallStatusRegistry>,
 ) -> Result<SessionRequestApproval> {
+    if let Some(bitcoin) = bitcoin_request_review_for_probe(review)? {
+        let scope = bitcoin_account_scope_for_probe(&bitcoin)?;
+        bitcoin.ensure_account_scope(&scope)?;
+        return SessionRequestApproval::new(review, UnknownSessionRequestMethodPolicy::AllowRaw)
+            .map_err(Into::into);
+    }
+
     wallet_call_status_registry.map_or_else(
         || {
             SessionRequestApproval::new(review, UnknownSessionRequestMethodPolicy::Reject)
@@ -2515,7 +2572,103 @@ fn print_session_request_review(
         review.verify_risk(),
         json_for_log(review.params())
     );
-    print_session_request_method_review(review, wallet_call_status_registry);
+    match bitcoin_request_review_for_probe(review) {
+        Ok(Some(bitcoin)) => print_bitcoin_review(&bitcoin),
+        Ok(None) => print_session_request_method_review(review, wallet_call_status_registry),
+        Err(error) => {
+            println!(
+                "core-single-session-client-session-request bitcoin_review_error method={} error={error}",
+                review.method()
+            );
+        }
+    }
+}
+
+fn bitcoin_request_review_for_probe(
+    review: &SessionRequestReview,
+) -> Result<Option<BitcoinRequestReview>> {
+    if !wc_bitcoin::is_bitcoin_chain_id(review.chain_id()) {
+        return Ok(None);
+    }
+
+    match BitcoinRequestReview::from_session_request(review) {
+        Ok(review) => Ok(Some(review)),
+        Err(BitcoinRequestError::UnsupportedMethod { .. }) => Ok(None),
+        Err(error) => Err(error).context("Bitcoin request review failed"),
+    }
+}
+
+fn bitcoin_account_scope_for_probe(review: &BitcoinRequestReview) -> Result<BitcoinAccountScope> {
+    let account = BitcoinConnectedAccount::from_wallet_first_external_address(
+        review.request().account().clone(),
+    );
+    let mut addresses = BTreeSet::new();
+    addresses.insert(review.request().account().clone());
+
+    if let Ok(value) = env::var("WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES") {
+        for address in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            addresses.insert(
+                address
+                    .parse::<BitcoinAddress>()
+                    .context("invalid WC_BITCOIN_ACCOUNT_SCOPE_ADDRESSES entry")?,
+            );
+        }
+    }
+
+    BitcoinAccountScope::new(account, addresses).map_err(Into::into)
+}
+
+fn print_bitcoin_review(review: &BitcoinRequestReview) {
+    let authorization = match review.authorization() {
+        BitcoinAccountAuthorization::NotChecked => "not_checked",
+        BitcoinAccountAuthorization::Authorized => "authorized",
+        BitcoinAccountAuthorization::Unauthorized => "unauthorized",
+    };
+
+    match review.request() {
+        BitcoinRequest::SendTransfer(params) => {
+            println!(
+                "core-single-session-client-session-request bitcoin method=sendTransfer account_status={} recipient={} amount_len={} memo_len={} change_address_present={}",
+                authorization,
+                sensitive_str_for_log(params.recipient_address.as_str()),
+                params.amount.to_sat().to_string().len(),
+                params
+                    .memo
+                    .as_ref()
+                    .map_or(0, wc_bitcoin::BitcoinMemo::byte_len),
+                params.change_address.is_some()
+            );
+        }
+        BitcoinRequest::GetAccountAddresses(params) => {
+            println!(
+                "core-single-session-client-session-request bitcoin method=getAccountAddresses account_status={} intentions={}",
+                authorization,
+                params.intentions.len()
+            );
+        }
+        BitcoinRequest::SignPsbt(params) => {
+            println!(
+                "core-single-session-client-session-request bitcoin method=signPsbt account_status={} psbt_len={} sign_inputs={} broadcast={}",
+                authorization,
+                params.psbt.as_str().len(),
+                params.sign_inputs.len(),
+                params.broadcast
+            );
+        }
+        BitcoinRequest::SignMessage(params) => {
+            println!(
+                "core-single-session-client-session-request bitcoin method=signMessage account_status={} message_len={} signing_address={} protocol={}",
+                authorization,
+                params.message.len(),
+                sensitive_str_for_log(params.signing_address().as_str()),
+                params.protocol_or_default()
+            );
+        }
+    }
 }
 
 fn print_session_request_method_review(
