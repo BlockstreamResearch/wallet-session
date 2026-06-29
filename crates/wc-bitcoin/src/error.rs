@@ -159,4 +159,18 @@ pub enum BitcoinRequestError {
     /// A broadcast `signPsbt` result omitted the required `txid`.
     #[error("broadcast signPsbt result must include txid")]
     BroadcastResultMissingTxid,
+    /// A `getAccountAddresses` result did not include any addresses.
+    #[error("getAccountAddresses result must not be empty")]
+    AccountAddressesResultEmpty,
+    /// A `getAccountAddresses` result omitted the connected account address.
+    #[error("getAccountAddresses result must include the connected account address")]
+    AccountAddressesResultMissingConnectedAccount,
+    /// A `signMessage` result reported a different signing address than the reviewed request.
+    #[error("signMessage result address does not match requested signer")]
+    SignMessageResultAddressMismatch {
+        /// Address the request allowed the wallet to sign with.
+        expected_address: String,
+        /// Address reported in the result.
+        actual_address: String,
+    },
 }

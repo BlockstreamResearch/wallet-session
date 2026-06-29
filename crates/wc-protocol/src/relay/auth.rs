@@ -30,7 +30,7 @@ const MULTICODEC_ED25519_HEADER: [u8; 2] = [0xed, 0x01];
 /// assert_eq!(token.as_str().split('.').count(), 3);
 /// # Ok::<(), wc_protocol::relay::RelayAuthError>(())
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RelayAuthToken(String);
 
@@ -119,7 +119,13 @@ impl RelayAuthToken {
 
 impl fmt::Display for RelayAuthToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        formatter.write_str("<redacted relay auth token>")
+    }
+}
+
+impl fmt::Debug for RelayAuthToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RelayAuthToken(<redacted>)")
     }
 }
 
@@ -206,7 +212,7 @@ pub fn ed25519_did_key(public_key: &[u8; 32]) -> String {
 ///     expected,
 /// );
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RelayConnectionUrl(String);
 
 impl RelayConnectionUrl {
@@ -256,7 +262,13 @@ impl RelayConnectionUrl {
 
 impl fmt::Display for RelayConnectionUrl {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        formatter.write_str("<redacted relay connection url>")
+    }
+}
+
+impl fmt::Debug for RelayConnectionUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RelayConnectionUrl(<redacted>)")
     }
 }
 
@@ -353,6 +365,24 @@ mod tests {
     }
 
     #[test]
+    fn relay_auth_token_debug_and_display_are_redacted() {
+        let token = RelayAuthToken::sign_with_seed(
+            &[7; 32],
+            "sub",
+            "wss://relay.walletconnect.com",
+            1_700_000_000,
+            60,
+        )
+        .expect("jwt is generated");
+        let raw = token.as_str().to_owned();
+
+        assert_eq!(format!("{token:?}"), "RelayAuthToken(<redacted>)");
+        assert_eq!(format!("{token}"), "<redacted relay auth token>");
+        assert!(!format!("{token:?}").contains(&raw));
+        assert!(!format!("{token}").contains(&raw));
+    }
+
+    #[test]
     fn relay_url_inserts_missing_path_before_query() {
         let url = RelayConnectionUrl::new(
             "wss://relay.walletconnect.com?existing=true",
@@ -380,5 +410,18 @@ mod tests {
             url.as_str()
                 .contains("ua=wc-2%2Frust-poc-0.1.0%2Fmacos%2Fnative")
         );
+    }
+
+    #[test]
+    fn relay_connection_url_debug_and_display_are_redacted() {
+        let url = RelayConnectionUrl::new(DEFAULT_RELAY_URL, "project", "jwt.secret", "ua");
+        let raw = url.as_str().to_owned();
+
+        assert_eq!(format!("{url:?}"), "RelayConnectionUrl(<redacted>)");
+        assert_eq!(format!("{url}"), "<redacted relay connection url>");
+        assert!(!format!("{url:?}").contains("jwt.secret"));
+        assert!(!format!("{url}").contains("jwt.secret"));
+        assert!(!format!("{url:?}").contains(&raw));
+        assert!(!format!("{url}").contains(&raw));
     }
 }

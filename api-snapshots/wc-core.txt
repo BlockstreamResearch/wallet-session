@@ -79,6 +79,7 @@ struct wc_core::EvmHexQuantity
 
 enum wc_core::EvmHexQuantityStatus
   variant Decoded
+  variant TooLong
   variant MissingPrefix
   variant Empty
   variant InvalidHex
@@ -95,6 +96,11 @@ struct wc_core::EvmTransactionSummary
   const fn to
   const fn value
 
+struct wc_core::ExternalSessionRequestMethodReview
+  const fn method
+  const fn reviewer
+  fn new
+
 enum wc_core::PairingClientError
   variant PairingUri
   variant PairingExpired
@@ -102,6 +108,7 @@ enum wc_core::PairingClientError
   variant Clock
   variant Relay
   variant KeyPair
+  variant SharedSecret
   variant Namespace
   variant ReceiveTimedOut
   variant UnexpectedTopic
@@ -360,6 +367,7 @@ struct wc_core::SessionRequestApproval
   const fn request_id
   const fn topic
   const fn verify_risk_review
+  fn from_external_typed_review
   fn new
   fn with_wallet_call_status_registry
 
@@ -389,6 +397,7 @@ enum wc_core::SessionRequestMethodReview
   variant Signing
   variant Transaction
   variant WalletCall
+  variant ExternalTyped
   variant Raw
 
 enum wc_core::SessionRequestMethodReviewError
@@ -545,12 +554,16 @@ struct wc_core::SingleSessionClient
 
 struct wc_core::SingleSessionClientConfig
   const fn automatic_reconnect_cooldown
+  const fn max_pending_session_requests
+  const fn max_pending_session_updates
   const fn max_queued_events
   const fn new
   const fn pairing
   const fn receive_timeouts_before_reconnect
   const fn reconnect
   const fn with_automatic_reconnect_cooldown
+  const fn with_max_pending_session_requests
+  const fn with_max_pending_session_updates
   const fn with_max_queued_events
   const fn with_receive_timeouts_before_reconnect
   const fn with_reconnect
@@ -653,6 +666,7 @@ struct wc_core::VerifyResolver
   async fn resolve_hash_for_metadata
   async fn resolve_jwt_attestation
   async fn resolve_jwt_for_context
+  async fn resolve_jwt_or_hash_for_context
   fn new
   fn with_timeout
 
@@ -735,6 +749,7 @@ struct wc_core::WalletCapabilities
   fn insert
   fn new
   fn plan_session_approval
+  fn to_session_namespaces
   fn validate_session_update_namespaces
   fn with_scoped_properties
   fn with_session_properties

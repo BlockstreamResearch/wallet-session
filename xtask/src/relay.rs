@@ -2692,6 +2692,13 @@ fn print_session_request_method_review(
         Ok(SessionRequestMethodReview::WalletCall(wallet_call)) => {
             print_wallet_call_review(&wallet_call);
         }
+        Ok(SessionRequestMethodReview::ExternalTyped(external)) => {
+            println!(
+                "core-single-session-client-session-request external_typed_review method={} reviewer={}",
+                external.method(),
+                external.reviewer()
+            );
+        }
         Ok(SessionRequestMethodReview::Raw) => {
             println!(
                 "core-single-session-client-session-request unknown_request method={} policy=raw",
@@ -4029,8 +4036,10 @@ async fn run_key_agreement_envelope_delivery(config: &RelayProbeConfig) -> Resul
     let label = "matrix-key-agreement-envelope";
     let proposer = X25519KeyPair::generate().context("failed to generate proposer key pair")?;
     let responder = X25519KeyPair::generate().context("failed to generate responder key pair")?;
-    let proposer_sym_key = derive_shared_sym_key(proposer.private_key(), responder.public_key());
-    let responder_sym_key = derive_shared_sym_key(responder.private_key(), proposer.public_key());
+    let proposer_sym_key = derive_shared_sym_key(proposer.private_key(), responder.public_key())
+        .context("failed to derive proposer shared symKey")?;
+    let responder_sym_key = derive_shared_sym_key(responder.private_key(), proposer.public_key())
+        .context("failed to derive responder shared symKey")?;
     if proposer_sym_key != responder_sym_key {
         bail!("{label} derived asymmetric symKeys");
     }

@@ -19,7 +19,7 @@ workspace = true
 # Bitcoin primitives are used behind WalletConnect-specific newtypes so wallet
 # request parsing does not rely on hand-rolled address, PSBT, txid, amount, or
 # derivation-path validation.
-bitcoin = { version = "0.33.0-beta", default-features = false, features = ["std"] }
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
 
 # Decode WalletConnect PSBT base64 with the workspace's existing base64 major,
 # then pass bytes to rust-bitcoin for PSBT validation.

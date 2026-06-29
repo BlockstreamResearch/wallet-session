@@ -43,8 +43,10 @@ pub fn run() -> Result<()> {
         bail!("crypto-probe vector B public key mismatch");
     }
 
-    let ab = derive_shared_sym_key(&a_private, &b_public);
-    let ba = derive_shared_sym_key(&b_private, &a_public);
+    let ab =
+        derive_shared_sym_key(&a_private, &b_public).context("failed to derive A->B symKey")?;
+    let ba =
+        derive_shared_sym_key(&b_private, &a_public).context("failed to derive B->A symKey")?;
     if ab != ba {
         bail!("crypto-probe derived asymmetric symKeys");
     }

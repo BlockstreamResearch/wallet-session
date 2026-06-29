@@ -671,15 +671,28 @@ impl SessionRequestReview {
                     (attestation_jwt.to_owned(), encrypted_id.to_owned())
                 })
         {
-            self.verify_context = resolver
-                .resolve_jwt_for_context(
-                    &attestation_jwt,
-                    &encrypted_id,
-                    &self.verify_context,
-                    now_unix_seconds,
-                )
-                .await
-                .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
+            if let Some(hash) = self.verify_attestation_hash.as_ref() {
+                self.verify_context = resolver
+                    .resolve_jwt_or_hash_for_context(
+                        &attestation_jwt,
+                        &encrypted_id,
+                        hash,
+                        &self.verify_context,
+                        now_unix_seconds,
+                    )
+                    .await
+                    .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
+            } else {
+                self.verify_context = resolver
+                    .resolve_jwt_for_context(
+                        &attestation_jwt,
+                        &encrypted_id,
+                        &self.verify_context,
+                        now_unix_seconds,
+                    )
+                    .await
+                    .map_err(|source| SessionRequestVerifyResolutionError::Resolver { source })?;
+            }
             return Ok(&self.verify_context);
         }
 
@@ -763,6 +776,8 @@ pub enum SessionRequestMethodReview {
     Transaction(Box<TransactionRequestReview>),
     /// Recognized EIP-5792 Wallet Call request.
     WalletCall(Box<WalletCallReview>),
+    /// Method reviewed by a caller-owned typed extension before approval.
+    ExternalTyped(ExternalSessionRequestMethodReview),
     /// Namespace-authorized method without a built-in method-specific parser.
     Raw,
 }
@@ -775,8 +790,56 @@ impl fmt::Debug for SessionRequestMethodReview {
                 formatter.debug_tuple("Transaction").field(review).finish()
             }
             Self::WalletCall(review) => formatter.debug_tuple("WalletCall").field(review).finish(),
+            Self::ExternalTyped(review) => formatter
+                .debug_tuple("ExternalTyped")
+                .field(review)
+                .finish(),
             Self::Raw => formatter.write_str("Raw"),
         }
+    }
+}
+
+/// Caller-owned typed review marker for methods implemented outside `wc-core`.
+///
+/// This is deliberately separate from `Raw`: constructing it means the caller
+/// has parsed, policy-checked, and result-bound the method through its own
+/// typed extension before asking the core client to publish success.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExternalSessionRequestMethodReview {
+    method: SessionMethod,
+    reviewer: &'static str,
+}
+
+impl fmt::Debug for ExternalSessionRequestMethodReview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalSessionRequestMethodReview")
+            .field("method", &self.method)
+            .field("reviewer", &self.reviewer)
+            .finish()
+    }
+}
+
+impl ExternalSessionRequestMethodReview {
+    /// Marks a session request as reviewed by a typed extension.
+    #[must_use]
+    pub fn new(review: &SessionRequestReview, reviewer: &'static str) -> Self {
+        Self {
+            method: review.method().clone(),
+            reviewer,
+        }
+    }
+
+    /// Reviewed method.
+    #[must_use]
+    pub const fn method(&self) -> &SessionMethod {
+        &self.method
+    }
+
+    /// Stable extension label that performed the typed review.
+    #[must_use]
+    pub const fn reviewer(&self) -> &'static str {
+        self.reviewer
     }
 }
 
@@ -865,6 +928,17 @@ impl SessionRequestApproval {
             .method_review_with_status_registry(unknown_policy, Some(registry))
             .map_err(|source| SessionRequestApprovalError::MethodReview { source })?;
         Self::from_method_review(review, method_review)
+    }
+
+    /// Builds approval for a caller-owned typed extension review.
+    pub fn from_external_typed_review(
+        review: &SessionRequestReview,
+        external_review: ExternalSessionRequestMethodReview,
+    ) -> Result<Self, SessionRequestApprovalError> {
+        Self::from_method_review(
+            review,
+            SessionRequestMethodReview::ExternalTyped(external_review),
+        )
     }
 
     fn from_method_review(
@@ -1891,6 +1965,8 @@ impl EvmAddressSummary {
 pub enum EvmHexQuantityStatus {
     /// The value decoded as a `0x`-prefixed hex quantity.
     Decoded,
+    /// The value has more hex digits than a wallet-displayable EVM quantity.
+    TooLong,
     /// The value is a string without a `0x` prefix.
     MissingPrefix,
     /// The value is `0x` without hex digits.
@@ -1901,7 +1977,9 @@ pub enum EvmHexQuantityStatus {
     UnsupportedType,
 }
 
-/// Hex quantity summary with an arbitrary-size decimal rendering.
+const MAX_EVM_HEX_QUANTITY_DIGITS: usize = 64;
+
+/// Hex quantity summary with bounded decimal rendering.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EvmHexQuantity {
     raw: Value,
@@ -1944,6 +2022,13 @@ impl EvmHexQuantity {
                 raw: raw.clone(),
                 decimal: None,
                 status: EvmHexQuantityStatus::Empty,
+            };
+        }
+        if hex.len() > MAX_EVM_HEX_QUANTITY_DIGITS {
+            return Self {
+                raw: raw.clone(),
+                decimal: None,
+                status: EvmHexQuantityStatus::TooLong,
             };
         }
         let Some(decimal) = hex_to_decimal_string(hex) else {
@@ -2570,7 +2655,7 @@ fn validate_method_review_for_approval(
         SessionRequestMethodReview::WalletCall(wallet_call) => {
             validate_wallet_call_for_approval(wallet_call)?;
         }
-        SessionRequestMethodReview::Raw => {}
+        SessionRequestMethodReview::ExternalTyped(_) | SessionRequestMethodReview::Raw => {}
     }
     Ok(())
 }
@@ -2586,7 +2671,7 @@ fn validate_wallet_call_for_approval(
             }
         }
         WalletCallReview::SendCalls(send_calls) => {
-            validate_account_for_approval(send_calls.from())?;
+            validate_explicit_account_for_approval(send_calls.from())?;
             validate_wallet_call_chain_for_approval(send_calls.requested_chain())?;
             if send_calls.call_count() == 0 {
                 return Err(SessionRequestApprovalError::TransactionDisplay {
@@ -2784,6 +2869,7 @@ const fn evm_address_status_name(status: EvmAddressStatus) -> &'static str {
 const fn evm_hex_quantity_status_name(status: EvmHexQuantityStatus) -> &'static str {
     match status {
         EvmHexQuantityStatus::Decoded => "decoded",
+        EvmHexQuantityStatus::TooLong => "too_long",
         EvmHexQuantityStatus::MissingPrefix => "missing_prefix",
         EvmHexQuantityStatus::Empty => "empty",
         EvmHexQuantityStatus::InvalidHex => "invalid_hex",
@@ -3752,6 +3838,46 @@ mod tests {
     }
 
     #[test]
+    fn session_request_approval_rejects_oversized_evm_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "eth_sendTransaction".parse()?,
+                    params: json!([{
+                        "from": "0x1111111111111111111111111111111111111111",
+                        "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+                        "value": format!("0x{}", "f".repeat(65)),
+                        "chainId": "0x1"
+                    }]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let error = SessionRequestApproval::new(&review, UnknownSessionRequestMethodPolicy::Reject)
+            .expect_err("oversized value cannot build approval");
+
+        assert!(matches!(
+            error,
+            SessionRequestApprovalError::TransactionDisplay {
+                field: "value",
+                status: "too_long",
+            }
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn session_request_approval_rejects_transaction_without_explicit_account()
     -> Result<(), Box<dyn std::error::Error>> {
         let request = JsonRpcRequest::new(
@@ -4028,6 +4154,48 @@ mod tests {
                 .map(super::EvmHexQuantity::status),
             Some(EvmHexQuantityStatus::Decoded)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn wallet_send_calls_approval_rejects_missing_sender_account()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "wallet_sendCalls".parse()?,
+                    params: json!([{
+                        "version": "2.0.0",
+                        "chainId": "0x1",
+                        "atomicRequired": false,
+                        "calls": [{
+                            "to": "0xd46e8dd67c5d32be8058bb8eb970870f07244567",
+                            "value": "0x0"
+                        }]
+                    }]),
+                    expiry_timestamp: None,
+                },
+            },
+        );
+        let review =
+            SessionRequestReview::from_request(RelayTopic::from_bytes([3; 32]), 0, &request)?
+                .with_authorized_accounts(vec![
+                    "eip155:1:0x1111111111111111111111111111111111111111".parse()?,
+                ]);
+
+        let error = SessionRequestApproval::new(&review, UnknownSessionRequestMethodPolicy::Reject)
+            .expect_err("sendCalls approval must bind an explicit sender");
+
+        assert!(matches!(
+            error,
+            SessionRequestApprovalError::Account {
+                status: SessionRequestAccountConstraintStatus::NoAccountRequested
+            }
+        ));
 
         Ok(())
     }

@@ -212,7 +212,7 @@ fn builds_session_authenticate_error_publish() -> Result<(), Box<dyn std::error:
     let response_sym_key = derive_shared_sym_key(
         responder.private_key(),
         &request.params.requester.public_key,
-    );
+    )?;
     let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
     let response: JsonRpcErrorResponse = decrypt_publish(&publish, &response_sym_key)?;
 
@@ -260,7 +260,7 @@ fn builds_session_authenticate_success_publish() -> Result<(), Box<dyn std::erro
     let response_sym_key = derive_shared_sym_key(
         responder.private_key(),
         &request.params.requester.public_key,
-    );
+    )?;
     let envelope = Envelope::decode(&publish.message, EnvelopeEncoding::Base64)?;
     let response: JsonRpcResponse<SessionAuthenticateResult> =
         decrypt_publish(&publish, &response_sym_key)?;

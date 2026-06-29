@@ -1,14 +1,21 @@
 #![allow(missing_docs)]
 
+use std::str::FromStr;
+
+use base64::prelude::{BASE64_STANDARD, Engine as _};
+use bitcoin::{
+    Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness, absolute, psbt::Psbt, transaction,
+};
 use serde_json::{Value, json};
 use wc_bitcoin::{
     BITCOIN_MAINNET_CHAIN_ID, BitcoinAccountAddress, BitcoinAccountAddresses,
     BitcoinAccountAuthorization, BitcoinAccountScope, BitcoinAddress, BitcoinConnectedAccount,
-    BitcoinEvent, BitcoinMemo, BitcoinMethod, BitcoinPsbt, BitcoinRequest, BitcoinRequestError,
-    BitcoinRequestReview, BitcoinTxid, BitcoinWalletAddressRole,
-    GET_ACCOUNT_ADDRESSES_SESSION_PROPERTY, GetAccountAddressesParams, SendTransferParams,
-    SendTransferResult, SignMessageParams, SignMessageProtocol, SignPsbtInput, SignPsbtParams,
-    SignPsbtResult,
+    BitcoinEvent, BitcoinMemo, BitcoinMethod, BitcoinPsbt, BitcoinPsbtOutputDestination,
+    BitcoinRequest, BitcoinRequestError, BitcoinRequestReview, BitcoinTxid,
+    BitcoinWalletAddressRole, GET_ACCOUNT_ADDRESSES_SESSION_PROPERTY, GetAccountAddressesParams,
+    SendTransferParams, SendTransferResult, SignMessageParams, SignMessageProtocol,
+    SignMessageResult, SignPsbtInput, SignPsbtParams, SignPsbtResult,
 };
 use wc_core::SessionRequestReview;
 use wc_protocol::{
@@ -73,6 +80,13 @@ fn parses_get_account_addresses_and_session_event_helpers() {
         .and_then(Value::as_str)
         .expect("serialized property");
     assert!(property.contains(ACCOUNT));
+    assert!(property.contains("m/84'/0'/0'/0/0"));
+    let reparsed: BitcoinAccountAddresses =
+        serde_json::from_str(property).expect("serialized property reparses");
+    assert_eq!(
+        reparsed.as_slice()[0].path,
+        sample_addresses().as_slice()[0].path
+    );
 
     let event = addresses
         .addresses_changed_event_params(BITCOIN_MAINNET_CHAIN_ID.parse().expect("chain parses"))
@@ -82,6 +96,47 @@ fn parses_get_account_addresses_and_session_event_helpers() {
         BitcoinEvent::AddressesChanged.as_str()
     );
     assert_eq!(event.chain_id.as_str(), BITCOIN_MAINNET_CHAIN_ID);
+}
+
+#[test]
+fn get_account_addresses_result_must_stay_inside_account_scope() {
+    let request = GetAccountAddressesParams {
+        account: ACCOUNT.parse().expect("account parses"),
+        intentions: Vec::new(),
+    };
+    let valid = sample_addresses();
+    valid
+        .validate_for_request_and_scope(&request, &account_scope([ACCOUNT]))
+        .expect("sample address is in account scope");
+
+    let leaked = BitcoinAccountAddresses::new(vec![
+        sample_addresses().into_vec().remove(0),
+        BitcoinAccountAddress {
+            address: RECIPIENT.parse().expect("recipient parses"),
+            public_key: None,
+            path: None,
+            intention: None,
+        },
+    ]);
+    assert!(matches!(
+        leaked.validate_for_request_and_scope(&request, &account_scope([ACCOUNT])),
+        Err(BitcoinRequestError::UnauthorizedWalletAddress {
+            role: BitcoinWalletAddressRole::AccountAddressResult,
+            ..
+        })
+    ));
+
+    let missing_connected = BitcoinAccountAddresses::new(vec![BitcoinAccountAddress {
+        address: RECIPIENT.parse().expect("recipient parses"),
+        public_key: None,
+        path: None,
+        intention: None,
+    }]);
+    assert!(matches!(
+        missing_connected
+            .validate_for_request_and_scope(&request, &account_scope([ACCOUNT, RECIPIENT])),
+        Err(BitcoinRequestError::AccountAddressesResultMissingConnectedAccount)
+    ));
 }
 
 #[test]
@@ -96,7 +151,7 @@ fn rejects_empty_get_account_addresses_intention() {
 }
 
 #[test]
-fn parses_sign_psbt_defaults_and_requires_inputs() {
+fn parses_sign_psbt_defaults_and_allows_wallet_selected_inputs() {
     let params: SignPsbtParams = serde_json::from_value(json!({
         "account": ACCOUNT,
         "psbt": PSBT,
@@ -108,12 +163,12 @@ fn parses_sign_psbt_defaults_and_requires_inputs() {
     assert_eq!(params.sign_inputs[0].sighash_types_or_default(), &[1]);
 
     let method = BitcoinMethod::SignPsbt.session_method();
-    let error = BitcoinRequest::from_method_and_params(
+    let wallet_selected = BitcoinRequest::from_method_and_params(
         &method,
         &json!({ "account": ACCOUNT, "psbt": PSBT, "signInputs": [] }),
     )
-    .expect_err("empty signInputs fail");
-    assert!(matches!(error, BitcoinRequestError::InvalidParams { .. }));
+    .expect("empty signInputs let the wallet select spendable inputs");
+    assert!(matches!(wallet_selected, BitcoinRequest::SignPsbt(_)));
 
     let error = BitcoinRequest::from_method_and_params(
         &method,
@@ -125,6 +180,55 @@ fn parses_sign_psbt_defaults_and_requires_inputs() {
     )
     .expect_err("invalid sighash type fails");
     assert!(matches!(error, BitcoinRequestError::InvalidParams { .. }));
+}
+
+#[test]
+fn summarizes_sign_psbt_outputs_and_fee_when_input_amounts_are_present() {
+    let account = Address::from_str(ACCOUNT)
+        .expect("account address parses")
+        .require_network(Network::Bitcoin)
+        .expect("account is mainnet");
+    let recipient = Address::from_str(RECIPIENT)
+        .expect("recipient address parses")
+        .require_network(Network::Bitcoin)
+        .expect("recipient is mainnet");
+    let unsigned_tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(TXID.parse::<Txid>().expect("txid parses"), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(99_000),
+            script_pubkey: recipient.script_pubkey(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).expect("unsigned tx converts to PSBT");
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey: account.script_pubkey(),
+    });
+
+    let psbt =
+        BitcoinPsbt::parse(BASE64_STANDARD.encode(psbt.serialize())).expect("PSBT parses newtype");
+    let summary = psbt
+        .summary(Some("000000000019d6689c085ae165831e93"))
+        .expect("summary builds");
+
+    assert_eq!(summary.input_count, 1);
+    assert_eq!(summary.output_count, 1);
+    assert_eq!(summary.total_output_sats, Some(99_000));
+    assert_eq!(summary.known_input_count, 1);
+    assert_eq!(summary.total_input_sats, Some(100_000));
+    assert_eq!(summary.fee_sats, Some(1_000));
+    assert_eq!(summary.op_return_output_count, 0);
+    assert_eq!(
+        summary.outputs[0].destination,
+        BitcoinPsbtOutputDestination::Address(RECIPIENT.to_owned())
+    );
 }
 
 #[test]
@@ -174,6 +278,35 @@ fn parses_sign_message_defaults() {
     }))
     .expect("bip322 params parse");
     assert_eq!(bip322.protocol_or_default(), SignMessageProtocol::Bip322);
+}
+
+#[test]
+fn sign_message_result_must_match_reviewed_signing_address() {
+    let request = SignMessageParams {
+        account: ACCOUNT.parse().expect("account parses"),
+        message: "hello".to_owned(),
+        address: Some(RECIPIENT.parse().expect("recipient parses")),
+        protocol: None,
+    };
+
+    let valid = SignMessageResult {
+        address: RECIPIENT.parse().expect("recipient parses"),
+        signature: "abcdef".parse().expect("signature parses"),
+        message_hash: None,
+    };
+    valid
+        .validate_for_request(&request)
+        .expect("result address matches signer");
+
+    let wrong = SignMessageResult {
+        address: ACCOUNT.parse().expect("account parses"),
+        signature: "abcdef".parse().expect("signature parses"),
+        message_hash: None,
+    };
+    assert!(matches!(
+        wrong.validate_for_request(&request),
+        Err(BitcoinRequestError::SignMessageResultAddressMismatch { .. })
+    ));
 }
 
 #[test]
@@ -342,26 +475,29 @@ fn value_newtypes_reject_malformed_wire_values() {
     assert!("12a".parse::<wc_bitcoin::HexBytes>().is_err());
     assert!("not-a-key".parse::<wc_bitcoin::BitcoinPublicKey>().is_err());
     assert!(
-        "2100000000000001"
-            .parse::<wc_bitcoin::BitcoinAmountSats>()
-            .is_err()
+        serde_json::from_value::<SendTransferParams>(json!({
+            "account": ACCOUNT,
+            "recipientAddress": RECIPIENT,
+            "amount": "2100000000000001"
+        }))
+        .is_err()
     );
     assert!(BitcoinTxid::parse("0x1234").is_err());
     assert!(BitcoinPsbt::parse("abcd=ef").is_err());
 }
 
 #[test]
-fn amount_sats_serializes_canonical_satoshi_string() {
-    let amount = "00000042"
-        .parse::<wc_bitcoin::BitcoinAmountSats>()
-        .expect("amount parses through rust-bitcoin");
+fn send_transfer_amount_serializes_canonical_satoshi_string() {
+    let params = serde_json::from_value::<SendTransferParams>(json!({
+        "account": ACCOUNT,
+        "recipientAddress": RECIPIENT,
+        "amount": "00000042"
+    }))
+    .expect("sendTransfer params parse");
 
-    assert_eq!(amount.to_sat(), 42);
-    assert_eq!(amount.to_string(), "42");
-    assert_eq!(
-        serde_json::to_value(amount).expect("amount serializes"),
-        json!("42")
-    );
+    assert_eq!(params.amount.to_sat(), 42);
+    let serialized = serde_json::to_value(params).expect("params serialize");
+    assert_eq!(serialized["amount"], json!("42"));
 }
 
 fn sample_addresses() -> BitcoinAccountAddresses {

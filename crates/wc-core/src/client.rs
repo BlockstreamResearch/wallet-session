@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     fmt,
     num::NonZeroUsize,
     time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
@@ -43,6 +43,12 @@ use crate::verify_resolver::{VerifyResolver, VerifyResolverError};
 /// Default number of fetched or internally queued events retained by `SingleSessionClient`.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY: usize = 128;
 
+/// Default number of decrypted session requests retained for wallet decisions.
+pub const DEFAULT_SINGLE_SESSION_CLIENT_PENDING_REQUEST_CAPACITY: usize = 32;
+
+/// Default number of decrypted session updates retained for wallet decisions.
+pub const DEFAULT_SINGLE_SESSION_CLIENT_PENDING_UPDATE_CAPACITY: usize = 16;
+
 /// Default cooldown between automatic reconnect cycles started by `next_event`.
 pub const DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 
@@ -58,6 +64,8 @@ const SINGLE_SESSION_REGISTERED_PAIRING_METHODS: &[&str] =
 pub struct SingleSessionClientConfig {
     pairing: SingleSessionRelayConfig,
     max_queued_events: usize,
+    max_pending_session_requests: usize,
+    max_pending_session_updates: usize,
     reconnect: RelayReconnectConfig,
     automatic_reconnect_cooldown: Duration,
     receive_timeouts_before_reconnect: NonZeroUsize,
@@ -70,6 +78,8 @@ impl SingleSessionClientConfig {
         Self {
             pairing,
             max_queued_events: DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
+            max_pending_session_requests: DEFAULT_SINGLE_SESSION_CLIENT_PENDING_REQUEST_CAPACITY,
+            max_pending_session_updates: DEFAULT_SINGLE_SESSION_CLIENT_PENDING_UPDATE_CAPACITY,
             reconnect: RelayReconnectConfig::new(
                 wc_transport::DEFAULT_CONNECT_RETRY_ATTEMPTS,
                 wc_transport::DEFAULT_CONNECT_RETRY_INITIAL_DELAY,
@@ -91,6 +101,18 @@ impl SingleSessionClientConfig {
     #[must_use]
     pub const fn max_queued_events(&self) -> usize {
         self.max_queued_events
+    }
+
+    /// Maximum number of decrypted session requests retained for wallet decisions.
+    #[must_use]
+    pub const fn max_pending_session_requests(&self) -> usize {
+        self.max_pending_session_requests
+    }
+
+    /// Maximum number of decrypted session updates retained for wallet decisions.
+    #[must_use]
+    pub const fn max_pending_session_updates(&self) -> usize {
+        self.max_pending_session_updates
     }
 
     /// Relay reconnect policy used by `SingleSessionClient::reconnect`.
@@ -115,6 +137,26 @@ impl SingleSessionClientConfig {
     #[must_use]
     pub const fn with_max_queued_events(mut self, max_queued_events: usize) -> Self {
         self.max_queued_events = max_queued_events;
+        self
+    }
+
+    /// Sets the pending session request retention bound.
+    #[must_use]
+    pub const fn with_max_pending_session_requests(
+        mut self,
+        max_pending_session_requests: usize,
+    ) -> Self {
+        self.max_pending_session_requests = max_pending_session_requests;
+        self
+    }
+
+    /// Sets the pending session update retention bound.
+    #[must_use]
+    pub const fn with_max_pending_session_updates(
+        mut self,
+        max_pending_session_updates: usize,
+    ) -> Self {
+        self.max_pending_session_updates = max_pending_session_updates;
         self
     }
 
@@ -616,12 +658,12 @@ impl SingleSessionClient {
             .unwrap_or(WalletRedirectOrigin::Unknown);
         self.pending_pairing_approval = None;
         self.active_pairing_origin = None;
-        self.state =
-            SingleSessionClientState::Session(Box::new(ActiveSession::new_with_redirect_origin(
-                approved.subscription().clone(),
-                approved.pending_session().clone(),
-                redirect_origin,
-            )));
+        self.state = SingleSessionClientState::Session(Box::new(ActiveSession::new_with_config(
+            approved.subscription().clone(),
+            approved.pending_session().clone(),
+            redirect_origin,
+            &self.config,
+        )));
 
         let settle_response = match self.pairing.next_session_settle_response(&approved).await {
             Ok(Some(response)) => response,
@@ -791,13 +833,13 @@ impl SingleSessionClient {
             };
             self.pending_pairing_approval = None;
             self.active_pairing_origin = None;
-            self.state = SingleSessionClientState::Session(Box::new(
-                ActiveSession::new_with_redirect_origin(
+            self.state =
+                SingleSessionClientState::Session(Box::new(ActiveSession::new_with_config(
                     session_subscription,
                     session.clone(),
                     redirect_origin,
-                ),
-            ));
+                    &self.config,
+                )));
 
             return Ok(SessionAuthenticateApprovalOutcome {
                 response_ack: approved.response_ack(),
@@ -2070,10 +2112,12 @@ impl SingleSessionProposal {
                     (attestation_jwt.to_owned(), encrypted_id.to_owned())
                 })
         {
+            let hash = VerifyAttestationHash::from_message(self.message.message().plaintext());
             self.verify_context = resolver
-                .resolve_jwt_for_context(
+                .resolve_jwt_or_hash_for_context(
                     &attestation_jwt,
                     &encrypted_id,
+                    &hash,
                     &self.verify_context,
                     now_unix_seconds,
                 )
@@ -2246,10 +2290,12 @@ impl SingleSessionAuthenticate {
                     (attestation_jwt.to_owned(), encrypted_id.to_owned())
                 })
         {
+            let hash = VerifyAttestationHash::from_message(self.message.message().plaintext());
             self.verify_context = resolver
-                .resolve_jwt_for_context(
+                .resolve_jwt_or_hash_for_context(
                     &attestation_jwt,
                     &encrypted_id,
+                    &hash,
                     &self.verify_context,
                     now_unix_seconds,
                 )
@@ -2395,6 +2441,8 @@ struct ActiveSession {
     pending_session_requests: BTreeMap<u64, Option<SessionReceivedMessage>>,
     pending_session_request_verify_contexts: BTreeMap<u64, VerifyContext>,
     pending_session_updates: BTreeMap<u64, Option<SessionReceivedMessage>>,
+    max_pending_session_requests: usize,
+    max_pending_session_updates: usize,
 }
 
 impl ActiveSession {
@@ -2415,7 +2463,33 @@ impl ActiveSession {
             pending_session_requests: BTreeMap::new(),
             pending_session_request_verify_contexts: BTreeMap::new(),
             pending_session_updates: BTreeMap::new(),
+            max_pending_session_requests: DEFAULT_SINGLE_SESSION_CLIENT_PENDING_REQUEST_CAPACITY,
+            max_pending_session_updates: DEFAULT_SINGLE_SESSION_CLIENT_PENDING_UPDATE_CAPACITY,
         }
+    }
+
+    fn new_with_config(
+        subscription: SessionSubscription,
+        session: Session,
+        redirect_origin: WalletRedirectOrigin,
+        config: &SingleSessionClientConfig,
+    ) -> Self {
+        Self {
+            max_pending_session_requests: config.max_pending_session_requests(),
+            max_pending_session_updates: config.max_pending_session_updates(),
+            ..Self::new_with_redirect_origin(subscription, session, redirect_origin)
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_pending_limits(
+        mut self,
+        max_pending_session_requests: usize,
+        max_pending_session_updates: usize,
+    ) -> Self {
+        self.max_pending_session_requests = max_pending_session_requests;
+        self.max_pending_session_updates = max_pending_session_updates;
+        self
     }
 
     fn redirect_review(&self) -> WalletRedirectReview {
@@ -2424,18 +2498,32 @@ impl ActiveSession {
 
     #[cfg(any(test, feature = "testkit"))]
     fn mark_session_request_pending(&mut self, request_id: u64) -> bool {
-        self.pending_session_requests
-            .insert(request_id, None)
-            .is_none()
+        if self.pending_session_requests.len() >= self.max_pending_session_requests {
+            return false;
+        }
+        match self.pending_session_requests.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(None);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     fn mark_session_request_message_pending(&mut self, message: SessionReceivedMessage) -> bool {
         let Ok(request_id) = session_request_id(&message) else {
             return false;
         };
-        self.pending_session_requests
-            .insert(request_id, Some(message))
-            .is_none()
+        if self.pending_session_requests.len() >= self.max_pending_session_requests {
+            return false;
+        }
+        match self.pending_session_requests.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(message));
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     fn ensure_pending_session_request(
@@ -2481,18 +2569,32 @@ impl ActiveSession {
 
     #[cfg(any(test, feature = "testkit"))]
     fn mark_session_update_pending(&mut self, request_id: u64) -> bool {
-        self.pending_session_updates
-            .insert(request_id, None)
-            .is_none()
+        if self.pending_session_updates.len() >= self.max_pending_session_updates {
+            return false;
+        }
+        match self.pending_session_updates.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(None);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     fn mark_session_update_message_pending(&mut self, message: SessionReceivedMessage) -> bool {
         let Ok(request_id) = session_update_id(&message) else {
             return false;
         };
-        self.pending_session_updates
-            .insert(request_id, Some(message))
-            .is_none()
+        if self.pending_session_updates.len() >= self.max_pending_session_updates {
+            return false;
+        }
+        match self.pending_session_updates.entry(request_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Some(message));
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     fn ensure_pending_session_update(
@@ -3061,6 +3163,8 @@ mod tests {
     use super::{
         ActiveSession, BoundedQueue, DEFAULT_SESSION_EXPIRY_SECONDS,
         DEFAULT_SINGLE_SESSION_CLIENT_EVENT_QUEUE_CAPACITY,
+        DEFAULT_SINGLE_SESSION_CLIENT_PENDING_REQUEST_CAPACITY,
+        DEFAULT_SINGLE_SESSION_CLIENT_PENDING_UPDATE_CAPACITY,
         DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT,
         DEFAULT_SINGLE_SESSION_CLIENT_RECONNECT_COOLDOWN, SingleSessionClient,
         SingleSessionClientConfig, SingleSessionClientConnectionState, SingleSessionClientError,
@@ -3130,6 +3234,14 @@ mod tests {
             config.receive_timeouts_before_reconnect(),
             DEFAULT_SINGLE_SESSION_CLIENT_RECEIVE_TIMEOUTS_BEFORE_RECONNECT
         );
+        assert_eq!(
+            config.max_pending_session_requests(),
+            DEFAULT_SINGLE_SESSION_CLIENT_PENDING_REQUEST_CAPACITY
+        );
+        assert_eq!(
+            config.max_pending_session_updates(),
+            DEFAULT_SINGLE_SESSION_CLIENT_PENDING_UPDATE_CAPACITY
+        );
     }
 
     #[test]
@@ -3164,10 +3276,14 @@ mod tests {
         let pairing = SingleSessionRelayConfig::new("project", [7; 32], "subject");
         let config = SingleSessionClientConfig::new(pairing)
             .with_max_queued_events(2)
+            .with_max_pending_session_requests(3)
+            .with_max_pending_session_updates(4)
             .with_automatic_reconnect_cooldown(Duration::from_millis(17))
             .with_receive_timeouts_before_reconnect(NonZeroUsize::new(3).expect("non-zero"));
 
         assert_eq!(config.max_queued_events(), 2);
+        assert_eq!(config.max_pending_session_requests(), 3);
+        assert_eq!(config.max_pending_session_updates(), 4);
         assert_eq!(
             config.automatic_reconnect_cooldown(),
             Duration::from_millis(17)
@@ -3465,6 +3581,154 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn active_session_duplicate_request_id_preserves_original_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0xa1; 32]);
+        let mut session = ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0xa2; 32])),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        );
+        let first = session_request(42, Some(FUTURE_SESSION_EXPIRY))?;
+        let second = JsonRpcRequest::new(
+            42,
+            SignMethod::SessionRequest,
+            SessionRequestParams {
+                chain_id: "eip155:1".parse()?,
+                request: SessionRequest {
+                    method: "eth_sign".parse()?,
+                    params: json!(["0x1111111111111111111111111111111111111111", "0x68656c6c6f"]),
+                    expiry_timestamp: Some(FUTURE_SESSION_EXPIRY),
+                },
+            },
+        );
+        let first_plaintext = serde_json::to_string(&first)?;
+        let second_plaintext = serde_json::to_string(&second)?;
+        let first_message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &first_plaintext,
+            SessionPayload::SessionRequest(Box::new(first)),
+        );
+        let second_message = SessionReceivedMessage::for_test(
+            topic,
+            &second_plaintext,
+            SessionPayload::SessionRequest(Box::new(second)),
+        );
+
+        assert!(session.mark_session_request_message_pending(first_message));
+        assert!(!session.mark_session_request_message_pending(second_message));
+
+        let messages = session.pending_session_request_messages();
+        assert_eq!(messages.len(), 1);
+        let SessionPayload::SessionRequest(request) = messages[0].payload() else {
+            panic!("expected retained session request");
+        };
+        assert_eq!(request.params.request.method.as_str(), "personal_sign");
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_session_duplicate_update_id_preserves_original_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0xa3; 32]);
+        let mut session = ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0xa4; 32])),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        );
+        let first = session_update_request(42, test_namespaces()?);
+        let mut second_namespaces = test_namespaces()?;
+        second_namespaces
+            .get_mut(&NamespaceKey::parse("eip155")?)
+            .expect("namespace exists")
+            .methods
+            .push(SessionMethod::parse("eth_sendTransaction")?);
+        let second = session_update_request(42, second_namespaces);
+        let first_plaintext = serde_json::to_string(&first)?;
+        let second_plaintext = serde_json::to_string(&second)?;
+        let first_message = SessionReceivedMessage::for_test(
+            topic.clone(),
+            &first_plaintext,
+            SessionPayload::SessionUpdate(first),
+        );
+        let second_message = SessionReceivedMessage::for_test(
+            topic,
+            &second_plaintext,
+            SessionPayload::SessionUpdate(second),
+        );
+
+        assert!(session.mark_session_update_message_pending(first_message));
+        assert!(!session.mark_session_update_message_pending(second_message));
+
+        let messages = session.pending_session_update_messages();
+        assert_eq!(messages.len(), 1);
+        let SessionPayload::SessionUpdate(request) = messages[0].payload() else {
+            panic!("expected retained session update");
+        };
+        assert_eq!(
+            request.params.namespaces[&NamespaceKey::parse("eip155")?]
+                .methods
+                .len(),
+            1
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_session_pending_message_retention_is_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let topic = RelayTopic::from_bytes([0xa5; 32]);
+        let mut session = ActiveSession::new(
+            SessionSubscription::for_test(topic.clone(), PairingSymKey::from_bytes([0xa6; 32])),
+            test_session(topic.clone(), FUTURE_SESSION_EXPIRY),
+        )
+        .with_pending_limits(1, 1);
+        let first_request = session_request(1, Some(FUTURE_SESSION_EXPIRY))?;
+        let second_request = session_request(2, Some(FUTURE_SESSION_EXPIRY))?;
+        let first_request_plaintext = serde_json::to_string(&first_request)?;
+        let second_request_plaintext = serde_json::to_string(&second_request)?;
+
+        assert!(
+            session.mark_session_request_message_pending(SessionReceivedMessage::for_test(
+                topic.clone(),
+                &first_request_plaintext,
+                SessionPayload::SessionRequest(Box::new(first_request)),
+            ))
+        );
+        assert!(
+            !session.mark_session_request_message_pending(SessionReceivedMessage::for_test(
+                topic.clone(),
+                &second_request_plaintext,
+                SessionPayload::SessionRequest(Box::new(second_request)),
+            ))
+        );
+        assert_eq!(session.pending_session_request_messages().len(), 1);
+
+        let first_update = session_update_request(3, test_namespaces()?);
+        let second_update = session_update_request(4, test_namespaces()?);
+        let first_update_plaintext = serde_json::to_string(&first_update)?;
+        let second_update_plaintext = serde_json::to_string(&second_update)?;
+
+        assert!(
+            session.mark_session_update_message_pending(SessionReceivedMessage::for_test(
+                topic.clone(),
+                &first_update_plaintext,
+                SessionPayload::SessionUpdate(first_update),
+            ))
+        );
+        assert!(
+            !session.mark_session_update_message_pending(SessionReceivedMessage::for_test(
+                topic,
+                &second_update_plaintext,
+                SessionPayload::SessionUpdate(second_update),
+            ))
+        );
+        assert_eq!(session.pending_session_update_messages().len(), 1);
+
+        Ok(())
     }
 
     #[tokio::test]

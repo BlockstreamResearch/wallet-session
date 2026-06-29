@@ -168,6 +168,30 @@ impl VerifyResolver {
         ))
     }
 
+    /// Resolves Verify context from a relay-carried JWT, falling back to the
+    /// exact payload hash when the signed JWT is not usable for this message.
+    pub async fn resolve_jwt_or_hash_for_context(
+        &self,
+        attestation_jwt: &str,
+        encrypted_id: &str,
+        hash: &VerifyAttestationHash,
+        context: &VerifyContext,
+        now_unix_seconds: u64,
+    ) -> Result<VerifyContext, VerifyResolverError> {
+        let Some(attestation) = self
+            .resolve_jwt_attestation(attestation_jwt, encrypted_id, now_unix_seconds)
+            .await?
+        else {
+            return self.resolve_hash_for_context(hash, context).await;
+        };
+
+        Ok(context_from_attestation(
+            context.clone(),
+            &attestation,
+            &context.verified.origin,
+        ))
+    }
+
     /// Fetches a hash-based attestation from a trusted Verify endpoint.
     ///
     /// HTTP 404 and other non-200 responses mean the server has no usable
@@ -526,6 +550,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::mpsc,
     };
     use wc_protocol::verify::{
         ALTERNATE_VERIFY_URL, DEFAULT_VERIFY_URL, VerifyAttestationHash, VerifyContext,
@@ -796,6 +821,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolver_falls_back_to_hash_when_jwt_is_not_usable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = VerifySequenceServer::new([
+            (200, FIXTURE_PUBLIC_KEY_BODY.to_owned()),
+            (200, r#"{"origin":"https://example.com"}"#.to_owned()),
+        ])
+        .await?;
+        let hash = VerifyAttestationHash::from_message("fallback payload");
+        let resolver = VerifyResolver::with_timeout_and_trusted_urls_and_verify_v3_url(
+            std::time::Duration::from_secs(2),
+            vec![server.url()],
+            server.url(),
+        )?;
+        let context = VerifyContext::unknown("https://example.com/path", server.url());
+
+        let context = resolver
+            .resolve_jwt_or_hash_for_context(
+                FIXTURE_UNVERIFIED_JWT,
+                FIXTURE_ENCRYPTED_ID,
+                &hash,
+                &context,
+                1_700_000_000,
+            )
+            .await?;
+
+        assert_eq!(context.verified.origin, "https://example.com");
+        assert_eq!(
+            crate::classify_verify_context(&context),
+            VerifyContextRisk::Valid
+        );
+        assert_eq!(
+            server.take_requests().await,
+            vec![
+                "/public-key".to_owned(),
+                format!("/attestation/{hash}?v2Supported=true"),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resolver_skips_jwt_with_mismatched_encrypted_id()
     -> Result<(), Box<dyn std::error::Error>> {
         let server = VerifyTestServer::new(200, FIXTURE_PUBLIC_KEY_BODY).await?;
@@ -934,6 +1001,68 @@ mod tests {
 
         async fn take_request(self) -> String {
             self.request_rx.await.expect("request path")
+        }
+    }
+
+    struct VerifySequenceServer {
+        url: String,
+        expected_requests: usize,
+        request_rx: mpsc::UnboundedReceiver<String>,
+    }
+
+    impl VerifySequenceServer {
+        async fn new(
+            responses: impl IntoIterator<Item = (u16, String)>,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+            let address = listener.local_addr()?;
+            let responses = responses.into_iter().collect::<Vec<_>>();
+            let expected_requests = responses.len();
+            let (request_tx, request_rx) = mpsc::unbounded_channel();
+
+            tokio::spawn(async move {
+                for (status, body) in responses {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_owned();
+                    let _ = request_tx.send(path);
+                    let reason = if status == 200 { "OK" } else { "Not Found" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+
+            Ok(Self {
+                url: format!("http://{address}"),
+                expected_requests,
+                request_rx,
+            })
+        }
+
+        fn url(&self) -> String {
+            self.url.clone()
+        }
+
+        async fn take_requests(mut self) -> Vec<String> {
+            let mut requests = Vec::with_capacity(self.expected_requests);
+            for _ in 0..self.expected_requests {
+                requests.push(self.request_rx.recv().await.expect("request path"));
+            }
+            requests
         }
     }
 }

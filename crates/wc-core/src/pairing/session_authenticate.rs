@@ -36,7 +36,8 @@ pub(super) fn session_authenticate_error_publish(
     let sym_key = derive_shared_sym_key(
         responder.private_key(),
         &request.params.requester.public_key,
-    );
+    )
+    .map_err(|source| PairingClientError::SharedSecret { source })?;
     let response_topic = derive_topic_from_x25519_public_key(&request.params.requester.public_key);
     let response = JsonRpcErrorResponse::new(request.id, error);
 
@@ -76,7 +77,8 @@ pub(super) fn session_authenticate_success_publish(
     let sym_key = derive_shared_sym_key(
         responder.private_key(),
         &request.params.requester.public_key,
-    );
+    )
+    .map_err(|source| PairingClientError::SharedSecret { source })?;
     let response_topic = derive_topic_from_x25519_public_key(&request.params.requester.public_key);
     let response = JsonRpcResponse::new(
         request.id,

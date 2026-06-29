@@ -330,6 +330,15 @@ pub enum PairingUriError {
         #[source]
         source: FromUtf8Error,
     },
+
+    /// Pairing URI input or decoded wrapper is larger than this wallet accepts.
+    #[error("pairing URI exceeds {max} bytes: {actual}")]
+    TooLarge {
+        /// Maximum accepted byte length.
+        max: usize,
+        /// Actual byte length.
+        actual: usize,
+    },
 }
 
 /// Symmetric key parse error.
@@ -357,6 +366,12 @@ pub const PAIRING_SYM_KEY_BYTES: usize = 32;
 
 /// Pairing `symKey` size after lowercase hex encoding.
 pub const PAIRING_SYM_KEY_HEX: usize = PAIRING_SYM_KEY_BYTES * 2;
+
+/// Maximum accepted pairing URI input size before optional base64 decoding.
+///
+/// Real `WalletConnect` pairing URIs are small. The bound keeps QR/deep-link
+/// parsing from allocating attacker-sized decoded buffers before URI validation.
+pub const MAX_PAIRING_URI_BYTES: usize = 8 * 1024;
 
 /// Query parameter accumulator used before required fields are known.
 ///
@@ -422,6 +437,13 @@ struct ParsedQuery {
 /// Invalid base64 is not treated as its own parse error because non-URI input
 /// should still fail at the URI layer with `MissingScheme`.
 fn decode_base64_wrapper(input: &str) -> Result<Cow<'_, str>, PairingUriError> {
+    if input.len() > MAX_PAIRING_URI_BYTES {
+        return Err(PairingUriError::TooLarge {
+            max: MAX_PAIRING_URI_BYTES,
+            actual: input.len(),
+        });
+    }
+
     if input.contains("wc:") {
         return Ok(Cow::Borrowed(input));
     }
@@ -432,6 +454,12 @@ fn decode_base64_wrapper(input: &str) -> Result<Cow<'_, str>, PairingUriError> {
     else {
         return Ok(Cow::Borrowed(input));
     };
+    if bytes.len() > MAX_PAIRING_URI_BYTES {
+        return Err(PairingUriError::TooLarge {
+            max: MAX_PAIRING_URI_BYTES,
+            actual: bytes.len(),
+        });
+    }
     let decoded =
         String::from_utf8(bytes).map_err(|source| PairingUriError::Base64Utf8 { source })?;
 
@@ -628,6 +656,27 @@ mod tests {
 
         assert_eq!(pairing.topic().as_str(), TOPIC);
         assert_eq!(pairing.sym_key().as_str(), SYM_KEY);
+    }
+
+    #[test]
+    fn rejects_oversized_raw_pairing_uri() {
+        let input = format!("wc:{}", "a".repeat(MAX_PAIRING_URI_BYTES));
+
+        assert!(matches!(
+            PairingUri::parse(&input).expect_err("oversized URI is rejected"),
+            PairingUriError::TooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_base64_wrapped_pairing_uri() {
+        let decoded = format!("wc:{}", "a".repeat(MAX_PAIRING_URI_BYTES));
+        let encoded = STANDARD.encode(decoded);
+
+        assert!(matches!(
+            PairingUri::parse(&encoded).expect_err("oversized decoded URI is rejected"),
+            PairingUriError::TooLarge { .. }
+        ));
     }
 
     #[test]

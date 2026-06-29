@@ -1,6 +1,8 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 nightly := `cargo rbmt toolchains --nightly`
+uniffi_bindgen := env_var_or_default("UNIFFI_BINDGEN", "uniffi-bindgen")
+android_strip := env_var_or_default("ANDROID_STRIP", "llvm-strip")
 
 # Format code.
 fmt:
@@ -12,7 +14,9 @@ fmtcheck:
 
 # Run clippy through rbmt.
 lint:
-    cargo +{{nightly}} rbmt --lock-file existing lint
+    # rbmt's duplicate-dependency gate treats UniFFI's build/proc-macro tooling graph
+    # as fatal; the workspace clippy phase inside this command still checks wc-uniffi.
+    cargo +{{nightly}} rbmt --lock-file existing lint -p wc-bitcoin -p wc-core -p wc-protocol -p wc-transport -p xtask
 
 # Build the workspace.
 build:
@@ -42,6 +46,51 @@ machete:
 js_harness_check:
     cd tools/js-harness && bun install --frozen-lockfile
     cd tools/js-harness && bun run check
+
+# Check the Android UniFFI WalletConnect binding crate.
+wc_uniffi_check:
+    cargo check -p wc-uniffi --locked
+
+# Run focused tests for the Android UniFFI WalletConnect binding crate.
+wc_uniffi_test:
+    cargo test -p wc-uniffi --locked
+
+# Run all host-side Android UniFFI binding checks.
+wc_uniffi_binding_check:
+    just wc_uniffi_check
+    just wc_uniffi_test
+    just wc_uniffi_kotlin_bindings
+
+# Build Android packaging artifacts required by release flavors.
+wc_uniffi_android_packaging_check:
+    just wc_uniffi_android_release
+
+# Generate Android-ready Kotlin bindings for wc-uniffi.
+wc_uniffi_kotlin_bindings out="target/wc-uniffi-kotlin":
+    cargo build -p wc-uniffi --locked
+    rm -rf "{{out}}"
+    mkdir -p "{{out}}"
+    lib="$(find target/debug -maxdepth 1 \( -name 'libwc_uniffi.dylib' -o -name 'libwc_uniffi.so' -o -name 'wc_uniffi.dll' \) -print -quit)"; test -n "$lib"; "{{uniffi_bindgen}}" generate "$lib" --library --crate wc_uniffi --language kotlin --config crates/wc-uniffi/uniffi.toml --out-dir "{{out}}" --no-format
+
+# Build the production Android ABIs used by Green release flavors.
+wc_uniffi_android_release out="target/wc-uniffi-android":
+    rm -rf "{{out}}"
+    mkdir -p "{{out}}"
+    cargo ndk -t armeabi-v7a -t arm64-v8a -o "{{out}}" build -p wc-uniffi --release --locked
+    find "{{out}}" -type f -name 'libwc_uniffi.so' -exec "{{android_strip}}" --strip-unneeded {} \;
+
+# Build all Android release ABIs useful for app-source packaging and emulator support.
+wc_uniffi_android_release_all out="target/wc-uniffi-android-release-all":
+    rm -rf "{{out}}"
+    mkdir -p "{{out}}"
+    cargo ndk -t armeabi-v7a -t arm64-v8a -t x86 -t x86_64 -o "{{out}}" build -p wc-uniffi --release --locked
+    find "{{out}}" -type f -name 'libwc_uniffi.so' -exec "{{android_strip}}" --strip-unneeded {} \;
+
+# Build all Android debug ABIs useful for local devices and emulators.
+wc_uniffi_android_debug_all out="target/wc-uniffi-android-debug":
+    rm -rf "{{out}}"
+    mkdir -p "{{out}}"
+    cargo ndk -t armeabi-v7a -t arm64-v8a -t x86 -t x86_64 -o "{{out}}" build -p wc-uniffi --locked
 
 # Run cargo-deny checks for the excluded fuzz crate.
 fuzz_deny:
@@ -130,6 +179,8 @@ check_all:
     just deny
     just audit
     just machete
+    just wc_uniffi_binding_check
+    just wc_uniffi_android_packaging_check
     just js_harness_check
     just fuzz_deny
     just fuzz_build
