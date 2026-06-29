@@ -3,7 +3,8 @@
 use serde_json::json;
 use wc_protocol::key::{
     X25519_PUBLIC_KEY_BYTES, X25519KeyPair, X25519PrivateKey, X25519PrivateKeyError,
-    X25519PublicKey, X25519PublicKeyError, derive_shared_sym_key, derive_topic_from_sym_key,
+    X25519PublicKey, X25519PublicKeyError, X25519SharedSecretError, derive_shared_sym_key,
+    derive_topic_from_sym_key,
 };
 
 const LIVE_JS_GENERATED_PUBLIC_KEY: &str =
@@ -62,14 +63,27 @@ fn derives_live_walletconnect_js_shared_key_and_topic() {
     assert_eq!(a_private.public_key(), a_public);
     assert_eq!(b_private.public_key(), b_public);
 
-    let ab = derive_shared_sym_key(&a_private, &b_public);
-    let ba = derive_shared_sym_key(&b_private, &a_public);
+    let ab = derive_shared_sym_key(&a_private, &b_public).expect("shared key derives");
+    let ba = derive_shared_sym_key(&b_private, &a_public).expect("shared key derives");
 
     assert_eq!(ab.as_str(), LIVE_JS_SHARED_SYM_KEY);
     assert_eq!(ba, ab);
     assert_eq!(
         derive_topic_from_sym_key(&ab).as_str(),
         LIVE_JS_DERIVED_TOPIC
+    );
+}
+
+#[test]
+fn rejects_non_contributory_peer_public_key() {
+    let private_key =
+        X25519PrivateKey::from_hex(LIVE_JS_A_PRIVATE_KEY).expect("private key parses");
+    let low_order_public_key = X25519PublicKey::from_bytes([0; X25519_PUBLIC_KEY_BYTES]);
+
+    assert_eq!(
+        derive_shared_sym_key(&private_key, &low_order_public_key)
+            .expect_err("all-zero shared secret is rejected"),
+        X25519SharedSecretError::NonContributoryPeerPublicKey
     );
 }
 

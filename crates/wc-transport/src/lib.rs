@@ -21,14 +21,14 @@ pub use client::{
     RelayReconnectConfig,
 };
 
-use std::{fmt, string::FromUtf8Error};
+use std::{fmt, string::FromUtf8Error, sync::Arc};
 
 use futures_util::{SinkExt, StreamExt};
-use rustls::crypto::aws_lc_rs;
+use rustls::{ClientConfig, Error as RustlsError, RootCertStore, crypto::aws_lc_rs};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::{Error as TungsteniteError, Message, Utf8Bytes},
 };
 use wc_protocol::relay::{
@@ -103,9 +103,11 @@ impl NativeRelayTransport {
         // provider to exist before Tungstenite starts a Rustls handshake.
         let _ = aws_lc_rs::default_provider().install_default();
 
-        let (stream, response) = connect_async(url)
-            .await
-            .map_err(|source| TransportError::Connect { source })?;
+        let tls_connector = relay_tls_connector()?;
+        let (stream, response) =
+            connect_async_tls_with_config(url, None, false, Some(tls_connector))
+                .await
+                .map_err(|source| TransportError::Connect { source })?;
 
         Ok(RelayConnection {
             transport: Self { stream, config },
@@ -249,6 +251,19 @@ impl NativeRelayTransport {
     }
 }
 
+fn relay_tls_connector() -> Result<Connector, TransportError> {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let tls_config = ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|source| TransportError::TlsConfig { source })?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(Connector::Rustls(Arc::new(tls_config)))
+}
+
 /// Result of opening a native relay transport.
 pub struct RelayConnection {
     transport: NativeRelayTransport,
@@ -321,6 +336,14 @@ pub enum TransportError {
         /// Source error from Tungstenite.
         #[source]
         source: TungsteniteError,
+    },
+
+    /// Rustls client configuration failed before connecting.
+    #[error("relay tls config failed")]
+    TlsConfig {
+        /// Source error from Rustls.
+        #[source]
+        source: RustlsError,
     },
 
     /// WebSocket send failed.

@@ -31,6 +31,6 @@ pub use request::{
     BitcoinWalletAddressRole,
 };
 pub use value::{
-    BitcoinAddress, BitcoinAmountSats, BitcoinDerivationPath, BitcoinMemo, BitcoinPsbt,
-    BitcoinPublicKey, BitcoinTxid, HexBytes,
+    BitcoinAddress, BitcoinDerivationPath, BitcoinMemo, BitcoinPsbt, BitcoinPsbtOutputDestination,
+    BitcoinPsbtOutputSummary, BitcoinPsbtSummary, BitcoinPublicKey, BitcoinTxid, HexBytes,
 };

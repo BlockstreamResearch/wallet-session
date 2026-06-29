@@ -82,7 +82,8 @@ pub(super) fn session_proposal_approval_publishes(
     let session_sym_key = derive_shared_sym_key(
         responder.private_key(),
         &proposal.params.proposer.public_key,
-    );
+    )
+    .map_err(|source| PairingClientError::SharedSecret { source })?;
     let session_topic = derive_topic_from_sym_key(&session_sym_key);
     let controller = SessionParticipant {
         public_key: responder.public_key().clone(),

@@ -132,6 +132,9 @@ try {
 
   if (session) {
     console.error(`js-harness approved_session_topic=${session.topic}`);
+    if (matchesEnvFlag(process.env.WC_JS_LOG_SESSION_NAMESPACES)) {
+      console.error(`js-harness approved_session_namespaces=${stringifyForLog(session.namespaces)}`);
+    }
     switch (afterApprovalAction) {
       case "approved":
         await writeResult({
@@ -140,7 +143,7 @@ try {
         });
         break;
       case "session_request":
-        await startSessionRequest(session.topic);
+        await startSessionRequest(session.topic, session.namespaces);
         break;
       case "session_ping":
         await startSessionPing(session.topic);
@@ -459,11 +462,11 @@ async function startSessionEvent(topic: string): Promise<void> {
   await writeResult(response);
 }
 
-async function startSessionRequest(topic: string): Promise<void> {
+async function startSessionRequest(topic: string, namespaces: unknown): Promise<void> {
   const chainId = process.env.WC_JS_SESSION_REQUEST_CHAIN_ID ?? "eip155:1";
   const method = process.env.WC_JS_SESSION_REQUEST_METHOD ?? "personal_sign";
   const expiry = Number.parseInt(process.env.WC_JS_SESSION_REQUEST_EXPIRY ?? "300", 10);
-  const params = sessionRequestParams();
+  const params = sessionRequestParams(namespaces);
 
   const request = signClient.request({
     topic,
@@ -764,16 +767,57 @@ function matchesEnvFlag(value: string | undefined): boolean {
   return value === "1" || value === "true" || value === "yes";
 }
 
-function sessionRequestParams(): unknown {
+function sessionRequestParams(namespaces?: unknown): unknown {
   const paramsJson = process.env.WC_JS_SESSION_REQUEST_PARAMS_JSON;
   if (paramsJson) {
-    return JSON.parse(paramsJson) as unknown;
+    return replaceSessionRequestPlaceholders(
+      JSON.parse(paramsJson) as unknown,
+      approvedBip122Address(namespaces, process.env.WC_JS_SESSION_REQUEST_CHAIN_ID),
+    );
   }
 
   const address =
     process.env.WC_JS_SESSION_REQUEST_ACCOUNT_ADDRESS ??
     "0xab16a96D359eC26a11e2C2b3d8f8B8942d5Bfcdb";
   return ["0x68656c6c6f", address];
+}
+
+function replaceSessionRequestPlaceholders(value: unknown, bip122Address?: string): unknown {
+  if (typeof value === "string") {
+    return value.replaceAll("__WC_APPROVED_BIP122_ADDRESS__", bip122Address ?? "");
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => replaceSessionRequestPlaceholders(item, bip122Address));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
+        entryKey,
+        replaceSessionRequestPlaceholders(entryValue, bip122Address),
+      ]),
+    );
+  }
+
+  return value;
+}
+
+function approvedBip122Address(namespaces: unknown, preferredChainId?: string): string | undefined {
+  const bip122 = (namespaces as { bip122?: { accounts?: unknown } } | undefined)?.bip122;
+  const accounts = bip122?.accounts;
+  if (!Array.isArray(accounts)) {
+    return undefined;
+  }
+
+  const bip122Accounts = accounts.filter(
+    (entry): entry is string => typeof entry === "string" && entry.startsWith("bip122:"),
+  );
+  const account =
+    preferredChainId === undefined
+      ? bip122Accounts[0]
+      : bip122Accounts.find((entry) => entry.startsWith(`${preferredChainId}:`)) ?? bip122Accounts[0];
+  return account?.split(":").at(-1);
 }
 
 function sessionEventData(): unknown {

@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fmt};
 
+use bitcoin::Amount;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wc_protocol::{
@@ -8,12 +9,36 @@ use wc_protocol::{
 };
 
 use crate::{
-    BitcoinAddress, BitcoinAmountSats, BitcoinDerivationPath, BitcoinEvent, BitcoinMemo,
-    BitcoinPsbt, BitcoinPublicKey, BitcoinRequestError, BitcoinTxid,
+    BitcoinAccountScope, BitcoinAddress, BitcoinDerivationPath, BitcoinEvent, BitcoinMemo,
+    BitcoinPsbt, BitcoinPublicKey, BitcoinRequestError, BitcoinTxid, BitcoinWalletAddressRole,
     GET_ACCOUNT_ADDRESSES_SESSION_PROPERTY, HexBytes,
 };
 
 const DEFAULT_SIGHASH_TYPES: [u32; 1] = [1];
+
+mod amount_sats {
+    use bitcoin::Amount;
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde with functions serialize field values by reference"
+    )]
+    pub(super) fn serialize<S>(amount: &Amount, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&amount.to_sat().to_string())
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Amount, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        crate::value::parse_amount(&value).map_err(de::Error::custom)
+    }
+}
 
 /// Parameters for `sendTransfer`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +49,8 @@ pub struct SendTransferParams {
     /// Recipient public address.
     pub recipient_address: BitcoinAddress,
     /// Amount to send, denominated in satoshis.
-    pub amount: BitcoinAmountSats,
+    #[serde(with = "amount_sats")]
+    pub amount: Amount,
     /// Optional sender-owned change address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_address: Option<BitcoinAddress>,
@@ -132,6 +158,42 @@ impl BitcoinAccountAddresses {
             },
             chain_id,
         })
+    }
+
+    /// Validates a `getAccountAddresses` result against the reviewed request
+    /// and the wallet-owned account scope used to authorize the session.
+    pub fn validate_for_request_and_scope(
+        &self,
+        request: &GetAccountAddressesParams,
+        scope: &BitcoinAccountScope,
+    ) -> Result<(), BitcoinRequestError> {
+        if &request.account != scope.connected_account().address() {
+            return Err(BitcoinRequestError::AccountScopeMismatch {
+                requested_account: request.account.to_string(),
+                connected_account: scope.connected_account().to_string(),
+            });
+        }
+        if self.is_empty() {
+            return Err(BitcoinRequestError::AccountAddressesResultEmpty);
+        }
+
+        let mut includes_connected_account = false;
+        for entry in self.as_slice() {
+            if &entry.address == scope.connected_account().address() {
+                includes_connected_account = true;
+            }
+            if !scope.contains_address(&entry.address) {
+                return Err(BitcoinRequestError::UnauthorizedWalletAddress {
+                    role: BitcoinWalletAddressRole::AccountAddressResult,
+                    address: entry.address.to_string(),
+                });
+            }
+        }
+        if !includes_connected_account {
+            return Err(BitcoinRequestError::AccountAddressesResultMissingConnectedAccount);
+        }
+
+        Ok(())
     }
 }
 
@@ -284,6 +346,22 @@ pub struct SignMessageResult {
     /// Optional message hash hex bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_hash: Option<HexBytes>,
+}
+
+impl SignMessageResult {
+    /// Validates that the result address is the exact reviewed signing address.
+    pub fn validate_for_request(
+        &self,
+        request: &SignMessageParams,
+    ) -> Result<(), BitcoinRequestError> {
+        if &self.address != request.signing_address() {
+            return Err(BitcoinRequestError::SignMessageResultAddressMismatch {
+                expected_address: request.signing_address().to_string(),
+                actual_address: self.address.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

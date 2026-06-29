@@ -2,8 +2,9 @@ use std::{borrow::Borrow, fmt, str::FromStr};
 
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use bitcoin::{
-    Amount, Denomination, Network, PublicKey, Txid,
+    Network, PublicKey, Txid,
     address::{Address, NetworkUnchecked},
+    amount::{Amount, Denomination},
     bip32::{ChildNumber, DerivationPath},
     psbt::Psbt,
 };
@@ -72,64 +73,6 @@ impl Serialize for BitcoinAddress {
 }
 
 impl<'de> Deserialize<'de> for BitcoinAddress {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(de::Error::custom)
-    }
-}
-
-/// Bitcoin amount encoded on the wire as a decimal satoshi string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BitcoinAmountSats(Amount);
-
-impl BitcoinAmountSats {
-    /// Parses a non-empty ASCII decimal satoshi amount.
-    pub fn parse(value: impl Into<String>) -> Result<Self, BitcoinValueError> {
-        let value = value.into();
-        let amount = parse_amount(&value)?;
-        Ok(Self(amount))
-    }
-
-    /// Amount in satoshis.
-    #[must_use]
-    pub fn to_sat(&self) -> u64 {
-        self.0.to_sat()
-    }
-
-    /// Converts the amount to the `WalletConnect` decimal satoshi string.
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.to_sat().to_string()
-    }
-}
-
-impl fmt::Display for BitcoinAmountSats {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.to_sat())
-    }
-}
-
-impl FromStr for BitcoinAmountSats {
-    type Err = BitcoinValueError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl Serialize for BitcoinAmountSats {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.to_sat().to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for BitcoinAmountSats {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -393,6 +336,17 @@ impl BitcoinPsbt {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Summarizes the unsigned transaction embedded in the PSBT for user review.
+    pub fn summary(
+        &self,
+        chain_reference: Option<&str>,
+    ) -> Result<BitcoinPsbtSummary, BitcoinValueError> {
+        Ok(BitcoinPsbtSummary::from_psbt(
+            &parse_base64_psbt(self.as_str())?,
+            chain_reference,
+        ))
+    }
 }
 
 impl AsRef<str> for BitcoinPsbt {
@@ -432,6 +386,106 @@ impl<'de> Deserialize<'de> for BitcoinPsbt {
         let value = String::deserialize(deserializer)?;
         Self::parse(value).map_err(de::Error::custom)
     }
+}
+
+/// Wallet-facing summary of the unsigned transaction embedded in a PSBT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitcoinPsbtSummary {
+    /// Number of transaction inputs in the unsigned transaction.
+    pub input_count: usize,
+    /// Number of transaction outputs in the unsigned transaction.
+    pub output_count: usize,
+    /// Total amount across all outputs, when it fits in a `u64`.
+    pub total_output_sats: Option<u64>,
+    /// Number of inputs that include UTXO data in the PSBT.
+    pub known_input_count: usize,
+    /// Total amount across inputs only when every input includes UTXO data.
+    pub total_input_sats: Option<u64>,
+    /// Implied fee only when every input amount is known and covers the outputs.
+    pub fee_sats: Option<u64>,
+    /// Number of outputs whose script starts with `OP_RETURN`.
+    pub op_return_output_count: usize,
+    /// Per-output summaries in transaction output order.
+    pub outputs: Vec<BitcoinPsbtOutputSummary>,
+}
+
+impl BitcoinPsbtSummary {
+    fn from_psbt(psbt: &Psbt, chain_reference: Option<&str>) -> Self {
+        let network = bitcoin_network_for_chain_reference(chain_reference);
+        let outputs = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .map(|(index, output)| BitcoinPsbtOutputSummary {
+                index,
+                amount_sats: output.value.to_sat(),
+                destination: psbt_output_destination(output, network),
+            })
+            .collect::<Vec<_>>();
+        let total_output_sats = outputs
+            .iter()
+            .try_fold(0_u64, |total, output| total.checked_add(output.amount_sats));
+        let op_return_output_count = outputs
+            .iter()
+            .filter(|output| matches!(output.destination, BitcoinPsbtOutputDestination::OpReturn))
+            .count();
+
+        let mut known_input_count = 0_usize;
+        let mut known_input_total = Some(0_u64);
+        for funding_utxo in psbt.iter_funding_utxos() {
+            match funding_utxo {
+                Ok(utxo) => {
+                    known_input_count += 1;
+                    if let Some(total) = known_input_total {
+                        known_input_total = total.checked_add(utxo.value.to_sat());
+                    }
+                }
+                Err(_) => known_input_total = None,
+            }
+        }
+
+        let all_input_amounts_known = known_input_count == psbt.unsigned_tx.input.len();
+        let total_input_sats = all_input_amounts_known
+            .then_some(known_input_total)
+            .flatten();
+        let fee_sats = total_input_sats
+            .zip(total_output_sats)
+            .and_then(|(input, output)| input.checked_sub(output));
+
+        Self {
+            input_count: psbt.unsigned_tx.input.len(),
+            output_count: outputs.len(),
+            total_output_sats,
+            known_input_count,
+            total_input_sats,
+            fee_sats,
+            op_return_output_count,
+            outputs,
+        }
+    }
+}
+
+/// One output in a wallet-facing PSBT summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitcoinPsbtOutputSummary {
+    /// Zero-based output index.
+    pub index: usize,
+    /// Output amount in satoshis.
+    pub amount_sats: u64,
+    /// Destination decoded from the output script.
+    pub destination: BitcoinPsbtOutputDestination,
+}
+
+/// User-reviewable destination for a PSBT output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitcoinPsbtOutputDestination {
+    /// Standard Bitcoin address decoded with the request chain.
+    Address(String),
+    /// Data-carrying `OP_RETURN` output.
+    OpReturn,
+    /// Non-standard or chain-unknown script, encoded as hex.
+    ScriptHex(String),
 }
 
 /// Bitcoin derivation path encoded on the wire as a string.
@@ -484,11 +538,15 @@ impl BitcoinDerivationPath {
     pub fn into_string(self) -> String {
         self.to_string()
     }
+
+    fn wire_string(&self) -> String {
+        format!("m/{}", self.0)
+    }
 }
 
 impl fmt::Display for BitcoinDerivationPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
+        formatter.write_str(&self.wire_string())
     }
 }
 
@@ -505,7 +563,7 @@ impl Serialize for BitcoinDerivationPath {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(&self.wire_string())
     }
 }
 
@@ -528,12 +586,11 @@ fn validate_address(value: &str) -> Result<(), BitcoinValueError> {
     }
     value
         .parse::<Address<NetworkUnchecked>>()
-        .and_then(|address| address.require_network(Network::Bitcoin))
         .map(|_| ())
         .map_err(|_| BitcoinValueError::InvalidAddress)
 }
 
-fn parse_amount(value: &str) -> Result<Amount, BitcoinValueError> {
+pub fn parse_amount(value: &str) -> Result<Amount, BitcoinValueError> {
     if value.is_empty() {
         return Err(BitcoinValueError::EmptyAmount);
     }
@@ -571,15 +628,44 @@ fn validate_hex_bytes(value: &str, policy: HexPolicy) -> Result<(), BitcoinValue
 }
 
 fn validate_base64(value: &str) -> Result<(), BitcoinValueError> {
+    parse_base64_psbt(value).map(|_| ())
+}
+
+fn parse_base64_psbt(value: &str) -> Result<Psbt, BitcoinValueError> {
     if value.is_empty() {
         return Err(BitcoinValueError::EmptyPsbt);
     }
     let bytes = BASE64_STANDARD
         .decode(value)
         .map_err(|_| BitcoinValueError::InvalidPsbt)?;
-    Psbt::deserialize(&bytes)
-        .map(|_| ())
-        .map_err(|_| BitcoinValueError::InvalidPsbt)
+    Psbt::deserialize(&bytes).map_err(|_| BitcoinValueError::InvalidPsbt)
+}
+
+fn bitcoin_network_for_chain_reference(chain_reference: Option<&str>) -> Option<Network> {
+    match chain_reference {
+        Some("000000000019d6689c085ae165831e93") => Some(Network::Bitcoin),
+        Some("000000000933ea01ad0ee984209779ba") => Some(Network::Testnet),
+        Some("00000008819873e925422c1ff0f99f7c") => Some(Network::Signet),
+        Some("0f9188f13cb7b2c71f2a335e3a4fc328") => Some(Network::Regtest),
+        _ => None,
+    }
+}
+
+fn psbt_output_destination(
+    output: &bitcoin::TxOut,
+    network: Option<Network>,
+) -> BitcoinPsbtOutputDestination {
+    if output.script_pubkey.is_op_return() {
+        return BitcoinPsbtOutputDestination::OpReturn;
+    }
+
+    if let Some(network) = network {
+        if let Ok(address) = Address::from_script(&output.script_pubkey, network) {
+            return BitcoinPsbtOutputDestination::Address(address.to_string());
+        }
+    }
+
+    BitcoinPsbtOutputDestination::ScriptHex(output.script_pubkey.to_hex_string())
 }
 
 fn parse_derivation_path(value: &str) -> Result<DerivationPath, BitcoinValueError> {

@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTimeError};
 
 use wc_protocol::{
     envelope::EnvelopeError,
-    key::X25519KeyPairError,
+    key::{X25519KeyPairError, X25519SharedSecretError},
     namespaces::NamespaceValidationError,
     pairing::{PairingUri, PairingUriError},
     pairing_message::PairingMessageError,
@@ -61,6 +61,14 @@ pub enum PairingClientError {
         /// Source X25519 key-pair error.
         #[source]
         source: X25519KeyPairError,
+    },
+
+    /// Peer X25519 public key produced unsafe shared key material.
+    #[error("pairing shared secret derivation failed")]
+    SharedSecret {
+        /// Source shared-secret derivation error.
+        #[source]
+        source: X25519SharedSecretError,
     },
 
     /// Approved namespaces do not satisfy the proposal.

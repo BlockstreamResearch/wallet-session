@@ -10,6 +10,7 @@
     "check:supply-chain": "bun run src/check-supply-chain.ts",
     "check:types": "tsc --noEmit",
     "authenticate": "bun run src/authenticate.ts",
+    "bitcoin-authenticate": "bun run src/bitcoin-authenticate.ts",
     "sign-auth": "bun run src/sign-auth.ts",
     "pairing-lifecycle": "bun run src/pairing-lifecycle.ts",
     "propose-session": "bun run src/propose-session.ts",

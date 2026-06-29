@@ -1128,7 +1128,8 @@ impl PairingClient {
         let session_sym_key = derive_shared_sym_key(
             responder.private_key(),
             &request.params.requester.public_key,
-        );
+        )
+        .map_err(|source| PairingClientError::SharedSecret { source })?;
         let session_topic = derive_topic_from_sym_key(&session_sym_key);
         let session_subscription = if subscribe_authenticated_session {
             Some(

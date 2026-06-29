@@ -40,6 +40,12 @@ jobs:
       - name: Install pinned Rust tools
         run: cargo rbmt tools
 
+      - name: Install UniFFI bindgen
+        run: cargo install uniffi --version 0.31.2 --features cli --bin uniffi-bindgen --locked
+
+      - name: Install Android Rust targets
+        run: rustup target add armv7-linux-androideabi aarch64-linux-android
+
       - name: Use Rust cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 

@@ -52,12 +52,6 @@ impl BitcoinRequest {
             }
             BitcoinMethod::SignPsbt => {
                 let request: SignPsbtParams = parse_params(method, params)?;
-                if request.sign_inputs.is_empty() {
-                    return Err(BitcoinRequestError::InvalidParams {
-                        method,
-                        source: BitcoinValueError::EmptySignInputs,
-                    });
-                }
                 for input in &request.sign_inputs {
                     if input.sighash_types.as_ref().is_some_and(Vec::is_empty) {
                         return Err(BitcoinRequestError::InvalidParams {
@@ -316,6 +310,8 @@ impl BitcoinAccountAuthorization {
 pub enum BitcoinWalletAddressRole {
     /// `sendTransfer.changeAddress`.
     ChangeAddress,
+    /// `getAccountAddresses` result address.
+    AccountAddressResult,
     /// `signPsbt.signInputs[].address`.
     PsbtInputSigner,
     /// `signMessage.address`, or the connected account when omitted.
@@ -328,6 +324,7 @@ impl BitcoinWalletAddressRole {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ChangeAddress => "change address",
+            Self::AccountAddressResult => "account address result",
             Self::PsbtInputSigner => "PSBT input signer",
             Self::MessageSigner => "message signer",
         }

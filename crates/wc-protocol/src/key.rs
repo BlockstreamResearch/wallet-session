@@ -235,25 +235,28 @@ impl X25519PublicKey {
 ///     "80dd64bd6e4c3612ff0f5ccbe9282f1f11ba56ada6a2f9740da063d1ed1f2b20",
 /// )?;
 ///
-/// let sym_key = derive_shared_sym_key(&private_key, &peer_public_key);
+/// let sym_key = derive_shared_sym_key(&private_key, &peer_public_key)?;
 /// assert_eq!(
 ///     sym_key.as_str(),
 ///     "81b30968ad471e842d9936c567429a0ce7c04787ed8d103143cdba785be7ba1a",
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use]
 pub fn derive_shared_sym_key(
     private_key: &X25519PrivateKey,
     peer_public_key: &X25519PublicKey,
-) -> PairingSymKey {
+) -> Result<PairingSymKey, X25519SharedSecretError> {
     let shared_secret =
         MontgomeryPoint(peer_public_key.to_bytes()).mul_clamped(private_key.to_bytes());
+    if shared_secret.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(X25519SharedSecretError::NonContributoryPeerPublicKey);
+    }
+
     let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
     let mut sym_key = [0_u8; crate::pairing::PAIRING_SYM_KEY_BYTES];
     hkdf.expand(&[], &mut sym_key)
         .expect("32-byte HKDF output is within SHA-256 expansion limit");
-    PairingSymKey::from_bytes(sym_key)
+    Ok(PairingSymKey::from_bytes(sym_key))
 }
 
 /// Hashes a symmetric key into the topic used for relay routing.
@@ -341,6 +344,14 @@ pub enum X25519PublicKeyError {
         /// Character rejected by lowercase ASCII hex validation.
         character: char,
     },
+}
+
+/// X25519 shared-secret derivation error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum X25519SharedSecretError {
+    /// Peer public key produced an all-zero shared secret and did not contribute entropy.
+    #[error("X25519 peer public key produced a non-contributory shared secret")]
+    NonContributoryPeerPublicKey,
 }
 
 /// X25519 private-key parse error.

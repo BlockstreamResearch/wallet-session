@@ -298,6 +298,41 @@ impl WalletCapabilities {
         Ok(())
     }
 
+    /// Converts this wallet capability set into a full session namespace map.
+    ///
+    /// This is useful for wallet-authored namespace replacement or an
+    /// authenticated session grant after the wallet has already selected the
+    /// exact accounts, methods, and events it is willing to disclose.
+    #[must_use]
+    pub fn to_session_namespaces(&self) -> SessionNamespaces {
+        let mut namespaces = SessionNamespaces::new();
+        for capability in self.chains.values() {
+            let key = NamespaceKey::parse(capability.chain_id.namespace())
+                .expect("validated CAIP-2 namespace must parse as a namespace key");
+            let entry = namespaces.entry(key).or_insert(SessionNamespace {
+                chains: Some(Vec::new()),
+                accounts: Vec::new(),
+                methods: Vec::new(),
+                events: Vec::new(),
+            });
+
+            insert_unique(
+                entry.chains.get_or_insert_with(Vec::new),
+                capability.chain_id.clone(),
+            );
+            for account in &capability.accounts {
+                insert_unique(&mut entry.accounts, account.clone());
+            }
+            for method in &capability.methods {
+                insert_unique(&mut entry.methods, method.clone());
+            }
+            for event in &capability.events {
+                insert_unique(&mut entry.events, event.clone());
+            }
+        }
+        namespaces
+    }
+
     fn add_proposal_namespaces(
         &self,
         proposal_namespaces: &ProposalNamespaces,
