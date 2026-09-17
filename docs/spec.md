@@ -44,7 +44,9 @@ Identity keys and connection token signatures: Ed25519
 
 Relay is a main connection point between dApp and wallet.
 
-Relay is a web socket server. Proposer are sending a request for session creation to the Relay with `Proposer` role specified. Responder is subscribing after session creation to the Relay with `Responder` role specified. After connection is established, any other attempts of connection to this topic is rejected.
+Relay is a web socket server. A client connects to the Relay by providing the topic and its role in the connection URL. The proposer connects with the `Proposer` role specified; the responder connects with the `Responder` role specified. Once the session is established, any further attempt to connect to the same topic is rejected.
+
+Once both parties are connected, the Relay sends `session_ready` to both. Neither party sends application messages before receiving that signal.
 
 Messages send by the `Proposer` is send to the `Responder`. Messages send by the `Responder` is send to the `Proposer`.  
 
@@ -64,14 +66,13 @@ Every client authenticates its WebSocket connection to the relay with a signed J
 
 URI scheme for proposer:
 ```
-wss://relay.example.com/?auth=<JWT>&registrationId=<registration-id>&role=proposer
+wss://relay.example.com/?auth=<JWT>&registrationId=<registration-id>&role=proposer&topic=<topic>
 ```
 
 URI scheme for responder:
 ```
-wss://relay.example.com/?auth=<JWT>&role=responder
+wss://relay.example.com/?auth=<JWT>&role=responder&topic=<topic>
 ```
-
 
 JWT scheme:
 ```rust
@@ -140,7 +141,7 @@ Session establishment flow:
 
 ## 10. Message envelope
 
-Every application message is an encrypted envelope:
+The encrypted envelope is the only application message unit and is sent directly over the relay connection. The relay reads the plaintext `topic` header to route and forwards the envelope verbatim to the peer; it does not wrap or re-encode it.
 
 ```
 {
@@ -155,22 +156,20 @@ Every application message is an encrypted envelope:
 }
 ```
 
-Control frames which sent to the Relay are plaintext because the relay must read them. They reuse the versioning and encoding conventions of the envelope:
+Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a reused nonce.
+
+Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Clients must maintain an list of `id`s which was sent for the last 5 minutes and silently drop any duplicates.
+
+Relay control frames are plaintext because the relay must read them. They carry an `op` field instead of message data and are never forwarded to peers:
 
 ```
 {
   "v": 1,
   "id": "<16 random bytes, base64url>",
-  "type": "request",
-  "topic": "<32 bytes, base64url>",
-  "payload": "<base64url of the app envelope>"
+  "op": "ping",                         // ping | pong | ack
+  "topic": "<32 bytes, base64url>"
 }
 ```
-
-Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a reused nonce.
-
-
-Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Clients must maintain an list of `id`s which was sent for the last 5 minutes and silently drop any duplicates.
 
 ## 11. AEAD AAD and nonce generation
 
