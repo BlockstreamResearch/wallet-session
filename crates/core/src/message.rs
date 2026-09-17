@@ -1,5 +1,8 @@
+use crate::codec::{self, Error};
 use crate::payload::Payload;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 /// Encrypted message.
 #[derive(Serialize, Deserialize)]
@@ -44,9 +47,6 @@ struct ControlFrame {
 
     /// Subscription topic.
     topic: Topic,
-
-    /// The encrypted message.
-    payload: Message,
 }
 
 /// Message type name.
@@ -91,13 +91,166 @@ impl From<Payload> for MessageType {
 }
 
 /// 32-byte topic, base64url.
-#[derive(Serialize, Deserialize)]
-struct Topic(String);
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct Topic(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl Topic {
+    /// Number of bytes in a topic.
+    const LEN: usize = 32;
+
+    /// Build a topic from raw bytes, rejecting the wrong length.
+    fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
+        let bytes = bytes.into();
+        if bytes.len() != Self::LEN {
+            return Err(Error::InvalidLength {
+                expected: Self::LEN,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Topic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&codec::encode(&self.0))
+    }
+}
+
+impl FromStr for Topic {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(codec::decode(s)?)
+    }
+}
 
 /// AEAD nonce.
-#[derive(Serialize, Deserialize)]
-struct Nonce(String);
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct Nonce(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl Nonce {
+    /// Number of bytes in a nonce.
+    const LEN: usize = 24;
+
+    /// Build a nonce from raw bytes, rejecting the wrong length.
+    fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
+        let bytes = bytes.into();
+        if bytes.len() != Self::LEN {
+            return Err(Error::InvalidLength {
+                expected: Self::LEN,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for Nonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&codec::encode(&self.0))
+    }
+}
+
+impl FromStr for Nonce {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(codec::decode(s)?)
+    }
+}
 
 /// Ciphertext (with tag), base64url.
-#[derive(Serialize, Deserialize)]
-struct Ciphertext(String);
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct Ciphertext(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl Ciphertext {
+    fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+}
+
+impl fmt::Display for Ciphertext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&codec::encode(&self.0))
+    }
+}
+
+impl FromStr for Ciphertext {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(codec::decode(s)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topic_accepts_32_bytes() {
+        assert!(Topic::new([0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn topic_rejects_wrong_length() {
+        assert!(matches!(
+            Topic::new([0u8; 31]),
+            Err(Error::InvalidLength {
+                expected: 32,
+                actual: 31
+            })
+        ));
+    }
+
+    #[test]
+    fn nonce_accepts_24_bytes() {
+        assert!(Nonce::new([0u8; 24]).is_ok());
+    }
+
+    #[test]
+    fn nonce_rejects_wrong_length() {
+        assert!(Nonce::new([0u8; 12]).is_err());
+    }
+
+    #[test]
+    fn topic_base64url_round_trip() {
+        let topic = Topic::new([7u8; 32]).unwrap();
+        assert_eq!(topic.to_string().parse::<Topic>().unwrap(), topic);
+    }
+
+    #[test]
+    fn ciphertext_base64url_round_trip() {
+        let data = Ciphertext::new(vec![1, 2, 3, 4, 5]);
+        assert_eq!(data.to_string().parse::<Ciphertext>().unwrap(), data);
+    }
+
+    #[test]
+    fn topic_serializes_as_plain_string() {
+        let topic = Topic::new([7u8; 32]).unwrap();
+        let json = serde_json::to_string(&topic).unwrap();
+        assert_eq!(json, format!("\"{topic}\""));
+        assert_eq!(serde_json::from_str::<Topic>(&json).unwrap(), topic);
+    }
+
+    #[test]
+    fn message_round_trips_through_json() {
+        let message = Message {
+            version: 1,
+            id: codec::encode(&[0u8; 16]),
+            type_: MessageType::Ping,
+            topic: Topic::new([1u8; 32]).unwrap(),
+            ts: 1_700_000_000,
+            nonce: Nonce::new([2u8; 24]).unwrap(),
+            data: Ciphertext::new(vec![9, 8, 7]),
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"v\":1"));
+        assert!(json.contains("\"type\":\"ping\""));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.topic, message.topic);
+        assert_eq!(back.nonce, message.nonce);
+        assert_eq!(back.data, message.data);
+    }
+}
