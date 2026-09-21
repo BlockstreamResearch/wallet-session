@@ -1,6 +1,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serializer};
 
+use crate::error::Error;
+
 /// Encode bytes as unpadded base64url.
 pub fn encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -9,15 +11,6 @@ pub fn encode(bytes: &[u8]) -> String {
 /// Decode unpadded base64url into bytes.
 pub fn decode(input: &str) -> Result<Vec<u8>, Error> {
     Ok(URL_SAFE_NO_PAD.decode(input)?)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("invalid base64url: {0}")]
-    Decode(#[from] base64::DecodeError),
-
-    #[error("invalid length: expected {expected}, got {actual}")]
-    InvalidLength { expected: usize, actual: usize },
 }
 
 /// `serde` adapter that encodes a byte field as unpadded base64url.

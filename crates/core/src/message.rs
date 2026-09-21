@@ -1,4 +1,5 @@
-use crate::codec::{self, Error};
+use crate::codec::{self};
+use crate::error::Error;
 use crate::payload::Payload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -91,15 +92,15 @@ impl From<Payload> for MessageType {
 }
 
 /// 32-byte topic, base64url.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct Topic(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Topic(#[serde(with = "crate::codec::base64url")] Vec<u8>);
 
 impl Topic {
     /// Number of bytes in a topic.
-    const LEN: usize = 32;
+    pub const LEN: usize = 32;
 
     /// Build a topic from raw bytes, rejecting the wrong length.
-    fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
         let bytes = bytes.into();
         if bytes.len() != Self::LEN {
             return Err(Error::InvalidLength {

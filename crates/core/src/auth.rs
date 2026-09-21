@@ -2,19 +2,19 @@ use serde::{Deserialize, Serialize};
 
 /// JWT token for authentication.
 #[derive(Serialize, Deserialize)]
-struct RelayAuthToken {
+pub struct RelayAuthToken {
     // did:key derived from the identity public key
-    iss: String,
+    pub iss: String,
 
     // random session identifier
-    sub: String,
+    pub sub: String,
 
     // relay URL
-    aud: String,
+    pub aud: String,
 
     // issued-at timestamp
-    iat: u64,
+    pub iat: u64,
 
     // expiry
-    exp: u64,
+    pub exp: u64,
 }
