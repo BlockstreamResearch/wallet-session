@@ -38,12 +38,18 @@ impl Registry {
         role: Role,
         peer: PeerHandle,
     ) -> Result<(Arc<Session>, Registration), RegistryError> {
-        let session = {
+        let identity = peer.identity.clone();
+        let (session, created) = {
             let mut sessions = self.lock()?;
-            sessions.entry(topic.clone()).or_default().clone()
+            let created = !sessions.contains_key(topic);
+            (sessions.entry(topic.clone()).or_default().clone(), created)
         };
+        if created {
+            log::debug!("created session for topic {topic}");
+        }
 
         let registration = session.register(role, peer)?;
+        log::debug!("registered peer {identity} on topic {topic} as {role:?}");
         Ok((session, registration))
     }
 
@@ -57,7 +63,9 @@ impl Registry {
 
         if session.unregister(role)? {
             sessions.remove(topic);
+            log::debug!("removed empty session for topic {topic}");
         }
+        log::debug!("released {role:?} slot on topic {topic}");
 
         Ok(())
     }

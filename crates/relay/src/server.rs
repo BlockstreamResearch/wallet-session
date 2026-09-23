@@ -18,9 +18,15 @@ pub async fn serve(
     registry: Arc<Registry>,
     config: NativeRelayTransportConfig,
 ) -> io::Result<()> {
+    match listener.local_addr() {
+        Ok(addr) => log::info!("relay listening on {addr}"),
+        Err(error) => log::warn!("relay listening address unavailable: {error}"),
+    }
+
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                log::debug!("accepted connection from {addr}");
                 let registry = Arc::clone(&registry);
                 let config = config.clone();
                 tokio::spawn(async move {

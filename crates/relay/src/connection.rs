@@ -164,6 +164,12 @@ impl Connection {
             },
         };
         let websocket = handshake.map_err(ConnectionError::from)?;
+        log::debug!(
+            "handshake accepted for topic {} as {:?} ({})",
+            params.topic,
+            params.role,
+            params.identity.did
+        );
 
         Ok((params, websocket))
     }
@@ -194,6 +200,10 @@ impl Connection {
             Registration::BothReady => true,
             Registration::Waiting => false,
             Registration::RoleTaken(role) => {
+                log::warn!(
+                    "rejecting connection for topic {}: {role:?} role already taken",
+                    self.params.topic
+                );
                 let frame = CloseFrame {
                     code: CloseCode::Policy,
                     reason: "role already taken".into(),
@@ -207,6 +217,11 @@ impl Connection {
         let writer = tokio::spawn(write_loop(sink, self.outbound));
 
         if both_ready {
+            log::info!(
+                "session ready for topic {}, role {:?}",
+                self.params.topic,
+                self.params.role
+            );
             let ready = RelayFrame {
                 v: 1,
                 id: random_id()?,
@@ -250,7 +265,11 @@ async fn read_loop(
     while let Some(message) = source.next().await {
         let message = message?;
         let frame = match message {
-            Message::Text(text) => serde_json::from_str::<RelayFrame>(&text)?,
+            Message::Text(text) => {
+                serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
+                    log::warn!("invalid relay frame on topic {}: {error}", params.topic);
+                })?
+            }
             Message::Close(_) => break,
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
                 continue;
@@ -258,11 +277,21 @@ async fn read_loop(
         };
 
         if matches!(&frame.body, RelayFrameBody::SessionReady) {
+            log::warn!(
+                "client sent relay-only session_ready on topic {}",
+                params.topic
+            );
             return Err(ConnectionError::ClientSessionReady);
         }
 
         match session.route(params.role, frame) {
-            Ok(()) | Err(SessionError::NoCounterpart) => {}
+            Ok(()) => {}
+            Err(SessionError::NoCounterpart) => {
+                log::trace!(
+                    "dropping frame on topic {}: counterpart not connected",
+                    params.topic
+                );
+            }
             Err(error) => return Err(error.into()),
         }
     }
