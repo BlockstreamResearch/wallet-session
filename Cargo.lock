@@ -851,6 +851,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "getrandom",
+ "log",
  "serde",
  "serde_json",
  "thiserror",
