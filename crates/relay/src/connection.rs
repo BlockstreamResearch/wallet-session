@@ -19,7 +19,7 @@ use url::form_urlencoded;
 use wallet_session_core::{codec, message::Topic};
 
 use crate::{
-    auth::{Identity, IdentityError},
+    auth::{Identity, IdentityError, unix_now},
     frame::{RelayFrame, RelayFrameBody},
     session::{Registration, Role, Session, SessionError},
 };
@@ -33,19 +33,24 @@ pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
 /// Runtime limits for the relay connection handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRelayTransportConfig {
+    /// Audience the relay expects in the auth token (`aud` claim).
+    pub audience: String,
+
     /// Maximum incoming text or binary frame size before JSON parsing.
     pub max_incoming_frame_bytes: usize,
 }
 
-impl Default for NativeRelayTransportConfig {
-    fn default() -> Self {
+impl NativeRelayTransportConfig {
+    /// Build a config that expects `audience` in the auth token.
+    pub fn new(audience: impl Into<String>) -> Self {
         Self {
+            audience: audience.into(),
             max_incoming_frame_bytes: DEFAULT_MAX_INCOMING_FRAME_BYTES,
         }
     }
 }
 
-/// Connection parameters parsed from the WebSocket request URL (spec §5).
+/// Connection parameters parsed from the WebSocket request URL.
 #[derive(Debug, Clone)]
 pub struct ConnectionParams {
     /// Topic the peer subscribes to.
@@ -63,8 +68,8 @@ pub struct ConnectionParams {
 }
 
 impl ConnectionParams {
-    /// Parse parameters from the handshake request URI.
-    pub fn from_uri(uri: &Uri) -> Result<Self, ConnectionError> {
+    /// Parse and verify parameters from the handshake request URI.
+    pub fn from_uri(uri: &Uri, audience: &str, now: u64) -> Result<Self, ConnectionError> {
         let query = uri
             .query()
             .ok_or(ConnectionError::MissingParameter("query"))?;
@@ -79,7 +84,7 @@ impl ConnectionParams {
         };
 
         let topic = required(&params, "topic")?.parse::<Topic>()?;
-        let identity = Identity::from_auth_token(required(&params, "auth")?)?;
+        let identity = Identity::verify_token(required(&params, "auth")?, audience, now)?;
         let registration_id = params.get("registrationId").cloned();
 
         if role == Role::Proposer && registration_id.is_none() {
@@ -138,11 +143,13 @@ impl Connection {
         stream: TcpStream,
         config: NativeRelayTransportConfig,
     ) -> Result<(ConnectionParams, RelayStream), ConnectionError> {
+        let audience = config.audience.as_str();
+        let now = unix_now();
         let mut parsed: Option<Result<ConnectionParams, ConnectionError>> = None;
         let handshake = accept_hdr_async_with_config(
             stream,
             |request: &Request, response: Response| {
-                let params = ConnectionParams::from_uri(request.uri());
+                let params = ConnectionParams::from_uri(request.uri(), audience, now);
                 let accepted = params.is_ok();
                 parsed = Some(params);
                 if accepted {
@@ -350,13 +357,15 @@ pub enum ConnectionError {
 mod tests {
     use super::*;
 
+    use crate::auth::test_utils::{self, signing_key};
+
+    const AUDIENCE: &str = "wss://relay.example.com";
+    const NOW: u64 = 1_700_000_000;
+
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn auth_token(iss: &str, sub: &str) -> String {
-        let payload =
-            format!(r#"{{"iss":"{iss}","sub":"{sub}","aud":"wss://relay","iat":0,"exp":0}}"#);
-        let encoded = codec::encode(payload.as_bytes());
-        format!("header.{encoded}.signature")
+    fn token() -> String {
+        test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 3600)
     }
 
     fn uri(query: &str) -> Result<Uri, Box<dyn std::error::Error>> {
@@ -372,27 +381,23 @@ mod tests {
         let topic = topic()?;
         let query = format!(
             "auth={}&role=proposer&topic={}&registrationId=reg-1",
-            auth_token("did:key:abc", "session-1"),
+            token(),
             topic
         );
-        let params = ConnectionParams::from_uri(&uri(&query)?)?;
+        let params = ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW)?;
 
         assert_eq!(params.role, Role::Proposer);
         assert_eq!(params.topic, topic);
-        assert_eq!(params.identity.did, "did:key:abc");
-        assert_eq!(params.identity.session, "session-1");
+        assert_eq!(params.identity.did, test_utils::did_key(&signing_key(1)));
+        assert_eq!(params.identity.session, "session");
         assert_eq!(params.registration_id.as_deref(), Some("reg-1"));
         Ok(())
     }
 
     #[test]
     fn responder_params_parse_without_registration_id() -> TestResult {
-        let query = format!(
-            "auth={}&role=responder&topic={}",
-            auth_token("did:key:xyz", "session-2"),
-            topic()?
-        );
-        let params = ConnectionParams::from_uri(&uri(&query)?)?;
+        let query = format!("auth={}&role=responder&topic={}", token(), topic()?);
+        let params = ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW)?;
 
         assert_eq!(params.role, Role::Responder);
         assert_eq!(params.registration_id, None);
@@ -401,13 +406,9 @@ mod tests {
 
     #[test]
     fn proposer_requires_registration_id() -> TestResult {
-        let query = format!(
-            "auth={}&role=proposer&topic={}",
-            auth_token("did:key:abc", "session-1"),
-            topic()?
-        );
+        let query = format!("auth={}&role=proposer&topic={}", token(), topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?),
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::MissingParameter("registrationId"))
         ));
         Ok(())
@@ -415,13 +416,9 @@ mod tests {
 
     #[test]
     fn invalid_role_is_rejected() -> TestResult {
-        let query = format!(
-            "auth={}&role=observer&topic={}",
-            auth_token("did:key:abc", "session-1"),
-            topic()?
-        );
+        let query = format!("auth={}&role=observer&topic={}", token(), topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?),
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::InvalidRole(_))
         ));
         Ok(())
@@ -429,12 +426,9 @@ mod tests {
 
     #[test]
     fn invalid_topic_is_rejected() -> TestResult {
-        let query = format!(
-            "auth={}&role=responder&topic=not-a-topic",
-            auth_token("did:key:abc", "session-1")
-        );
+        let query = format!("auth={}&role=responder&topic=not-a-topic", token());
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?),
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::Topic(_))
         ));
         Ok(())
@@ -444,7 +438,7 @@ mod tests {
     fn missing_auth_is_rejected() -> TestResult {
         let query = format!("role=responder&topic={}", topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?),
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::MissingParameter("auth"))
         ));
         Ok(())
@@ -454,8 +448,19 @@ mod tests {
     fn malformed_auth_token_is_rejected() -> TestResult {
         let query = format!("auth=no-dots&role=responder&topic={}", topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?),
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::Identity(IdentityError::MalformedToken))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_audience_is_rejected() -> TestResult {
+        let token = test_utils::token(&signing_key(1), "wss://other", NOW, NOW + 3600);
+        let query = format!("auth={}&role=responder&topic={}", token, topic()?);
+        assert!(matches!(
+            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
+            Err(ConnectionError::Identity(IdentityError::Audience))
         ));
         Ok(())
     }

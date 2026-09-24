@@ -86,21 +86,22 @@ pub enum ServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::test_utils::{self, signing_key};
     use crate::frame::{RelayFrame, RelayFrameBody};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-    use wallet_session_core::{codec, message::Topic};
+    use wallet_session_core::message::Topic;
+
+    const AUDIENCE: &str = "wss://relay.example.com";
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-    fn auth_token(iss: &str, sub: &str) -> String {
-        let payload =
-            format!(r#"{{"iss":"{iss}","sub":"{sub}","aud":"wss://relay","iat":0,"exp":0}}"#);
-        let encoded = codec::encode(payload.as_bytes());
-        format!("header.{encoded}.signature")
+    fn token() -> String {
+        let now = crate::auth::unix_now();
+        test_utils::token(&signing_key(7), AUDIENCE, now, now + 3600)
     }
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
@@ -113,10 +114,7 @@ mod tests {
         topic: &Topic,
         registration_id: Option<&str>,
     ) -> Result<Client, Box<dyn std::error::Error>> {
-        let mut query = format!(
-            "auth={}&role={role}&topic={topic}",
-            auth_token("did:key:peer", "session")
-        );
+        let mut query = format!("auth={}&role={role}&topic={topic}", token());
         if let Some(registration_id) = registration_id {
             query.push_str(&format!("&registrationId={registration_id}"));
         }
@@ -142,7 +140,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             Arc::new(Registry::new()),
-            NativeRelayTransportConfig::default(),
+            NativeRelayTransportConfig::new(AUDIENCE),
         ));
 
         let topic = topic()?;
@@ -185,7 +183,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             Arc::new(Registry::new()),
-            NativeRelayTransportConfig::default(),
+            NativeRelayTransportConfig::new(AUDIENCE),
         ));
 
         // No auth/role/topic query parameters.
