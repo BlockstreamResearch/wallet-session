@@ -308,47 +308,36 @@ async fn read_loop(
 /// Connection handler failures.
 #[derive(Debug, Error)]
 pub enum ConnectionError {
-    /// A required query parameter is absent.
     #[error("missing query parameter: {0}")]
     MissingParameter(&'static str),
 
-    /// The `role` parameter is not `proposer` or `responder`.
     #[error("invalid role: {0}")]
     InvalidRole(String),
 
-    /// The `topic` parameter is not a 32-byte base64url value.
     #[error("invalid topic: {0}")]
     Topic(#[from] wallet_session_core::error::Error),
 
-    /// The `auth` token could not be decoded.
     #[error("invalid auth token: {0}")]
     Identity(#[from] IdentityError),
 
-    /// The WebSocket handshake or stream failed.
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 
-    /// An inbound text frame is not a valid relay frame.
     #[error("malformed relay frame: {0}")]
     Frame(#[from] serde_json::Error),
 
-    /// A session operation failed.
     #[error(transparent)]
     Session(#[from] SessionError),
 
-    /// The topic/role slot is already held by another connection.
     #[error("role already taken: {0:?}")]
     RoleTaken(Role),
 
-    /// A client attempted to originate a relay-only frame.
     #[error("clients may not send session_ready")]
     ClientSessionReady,
 
-    /// The handshake ended before the request could be inspected.
     #[error("websocket handshake failed")]
     HandshakeFailed,
 
-    /// Generating a random frame id failed.
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),
 }

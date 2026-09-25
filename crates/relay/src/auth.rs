@@ -42,7 +42,7 @@ pub enum IdentityError {
     DidKey(String),
 
     #[error("invalid token signature")]
-    Signature,
+    Signature(#[from] ed25519_dalek::ed25519::signature::Error),
 
     #[error("token audience mismatch")]
     Audience,
@@ -81,11 +81,10 @@ impl Identity {
         let token: RelayAuthToken = serde_json::from_slice(&codec::decode(payload_b64)?)?;
         let key = ed25519_key_from_did(&token.iss)?;
 
-        let signature = Signature::from_slice(&codec::decode(signature_b64)?)
-            .map_err(|_| IdentityError::Signature)?;
+        let signature = Signature::from_slice(&codec::decode(signature_b64)?)?;
         let signing_input = format!("{header_b64}.{payload_b64}");
-        key.verify_strict(signing_input.as_bytes(), &signature)
-            .map_err(|_| IdentityError::Signature)?;
+
+        key.verify_strict(signing_input.as_bytes(), &signature)?;
 
         if token.aud != audience {
             return Err(IdentityError::Audience);
@@ -118,7 +117,7 @@ fn ed25519_key_from_did(did: &str) -> Result<VerifyingKey, IdentityError> {
         .into_vec()
         .map_err(|error| IdentityError::DidKey(error.to_string()))?;
 
-    if bytes.len() != ED25519_MULTICODEC.len() + 32 || !bytes.starts_with(&ED25519_MULTICODEC) {
+    if (bytes.len() != ED25519_MULTICODEC.len() + 32) || !bytes.starts_with(&ED25519_MULTICODEC) {
         return Err(IdentityError::DidKey(did.to_owned()));
     }
 
@@ -268,7 +267,7 @@ mod tests {
         let tampered = segments.join(".");
         assert!(matches!(
             Identity::verify_token(&tampered, AUDIENCE, NOW),
-            Err(IdentityError::Signature)
+            Err(IdentityError::Signature(..))
         ));
     }
 
@@ -307,7 +306,7 @@ mod tests {
         );
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
-            Err(IdentityError::Signature)
+            Err(IdentityError::Signature(..))
         ));
     }
 

@@ -9,7 +9,6 @@ use crate::frame::RelayFrame;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Proposer,
-
     Responder,
 }
 
@@ -39,11 +38,9 @@ pub enum Registration {
 /// Session operation failures.
 #[derive(Debug, Error)]
 pub enum SessionError {
-    /// The session lock was poisoned by a panicking thread.
     #[error("session lock poisoned")]
     LockPoisoned,
 
-    /// The counterpart is not connected.
     #[error("counterpart not connected")]
     NoCounterpart,
 }
@@ -58,17 +55,16 @@ pub struct Session {
 #[derive(Default)]
 struct Slots {
     proposer: Option<PeerHandle>,
-
     responder: Option<PeerHandle>,
 }
 
 impl Session {
-    /// Acquire the slot lock, reporting a poisoned lock.
+    /// Acquire the slot lock
     fn lock(&self) -> Result<MutexGuard<'_, Slots>, SessionError> {
         self.slots.lock().map_err(|_| SessionError::LockPoisoned)
     }
 
-    /// Bind a peer to its role slot, or report a conflict.
+    /// Bind a peer to its role slot
     pub(crate) fn register(
         &self,
         role: Role,
@@ -93,7 +89,7 @@ impl Session {
         })
     }
 
-    /// Clear a peer's slot on disconnect, reporting whether the session is empty.
+    /// Clear a peer's slot on disconnect
     pub(crate) fn unregister(&self, role: Role) -> Result<bool, SessionError> {
         let mut slots = self.lock()?;
         *slot(&mut slots, role) = None;

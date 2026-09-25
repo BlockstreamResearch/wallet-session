@@ -74,11 +74,9 @@ impl Registry {
 /// Registration and teardown failures.
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    /// The registry lock was poisoned by a panicking thread.
     #[error("registry lock poisoned")]
     LockPoisoned,
 
-    /// A session operation failed.
     #[error(transparent)]
     Session(#[from] SessionError),
 }
