@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 /// Encrypted message.
 #[derive(Serialize, Deserialize)]
-struct Message {
+pub struct Message {
     /// Protocol version.
     #[serde(rename = "v")]
     version: u8,
@@ -32,9 +32,32 @@ struct Message {
     data: Ciphertext,
 }
 
+impl Message {
+    pub const VERSION: u8 = 1;
+
+    pub fn new(
+        id: impl Into<String>,
+        type_: MessageType,
+        topic: Topic,
+        ts: u64,
+        nonce: Nonce,
+        data: Ciphertext,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            id: id.into(),
+            type_,
+            topic,
+            ts,
+            nonce,
+            data,
+        }
+    }
+}
+
 /// Plaintext frame for the relay.
 #[derive(Serialize, Deserialize)]
-struct ControlFrame {
+pub struct ControlFrame {
     /// Protocol version.
     #[serde(rename = "v")]
     version: u8,
@@ -50,10 +73,23 @@ struct ControlFrame {
     topic: Topic,
 }
 
+impl ControlFrame {
+    pub const VERSION: u8 = 1;
+
+    pub fn new(id: impl Into<String>, type_: MessageType, topic: Topic) -> Self {
+        Self {
+            version: Self::VERSION,
+            id: id.into(),
+            type_,
+            topic,
+        }
+    }
+}
+
 /// Message type name.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum MessageType {
+pub enum MessageType {
     Proposal,
     Approve,
     Reject,
@@ -128,14 +164,13 @@ impl FromStr for Topic {
 
 /// AEAD nonce.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct Nonce(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+pub struct Nonce(#[serde(with = "crate::codec::base64url")] Vec<u8>);
 
 impl Nonce {
     /// Number of bytes in a nonce.
-    const LEN: usize = 24;
+    pub const LEN: usize = 24;
 
-    /// Build a nonce from raw bytes, rejecting the wrong length.
-    fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
         let bytes = bytes.into();
         if bytes.len() != Self::LEN {
             return Err(Error::InvalidLength {
@@ -163,10 +198,10 @@ impl FromStr for Nonce {
 
 /// Ciphertext (with tag), base64url.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct Ciphertext(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+pub struct Ciphertext(#[serde(with = "crate::codec::base64url")] Vec<u8>);
 
 impl Ciphertext {
-    fn new(bytes: impl Into<Vec<u8>>) -> Self {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         Self(bytes.into())
     }
 }
