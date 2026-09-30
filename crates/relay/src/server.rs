@@ -176,6 +176,60 @@ mod tests {
         Ok(())
     }
 
+    async fn try_responder(addr: SocketAddr, topic: &Topic) -> bool {
+        let Ok(mut client) = connect(addr, "responder", topic, None).await else {
+            return false;
+        };
+        let Ok(Ok(frame)) = timeout(Duration::from_secs(1), read_frame(&mut client)).await else {
+            return false;
+        };
+        matches!(frame.body, RelayFrameBody::SessionReady)
+    }
+
+    #[tokio::test]
+    async fn responder_slot_is_released_after_disconnect() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(serve(
+            listener,
+            Arc::new(Registry::new()),
+            NativeRelayTransportConfig::new(AUDIENCE),
+        ));
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // Disconnect the responder; the relay must free its role slot.
+        drop(responder);
+
+        // A fresh connection for the same role/topic must eventually be accepted
+        // and receive session_ready. Retry to allow the relay to observe the
+        // disconnect.
+        let mut reconnected = false;
+        for _ in 0..100 {
+            if try_responder(addr, &topic).await {
+                reconnected = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reconnected,
+            "responder role slot was not released after disconnect"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn invalid_params_are_rejected() -> TestResult {
         let listener = TcpListener::bind("127.0.0.1:0").await?;

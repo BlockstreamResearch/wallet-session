@@ -5,7 +5,10 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
 };
 use thiserror::Error;
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::{
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async_with_config,
     tungstenite::{
@@ -221,7 +224,8 @@ impl Connection {
         };
 
         let (sink, source) = websocket.split();
-        let writer = tokio::spawn(write_loop(sink, self.outbound));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let writer = tokio::spawn(write_loop(sink, self.outbound, shutdown_rx));
 
         if both_ready {
             log::info!(
@@ -242,6 +246,7 @@ impl Connection {
         let result = read_loop(source, &self.params, &self.session).await;
 
         drop(self.self_tx);
+        let _ = shutdown_tx.send(());
         let _ = writer.await;
 
         result
@@ -251,14 +256,24 @@ impl Connection {
 async fn write_loop(
     mut sink: SplitSink<RelayStream, Message>,
     mut rx: mpsc::UnboundedReceiver<RelayFrame>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
-    while let Some(frame) = rx.recv().await {
-        let text = match serde_json::to_string(&frame) {
-            Ok(text) => text,
-            Err(_) => break,
-        };
-        if sink.send(Message::text(text)).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            received = rx.recv() => match received {
+                Some(frame) => {
+                    let text = match serde_json::to_string(&frame) {
+                        Ok(text) => text,
+                        Err(_) => break,
+                    };
+                    log::trace!("relay -> topic={} frame={text}", frame.topic);
+                    if sink.send(Message::text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+            _ = &mut shutdown => break,
         }
     }
     let _ = sink.close().await;
@@ -273,6 +288,7 @@ async fn read_loop(
         let message = message?;
         let frame = match message {
             Message::Text(text) => {
+                log::trace!("relay <- topic={} frame={text}", params.topic);
                 serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
                     log::warn!("invalid relay frame on topic {}: {error}", params.topic);
                 })?
