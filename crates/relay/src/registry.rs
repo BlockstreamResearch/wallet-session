@@ -84,7 +84,7 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::RelayFrame;
+    use wallet_session_core::frame::RelayFrame;
     use tokio::sync::mpsc;
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {

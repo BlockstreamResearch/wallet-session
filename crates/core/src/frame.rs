@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use wallet_session_core::message::Topic;
 
-/// Plaintext control frame exchanged over the relay
+use crate::message::Topic;
+
+/// Plaintext control frame exchanged over the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayFrame {
     /// Protocol version.
@@ -25,6 +26,6 @@ pub enum RelayFrameBody {
     /// Relay signal that both peers are connected.
     SessionReady,
 
-    /// Opaque encrypted application envelope routed to the counterpart.
+    /// Opaque application envelope routed to the counterpart.
     Message { payload: String },
 }

@@ -3,7 +3,7 @@ use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::frame::RelayFrame;
+use wallet_session_core::frame::RelayFrame;
 
 /// Role a peer claims on a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,7 +122,7 @@ fn slot(slots: &mut Slots, role: Role) -> &mut Option<PeerHandle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::RelayFrameBody;
+    use wallet_session_core::frame::RelayFrameBody;
     use wallet_session_core::message::Topic;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

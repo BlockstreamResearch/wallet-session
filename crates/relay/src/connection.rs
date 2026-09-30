@@ -20,9 +20,9 @@ use wallet_session_core::{codec, message::Topic};
 
 use crate::{
     auth::{Identity, IdentityError, unix_now},
-    frame::{RelayFrame, RelayFrameBody},
     session::{Registration, Role, Session, SessionError},
 };
+use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
 /// Server-side relay WebSocket stream.
 type RelayStream = WebSocketStream<TcpStream>;

@@ -87,7 +87,7 @@ pub enum ServerError {
 mod tests {
     use super::*;
     use crate::auth::test_utils::{self, signing_key};
-    use crate::frame::{RelayFrame, RelayFrameBody};
+    use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
