@@ -48,13 +48,13 @@ pub async fn handle(
     registry: Arc<Registry>,
     config: NativeRelayTransportConfig,
 ) -> Result<(), ServerError> {
-    let (params, websocket) = Connection::handshake(stream, config).await?;
+    let (query, identity, websocket) = Connection::handshake(stream, config).await?;
 
-    let topic = params.topic.clone();
-    let role = params.role;
+    let topic = query.topic.clone();
+    let role = query.role;
     let (tx, rx) = mpsc::unbounded_channel();
     let peer = PeerHandle {
-        identity: params.identity.did.clone(),
+        identity: identity.did.clone(),
         tx: tx.clone(),
     };
 
@@ -63,7 +63,7 @@ pub async fn handle(
     // `RoleTaken` leaves the existing peer's slot intact, so only release the
     // slot when this connection actually took it.
     let holds_slot = !matches!(registration, Registration::RoleTaken(_));
-    let result = Connection::new(params, session, rx, tx)
+    let result = Connection::new(query, identity, session, rx, tx)
         .run(websocket, registration)
         .await;
 

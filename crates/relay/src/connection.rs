@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use futures_util::{
     SinkExt, StreamExt,
@@ -18,8 +18,7 @@ use tokio_tungstenite::{
         protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
 };
-use url::form_urlencoded;
-use wallet_session_core::{codec, message::Topic};
+use wallet_session_core::{codec, connection::ConnectionQuery};
 
 use crate::{
     auth::{Identity, IdentityError, unix_now},
@@ -53,64 +52,23 @@ impl NativeRelayTransportConfig {
     }
 }
 
-/// Connection parameters parsed from the WebSocket request URL.
-#[derive(Debug, Clone)]
-pub struct ConnectionParams {
-    /// Topic the peer subscribes to.
-    pub topic: Topic,
+/// Parse and verify the handshake query, returning the params and peer identity.
+fn parse_connection(
+    uri: &Uri,
+    audience: &str,
+    now: u64,
+) -> Result<(ConnectionQuery, Identity), ConnectionError> {
+    let query = uri
+        .query()
+        .ok_or(ConnectionError::MissingParameter("query"))?;
+    let query: ConnectionQuery = serde_urlencoded::from_str(query)?;
 
-    /// Role the peer claims.
-    pub role: Role,
-
-    /// Identity decoded from the `auth` token.
-    pub identity: Identity,
-
-    /// Registration id; required for proposers.
-    /// TODO: reg_id as wrapper type
-    pub registration_id: Option<String>,
-}
-
-impl ConnectionParams {
-    /// Parse and verify parameters from the handshake request URI.
-    pub fn from_uri(uri: &Uri, audience: &str, now: u64) -> Result<Self, ConnectionError> {
-        let query = uri
-            .query()
-            .ok_or(ConnectionError::MissingParameter("query"))?;
-        let params: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
-
-        let role = match required(&params, "role")? {
-            "proposer" => Role::Proposer,
-            "responder" => Role::Responder,
-            other => return Err(ConnectionError::InvalidRole(other.to_owned())),
-        };
-
-        let topic = required(&params, "topic")?.parse::<Topic>()?;
-        let identity = Identity::verify_token(required(&params, "auth")?, audience, now)?;
-        let registration_id = params.get("registrationId").cloned();
-
-        if role == Role::Proposer && registration_id.is_none() {
-            return Err(ConnectionError::MissingParameter("registrationId"));
-        }
-
-        Ok(Self {
-            topic,
-            role,
-            identity,
-            registration_id,
-        })
+    let identity = Identity::verify_token(&query.auth, audience, now)?;
+    if query.role == Role::Proposer && query.registration_id.is_none() {
+        return Err(ConnectionError::MissingParameter("registrationId"));
     }
-}
 
-fn required<'a>(
-    params: &'a HashMap<String, String>,
-    key: &'static str,
-) -> Result<&'a str, ConnectionError> {
-    params
-        .get(key)
-        .map(String::as_str)
-        .ok_or(ConnectionError::MissingParameter(key))
+    Ok((query, identity))
 }
 
 fn websocket_config(config: &NativeRelayTransportConfig) -> WebSocketConfig {
@@ -134,7 +92,8 @@ fn random_id() -> Result<String, ConnectionError> {
 /// A connection only depends on its [`Session`]; peer registration and
 /// teardown are the caller's responsibility.
 pub struct Connection {
-    params: ConnectionParams,
+    query: ConnectionQuery,
+    identity: Identity,
     session: Arc<Session>,
     outbound: mpsc::UnboundedReceiver<RelayFrame>,
     self_tx: mpsc::UnboundedSender<RelayFrame>,
@@ -145,14 +104,14 @@ impl Connection {
     pub async fn handshake(
         stream: TcpStream,
         config: NativeRelayTransportConfig,
-    ) -> Result<(ConnectionParams, RelayStream), ConnectionError> {
+    ) -> Result<(ConnectionQuery, Identity, RelayStream), ConnectionError> {
         let audience = config.audience.as_str();
         let now = unix_now();
-        let mut parsed: Option<Result<ConnectionParams, ConnectionError>> = None;
+        let mut parsed: Option<Result<(ConnectionQuery, Identity), ConnectionError>> = None;
         let handshake = accept_hdr_async_with_config(
             stream,
             |request: &Request, response: Response| {
-                let params = ConnectionParams::from_uri(request.uri(), audience, now);
+                let params = parse_connection(request.uri(), audience, now);
                 let accepted = params.is_ok();
                 parsed = Some(params);
                 if accepted {
@@ -165,8 +124,8 @@ impl Connection {
         )
         .await;
 
-        let params = match parsed {
-            Some(Ok(params)) => params,
+        let (query, identity) = match parsed {
+            Some(Ok(parsed)) => parsed,
             Some(Err(error)) => return Err(error),
             None => match handshake.err() {
                 Some(error) => return Err(ConnectionError::from(error)),
@@ -176,23 +135,25 @@ impl Connection {
         let websocket = handshake.map_err(ConnectionError::from)?;
         log::debug!(
             "handshake accepted for topic {} as {:?} ({})",
-            params.topic,
-            params.role,
-            params.identity.did
+            query.topic,
+            query.role,
+            identity.did
         );
 
-        Ok((params, websocket))
+        Ok((query, identity, websocket))
     }
 
     /// Build a connection for a peer that has been registered on `session`.
     pub fn new(
-        params: ConnectionParams,
+        query: ConnectionQuery,
+        identity: Identity,
         session: Arc<Session>,
         outbound: mpsc::UnboundedReceiver<RelayFrame>,
         self_tx: mpsc::UnboundedSender<RelayFrame>,
     ) -> Self {
         Self {
-            params,
+            query,
+            identity,
             session,
             outbound,
             self_tx,
@@ -206,13 +167,19 @@ impl Connection {
         registration: Registration,
     ) -> Result<(), ConnectionError> {
         let mut websocket = websocket;
+        log::debug!(
+            "serving peer {} on topic {} as {:?}",
+            self.identity.did,
+            self.query.topic,
+            self.query.role
+        );
         let both_ready = match registration {
             Registration::BothReady => true,
             Registration::Waiting => false,
             Registration::RoleTaken(role) => {
                 log::warn!(
                     "rejecting connection for topic {}: {role:?} role already taken",
-                    self.params.topic
+                    self.query.topic
                 );
                 let frame = CloseFrame {
                     code: CloseCode::Policy,
@@ -230,20 +197,20 @@ impl Connection {
         if both_ready {
             log::info!(
                 "session ready for topic {}, role {:?}",
-                self.params.topic,
-                self.params.role
+                self.query.topic,
+                self.query.role
             );
             let ready = RelayFrame {
                 v: 1,
                 id: random_id()?,
-                topic: self.params.topic.clone(),
+                topic: self.query.topic.clone(),
                 body: RelayFrameBody::SessionReady,
             };
-            let _ = self.session.route(self.params.role, ready.clone());
+            let _ = self.session.route(self.query.role, ready.clone());
             let _ = self.self_tx.send(ready);
         }
 
-        let result = read_loop(source, &self.params, &self.session).await;
+        let result = read_loop(source, &self.query, &self.session).await;
 
         drop(self.self_tx);
         let _ = shutdown_tx.send(());
@@ -281,16 +248,16 @@ async fn write_loop(
 
 async fn read_loop(
     mut source: SplitStream<RelayStream>,
-    params: &ConnectionParams,
+    query: &ConnectionQuery,
     session: &Session,
 ) -> Result<(), ConnectionError> {
     while let Some(message) = source.next().await {
         let message = message?;
         let frame = match message {
             Message::Text(text) => {
-                log::trace!("relay <- topic={} frame={text}", params.topic);
+                log::trace!("relay <- topic={} frame={text}", query.topic);
                 serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
-                    log::warn!("invalid relay frame on topic {}: {error}", params.topic);
+                    log::warn!("invalid relay frame on topic {}: {error}", query.topic);
                 })?
             }
             Message::Close(_) => break,
@@ -302,17 +269,17 @@ async fn read_loop(
         if matches!(&frame.body, RelayFrameBody::SessionReady) {
             log::warn!(
                 "client sent relay-only session_ready on topic {}",
-                params.topic
+                query.topic
             );
             return Err(ConnectionError::ClientSessionReady);
         }
 
-        match session.route(params.role, frame) {
+        match session.route(query.role, frame) {
             Ok(()) => {}
             Err(SessionError::NoCounterpart) => {
                 log::trace!(
                     "dropping frame on topic {}: counterpart not connected",
-                    params.topic
+                    query.topic
                 );
             }
             Err(error) => return Err(error.into()),
@@ -327,11 +294,8 @@ pub enum ConnectionError {
     #[error("missing query parameter: {0}")]
     MissingParameter(&'static str),
 
-    #[error("invalid role: {0}")]
-    InvalidRole(String),
-
-    #[error("invalid topic: {0}")]
-    Topic(#[from] wallet_session_core::error::Error),
+    #[error("invalid query parameters: {0}")]
+    Query(#[from] serde_urlencoded::de::Error),
 
     #[error("invalid auth token: {0}")]
     Identity(#[from] IdentityError),
@@ -363,6 +327,7 @@ mod tests {
     use super::*;
 
     use crate::auth::test_utils::{self, signing_key};
+    use wallet_session_core::message::Topic;
 
     const AUDIENCE: &str = "wss://relay.example.com";
     const NOW: u64 = 1_700_000_000;
@@ -389,23 +354,23 @@ mod tests {
             token(),
             topic
         );
-        let params = ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW)?;
+        let (query, identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
 
-        assert_eq!(params.role, Role::Proposer);
-        assert_eq!(params.topic, topic);
-        assert_eq!(params.identity.did, test_utils::did_key(&signing_key(1)));
-        assert_eq!(params.identity.session, "session");
-        assert_eq!(params.registration_id.as_deref(), Some("reg-1"));
+        assert_eq!(query.role, Role::Proposer);
+        assert_eq!(query.topic, topic);
+        assert_eq!(identity.did, test_utils::did_key(&signing_key(1)));
+        assert_eq!(identity.session, "session");
+        assert_eq!(query.registration_id.as_deref(), Some("reg-1"));
         Ok(())
     }
 
     #[test]
     fn responder_params_parse_without_registration_id() -> TestResult {
         let query = format!("auth={}&role=responder&topic={}", token(), topic()?);
-        let params = ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW)?;
+        let (query, _identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
 
-        assert_eq!(params.role, Role::Responder);
-        assert_eq!(params.registration_id, None);
+        assert_eq!(query.role, Role::Responder);
+        assert_eq!(query.registration_id, None);
         Ok(())
     }
 
@@ -413,7 +378,7 @@ mod tests {
     fn proposer_requires_registration_id() -> TestResult {
         let query = format!("auth={}&role=proposer&topic={}", token(), topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::MissingParameter("registrationId"))
         ));
         Ok(())
@@ -423,8 +388,8 @@ mod tests {
     fn invalid_role_is_rejected() -> TestResult {
         let query = format!("auth={}&role=observer&topic={}", token(), topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::InvalidRole(_))
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
+            Err(ConnectionError::Query(_))
         ));
         Ok(())
     }
@@ -433,8 +398,8 @@ mod tests {
     fn invalid_topic_is_rejected() -> TestResult {
         let query = format!("auth={}&role=responder&topic=not-a-topic", token());
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::Topic(_))
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
+            Err(ConnectionError::Query(_))
         ));
         Ok(())
     }
@@ -443,8 +408,8 @@ mod tests {
     fn missing_auth_is_rejected() -> TestResult {
         let query = format!("role=responder&topic={}", topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::MissingParameter("auth"))
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
+            Err(ConnectionError::Query(_))
         ));
         Ok(())
     }
@@ -453,7 +418,7 @@ mod tests {
     fn malformed_auth_token_is_rejected() -> TestResult {
         let query = format!("auth=no-dots&role=responder&topic={}", topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::Identity(IdentityError::MalformedToken))
         ));
         Ok(())
@@ -464,7 +429,7 @@ mod tests {
         let token = test_utils::token(&signing_key(1), "wss://other", NOW, NOW + 3600);
         let query = format!("auth={}&role=responder&topic={}", token, topic()?);
         assert!(matches!(
-            ConnectionParams::from_uri(&uri(&query)?, AUDIENCE, NOW),
+            parse_connection(&uri(&query)?, AUDIENCE, NOW),
             Err(ConnectionError::Identity(IdentityError::Audience))
         ));
         Ok(())

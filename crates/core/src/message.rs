@@ -128,8 +128,18 @@ impl From<Payload> for MessageType {
 }
 
 /// 32-byte topic, base64url.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Topic(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl<'de> Deserialize<'de> for Topic {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        encoded.parse::<Topic>().map_err(serde::de::Error::custom)
+    }
+}
 
 impl Topic {
     /// Number of bytes in a topic.

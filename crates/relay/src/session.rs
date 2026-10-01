@@ -5,12 +5,7 @@ use tokio::sync::mpsc;
 
 use wallet_session_core::frame::RelayFrame;
 
-/// Role a peer claims on a topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Role {
-    Proposer,
-    Responder,
-}
+pub use wallet_session_core::connection::Role;
 
 /// A connected peer's outbound channel.
 #[derive(Clone)]
