@@ -1,14 +1,17 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+mod client;
+mod config;
+mod error;
+mod identity;
+mod messages;
+mod pairing;
+mod random;
+mod relay;
+mod session;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use client::Client;
+pub use config::ClientConfig;
+pub use error::{ClientError, Result};
+pub use identity::{IdentityKey, Seed};
+pub use messages::{ClientMessage, RequestId};
+pub use pairing::{PairingKey, PairingUri};
+pub use session::{Role, Session, SessionState};
