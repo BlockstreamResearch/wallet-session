@@ -21,6 +21,7 @@ pub(crate) type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub(crate) struct RelayClient {
     stream: RelayStream,
     topic: Topic,
+    idle_timeout: std::time::Duration,
 }
 
 impl RelayClient {
@@ -61,6 +62,7 @@ impl RelayClient {
         Ok(Self {
             stream,
             topic: topic.clone(),
+            idle_timeout: config.idle_timeout,
         })
     }
 
@@ -80,16 +82,22 @@ impl RelayClient {
     /// Await the next relay frame
     pub(crate) async fn recv(&mut self) -> Result<RelayFrame> {
         loop {
-            let message = self.stream.next().await.ok_or(ClientError::Closed)??;
+            let message = match tokio::time::timeout(self.idle_timeout, self.stream.next()).await {
+                Ok(Some(message)) => message?,
+                Ok(None) => return Err(ClientError::Closed),
+                Err(_) => return Err(ClientError::Timeout),
+            };
+
             match message {
                 Message::Text(text) => {
                     log::trace!("client <- topic={} frame={}", self.topic, text);
                     return Ok(serde_json::from_str(&text)?);
                 }
                 Message::Close(_) => return Err(ClientError::Closed),
-                Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
-                    continue;
+                Message::Ping(payload) => {
+                    self.stream.send(Message::Pong(payload)).await?;
                 }
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
             }
         }
     }

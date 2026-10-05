@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use thiserror::Error;
-use wallet_session_core::message::Topic;
+use wallet_session_core::{frame::RelayFrame, message::Topic};
 
 use crate::session::{PeerHandle, Registration, Role, Session, SessionError};
 
@@ -28,16 +29,14 @@ impl Registry {
             .map_err(|_| RegistryError::LockPoisoned)
     }
 
-    /// Bind a peer to its topic/role slot, returning the shared session.
-    ///
-    /// Creates the topic's session on first registration. The registry lock is
-    /// released before locking the session, so the two locks are never nested.
+    /// Bind a peer to its topic/role slot, returning the shared session and any
+    /// frames buffered for it while it was disconnected.
     pub fn register(
         &self,
         topic: &Topic,
         role: Role,
         peer: PeerHandle,
-    ) -> Result<(Arc<Session>, Registration), RegistryError> {
+    ) -> Result<(Arc<Session>, Registration, Vec<RelayFrame>), RegistryError> {
         let identity = peer.identity.clone();
         let (session, created) = {
             let mut sessions = self.lock()?;
@@ -48,26 +47,48 @@ impl Registry {
             log::debug!("created session for topic {topic}");
         }
 
-        let registration = session.register(role, peer)?;
+        let (registration, buffered) = session.register(role, peer)?;
         log::debug!("registered peer {identity} on topic {topic} as {role:?}");
-        Ok((session, registration))
+        Ok((session, registration, buffered))
     }
 
-    /// Release a peer's slot, dropping the session once both slots are empty.
-    pub fn release(&self, topic: &Topic, role: Role) -> Result<(), RegistryError> {
-        let mut sessions = self.lock()?;
+    /// Reserve a disconnected peer's slot for `grace`.
+    pub fn disconnect(
+        &self,
+        topic: &Topic,
+        role: Role,
+        grace: Duration,
+    ) -> Result<(), RegistryError> {
+        let sessions = self.lock()?;
         let Some(session) = sessions.get(topic) else {
             return Ok(());
         };
         let session = session.clone();
-
-        if session.unregister(role)? {
-            sessions.remove(topic);
-            log::debug!("removed empty session for topic {topic}");
-        }
-        log::debug!("released {role:?} slot on topic {topic}");
-
+        session.disconnect(role, grace)?;
+        log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
         Ok(())
+    }
+
+    /// Expire a reservation, pruning the session when empty and returning the
+    /// remaining peer to notify.
+    pub fn expire(&self, topic: &Topic, role: Role) -> Result<Option<PeerHandle>, RegistryError> {
+        let mut sessions = self.lock()?;
+        let Some(session) = sessions.get(topic) else {
+            return Ok(None);
+        };
+        let session = session.clone();
+
+        match session.expire(role)? {
+            Some(expiry) => {
+                if expiry.empty {
+                    sessions.remove(topic);
+                    log::debug!("removed empty session for topic {topic}");
+                }
+                log::debug!("expired {role:?} reservation on topic {topic}");
+                Ok(expiry.counterpart)
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -84,7 +105,6 @@ pub enum RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wallet_session_core::frame::RelayFrame;
     use tokio::sync::mpsc;
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
@@ -108,8 +128,9 @@ mod tests {
     fn first_registration_waits() -> TestResult {
         let registry = Registry::new();
         let (proposer, _) = peer("did:key:proposer");
-        let (_, registration) = registry.register(&topic()?, Role::Proposer, proposer)?;
+        let (_, registration, buffered) = registry.register(&topic()?, Role::Proposer, proposer)?;
         assert!(matches!(registration, Registration::Waiting));
+        assert!(buffered.is_empty());
         Ok(())
     }
 
@@ -119,9 +140,9 @@ mod tests {
         let (proposer, _) = peer("did:key:proposer");
         let (responder, _) = peer("did:key:responder");
         let topic = topic()?;
-        let (_, first) = registry.register(&topic, Role::Proposer, proposer)?;
+        let (_, first, _) = registry.register(&topic, Role::Proposer, proposer)?;
         assert!(matches!(first, Registration::Waiting));
-        let (_, second) = registry.register(&topic, Role::Responder, responder)?;
+        let (_, second, _) = registry.register(&topic, Role::Responder, responder)?;
         assert!(matches!(second, Registration::BothReady));
         Ok(())
     }
@@ -133,7 +154,7 @@ mod tests {
         let (second, _) = peer("did:key:second");
         let topic = topic()?;
         registry.register(&topic, Role::Proposer, first)?;
-        let (_, registration) = registry.register(&topic, Role::Proposer, second)?;
+        let (_, registration, _) = registry.register(&topic, Role::Proposer, second)?;
         assert!(matches!(
             registration,
             Registration::RoleTaken(Role::Proposer)
@@ -141,33 +162,22 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn release_prunes_empty_session() -> TestResult {
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_reserves_and_expire_prunes() -> TestResult {
         let registry = Registry::new();
         let topic = topic()?;
         let (proposer, _) = peer("did:key:proposer");
-        let (first, _) = registry.register(&topic, Role::Proposer, proposer)?;
-        registry.release(&topic, Role::Proposer)?;
+        let (session, _, _) = registry.register(&topic, Role::Proposer, proposer)?;
+
+        registry.disconnect(&topic, Role::Proposer, Duration::from_secs(10))?;
+        assert!(registry.expire(&topic, Role::Proposer)?.is_none());
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(registry.expire(&topic, Role::Proposer)?.is_none());
 
         let (replacement, _) = peer("did:key:replacement");
-        let (second, registration) = registry.register(&topic, Role::Proposer, replacement)?;
-        assert!(matches!(registration, Registration::Waiting));
-        assert!(!Arc::ptr_eq(&first, &second));
-        Ok(())
-    }
-
-    #[test]
-    fn release_keeps_session_while_peer_remains() -> TestResult {
-        let registry = Registry::new();
-        let topic = topic()?;
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
-        let (session, _) = registry.register(&topic, Role::Proposer, proposer)?;
-        registry.register(&topic, Role::Responder, responder)?;
-        registry.release(&topic, Role::Proposer)?;
-
-        let (again, _) = registry.register(&topic, Role::Proposer, peer("did:key:again").0)?;
-        assert!(Arc::ptr_eq(&session, &again));
+        let (again, _, _) = registry.register(&topic, Role::Proposer, replacement)?;
+        assert!(!Arc::ptr_eq(&session, &again));
         Ok(())
     }
 

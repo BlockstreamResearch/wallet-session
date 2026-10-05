@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
-
+use tokio::time::{Duration, Instant};
 use wallet_session_core::frame::RelayFrame;
 
 pub use wallet_session_core::connection::Role;
@@ -46,11 +47,50 @@ pub struct Session {
     slots: Mutex<Slots>,
 }
 
+/// A role slot: either a live peer or a disconnected peer's reservation.
+enum Slot {
+    Connected(PeerHandle),
+    Disconnected {
+        identity: String,
+        deadline: Instant,
+        buffered: VecDeque<RelayFrame>,
+    },
+}
+
 /// The two role slots for one topic.
 #[derive(Default)]
 struct Slots {
-    proposer: Option<PeerHandle>,
-    responder: Option<PeerHandle>,
+    proposer: Option<Slot>,
+    responder: Option<Slot>,
+}
+
+impl Slots {
+    fn get(&self, role: Role) -> &Option<Slot> {
+        match role {
+            Role::Proposer => &self.proposer,
+            Role::Responder => &self.responder,
+        }
+    }
+
+    fn get_mut(&mut self, role: Role) -> &mut Option<Slot> {
+        match role {
+            Role::Proposer => &mut self.proposer,
+            Role::Responder => &mut self.responder,
+        }
+    }
+
+    fn is_connected(&self, role: Role) -> bool {
+        matches!(self.get(role), Some(Slot::Connected(_)))
+    }
+}
+
+/// Result of expiring a reservation.
+pub(crate) struct Expiry {
+    /// Whether the session now has no peers left.
+    pub empty: bool,
+
+    /// The remaining peer to notify, if any.
+    pub counterpart: Option<PeerHandle>,
 }
 
 impl Session {
@@ -59,58 +99,109 @@ impl Session {
         self.slots.lock().map_err(|_| SessionError::LockPoisoned)
     }
 
-    /// Bind a peer to its role slot
+    /// Bind a peer to its role slot, reclaiming a same-identity reservation.
+    ///
+    /// Returns the registration result and any frames buffered for this peer
+    /// while it was disconnected.
     pub(crate) fn register(
         &self,
         role: Role,
         peer: PeerHandle,
-    ) -> Result<Registration, SessionError> {
+    ) -> Result<(Registration, Vec<RelayFrame>), SessionError> {
         let mut slots = self.lock()?;
+        let now = Instant::now();
 
-        if slot(&mut slots, role).is_some() {
-            return Ok(Registration::RoleTaken(role));
+        match slots.get(role) {
+            Some(Slot::Connected(_)) => {
+                return Ok((Registration::RoleTaken(role), Vec::new()));
+            }
+            Some(Slot::Disconnected {
+                identity, deadline, ..
+            }) if now < *deadline && *identity != peer.identity => {
+                return Ok((Registration::RoleTaken(role), Vec::new()));
+            }
+            _ => {}
         }
-        *slot(&mut slots, role) = Some(peer);
 
-        let counterpart_present = match role {
-            Role::Proposer => slots.responder.is_some(),
-            Role::Responder => slots.proposer.is_some(),
+        let buffered = match slots.get_mut(role).take() {
+            Some(Slot::Disconnected { buffered, .. }) => buffered.into_iter().collect(),
+            _ => Vec::new(),
         };
+        *slots.get_mut(role) = Some(Slot::Connected(peer));
 
-        Ok(if counterpart_present {
+        let counterpart_connected = slots.is_connected(role.counterpart());
+        let registration = if counterpart_connected {
             Registration::BothReady
         } else {
             Registration::Waiting
-        })
-    }
-
-    /// Clear a peer's slot on disconnect
-    pub(crate) fn unregister(&self, role: Role) -> Result<bool, SessionError> {
-        let mut slots = self.lock()?;
-        *slot(&mut slots, role) = None;
-        Ok(slots.proposer.is_none() && slots.responder.is_none())
-    }
-
-    /// Forward a frame to the peer on the other side of the topic.
-    pub(crate) fn route(&self, from: Role, frame: RelayFrame) -> Result<(), SessionError> {
-        let slots = self.lock()?;
-        let counterpart = match from {
-            Role::Proposer => slots.responder.as_ref(),
-            Role::Responder => slots.proposer.as_ref(),
         };
 
-        counterpart
-            .ok_or(SessionError::NoCounterpart)?
-            .tx
-            .send(frame)
-            .map_err(|_| SessionError::NoCounterpart)
+        Ok((registration, buffered))
     }
-}
 
-fn slot(slots: &mut Slots, role: Role) -> &mut Option<PeerHandle> {
-    match role {
-        Role::Proposer => &mut slots.proposer,
-        Role::Responder => &mut slots.responder,
+    /// Reserve a peer's slot for `grace`, buffering frames addressed to it.
+    pub(crate) fn disconnect(&self, role: Role, grace: Duration) -> Result<(), SessionError> {
+        let mut slots = self.lock()?;
+        let Some(Slot::Connected(peer)) = slots.get(role) else {
+            return Ok(());
+        };
+        let identity = peer.identity.clone();
+        *slots.get_mut(role) = Some(Slot::Disconnected {
+            identity,
+            deadline: Instant::now() + grace,
+            buffered: VecDeque::new(),
+        });
+        Ok(())
+    }
+
+    /// Clear an expired reservation, reporting the remaining peer.
+    pub(crate) fn expire(&self, role: Role) -> Result<Option<Expiry>, SessionError> {
+        let mut slots = self.lock()?;
+
+        let expired = matches!(
+            slots.get(role),
+            Some(Slot::Disconnected { deadline, .. }) if Instant::now() >= *deadline
+        );
+        if !expired {
+            return Ok(None);
+        }
+        *slots.get_mut(role) = None;
+
+        let counterpart = match slots.get(role.counterpart()) {
+            Some(Slot::Connected(peer)) => Some(peer.clone()),
+            _ => None,
+        };
+        let empty = slots.proposer.is_none() && slots.responder.is_none();
+
+        Ok(Some(Expiry { empty, counterpart }))
+    }
+
+    /// Forward a frame to the counterpart, buffering while it is disconnected.
+    pub(crate) fn route(
+        &self,
+        from: Role,
+        frame: RelayFrame,
+        max_buffered: usize,
+    ) -> Result<(), SessionError> {
+        let mut slots = self.lock()?;
+        let target = from.counterpart();
+
+        if let Some(Slot::Connected(peer)) = slots.get(target) {
+            return peer.tx.send(frame).map_err(|_| SessionError::NoCounterpart);
+        }
+
+        match slots.get_mut(target) {
+            Some(Slot::Disconnected { buffered, .. }) => {
+                if max_buffered > 0 {
+                    if buffered.len() >= max_buffered {
+                        buffered.pop_front();
+                    }
+                    buffered.push_back(frame);
+                }
+                Ok(())
+            }
+            _ => Err(SessionError::NoCounterpart),
+        }
     }
 }
 
@@ -121,6 +212,8 @@ mod tests {
     use wallet_session_core::message::Topic;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const MAX_BUFFERED: usize = 8;
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([1u8; 32])
@@ -154,11 +247,11 @@ mod tests {
         let (proposer, _) = peer("did:key:proposer");
         let (responder, _) = peer("did:key:responder");
         assert!(matches!(
-            session.register(Role::Proposer, proposer)?,
+            session.register(Role::Proposer, proposer)?.0,
             Registration::Waiting
         ));
         assert!(matches!(
-            session.register(Role::Responder, responder)?,
+            session.register(Role::Responder, responder)?.0,
             Registration::BothReady
         ));
         Ok(())
@@ -171,7 +264,7 @@ mod tests {
         let (second, _) = peer("did:key:second");
         session.register(Role::Proposer, first)?;
         assert!(matches!(
-            session.register(Role::Proposer, second)?,
+            session.register(Role::Proposer, second)?.0,
             Registration::RoleTaken(Role::Proposer)
         ));
         Ok(())
@@ -185,7 +278,7 @@ mod tests {
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
 
-        session.route(Role::Proposer, frame(&topic()?))?;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
 
         let received = responder_rx.try_recv()?;
         assert!(matches!(received.body, RelayFrameBody::Message { .. }));
@@ -199,50 +292,99 @@ mod tests {
         session.register(Role::Proposer, proposer)?;
 
         assert!(matches!(
-            session.route(Role::Proposer, frame(&topic()?)),
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED),
             Err(SessionError::NoCounterpart)
         ));
         Ok(())
     }
 
-    #[test]
-    fn route_errors_when_counterpart_channel_is_closed() -> TestResult {
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_buffers_and_same_identity_reclaims() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer("did:key:proposer");
-        let (responder, responder_rx) = peer("did:key:responder");
+        let (responder, mut responder_rx) = peer("did:key:responder");
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
-        drop(responder_rx);
 
-        assert!(matches!(
-            session.route(Role::Proposer, frame(&topic()?)),
-            Err(SessionError::NoCounterpart)
-        ));
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        // Frames to the disconnected peer are buffered, not dropped.
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
+        assert!(responder_rx.try_recv().is_err());
+
+        // Same identity reconnects within grace and receives the buffer.
+        let (responder, _) = peer("did:key:responder");
+        let (registration, buffered) = session.register(Role::Responder, responder)?;
+        assert!(matches!(registration, Registration::BothReady));
+        assert_eq!(buffered.len(), 1);
         Ok(())
     }
 
-    #[test]
-    fn unregister_clears_slot() -> TestResult {
+    #[tokio::test(start_paused = true)]
+    async fn reclaim_with_different_identity_is_rejected() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer("did:key:proposer");
         let (responder, _) = peer("did:key:responder");
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
-        session.unregister(Role::Proposer)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
+        let (impostor, _) = peer("did:key:impostor");
         assert!(matches!(
-            session.route(Role::Responder, frame(&topic()?)),
-            Err(SessionError::NoCounterpart)
+            session.register(Role::Responder, impostor)?.0,
+            Registration::RoleTaken(Role::Responder)
         ));
         Ok(())
     }
 
-    #[test]
-    fn unregister_reports_empty_session() -> TestResult {
+    #[tokio::test(start_paused = true)]
+    async fn overflow_drops_oldest() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer("did:key:proposer");
+        let (responder, _) = peer("did:key:responder");
+        session.register(Role::Proposer, proposer)?;
+        session.register(Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        for _ in 0..3 {
+            session.route(Role::Proposer, frame(&topic()?), 2)?;
+        }
+
+        let (responder, _) = peer("did:key:responder");
+        let (_, buffered) = session.register(Role::Responder, responder)?;
+        assert_eq!(buffered.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expire_reports_counterpart() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer("did:key:proposer");
+        let (responder, _) = peer("did:key:responder");
+        session.register(Role::Proposer, proposer)?;
+        session.register(Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        assert!(session.expire(Role::Responder)?.is_none());
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let expiry = session.expire(Role::Responder)?.expect("expired");
+        assert!(!expiry.empty);
+        assert!(expiry.counterpart.is_some());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expire_prunes_when_both_gone() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer("did:key:proposer");
         session.register(Role::Proposer, proposer)?;
-        assert!(session.unregister(Role::Proposer)?);
+        session.disconnect(Role::Proposer, Duration::from_secs(10))?;
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let expiry = session.expire(Role::Proposer)?.expect("expired");
+        assert!(expiry.empty);
+        assert!(expiry.counterpart.is_none());
         Ok(())
     }
 
@@ -259,7 +401,7 @@ mod tests {
         assert!(outcome.is_err());
 
         assert!(matches!(
-            session.route(Role::Proposer, frame(&topic()?)),
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED),
             Err(SessionError::LockPoisoned)
         ));
         Ok(())

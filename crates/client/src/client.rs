@@ -6,7 +6,7 @@ use wallet_session_core::{
 
 use crate::{
     config::ClientConfig,
-    error::Result,
+    error::{ClientError, Result},
     identity::IdentityKey,
     messages::{ClientMessage, RequestId},
     random,
@@ -48,6 +48,10 @@ impl Client {
                 RelayFrameBody::SessionReady => {
                     self.session.state = SessionState::Active;
                 }
+                RelayFrameBody::PeerDisconnected => {
+                    self.session.state = SessionState::Disconnected;
+                    return Err(ClientError::PeerDisconnected);
+                }
                 RelayFrameBody::Message { payload } => {
                     log::debug!("dropping message received before session_ready: {payload}");
                 }
@@ -71,8 +75,15 @@ impl Client {
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         loop {
             let frame = self.transport.recv().await?;
-            if let RelayFrameBody::Message { payload } = frame.body {
-                return ClientMessage::from_payload(&payload);
+            match frame.body {
+                RelayFrameBody::Message { payload } => {
+                    return ClientMessage::from_payload(&payload);
+                }
+                RelayFrameBody::PeerDisconnected => {
+                    self.session.state = SessionState::Disconnected;
+                    return Err(ClientError::PeerDisconnected);
+                }
+                RelayFrameBody::SessionReady => {}
             }
         }
     }

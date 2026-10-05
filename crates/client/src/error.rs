@@ -24,6 +24,12 @@ pub enum ClientError {
     #[error("relay connection closed")]
     Closed,
 
+    #[error("relay connection timed out")]
+    Timeout,
+
+    #[error("peer disconnected")]
+    PeerDisconnected,
+
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),
 

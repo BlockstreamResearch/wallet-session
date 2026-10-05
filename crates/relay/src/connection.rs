@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures_util::{
     SinkExt, StreamExt,
@@ -12,7 +12,7 @@ use tokio::{
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async_with_config,
     tungstenite::{
-        Message,
+        Bytes, Message,
         handshake::server::{ErrorResponse, Request, Response},
         http::{StatusCode, Uri},
         protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
@@ -32,6 +32,18 @@ type RelayStream = WebSocketStream<TcpStream>;
 /// Default maximum WebSocket text or binary frame size accepted from a client.
 pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Default time a disconnected peer's slot is reserved for reconnection.
+pub const DEFAULT_SESSION_GRACE: Duration = Duration::from_secs(10);
+
+/// Default maximum frames buffered per disconnected peer.
+pub const DEFAULT_SESSION_BUFFER_MAX_MESSAGES: usize = 256;
+
+/// Default interval between relay keepalive pings.
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default maximum time without any inbound traffic before a peer is dropped.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Runtime limits for the relay connection handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRelayTransportConfig {
@@ -40,6 +52,18 @@ pub struct NativeRelayTransportConfig {
 
     /// Maximum incoming text or binary frame size before JSON parsing.
     pub max_incoming_frame_bytes: usize,
+
+    /// Time a disconnected peer's slot is reserved for reconnection.
+    pub session_grace: Duration,
+
+    /// Maximum frames buffered per disconnected peer.
+    pub session_buffer_max_messages: usize,
+
+    /// Interval between relay keepalive pings.
+    pub ping_interval: Duration,
+
+    /// Maximum time without any inbound traffic before a peer is dropped.
+    pub idle_timeout: Duration,
 }
 
 impl NativeRelayTransportConfig {
@@ -48,7 +72,35 @@ impl NativeRelayTransportConfig {
         Self {
             audience: audience.into(),
             max_incoming_frame_bytes: DEFAULT_MAX_INCOMING_FRAME_BYTES,
+            session_grace: DEFAULT_SESSION_GRACE,
+            session_buffer_max_messages: DEFAULT_SESSION_BUFFER_MAX_MESSAGES,
+            ping_interval: DEFAULT_PING_INTERVAL,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+
+    /// Set the reconnection grace window.
+    pub fn with_session_grace(mut self, grace: Duration) -> Self {
+        self.session_grace = grace;
+        self
+    }
+
+    /// Set the per-peer buffer limit.
+    pub fn with_session_buffer_max_messages(mut self, max: usize) -> Self {
+        self.session_buffer_max_messages = max;
+        self
+    }
+
+    /// Set the keepalive ping interval.
+    pub fn with_ping_interval(mut self, interval: Duration) -> Self {
+        self.ping_interval = interval;
+        self
+    }
+
+    /// Set the idle timeout.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 }
 
@@ -81,7 +133,7 @@ fn reject_response() -> ErrorResponse {
     response
 }
 
-fn random_id() -> Result<String, ConnectionError> {
+pub(crate) fn random_id() -> Result<String, ConnectionError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)?;
     Ok(codec::encode(&bytes))
@@ -97,10 +149,12 @@ pub struct Connection {
     session: Arc<Session>,
     outbound: mpsc::UnboundedReceiver<RelayFrame>,
     self_tx: mpsc::UnboundedSender<RelayFrame>,
+    config: NativeRelayTransportConfig,
 }
 
 impl Connection {
     /// Perform the WebSocket handshake and parse the connection parameters.
+    #[allow(clippy::result_large_err)]
     pub async fn handshake(
         stream: TcpStream,
         config: NativeRelayTransportConfig,
@@ -150,6 +204,7 @@ impl Connection {
         session: Arc<Session>,
         outbound: mpsc::UnboundedReceiver<RelayFrame>,
         self_tx: mpsc::UnboundedSender<RelayFrame>,
+        config: NativeRelayTransportConfig,
     ) -> Self {
         Self {
             query,
@@ -157,6 +212,7 @@ impl Connection {
             session,
             outbound,
             self_tx,
+            config,
         }
     }
 
@@ -165,6 +221,7 @@ impl Connection {
         self,
         websocket: RelayStream,
         registration: Registration,
+        buffered: Vec<RelayFrame>,
     ) -> Result<(), ConnectionError> {
         let mut websocket = websocket;
         log::debug!(
@@ -192,7 +249,12 @@ impl Connection {
 
         let (sink, source) = websocket.split();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let writer = tokio::spawn(write_loop(sink, self.outbound, shutdown_rx));
+        let writer = tokio::spawn(write_loop(
+            sink,
+            self.outbound,
+            shutdown_rx,
+            self.config.ping_interval,
+        ));
 
         if both_ready {
             log::info!(
@@ -206,11 +268,33 @@ impl Connection {
                 topic: self.query.topic.clone(),
                 body: RelayFrameBody::SessionReady,
             };
-            let _ = self.session.route(self.query.role, ready.clone());
+            let _ = self.session.route(
+                self.query.role,
+                ready.clone(),
+                self.config.session_buffer_max_messages,
+            );
             let _ = self.self_tx.send(ready);
         }
 
-        let result = read_loop(source, &self.query, &self.session).await;
+        if !buffered.is_empty() {
+            log::debug!(
+                "redelivering {} buffered frame(s) to {}",
+                buffered.len(),
+                self.identity.did
+            );
+            for frame in buffered {
+                let _ = self.self_tx.send(frame);
+            }
+        }
+
+        let result = read_loop(
+            source,
+            &self.query,
+            &self.session,
+            self.config.session_buffer_max_messages,
+            self.config.idle_timeout,
+        )
+        .await;
 
         drop(self.self_tx);
         let _ = shutdown_tx.send(());
@@ -224,7 +308,12 @@ async fn write_loop(
     mut sink: SplitSink<RelayStream, Message>,
     mut rx: mpsc::UnboundedReceiver<RelayFrame>,
     mut shutdown: oneshot::Receiver<()>,
+    ping_interval: Duration,
 ) {
+    let mut ping =
+        tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             received = rx.recv() => match received {
@@ -240,6 +329,11 @@ async fn write_loop(
                 }
                 None => break,
             },
+            _ = ping.tick() => {
+                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break;
+                }
+            }
             _ = &mut shutdown => break,
         }
     }
@@ -250,9 +344,23 @@ async fn read_loop(
     mut source: SplitStream<RelayStream>,
     query: &ConnectionQuery,
     session: &Session,
+    max_buffered: usize,
+    idle_timeout: Duration,
 ) -> Result<(), ConnectionError> {
-    while let Some(message) = source.next().await {
-        let message = message?;
+    loop {
+        let message = match tokio::time::timeout(idle_timeout, source.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(None) => break,
+            Err(_) => {
+                log::debug!(
+                    "peer on topic {} idle for {idle_timeout:?}; dropping",
+                    query.topic
+                );
+                return Err(ConnectionError::IdleTimeout);
+            }
+        };
+
         let frame = match message {
             Message::Text(text) => {
                 log::trace!("relay <- topic={} frame={text}", query.topic);
@@ -261,6 +369,7 @@ async fn read_loop(
                 })?
             }
             Message::Close(_) => break,
+            // Keepalive pongs and other control frames count as activity.
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
                 continue;
             }
@@ -274,7 +383,7 @@ async fn read_loop(
             return Err(ConnectionError::ClientSessionReady);
         }
 
-        match session.route(query.role, frame) {
+        match session.route(query.role, frame, max_buffered) {
             Ok(()) => {}
             Err(SessionError::NoCounterpart) => {
                 log::trace!(
@@ -317,6 +426,9 @@ pub enum ConnectionError {
 
     #[error("websocket handshake failed")]
     HandshakeFailed,
+
+    #[error("peer idle timeout")]
+    IdleTimeout,
 
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),

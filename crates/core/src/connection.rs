@@ -20,6 +20,13 @@ impl Role {
             Role::Responder => "responder",
         }
     }
+
+    pub fn counterpart(self) -> Self {
+        match self {
+            Role::Proposer => Role::Responder,
+            Role::Responder => Role::Proposer,
+        }
+    }
 }
 
 impl fmt::Display for Role {

@@ -26,6 +26,9 @@ pub enum RelayFrameBody {
     /// Relay signal that both peers are connected.
     SessionReady,
 
+    /// Relay signal that the counterpart disconnected and its session expired.
+    PeerDisconnected,
+
     /// Opaque application envelope routed to the counterpart.
     Message { payload: String },
 }

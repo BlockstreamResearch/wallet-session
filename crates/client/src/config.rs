@@ -14,6 +14,9 @@ pub struct ClientConfig {
 
     /// Lifetime of the signed connection token.
     pub token_ttl: Duration,
+
+    /// Maximum time without an inbound frame before the relay is considered dead.
+    pub idle_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -25,6 +28,7 @@ impl ClientConfig {
             relay_url,
             registration_id: None,
             token_ttl: Duration::from_secs(300),
+            idle_timeout: Duration::from_secs(60),
         }
     }
 
@@ -43,6 +47,12 @@ impl ClientConfig {
     /// Set the connection token lifetime.
     pub fn with_token_ttl(mut self, token_ttl: Duration) -> Self {
         self.token_ttl = token_ttl;
+        self
+    }
+
+    /// Set the inbound idle timeout.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
         self
     }
 }
