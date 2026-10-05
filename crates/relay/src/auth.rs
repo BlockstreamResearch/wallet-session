@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
-use wallet_session_core::{auth::RelayAuthToken, codec};
+use wallet_session_core::{auth::RelayAuthToken, codec, did::DidKey};
 
 /// JWT `alg` accepted for the identity signature
 const JWT_ALGORITHM: &str = "EdDSA";
@@ -10,14 +10,11 @@ const JWT_ALGORITHM: &str = "EdDSA";
 /// Tolerance applied to `iat`/`exp` checks, in seconds
 const TOKEN_LEEWAY_SECS: u64 = 60;
 
-/// Multicodec prefix for an Ed25519 public key
-const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
-
 /// Identity established by a verified connection token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// `did:key` derived from the identity public key.
-    pub did: String,
+    pub did: DidKey,
 
     /// Session identifier.
     pub session: String,
@@ -79,7 +76,8 @@ impl Identity {
         }
 
         let token: RelayAuthToken = serde_json::from_slice(&codec::decode(payload_b64)?)?;
-        let key = ed25519_key_from_did(&token.iss)?;
+        let key = VerifyingKey::from_bytes(&token.iss.to_ed25519_bytes())
+            .map_err(|error| IdentityError::DidKey(error.to_string()))?;
 
         let signature = Signature::from_slice(&codec::decode(signature_b64)?)?;
         let signing_input = format!("{header_b64}.{payload_b64}");
@@ -108,39 +106,17 @@ struct JwtHeader {
     alg: String,
 }
 
-/// Decode an Ed25519 public key from a `did:key` identifier.
-fn ed25519_key_from_did(did: &str) -> Result<VerifyingKey, IdentityError> {
-    let encoded = did
-        .strip_prefix("did:key:z")
-        .ok_or_else(|| IdentityError::DidKey(did.to_owned()))?;
-    let bytes = bs58::decode(encoded)
-        .into_vec()
-        .map_err(|error| IdentityError::DidKey(error.to_string()))?;
-
-    if (bytes.len() != ED25519_MULTICODEC.len() + 32) || !bytes.starts_with(&ED25519_MULTICODEC) {
-        return Err(IdentityError::DidKey(did.to_owned()));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes[ED25519_MULTICODEC.len()..]);
-    VerifyingKey::from_bytes(&key).map_err(|error| IdentityError::DidKey(error.to_string()))
-}
-
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use super::ED25519_MULTICODEC;
     use ed25519_dalek::{Signer, SigningKey};
-    use wallet_session_core::codec;
+    use wallet_session_core::{codec, did::DidKey};
 
     pub(crate) fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    pub(crate) fn did_key(signing_key: &SigningKey) -> String {
-        let mut bytes = [0u8; ED25519_MULTICODEC.len() + 32];
-        bytes[..ED25519_MULTICODEC.len()].copy_from_slice(&ED25519_MULTICODEC);
-        bytes[ED25519_MULTICODEC.len()..].copy_from_slice(&signing_key.verifying_key().to_bytes());
-        format!("did:key:z{}", bs58::encode(bytes).into_string())
+    pub(crate) fn did_key(signing_key: &SigningKey) -> DidKey {
+        DidKey::from_ed25519_bytes(signing_key.verifying_key().to_bytes())
     }
 
     /// Build a validly signed token with the given audience and timestamps.
@@ -157,11 +133,20 @@ pub(crate) mod test_utils {
         exp: u64,
     ) -> String {
         let iss = did_key(signing_key);
-        build_token(signing_key, alg, &iss, aud, iat, exp)
+        build_token(signing_key, alg, &iss.to_string(), aud, iat, exp)
     }
 
-    /// Build a signed token whose `iss` claim is not the signing key's did:key.
     pub(crate) fn token_with_iss(
+        signing_key: &SigningKey,
+        iss: &DidKey,
+        aud: &str,
+        iat: u64,
+        exp: u64,
+    ) -> String {
+        build_token(signing_key, "EdDSA", &iss.to_string(), aud, iat, exp)
+    }
+
+    pub(crate) fn raw_token_with_iss(
         signing_key: &SigningKey,
         iss: &str,
         aud: &str,
@@ -282,16 +267,17 @@ mod tests {
 
     #[test]
     fn rejects_non_did_key_issuer() {
-        let token = test_utils::token_with_iss(
+        let token = test_utils::raw_token_with_iss(
             &signing_key(1),
             "did:web:example.com",
             AUDIENCE,
             NOW,
             NOW + 3600,
         );
+        // The malformed issuer fails while deserializing the payload.
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
-            Err(IdentityError::DidKey(_))
+            Err(IdentityError::Token(_))
         ));
     }
 

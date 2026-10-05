@@ -1,12 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
-use wallet_session_core::{auth::RelayAuthToken, codec};
+use wallet_session_core::{auth::RelayAuthToken, codec, did::DidKey};
 
 use crate::{error::Result, random};
-
-/// Multicodec prefix for an Ed25519 public key (`ed25519-pub`).
-const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 
 /// Long-term identity seed, persisted across reconnects and restarts.
 #[derive(Clone)]
@@ -44,8 +41,8 @@ impl IdentityKey {
     }
 
     /// `did:key` identifier derived from the identity public key.
-    pub fn did(&self) -> String {
-        did_key(&self.0.verifying_key().to_bytes())
+    pub fn did(&self) -> DidKey {
+        DidKey::from_ed25519_bytes(self.0.verifying_key().to_bytes())
     }
 
     /// Sign a connection token for the given relay session and audience.
@@ -82,13 +79,6 @@ pub fn unix_now() -> u64 {
     }
 }
 
-fn did_key(public_key: &[u8; 32]) -> String {
-    let mut bytes = [0u8; ED25519_MULTICODEC.len() + 32];
-    bytes[..ED25519_MULTICODEC.len()].copy_from_slice(&ED25519_MULTICODEC);
-    bytes[ED25519_MULTICODEC.len()..].copy_from_slice(public_key);
-    format!("did:key:z{}", bs58::encode(bytes).into_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,7 +89,7 @@ mod tests {
         let first = IdentityKey::from_seed(&seed).did();
         let second = IdentityKey::from_seed(&seed).did();
         assert_eq!(first, second);
-        assert!(first.starts_with("did:key:z"));
+        assert!(first.to_string().starts_with("did:key:z"));
     }
 
     #[test]

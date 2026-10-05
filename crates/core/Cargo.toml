@@ -13,6 +13,8 @@ sha2 = "0.11.0"
 x25519-dalek = "3.0.0"
 ed25519-dalek = "3.0.0"
 
+bs58 = "0.5.1"
+
 serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

@@ -111,11 +111,11 @@ mod tests {
         Topic::new([0u8; 32])
     }
 
-    fn peer(identity: &str) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
+    fn peer(seed: u8) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             PeerHandle {
-                identity: identity.to_owned(),
+                identity: wallet_session_core::did::DidKey::from_ed25519_bytes([seed; 32]),
                 tx,
             },
             rx,
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn first_registration_waits() -> TestResult {
         let registry = Registry::new();
-        let (proposer, _) = peer("did:key:proposer");
+        let (proposer, _) = peer(1);
         let (_, registration, buffered) = registry.register(&topic()?, Role::Proposer, proposer)?;
         assert!(matches!(registration, Registration::Waiting));
         assert!(buffered.is_empty());
@@ -137,8 +137,8 @@ mod tests {
     #[test]
     fn second_registration_signals_both_ready() -> TestResult {
         let registry = Registry::new();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
         let topic = topic()?;
         let (_, first, _) = registry.register(&topic, Role::Proposer, proposer)?;
         assert!(matches!(first, Registration::Waiting));
@@ -150,8 +150,8 @@ mod tests {
     #[test]
     fn duplicate_role_is_rejected() -> TestResult {
         let registry = Registry::new();
-        let (first, _) = peer("did:key:first");
-        let (second, _) = peer("did:key:second");
+        let (first, _) = peer(1);
+        let (second, _) = peer(2);
         let topic = topic()?;
         registry.register(&topic, Role::Proposer, first)?;
         let (_, registration, _) = registry.register(&topic, Role::Proposer, second)?;
@@ -166,7 +166,7 @@ mod tests {
     async fn disconnect_reserves_and_expire_prunes() -> TestResult {
         let registry = Registry::new();
         let topic = topic()?;
-        let (proposer, _) = peer("did:key:proposer");
+        let (proposer, _) = peer(1);
         let (session, _, _) = registry.register(&topic, Role::Proposer, proposer)?;
 
         registry.disconnect(&topic, Role::Proposer, Duration::from_secs(10))?;
@@ -175,7 +175,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(11)).await;
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
 
-        let (replacement, _) = peer("did:key:replacement");
+        let (replacement, _) = peer(3);
         let (again, _, _) = registry.register(&topic, Role::Proposer, replacement)?;
         assert!(!Arc::ptr_eq(&session, &again));
         Ok(())
@@ -193,7 +193,7 @@ mod tests {
         std::panic::set_hook(previous_hook);
         assert!(outcome.is_err());
 
-        let (proposer, _) = peer("did:key:proposer");
+        let (proposer, _) = peer(1);
         assert!(matches!(
             registry.register(&topic()?, Role::Proposer, proposer),
             Err(RegistryError::LockPoisoned)

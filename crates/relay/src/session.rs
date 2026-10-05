@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
-use wallet_session_core::frame::RelayFrame;
+use wallet_session_core::{did::DidKey, frame::RelayFrame};
 
 pub use wallet_session_core::connection::Role;
 
@@ -12,7 +12,7 @@ pub use wallet_session_core::connection::Role;
 #[derive(Clone)]
 pub struct PeerHandle {
     /// `did:key` of the peer.
-    pub identity: String,
+    pub identity: DidKey,
 
     /// Channel to the peer's writer task.
     pub tx: mpsc::UnboundedSender<RelayFrame>,
@@ -51,7 +51,7 @@ pub struct Session {
 enum Slot {
     Connected(PeerHandle),
     Disconnected {
-        identity: String,
+        identity: DidKey,
         deadline: Instant,
         buffered: VecDeque<RelayFrame>,
     },
@@ -219,11 +219,11 @@ mod tests {
         Topic::new([1u8; 32])
     }
 
-    fn peer(identity: &str) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
+    fn peer(seed: u8) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             PeerHandle {
-                identity: identity.to_owned(),
+                identity: DidKey::from_ed25519_bytes([seed; 32]),
                 tx,
             },
             rx,
@@ -244,8 +244,8 @@ mod tests {
     #[test]
     fn second_registration_signals_both_ready() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
         assert!(matches!(
             session.register(Role::Proposer, proposer)?.0,
             Registration::Waiting
@@ -260,8 +260,8 @@ mod tests {
     #[test]
     fn duplicate_role_is_rejected() -> TestResult {
         let session = Session::default();
-        let (first, _) = peer("did:key:first");
-        let (second, _) = peer("did:key:second");
+        let (first, _) = peer(1);
+        let (second, _) = peer(2);
         session.register(Role::Proposer, first)?;
         assert!(matches!(
             session.register(Role::Proposer, second)?.0,
@@ -273,8 +273,8 @@ mod tests {
     #[test]
     fn route_delivers_to_counterpart() -> TestResult {
         let session = Session::default();
-        let (proposer, _proposer_rx) = peer("did:key:proposer");
-        let (responder, mut responder_rx) = peer("did:key:responder");
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, mut responder_rx) = peer(2);
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
 
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn route_without_counterpart_errors() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
+        let (proposer, _) = peer(1);
         session.register(Role::Proposer, proposer)?;
 
         assert!(matches!(
@@ -301,8 +301,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn disconnect_buffers_and_same_identity_reclaims() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, mut responder_rx) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, mut responder_rx) = peer(2);
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
 
@@ -313,7 +313,7 @@ mod tests {
         assert!(responder_rx.try_recv().is_err());
 
         // Same identity reconnects within grace and receives the buffer.
-        let (responder, _) = peer("did:key:responder");
+        let (responder, _) = peer(2);
         let (registration, buffered) = session.register(Role::Responder, responder)?;
         assert!(matches!(registration, Registration::BothReady));
         assert_eq!(buffered.len(), 1);
@@ -323,13 +323,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reclaim_with_different_identity_is_rejected() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
-        let (impostor, _) = peer("did:key:impostor");
+        let (impostor, _) = peer(3);
         assert!(matches!(
             session.register(Role::Responder, impostor)?.0,
             Registration::RoleTaken(Role::Responder)
@@ -340,8 +340,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn overflow_drops_oldest() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
@@ -350,7 +350,7 @@ mod tests {
             session.route(Role::Proposer, frame(&topic()?), 2)?;
         }
 
-        let (responder, _) = peer("did:key:responder");
+        let (responder, _) = peer(2);
         let (_, buffered) = session.register(Role::Responder, responder)?;
         assert_eq!(buffered.len(), 2);
         Ok(())
@@ -359,8 +359,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expire_reports_counterpart() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
-        let (responder, _) = peer("did:key:responder");
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
@@ -377,7 +377,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expire_prunes_when_both_gone() -> TestResult {
         let session = Session::default();
-        let (proposer, _) = peer("did:key:proposer");
+        let (proposer, _) = peer(1);
         session.register(Role::Proposer, proposer)?;
         session.disconnect(Role::Proposer, Duration::from_secs(10))?;
 
