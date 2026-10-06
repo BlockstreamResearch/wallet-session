@@ -1,11 +1,13 @@
 use serde_json::Value;
 use wallet_session_core::{
+    crypto::MessageCipher,
     frame::{RelayFrame, RelayFrameBody},
     message::Topic,
 };
 
 use crate::{
     config::ClientConfig,
+    crypto::{Aad, CipherError, SealedPayload, WireEnvelope},
     error::{ClientError, Result},
     identity::IdentityKey,
     messages::{ClientMessage, RequestId},
@@ -14,22 +16,28 @@ use crate::{
     session::{Role, Session, SessionState},
 };
 
-pub struct Client {
+pub struct Client<C> {
     transport: RelayClient,
     session: Session,
+    cipher: C,
 }
 
-impl Client {
+impl<C> Client<C>
+where
+    C: MessageCipher<Sealed = SealedPayload, Error = CipherError>,
+{
     pub async fn connect(
         config: ClientConfig,
         identity: IdentityKey,
         role: Role,
         topic: Topic,
+        cipher: C,
     ) -> Result<Self> {
         let transport = RelayClient::connect(&config, &identity, role, &topic).await?;
         Ok(Self {
             transport,
             session: Session::new(topic, role),
+            cipher,
         })
     }
 
@@ -61,12 +69,19 @@ impl Client {
     }
 
     pub async fn send(&mut self, message: &ClientMessage) -> Result<()> {
+        let id = random::id()?;
+        let topic = self.transport.topic().clone();
+        let kind = message.message_type();
+        let aad = Aad::new(&id, kind, &topic).to_bytes();
+        let sealed = self.cipher.seal(&aad, &message.to_bytes()?)?;
+        let wire = WireEnvelope::new(kind, sealed);
+
         let frame = RelayFrame {
             v: 1,
-            id: random::id()?,
-            topic: self.transport.topic().clone(),
+            id,
+            topic,
             body: RelayFrameBody::Message {
-                payload: message.to_payload()?,
+                payload: serde_json::to_string(&wire)?,
             },
         };
         self.transport.send(frame).await
@@ -77,7 +92,11 @@ impl Client {
             let frame = self.transport.recv().await?;
             match frame.body {
                 RelayFrameBody::Message { payload } => {
-                    return ClientMessage::from_payload(&payload);
+                    let wire: WireEnvelope = serde_json::from_str(&payload)?;
+                    let (kind, sealed) = wire.into_parts();
+                    let aad = Aad::new(&frame.id, kind, &frame.topic).to_bytes();
+                    let bytes = self.cipher.open(&aad, &sealed)?;
+                    return ClientMessage::from_bytes(&bytes);
                 }
                 RelayFrameBody::PeerDisconnected => {
                     self.session.state = SessionState::Disconnected;

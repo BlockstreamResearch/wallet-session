@@ -8,8 +8,11 @@ mod random;
 mod relay;
 mod session;
 
+pub mod crypto;
+
 pub use client::Client;
 pub use config::ClientConfig;
+pub use crypto::XChaCha20Poly1305Cipher;
 pub use error::{ClientError, Result};
 pub use identity::{IdentityKey, Seed};
 pub use messages::{ClientMessage, RequestId};

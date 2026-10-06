@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use wallet_session_core::message::MessageType;
 
 use crate::error::Result;
 
@@ -47,14 +48,26 @@ pub enum ClientMessage {
 }
 
 impl ClientMessage {
-    /// Serialize to the relay frame payload.
-    pub fn to_payload(&self) -> Result<String> {
-        Ok(serde_json::to_string(self)?)
+    /// Message type used as the plaintext envelope tag.
+    pub fn message_type(&self) -> MessageType {
+        match self {
+            ClientMessage::Proposal { .. } => MessageType::Proposal,
+            ClientMessage::Approve { .. } => MessageType::Approve,
+            ClientMessage::Reject { .. } => MessageType::Reject,
+            ClientMessage::Request { .. } => MessageType::Request,
+            ClientMessage::Response { .. } => MessageType::Response,
+            ClientMessage::Ack { .. } => MessageType::Ack,
+            ClientMessage::Disconnect { .. } => MessageType::Disconnect,
+            ClientMessage::SessionDelete { .. } => MessageType::SessionDelete,
+        }
     }
 
-    /// Parse a relay frame payload.
-    pub fn from_payload(payload: &str) -> Result<Self> {
-        Ok(serde_json::from_str(payload)?)
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
     }
 }
 
@@ -69,12 +82,9 @@ mod tests {
             request_id: "req-1".to_owned(),
             request: json!({ "method": "get" }),
         };
-        let payload = message.to_payload().expect("payload");
-        assert!(payload.contains("\"type\":\"request\""));
-        assert_eq!(
-            ClientMessage::from_payload(&payload).expect("parsed"),
-            message
-        );
+        let bytes = message.to_bytes().expect("bytes");
+        assert_eq!(ClientMessage::from_bytes(&bytes).expect("parsed"), message);
+        assert_eq!(message.message_type(), MessageType::Request);
     }
 
     #[test]
@@ -84,10 +94,7 @@ mod tests {
             response: None,
             error: Some(json!({ "code": 4001 })),
         };
-        let payload = message.to_payload().expect("payload");
-        assert_eq!(
-            ClientMessage::from_payload(&payload).expect("parsed"),
-            message
-        );
+        let bytes = message.to_bytes().expect("bytes");
+        assert_eq!(ClientMessage::from_bytes(&bytes).expect("parsed"), message);
     }
 }

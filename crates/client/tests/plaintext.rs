@@ -10,9 +10,44 @@ use wallet_session_relay::{
     connection::NativeRelayTransportConfig, registry::Registry, server::serve,
 };
 
+use wallet_session_client::crypto::{CipherError, NONCE_LEN, SealedPayload};
+use wallet_session_core::{
+    crypto::MessageCipher,
+    message::{Ciphertext, Nonce},
+};
+
 const AUDIENCE: &str = "wss://relay.example.com";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+/// Test-only passthrough cipher: no encryption, zero nonce.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlaintextCipher;
+
+impl PlaintextCipher {
+    /// Build a plaintext cipher.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl MessageCipher for PlaintextCipher {
+    type Sealed = SealedPayload;
+    type Error = CipherError;
+
+    fn seal(&mut self, _aad: &[u8], plaintext: &[u8]) -> Result<SealedPayload, CipherError> {
+        let nonce =
+            Nonce::new(vec![0u8; NONCE_LEN]).map_err(|_| CipherError::NonceLength(NONCE_LEN))?;
+        Ok(SealedPayload {
+            nonce,
+            data: Ciphertext::new(plaintext.to_vec()),
+        })
+    }
+
+    fn open(&self, _aad: &[u8], sealed: &SealedPayload) -> Result<Vec<u8>, CipherError> {
+        Ok(sealed.data.as_bytes().to_vec())
+    }
+}
 
 #[tokio::test]
 async fn plaintext_request_response() -> TestResult {
@@ -51,6 +86,7 @@ async fn run() -> TestResult {
         proposer_identity,
         Role::Proposer,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
     let mut responder = Client::connect(
@@ -58,16 +94,17 @@ async fn run() -> TestResult {
         responder_identity,
         Role::Responder,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
 
     proposer.wait_session_ready().await?;
     responder.wait_session_ready().await?;
 
-    proposer.propose(json!({ "chains": ["eip155:1"] })).await?;
+    proposer.propose(json!({ "capabilities": ["read"] })).await?;
     match responder.recv().await? {
         ClientMessage::Proposal { proposal } => {
-            assert_eq!(proposal, json!({ "chains": ["eip155:1"] }));
+            assert_eq!(proposal, json!({ "capabilities": ["read"] }));
         }
         other => panic!("expected proposal, got {other:?}"),
     }
@@ -78,20 +115,20 @@ async fn run() -> TestResult {
         ClientMessage::Approve { .. }
     ));
 
-    let request_id = proposer.request(json!({ "method": "eth_chainId" })).await?;
+    let request_id = proposer.request(json!({ "method": "get_status" })).await?;
     match responder.recv().await? {
         ClientMessage::Request {
             request_id: received,
             request,
         } => {
             assert_eq!(received, request_id);
-            assert_eq!(request, json!({ "method": "eth_chainId" }));
+            assert_eq!(request, json!({ "method": "get_status" }));
         }
         other => panic!("expected request, got {other:?}"),
     }
 
     responder
-        .respond(request_id.clone(), Some(json!({ "result": "0x1" })), None)
+        .respond(request_id.clone(), Some(json!({ "result": "ok" })), None)
         .await?;
     match proposer.recv().await? {
         ClientMessage::Response {
@@ -100,7 +137,7 @@ async fn run() -> TestResult {
             error,
         } => {
             assert_eq!(received, request_id);
-            assert_eq!(response, Some(json!({ "result": "0x1" })));
+            assert_eq!(response, Some(json!({ "result": "ok" })));
             assert_eq!(error, None);
         }
         other => panic!("expected response, got {other:?}"),
@@ -147,6 +184,7 @@ async fn run_reconnect() -> TestResult {
         IdentityKey::from_seed(&Seed::from_bytes([1u8; 32])),
         Role::Proposer,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
     let mut responder = Client::connect(
@@ -154,6 +192,7 @@ async fn run_reconnect() -> TestResult {
         IdentityKey::from_seed(&responder_seed),
         Role::Responder,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
 
@@ -166,7 +205,7 @@ async fn run_reconnect() -> TestResult {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Sent while the responder is away: the relay buffers it for redelivery.
-    let request_id = proposer.request(json!({ "method": "eth_chainId" })).await?;
+    let request_id = proposer.request(json!({ "method": "get_status" })).await?;
 
     // The same identity reconnects within the grace window.
     let mut responder = Client::connect(
@@ -174,6 +213,7 @@ async fn run_reconnect() -> TestResult {
         IdentityKey::from_seed(&responder_seed),
         Role::Responder,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
 
@@ -187,7 +227,7 @@ async fn run_reconnect() -> TestResult {
     }
 
     responder
-        .respond(request_id.clone(), Some(json!({ "result": "0x1" })), None)
+        .respond(request_id.clone(), Some(json!({ "result": "ok" })), None)
         .await?;
     match proposer.recv().await? {
         ClientMessage::Response {
@@ -196,7 +236,7 @@ async fn run_reconnect() -> TestResult {
             ..
         } => {
             assert_eq!(received, request_id);
-            assert_eq!(response, Some(json!({ "result": "0x1" })));
+            assert_eq!(response, Some(json!({ "result": "ok" })));
         }
         other => panic!("expected response, got {other:?}"),
     }
@@ -223,8 +263,7 @@ async fn run_expiry() -> TestResult {
     tokio::spawn(serve(
         listener,
         Arc::new(Registry::new()),
-        NativeRelayTransportConfig::new(AUDIENCE)
-            .with_session_grace(Duration::from_millis(200)),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(200)),
     ));
 
     let relay_url = format!("ws://{addr}");
@@ -241,6 +280,7 @@ async fn run_expiry() -> TestResult {
         IdentityKey::from_seed(&Seed::from_bytes([1u8; 32])),
         Role::Proposer,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
     let responder = Client::connect(
@@ -248,6 +288,7 @@ async fn run_expiry() -> TestResult {
         IdentityKey::from_seed(&Seed::from_bytes([2u8; 32])),
         Role::Responder,
         topic.clone(),
+        PlaintextCipher::new(),
     )
     .await?;
 

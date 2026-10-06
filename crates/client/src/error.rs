@@ -12,6 +12,9 @@ pub enum ClientError {
     #[error("encoding error: {0}")]
     Codec(#[from] wallet_session_core::error::Error),
 
+    #[error("cipher error: {0}")]
+    Cipher(#[from] crate::crypto::CipherError),
+
     #[error("invalid pairing uri: {0}")]
     PairingUri(String),
 

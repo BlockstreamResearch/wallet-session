@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod codec;
 pub mod connection;
+pub mod crypto;
 pub mod did;
 pub mod error;
 pub mod frame;

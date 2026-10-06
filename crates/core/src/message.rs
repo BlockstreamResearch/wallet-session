@@ -103,6 +103,24 @@ pub enum MessageType {
     SessionReady,
 }
 
+impl MessageType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageType::Proposal => "proposal",
+            MessageType::Approve => "approve",
+            MessageType::Reject => "reject",
+            MessageType::Request => "request",
+            MessageType::Response => "response",
+            MessageType::Ack => "ack",
+            MessageType::Ping => "ping",
+            MessageType::Pong => "pong",
+            MessageType::Disconnect => "disconnect",
+            MessageType::SessionDelete => "session_delete",
+            MessageType::SessionReady => "session_ready",
+        }
+    }
+}
+
 impl From<&Payload> for MessageType {
     fn from(payload: &Payload) -> Self {
         match payload {
@@ -180,6 +198,11 @@ impl Nonce {
     /// Number of bytes in a nonce.
     pub const LEN: usize = 24;
 
+    /// Borrow the raw nonce bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
         let bytes = bytes.into();
         if bytes.len() != Self::LEN {
@@ -213,6 +236,11 @@ pub struct Ciphertext(#[serde(with = "crate::codec::base64url")] Vec<u8>);
 impl Ciphertext {
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         Self(bytes.into())
+    }
+
+    /// Borrow the raw ciphertext bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
