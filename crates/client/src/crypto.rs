@@ -1,6 +1,6 @@
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, Key, KeyInit, Payload},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -160,7 +160,6 @@ impl XChaCha20Poly1305Cipher {
 impl MessageCipher for XChaCha20Poly1305Cipher {
     type Sealed = SealedPayload;
     type Error = CipherError;
-
     fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<SealedPayload, CipherError> {
         let nonce = self.nonce();
         let data = self
@@ -197,6 +196,10 @@ impl MessageCipher for XChaCha20Poly1305Cipher {
                 },
             )
             .map_err(|_| CipherError::Decrypt)
+    }
+
+    fn rekey(&mut self, key: &[u8; KEY_LEN]) {
+        self.inner = XChaCha20Poly1305::new(&Key::<XChaCha20Poly1305>::from(*key));
     }
 }
 

@@ -15,6 +15,9 @@ pub enum ClientError {
     #[error("cipher error: {0}")]
     Cipher(#[from] crate::crypto::CipherError),
 
+    #[error("handshake error: {0}")]
+    Handshake(#[from] crate::handshake::HandshakeError),
+
     #[error("invalid pairing uri: {0}")]
     PairingUri(String),
 
@@ -32,6 +35,9 @@ pub enum ClientError {
 
     #[error("peer disconnected")]
     PeerDisconnected,
+
+    #[error("unexpected handshake message")]
+    UnexpectedHandshake,
 
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),

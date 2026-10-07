@@ -69,17 +69,15 @@ async fn run() -> TestResult {
         .propose(json!({ "capabilities": ["read"] }))
         .await?;
     match responder.recv().await? {
-        ClientMessage::Proposal { proposal } => {
+        ClientMessage::Proposal(payload) => {
+            let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
             assert_eq!(proposal, json!({ "capabilities": ["read"] }));
         }
         other => panic!("expected proposal, got {other:?}"),
     }
 
     responder.approve(json!({ "ok": true })).await?;
-    assert!(matches!(
-        proposer.recv().await?,
-        ClientMessage::Approve { .. }
-    ));
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
 
     let request_id = proposer.request(json!({ "method": "get_status" })).await?;
     match responder.recv().await? {

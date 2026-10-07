@@ -9,6 +9,7 @@ mod relay;
 mod session;
 
 pub mod crypto;
+pub mod handshake;
 
 pub use client::Client;
 pub use config::ClientConfig;

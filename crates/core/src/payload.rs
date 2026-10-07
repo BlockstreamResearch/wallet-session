@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Opaque application data carried inside a payload shape.
-#[derive(Serialize, Deserialize)]
-pub struct Opaque(pub Vec<u8>);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Opaque(#[serde(with = "crate::codec::base64url")] pub Vec<u8>);
 
 /// Body of a `proposal` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProposalPayload {
     /// The proposer's one-time X25519 public key.
@@ -19,7 +19,7 @@ pub struct ProposalPayload {
 }
 
 /// Body of an `approve` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovePayload {
     /// The responder's one-time X25519 public key.

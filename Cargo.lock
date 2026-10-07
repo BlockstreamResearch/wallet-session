@@ -1075,6 +1075,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "getrandom",
+ "hkdf",
  "log",
  "serde",
  "serde_json",
@@ -1086,6 +1087,7 @@ dependencies = [
  "url",
  "wallet-session-core",
  "wallet-session-relay",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -1156,6 +1158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek",
+ "getrandom",
  "rand_core",
  "zeroize",
 ]

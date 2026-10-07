@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use wallet_session_core::message::MessageType;
+use wallet_session_core::{
+    message::MessageType,
+    payload::{ApprovePayload, ProposalPayload},
+};
 
 use crate::error::Result;
 
@@ -12,10 +15,10 @@ pub type RequestId = String;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Propose a session.
-    Proposal { proposal: Value },
+    Proposal(ProposalPayload),
 
     /// Approve a session.
-    Approve { approval: Value },
+    Approve(ApprovePayload),
 
     /// Reject a proposal.
     Reject { code: u32, message: String },
@@ -51,8 +54,8 @@ impl ClientMessage {
     /// Message type used as the plaintext envelope tag.
     pub fn message_type(&self) -> MessageType {
         match self {
-            ClientMessage::Proposal { .. } => MessageType::Proposal,
-            ClientMessage::Approve { .. } => MessageType::Approve,
+            ClientMessage::Proposal(_) => MessageType::Proposal,
+            ClientMessage::Approve(_) => MessageType::Approve,
             ClientMessage::Reject { .. } => MessageType::Reject,
             ClientMessage::Request { .. } => MessageType::Request,
             ClientMessage::Response { .. } => MessageType::Response,
