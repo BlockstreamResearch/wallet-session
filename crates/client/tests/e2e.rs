@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use serde_json::json;
 use tokio::net::TcpListener;
 use wallet_session_client::{
-    Client, ClientConfig, ClientMessage, IdentityKey, PairingKey, Role, Seed,
+    Client, ClientConfig, ClientEvent, ClientMessage, IdentityKey, PairingKey, Role, Seed,
     XChaCha20Poly1305Cipher,
 };
 use wallet_session_relay::{
@@ -105,6 +105,16 @@ async fn run() -> TestResult {
         }
         other => panic!("expected response, got {other:?}"),
     }
+
+    // The proposer's request was acknowledged by the responder.
+    let mut delivered = Vec::new();
+    while let Some(ClientEvent::Delivered { id }) = proposer.poll_event() {
+        delivered.push(id);
+    }
+    assert!(
+        delivered.contains(&request_id),
+        "expected a Delivered event for {request_id}, got {delivered:?}"
+    );
 
     Ok(())
 }

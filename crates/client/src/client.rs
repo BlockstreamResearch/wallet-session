@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::mpsc;
 use wallet_session_core::{
     crypto::MessageCipher,
     frame::{RelayFrame, RelayFrameBody},
@@ -17,6 +18,7 @@ use crate::{
     messages::{ClientMessage, RequestId},
     random,
     relay::RelayClient,
+    reliability::{ClientEvent, Reliability, requires_ack},
     session::{Role, Session, SessionState},
 };
 
@@ -43,6 +45,8 @@ pub struct Client<C> {
     session: Session,
     cipher: C,
     handshake: Handshake,
+    reliability: Reliability,
+    events: mpsc::UnboundedReceiver<ClientEvent>,
 }
 
 impl<C> Client<C>
@@ -57,11 +61,20 @@ where
         cipher: C,
     ) -> Result<Self> {
         let transport = RelayClient::connect(&config, &identity, role, &topic).await?;
+        let (reliability, events) = Reliability::spawn(
+            transport.outbox(),
+            config.ack_base_delay,
+            config.ack_max_attempts,
+            config.seen_ttl,
+        );
+
         Ok(Self {
             transport,
             session: Session::new(topic, role),
             cipher,
             handshake: Handshake::Idle,
+            reliability,
+            events,
         })
     }
 
@@ -92,8 +105,15 @@ where
         Ok(())
     }
 
-    pub async fn send(&mut self, message: &ClientMessage) -> Result<()> {
+    /// Seal and send a message, returning its envelope id.
+    pub async fn send(&mut self, message: &ClientMessage) -> Result<String> {
         let id = random::id()?;
+        self.send_with_id(id.clone(), message).await?;
+        Ok(id)
+    }
+
+    /// Seal and send a message with a caller-chosen envelope id.
+    async fn send_with_id(&mut self, id: String, message: &ClientMessage) -> Result<()> {
         let topic = self.transport.topic().clone();
         let kind = message.message_type();
         let aad = Aad::new(&id, kind, &topic).to_bytes();
@@ -108,7 +128,7 @@ where
                 payload: serde_json::to_string(&wire)?,
             },
         };
-        self.transport.send(frame).await
+        self.reliability.dispatch(frame, requires_ack(kind))
     }
 
     pub async fn recv(&mut self) -> Result<ClientMessage> {
@@ -116,12 +136,29 @@ where
             let frame = self.transport.recv().await?;
             match frame.body {
                 RelayFrameBody::Message { payload } => {
+                    if self.reliability.is_duplicate(&frame.id) {
+                        log::debug!("dropping duplicate frame {}", frame.id);
+                        continue;
+                    }
+
                     let wire: WireEnvelope = serde_json::from_str(&payload)?;
                     let (kind, sealed) = wire.into_parts();
                     let aad = Aad::new(&frame.id, kind, &frame.topic).to_bytes();
                     let bytes = self.cipher.open(&aad, &sealed)?;
                     let message = ClientMessage::from_bytes(&bytes)?;
+
+                    // acks are consumed by reliability
+                    if let ClientMessage::Ack { ack_id } = &message {
+                        self.reliability.mark_delivered(ack_id);
+                        continue;
+                    }
+
                     self.observe(&message)?;
+
+                    if requires_ack(message.message_type()) {
+                        self.send_ack(&frame.id).await?;
+                    }
+
                     return Ok(message);
                 }
                 RelayFrameBody::PeerDisconnected => {
@@ -131,6 +168,20 @@ where
                 RelayFrameBody::SessionReady => {}
             }
         }
+    }
+
+    /// Acknowledge a received envelope by id.
+    async fn send_ack(&mut self, ack_id: &str) -> Result<()> {
+        self.send(&ClientMessage::Ack {
+            ack_id: ack_id.to_owned(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Non-blocking read of the next reliability event, if any.
+    pub fn poll_event(&mut self) -> Option<ClientEvent> {
+        self.events.try_recv().ok()
     }
 
     /// Update handshake state from an inbound message.
@@ -206,10 +257,13 @@ where
     /// Send a `request` and return its correlation id.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
         let request_id = random::id()?;
-        self.send(&ClientMessage::Request {
-            request_id: request_id.clone(),
-            request,
-        })
+        self.send_with_id(
+            request_id.clone(),
+            &ClientMessage::Request {
+                request_id: request_id.clone(),
+                request,
+            },
+        )
         .await?;
         Ok(request_id)
     }
@@ -226,7 +280,8 @@ where
             response,
             error,
         })
-        .await
+        .await?;
+        Ok(())
     }
 
     /// Acknowledge a received message.
@@ -234,7 +289,8 @@ where
         self.send(&ClientMessage::Ack {
             ack_id: ack_id.into(),
         })
-        .await
+        .await?;
+        Ok(())
     }
 
     /// Gracefully disconnect.
