@@ -11,7 +11,11 @@ use tokio::{
 };
 use wallet_session_core::{frame::RelayFrame, message::MessageType};
 
-use crate::{error::ClientError, relay::Outbound};
+use crate::{
+    crypto::{NONCE_LEN, SENDER_PREFIX_LEN},
+    error::ClientError,
+    relay::Outbound,
+};
 
 /// Reliability events surfaced to the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +81,55 @@ impl SeenIds {
         } else {
             self.seen.insert(id.to_owned(), now);
             false
+        }
+    }
+}
+
+/// Maximum distinct sender prefixes tracked before the guard resets.
+const MAX_NONCE_PREFIXES: usize = 64;
+
+/// Rejects reused AEAD nonces for the current key.
+///
+/// Tracks the highest counter seen per 16-byte sender prefix and requires each
+/// new nonce to be strictly greater. Reset on rekey.
+pub(crate) struct NonceGuard {
+    highest: HashMap<[u8; SENDER_PREFIX_LEN], u64>,
+}
+
+impl NonceGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            highest: HashMap::new(),
+        }
+    }
+
+    /// Forget all seen nonces (called when the key changes).
+    pub(crate) fn clear(&mut self) {
+        self.highest.clear();
+    }
+
+    /// Returns true if the nonce was already used (not strictly increasing).
+    pub(crate) fn is_reused(&mut self, nonce: &[u8]) -> bool {
+        if nonce.len() != NONCE_LEN {
+            return true;
+        }
+        let Ok(prefix) = <[u8; SENDER_PREFIX_LEN]>::try_from(&nonce[..SENDER_PREFIX_LEN]) else {
+            return true;
+        };
+        let Ok(counter) = <[u8; 8]>::try_from(&nonce[SENDER_PREFIX_LEN..]) else {
+            return true;
+        };
+        let counter = u64::from_be_bytes(counter);
+
+        match self.highest.get(&prefix) {
+            Some(&highest) if counter <= highest => true,
+            _ => {
+                if self.highest.len() >= MAX_NONCE_PREFIXES {
+                    self.highest.clear();
+                }
+                self.highest.insert(prefix, counter);
+                false
+            }
         }
     }
 }
@@ -249,6 +302,27 @@ mod tests {
         assert!(!reliability.is_duplicate("x"));
         assert!(reliability.is_duplicate("x"));
         assert!(!reliability.is_duplicate("y"));
+    }
+
+    #[test]
+    fn rejects_reused_nonces() {
+        let mut guard = NonceGuard::new();
+        let mut nonce = [0u8; NONCE_LEN];
+
+        nonce[16..].copy_from_slice(&1u64.to_be_bytes());
+        assert!(!guard.is_reused(&nonce));
+        assert!(guard.is_reused(&nonce));
+
+        nonce[16..].copy_from_slice(&0u64.to_be_bytes());
+        assert!(guard.is_reused(&nonce));
+
+        nonce[16..].copy_from_slice(&2u64.to_be_bytes());
+        assert!(!guard.is_reused(&nonce));
+
+        // A different sender prefix has its own counter.
+        nonce[0] = 9;
+        nonce[16..].copy_from_slice(&0u64.to_be_bytes());
+        assert!(!guard.is_reused(&nonce));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use wallet_session_core::{
     crypto::MessageCipher,
+    did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
     message::Topic,
     payload::{ApprovePayload, Opaque, ProposalPayload},
@@ -11,19 +12,22 @@ use wallet_session_core::{
 
 use crate::{
     config::ClientConfig,
-    crypto::{Aad, CipherError, SealedPayload, WireEnvelope},
+    crypto::{Aad, CipherError, ENVELOPE_VERSION, SealedPayload, WireEnvelope},
     error::{ClientError, Result},
     handshake::{EphemeralKeyPair, SessionKey, SessionTopic, decode_public_key},
     identity::{IdentityKey, unix_now},
     messages::{ClientMessage, RequestId},
     random,
     relay::RelayClient,
-    reliability::{ClientEvent, Reliability, requires_ack},
+    reliability::{ClientEvent, NonceGuard, Reliability, requires_ack},
     session::{Role, Session, SessionState},
 };
 
 /// Default session lifetime.
 const SESSION_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Maximum accepted clock skew between envelope `ts` and local time.
+const MAX_TS_SKEW_SECS: u64 = 300;
 
 /// Local side of the session handshake.
 enum Handshake {
@@ -47,6 +51,8 @@ pub struct Client<C> {
     handshake: Handshake,
     reliability: Reliability,
     events: mpsc::UnboundedReceiver<ClientEvent>,
+    did: DidKey,
+    nonce_guard: NonceGuard,
 }
 
 impl<C> Client<C>
@@ -60,6 +66,7 @@ where
         topic: Topic,
         cipher: C,
     ) -> Result<Self> {
+        let did = identity.did();
         let transport = RelayClient::connect(&config, &identity, role, &topic).await?;
         let (reliability, events) = Reliability::spawn(
             transport.outbox(),
@@ -75,6 +82,8 @@ where
             handshake: Handshake::Idle,
             reliability,
             events,
+            did,
+            nonce_guard: NonceGuard::new(),
         })
     }
 
@@ -116,9 +125,16 @@ where
     async fn send_with_id(&mut self, id: String, message: &ClientMessage) -> Result<()> {
         let topic = self.transport.topic().clone();
         let kind = message.message_type();
-        let aad = Aad::new(&id, kind, &topic).to_bytes();
+        let aad = Aad::new(&id, kind, &topic, &self.did).to_bytes();
         let sealed = self.cipher.seal(&aad, &message.to_bytes()?)?;
-        let wire = WireEnvelope::new(kind, sealed);
+        let wire = WireEnvelope {
+            version: ENVELOPE_VERSION,
+            kind,
+            from: self.did.clone(),
+            ts: unix_now(),
+            nonce: sealed.nonce,
+            data: sealed.data,
+        };
 
         let frame = RelayFrame {
             v: 1,
@@ -134,17 +150,43 @@ where
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         loop {
             let frame = self.transport.recv().await?;
-            match frame.body {
+            let RelayFrame { id, topic, body, .. } = frame;
+
+            match body {
                 RelayFrameBody::Message { payload } => {
-                    if self.reliability.is_duplicate(&frame.id) {
-                        log::debug!("dropping duplicate frame {}", frame.id);
+                    if topic != self.session.topic {
+                        log::warn!("dropping frame for unsubscribed topic {topic}");
+                        continue;
+                    }
+                    if self.reliability.is_duplicate(&id) {
+                        log::debug!("dropping duplicate frame {id}");
                         continue;
                     }
 
                     let wire: WireEnvelope = serde_json::from_str(&payload)?;
-                    let (kind, sealed) = wire.into_parts();
-                    let aad = Aad::new(&frame.id, kind, &frame.topic).to_bytes();
+
+                    if wire.version != ENVELOPE_VERSION {
+                        log::warn!("dropping frame with unsupported version {}", wire.version);
+                        continue;
+                    }
+                    let now = unix_now();
+                    if now.abs_diff(wire.ts) > MAX_TS_SKEW_SECS {
+                        log::warn!("dropping frame with stale timestamp ts={}", wire.ts);
+                        continue;
+                    }
+
+                    let aad = Aad::new(&id, wire.kind, &topic, &wire.from).to_bytes();
+                    let sealed = SealedPayload {
+                        nonce: wire.nonce.clone(),
+                        data: wire.data.clone(),
+                    };
                     let bytes = self.cipher.open(&aad, &sealed)?;
+
+                    if self.nonce_guard.is_reused(wire.nonce.as_bytes()) {
+                        log::warn!("dropping frame with reused nonce {id}");
+                        continue;
+                    }
+
                     let message = ClientMessage::from_bytes(&bytes)?;
 
                     // acks are consumed by reliability
@@ -156,7 +198,7 @@ where
                     self.observe(&message)?;
 
                     if requires_ack(message.message_type()) {
-                        self.send_ack(&frame.id).await?;
+                        self.send_ack(&id).await?;
                     }
 
                     return Ok(message);
@@ -209,6 +251,7 @@ where
     /// Replace the cipher with one keyed by the derived session key.
     fn rekey(&mut self, key: SessionKey, _topic: SessionTopic) {
         self.cipher.rekey(key.as_bytes());
+        self.nonce_guard.clear();
         self.handshake = Handshake::Established;
         self.session.state = SessionState::Active;
     }

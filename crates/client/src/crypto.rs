@@ -6,8 +6,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wallet_session_core::{
     crypto::MessageCipher,
+    did::DidKey,
     message::{Ciphertext, MessageType, Nonce, Topic},
 };
+
+/// Wire envelope version written by this implementation.
+pub const ENVELOPE_VERSION: u8 = 1;
 
 /// Symmetric key length
 pub const KEY_LEN: usize = 32;
@@ -18,10 +22,11 @@ pub const SENDER_PREFIX_LEN: usize = 16;
 /// AEAD nonce length: sender prefix plus counter
 pub const NONCE_LEN: usize = 24;
 
-/// AEAD associated data bound to the plaintext envelope header
+/// AEAD associated data bound to the plaintext envelope header.
 ///
-/// `AAD = version || id || type || topic`.
-/// TODO:: add `from` field
+/// `AAD = version || id || type || topic || from`.
+///
+/// TODO: verify `from` against the expected peer identity once it is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aad<'a> {
     /// Protocol version
@@ -35,24 +40,31 @@ pub struct Aad<'a> {
 
     /// Subscription topic
     pub topic: &'a Topic,
+
+    /// Sender identity
+    pub from: &'a DidKey,
 }
 
 impl<'a> Aad<'a> {
-    pub fn new(id: &'a str, kind: MessageType, topic: &'a Topic) -> Self {
+    /// Build associated data with the current envelope version.
+    pub fn new(id: &'a str, kind: MessageType, topic: &'a Topic, from: &'a DidKey) -> Self {
         Self {
-            version: 1,
+            version: ENVELOPE_VERSION,
             id,
             kind,
             topic,
+            from,
         }
     }
 
+    /// Serialize the associated data as UTF-8 bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.version.to_string().as_bytes());
         bytes.extend_from_slice(self.id.as_bytes());
         bytes.extend_from_slice(self.kind.as_str().as_bytes());
         bytes.extend_from_slice(self.topic.to_string().as_bytes());
+        bytes.extend_from_slice(self.from.to_string().as_bytes());
         bytes
     }
 }
@@ -67,11 +79,20 @@ pub struct SealedPayload {
     pub data: Ciphertext,
 }
 
-/// Wire payload: plaintext type tag plus the sealed payload.
+/// Wire payload: versioned envelope header plus the sealed payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireEnvelope {
+    /// Protocol version.
+    pub version: u8,
+
     /// Message type (plaintext, authenticated via the AAD).
     pub kind: MessageType,
+
+    /// Sender identity (plaintext, authenticated via the AAD).
+    pub from: DidKey,
+
+    /// Sender timestamp, unix seconds.
+    pub ts: u64,
 
     /// AEAD nonce, base64url.
     pub nonce: Nonce,
@@ -81,24 +102,12 @@ pub struct WireEnvelope {
 }
 
 impl WireEnvelope {
-    /// Wrap a sealed payload with its plaintext type tag.
-    pub fn new(kind: MessageType, sealed: SealedPayload) -> Self {
-        Self {
-            kind,
-            nonce: sealed.nonce,
-            data: sealed.data,
+    /// Split out the sealed payload (nonce plus ciphertext).
+    pub fn into_sealed(self) -> SealedPayload {
+        SealedPayload {
+            nonce: self.nonce,
+            data: self.data,
         }
-    }
-
-    /// Split into the plaintext type tag and the sealed payload.
-    pub fn into_parts(self) -> (MessageType, SealedPayload) {
-        (
-            self.kind,
-            SealedPayload {
-                nonce: self.nonce,
-                data: self.data,
-            },
-        )
     }
 }
 
@@ -213,14 +222,12 @@ mod tests {
         Topic::new([1u8; 32]).expect("topic")
     }
 
+    fn did(seed: u8) -> DidKey {
+        DidKey::from_ed25519_bytes([seed; 32])
+    }
+
     fn aad(kind: MessageType, topic: &Topic) -> Vec<u8> {
-        Aad {
-            version: 1,
-            id: "frame-id",
-            kind,
-            topic,
-        }
-        .to_bytes()
+        Aad::new("frame-id", kind, topic, &did(7)).to_bytes()
     }
 
     #[test]
@@ -243,6 +250,24 @@ mod tests {
         let other = aad(MessageType::Response, &topic);
         assert!(matches!(
             cipher.open(&other, &sealed),
+            Err(CipherError::Decrypt)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_tampered_from() -> TestResult {
+        let topic = topic();
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+
+        let sealed = cipher.seal(
+            &Aad::new("frame-id", MessageType::Request, &topic, &did(1)).to_bytes(),
+            b"hello",
+        )?;
+        let tampered = Aad::new("frame-id", MessageType::Request, &topic, &did(2)).to_bytes();
+
+        assert!(matches!(
+            cipher.open(&tampered, &sealed),
             Err(CipherError::Decrypt)
         ));
         Ok(())

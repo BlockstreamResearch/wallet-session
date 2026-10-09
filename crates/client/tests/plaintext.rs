@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -10,7 +16,7 @@ use wallet_session_relay::{
     connection::NativeRelayTransportConfig, registry::Registry, server::serve,
 };
 
-use wallet_session_client::crypto::{CipherError, NONCE_LEN, SealedPayload};
+use wallet_session_client::crypto::{CipherError, NONCE_LEN, SENDER_PREFIX_LEN, SealedPayload};
 use wallet_session_core::{
     crypto::MessageCipher,
     message::{Ciphertext, Nonce},
@@ -20,14 +26,36 @@ const AUDIENCE: &str = "wss://relay.example.com";
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Test-only passthrough cipher: no encryption, zero nonce.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PlaintextCipher;
+/// Process-unique prefix so two test clients don't share a nonce space.
+static PREFIX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only passthrough cipher: no encryption, but a valid nonce sequence.
+#[derive(Debug)]
+pub struct PlaintextCipher {
+    prefix: [u8; SENDER_PREFIX_LEN],
+    counter: u64,
+}
 
 impl PlaintextCipher {
-    /// Build a plaintext cipher.
+    /// Build a plaintext cipher with a fresh sender prefix.
     pub fn new() -> Self {
-        Self
+        let sequence = PREFIX_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut prefix = [0u8; SENDER_PREFIX_LEN];
+        prefix[SENDER_PREFIX_LEN - 8..].copy_from_slice(&sequence.to_be_bytes());
+        Self { prefix, counter: 0 }
+    }
+
+    fn nonce(&self) -> Nonce {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[..SENDER_PREFIX_LEN].copy_from_slice(&self.prefix);
+        nonce[SENDER_PREFIX_LEN..].copy_from_slice(&self.counter.to_be_bytes());
+        Nonce::new(nonce.to_vec()).expect("nonce length")
+    }
+}
+
+impl Default for PlaintextCipher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -36,8 +64,8 @@ impl MessageCipher for PlaintextCipher {
     type Error = CipherError;
 
     fn seal(&mut self, _aad: &[u8], plaintext: &[u8]) -> Result<SealedPayload, CipherError> {
-        let nonce =
-            Nonce::new(vec![0u8; NONCE_LEN]).map_err(|_| CipherError::NonceLength(NONCE_LEN))?;
+        let nonce = self.nonce();
+        self.counter = self.counter.wrapping_add(1);
         Ok(SealedPayload {
             nonce,
             data: Ciphertext::new(plaintext.to_vec()),
@@ -48,7 +76,9 @@ impl MessageCipher for PlaintextCipher {
         Ok(sealed.data.as_bytes().to_vec())
     }
 
-    fn rekey(&mut self, _key: &[u8; 32]) {}
+    fn rekey(&mut self, _key: &[u8; 32]) {
+        self.counter = 0;
+    }
 }
 
 #[tokio::test]
