@@ -18,7 +18,7 @@ use crate::{
     identity::{IdentityKey, unix_now},
     messages::{ClientMessage, RequestId},
     random,
-    relay::RelayClient,
+    relay::{Inbox, Transport},
     reliability::{ClientEvent, NonceGuard, Reliability, requires_ack},
     session::{Role, Session, SessionState},
 };
@@ -45,7 +45,7 @@ enum Handshake {
 }
 
 pub struct Client<C> {
-    transport: RelayClient,
+    transport: Transport,
     session: Session,
     cipher: C,
     handshake: Handshake,
@@ -53,6 +53,7 @@ pub struct Client<C> {
     events: mpsc::UnboundedReceiver<ClientEvent>,
     did: DidKey,
     nonce_guard: NonceGuard,
+    saw_disconnect: bool,
 }
 
 impl<C> Client<C>
@@ -67,9 +68,9 @@ where
         cipher: C,
     ) -> Result<Self> {
         let did = identity.did();
-        let transport = RelayClient::connect(&config, &identity, role, &topic).await?;
+        let transport = Transport::connect(config.clone(), identity, role, topic.clone());
         let (reliability, events) = Reliability::spawn(
-            transport.outbox(),
+            transport.outbound(),
             config.ack_base_delay,
             config.ack_max_attempts,
             config.seen_ttl,
@@ -84,6 +85,7 @@ where
             events,
             did,
             nonce_guard: NonceGuard::new(),
+            saw_disconnect: false,
         })
     }
 
@@ -95,9 +97,33 @@ where
         self.session.state != SessionState::Idle
     }
 
+    /// Await the next relay frame, folding in transport lifecycle events.
+    async fn next_frame(&mut self) -> Result<RelayFrame> {
+        loop {
+            match self.transport.recv().await {
+                Some(Inbox::Frame(frame)) => return Ok(frame),
+                Some(Inbox::Connected) => {
+                    self.reliability.set_connected(true);
+                    if self.saw_disconnect {
+                        self.reliability.emit(ClientEvent::Reconnected);
+                        self.saw_disconnect = false;
+                    }
+                }
+                Some(Inbox::Disconnected) => {
+                    self.reliability.set_connected(false);
+                    if !self.saw_disconnect {
+                        self.reliability.emit(ClientEvent::Reconnecting);
+                        self.saw_disconnect = true;
+                    }
+                }
+                Some(Inbox::Closed) | None => return Err(ClientError::Closed),
+            }
+        }
+    }
+
     pub async fn wait_session_ready(&mut self) -> Result<()> {
         while !self.is_ready() {
-            let frame = self.transport.recv().await?;
+            let frame = self.next_frame().await?;
             match frame.body {
                 RelayFrameBody::SessionReady => {
                     self.session.state = SessionState::Active;
@@ -149,7 +175,7 @@ where
 
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         loop {
-            let frame = self.transport.recv().await?;
+            let frame = self.next_frame().await?;
             let RelayFrame { id, topic, body, .. } = frame;
 
             match body {

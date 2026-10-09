@@ -1,10 +1,10 @@
-use std::time::Duration;
-
-use futures_util::{
-    SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
+use futures_util::{SinkExt, StreamExt};
+use tokio::{
+    net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior, interval_at, sleep_until},
 };
-use tokio::{net::TcpStream, sync::mpsc, task::JoinHandle};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Bytes, Message},
@@ -25,74 +25,64 @@ use crate::{
 /// Client-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Everything the writer task can put on the wire.
+/// Everything the connection task can put on the wire.
 pub(crate) enum Outbound {
     /// A relay frame to serialize and send.
     Frame(RelayFrame),
-
-    /// A WebSocket keepalive reply to a relay ping.
-    Pong(Bytes),
 }
 
-/// A single relay connection for one topic and role.
+/// Everything the connection task reports to the client.
+pub(crate) enum Inbox {
+    /// A relay frame received from the relay.
+    Frame(RelayFrame),
+
+    /// The connection is established (initial or after reconnect).
+    Connected,
+
+    /// The connection was lost; a reconnect is starting.
+    Disconnected,
+
+    /// Reconnect attempts were exhausted.
+    Closed,
+}
+
+/// A reconnecting relay connection for one topic and role.
 ///
-/// Reads happen through `recv`; writes go through the `outbox` channel drained
-/// by a writer task, so several producers (app, acks, retries) can send
-/// concurrently with the read loop.
-pub(crate) struct RelayClient {
+/// A background task owns the WebSocket lifecycle and exposes stable inbound
+/// and outbound channels, so the client and reliability layer never observe a
+/// socket swap.
+pub(crate) struct Transport {
     topic: Topic,
-    idle_timeout: Duration,
-    outbox: mpsc::UnboundedSender<Outbound>,
-    source: SplitStream<RelayStream>,
-    _writer: JoinHandle<()>,
+    outbound: mpsc::UnboundedSender<Outbound>,
+    inbox: mpsc::UnboundedReceiver<Inbox>,
+    _task: JoinHandle<()>,
 }
 
-impl RelayClient {
-    /// Connect and authenticate to the relay for `topic` as `role`.
-    pub(crate) async fn connect(
-        config: &ClientConfig,
-        identity: &IdentityKey,
+impl Transport {
+    /// Start (asynchronously) a connection to the relay for `topic` as `role`.
+    pub(crate) fn connect(
+        config: ClientConfig,
+        identity: IdentityKey,
         role: Role,
-        topic: &Topic,
-    ) -> Result<Self> {
-        let session_id = random::id()?;
-        let token = identity.connection_token(&session_id, &config.audience, config.token_ttl)?;
-
-        let registration_id = if role == Role::Proposer {
-            Some(
-                config
-                    .registration_id
-                    .clone()
-                    .ok_or(ClientError::MissingRegistrationId)?,
-            )
-        } else {
-            None
-        };
-        let query = ConnectionQuery {
-            auth: token,
+        topic: Topic,
+    ) -> Self {
+        let (outbound, outbound_rx) = mpsc::unbounded_channel();
+        let (inbox_tx, inbox) = mpsc::unbounded_channel();
+        let _task = tokio::spawn(connection_task(
+            config,
+            identity,
             role,
-            topic: topic.clone(),
-            registration_id,
-        };
-        let query = serde_urlencoded::to_string(&query)?;
+            topic.clone(),
+            outbound_rx,
+            inbox_tx,
+        ));
 
-        let mut url = url::Url::parse(&config.relay_url)?;
-        url.set_query(Some(&query));
-
-        log::debug!("connecting to relay {url}");
-        let (stream, _response) = connect_async(url.as_str()).await?;
-
-        let (sink, source) = stream.split();
-        let (outbox, outbound) = mpsc::unbounded_channel();
-        let _writer = tokio::spawn(write_loop(sink, outbound));
-
-        Ok(Self {
-            topic: topic.clone(),
-            idle_timeout: config.idle_timeout,
-            outbox,
-            source,
-            _writer,
-        })
+        Self {
+            topic,
+            outbound,
+            inbox,
+            _task,
+        }
     }
 
     /// Topic of this connection.
@@ -101,51 +91,153 @@ impl RelayClient {
     }
 
     /// Cloneable handle to the outbound writer.
-    pub(crate) fn outbox(&self) -> mpsc::UnboundedSender<Outbound> {
-        self.outbox.clone()
+    pub(crate) fn outbound(&self) -> mpsc::UnboundedSender<Outbound> {
+        self.outbound.clone()
     }
 
-    /// Await the next relay frame.
-    pub(crate) async fn recv(&mut self) -> Result<RelayFrame> {
-        loop {
-            let message = match tokio::time::timeout(self.idle_timeout, self.source.next()).await {
-                Ok(Some(message)) => message?,
-                Ok(None) => return Err(ClientError::Closed),
-                Err(_) => return Err(ClientError::Timeout),
-            };
-
-            match message {
-                Message::Text(text) => {
-                    log::trace!("client <- topic={} frame={}", self.topic, text);
-                    return Ok(serde_json::from_str(&text)?);
-                }
-                Message::Close(_) => return Err(ClientError::Closed),
-                Message::Ping(payload) => {
-                    let _ = self.outbox.send(Outbound::Pong(payload));
-                }
-                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
-            }
-        }
+    /// Await the next inbox item, or `None` once the connection task exits.
+    pub(crate) async fn recv(&mut self) -> Option<Inbox> {
+        self.inbox.recv().await
     }
 }
 
-async fn write_loop(mut sink: SplitSink<RelayStream, Message>, mut rx: mpsc::UnboundedReceiver<Outbound>) {
-    while let Some(outbound) = rx.recv().await {
-        let message = match outbound {
-            Outbound::Frame(frame) => {
-                let text = match serde_json::to_string(&frame) {
-                    Ok(text) => text,
-                    Err(_) => break,
-                };
-                log::trace!("client -> topic={} frame={text}", frame.topic);
-                Message::text(text)
-            }
-            Outbound::Pong(payload) => Message::Pong(payload),
-        };
+async fn connection_task(
+    config: ClientConfig,
+    identity: IdentityKey,
+    role: Role,
+    topic: Topic,
+    mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    inbox: mpsc::UnboundedSender<Inbox>,
+) {
+    let mut delay = config.reconnect_initial_delay;
+    let mut attempt = 0usize;
 
-        if sink.send(message).await.is_err() {
-            break;
+    loop {
+        match connect_once(&config, &identity, role, &topic).await {
+            Ok(stream) => {
+                attempt = 0;
+                delay = config.reconnect_initial_delay;
+                let _ = inbox.send(Inbox::Connected);
+
+                if !run_connection(stream, &mut outbound, &inbox, &config).await {
+                    return; // all senders dropped: shutting down
+                }
+                let _ = inbox.send(Inbox::Disconnected);
+            }
+            Err(error) => {
+                log::debug!("relay connect failed: {error}");
+                let _ = inbox.send(Inbox::Disconnected);
+            }
+        }
+
+        attempt += 1;
+        if attempt >= config.reconnect_max_attempts {
+            log::warn!("relay reconnect attempts exhausted");
+            let _ = inbox.send(Inbox::Closed);
+            return;
+        }
+
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(config.reconnect_max_delay);
+    }
+}
+
+async fn connect_once(
+    config: &ClientConfig,
+    identity: &IdentityKey,
+    role: Role,
+    topic: &Topic,
+) -> Result<RelayStream> {
+    let session_id = random::id()?;
+    let token = identity.connection_token(&session_id, &config.audience, config.token_ttl)?;
+
+    let registration_id = if role == Role::Proposer {
+        Some(
+            config
+                .registration_id
+                .clone()
+                .ok_or(ClientError::MissingRegistrationId)?,
+        )
+    } else {
+        None
+    };
+    let query = ConnectionQuery {
+        auth: token,
+        role,
+        topic: topic.clone(),
+        registration_id,
+    };
+    let query = serde_urlencoded::to_string(&query)?;
+
+    let mut url = url::Url::parse(&config.relay_url)?;
+    url.set_query(Some(&query));
+
+    log::debug!("connecting to relay {url}");
+    let (stream, _response) = connect_async(url.as_str()).await?;
+    Ok(stream)
+}
+
+/// Drive one WebSocket session. Returns `true` to reconnect, `false` to stop.
+async fn run_connection(
+    stream: RelayStream,
+    outbound: &mut mpsc::UnboundedReceiver<Outbound>,
+    inbox: &mpsc::UnboundedSender<Inbox>,
+    config: &ClientConfig,
+) -> bool {
+    let (mut sink, mut source) = stream.split();
+
+    let mut ping = interval_at(Instant::now() + config.ping_interval, config.ping_interval);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut awaiting_pong = false;
+    let mut pong_deadline = Instant::now();
+
+    loop {
+        tokio::select! {
+            outbound_item = outbound.recv() => match outbound_item {
+                Some(Outbound::Frame(frame)) => {
+                    let Ok(text) = serde_json::to_string(&frame) else {
+                        return true;
+                    };
+                    log::trace!("client -> topic={} frame={text}", frame.topic);
+                    if sink.send(Message::text(text)).await.is_err() {
+                        return true;
+                    }
+                }
+                None => return false,
+            },
+            message = source.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<RelayFrame>(&text) {
+                        Ok(frame) => {
+                            log::trace!("client <- topic={} frame={text}", frame.topic);
+                            let _ = inbox.send(Inbox::Frame(frame));
+                        }
+                        Err(error) => log::warn!("invalid relay frame: {error}"),
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    let _ = sink.send(Message::Pong(payload)).await;
+                }
+                Some(Ok(Message::Pong(_))) => awaiting_pong = false,
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                Some(Err(error)) => {
+                    log::debug!("relay read error: {error}");
+                    return true;
+                }
+                None => return true,
+            },
+            _ = ping.tick(), if !awaiting_pong => {
+                awaiting_pong = true;
+                pong_deadline = Instant::now() + config.pong_timeout;
+                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                    return true;
+                }
+            }
+            _ = sleep_until(pong_deadline), if awaiting_pong => {
+                log::debug!("relay pong timed out");
+                return true;
+            }
         }
     }
-    let _ = sink.close().await;
 }

@@ -26,6 +26,21 @@ pub struct ClientConfig {
 
     /// How long an inbound envelope id is remembered for duplicate suppression.
     pub seen_ttl: Duration,
+
+    /// Interval between client keepalive pings.
+    pub ping_interval: Duration,
+
+    /// How long to wait for a pong before treating the connection as dead.
+    pub pong_timeout: Duration,
+
+    /// Initial delay before the first reconnect attempt.
+    pub reconnect_initial_delay: Duration,
+
+    /// Maximum reconnect backoff delay.
+    pub reconnect_max_delay: Duration,
+
+    /// Maximum reconnect attempts before giving up.
+    pub reconnect_max_attempts: usize,
 }
 
 impl ClientConfig {
@@ -41,6 +56,11 @@ impl ClientConfig {
             ack_base_delay: Duration::from_secs(2),
             ack_max_attempts: 5,
             seen_ttl: Duration::from_secs(300),
+            ping_interval: Duration::from_secs(30),
+            pong_timeout: Duration::from_secs(10),
+            reconnect_initial_delay: Duration::from_millis(250),
+            reconnect_max_delay: Duration::from_secs(5),
+            reconnect_max_attempts: 5,
         }
     }
 
@@ -83,6 +103,36 @@ impl ClientConfig {
     /// Set the duplicate-suppression TTL.
     pub fn with_seen_ttl(mut self, seen_ttl: Duration) -> Self {
         self.seen_ttl = seen_ttl;
+        self
+    }
+
+    /// Set the keepalive ping interval.
+    pub fn with_ping_interval(mut self, ping_interval: Duration) -> Self {
+        self.ping_interval = ping_interval;
+        self
+    }
+
+    /// Set the pong deadline.
+    pub fn with_pong_timeout(mut self, pong_timeout: Duration) -> Self {
+        self.pong_timeout = pong_timeout;
+        self
+    }
+
+    /// Set the initial reconnect delay.
+    pub fn with_reconnect_initial_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_initial_delay = delay;
+        self
+    }
+
+    /// Set the maximum reconnect backoff delay.
+    pub fn with_reconnect_max_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_max_delay = delay;
+        self
+    }
+
+    /// Set the maximum reconnect attempts.
+    pub fn with_reconnect_max_attempts(mut self, attempts: usize) -> Self {
+        self.reconnect_max_attempts = attempts;
         self
     }
 }

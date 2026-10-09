@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,12 @@ pub enum ClientEvent {
         /// Retransmissions attempted.
         attempts: usize,
     },
+
+    /// The relay connection was lost and a reconnect is starting.
+    Reconnecting,
+
+    /// The relay connection was re-established.
+    Reconnected,
 }
 
 /// Whether a message type must be acknowledged.
@@ -138,6 +147,7 @@ impl NonceGuard {
 pub(crate) struct Reliability {
     outbox: mpsc::UnboundedSender<Outbound>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
+    connected: Arc<AtomicBool>,
     seen: SeenIds,
     events: mpsc::UnboundedSender<ClientEvent>,
     base_delay: Duration,
@@ -152,9 +162,11 @@ impl Reliability {
         seen_ttl: Duration,
     ) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(false));
         let (events, events_rx) = mpsc::unbounded_channel();
         let _retry = tokio::spawn(retry_loop(
             Arc::clone(&pending),
+            Arc::clone(&connected),
             outbox.clone(),
             events.clone(),
             base_delay,
@@ -165,6 +177,7 @@ impl Reliability {
             Self {
                 outbox,
                 pending,
+                connected,
                 seen: SeenIds::new(seen_ttl),
                 events,
                 base_delay,
@@ -172,6 +185,23 @@ impl Reliability {
             },
             events_rx,
         )
+    }
+
+    /// Report the transport connection state; on reconnect, flush pending.
+    pub(crate) fn set_connected(&mut self, connected: bool) {
+        self.connected.store(connected, Ordering::Relaxed);
+        if connected {
+            let now = Instant::now();
+            let mut pending = self.pending.lock().expect("reliability lock");
+            for entry in pending.values_mut() {
+                entry.next = now;
+            }
+        }
+    }
+
+    /// Emit an event to the application.
+    pub(crate) fn emit(&self, event: ClientEvent) {
+        let _ = self.events.send(event);
     }
 
     /// Enqueue a frame, tracking it for retransmission when `track` is set.
@@ -224,6 +254,7 @@ impl Drop for Reliability {
 
 async fn retry_loop(
     pending: Arc<Mutex<HashMap<String, Pending>>>,
+    connected: Arc<AtomicBool>,
     outbox: mpsc::UnboundedSender<Outbound>,
     events: mpsc::UnboundedSender<ClientEvent>,
     base_delay: Duration,
@@ -233,6 +264,12 @@ async fn retry_loop(
 
     loop {
         ticker.tick().await;
+
+        // Pause retransmission while the transport is down; flushed on reconnect.
+        if !connected.load(Ordering::Relaxed) {
+            continue;
+        }
+
         let now = Instant::now();
         let mut resend = Vec::new();
         let mut failed = Vec::new();
@@ -348,6 +385,7 @@ mod tests {
             Reliability::spawn(outbox, Duration::from_secs(1), 2, Duration::from_secs(60));
 
         reliability.dispatch(frame("a"), true).expect("dispatch");
+        reliability.set_connected(true);
         assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
 
         // Let the retry task run through the backoff schedule and give up.
@@ -372,5 +410,37 @@ mod tests {
             }
         }
         assert_eq!(failed, Some(("a".to_owned(), 2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pauses_while_disconnected_and_flushes_on_reconnect() {
+        let (outbox, mut outbound) = mpsc::unbounded_channel();
+        let (mut reliability, _events) =
+            Reliability::spawn(outbox, Duration::from_secs(1), 3, Duration::from_secs(60));
+
+        // Reliability starts disconnected.
+        reliability.dispatch(frame("a"), true).expect("dispatch");
+        assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
+
+        // No retransmission while the transport is down.
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            outbound.try_recv().is_err(),
+            "no resend expected while disconnected"
+        );
+
+        // Reconnect flushes pending immediately.
+        reliability.set_connected(true);
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(outbound.try_recv(), Ok(Outbound::Frame(_))),
+            "expected a flush resend after reconnect"
+        );
     }
 }
