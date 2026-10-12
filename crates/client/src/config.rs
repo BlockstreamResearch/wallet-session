@@ -9,7 +9,7 @@ pub struct ClientConfig {
     /// Audience (`aud`) expected by the relay in the connection token.
     pub audience: String,
 
-    /// Registration id; required when connecting as the proposer.
+    /// Optional registration id sent to the relay as an attribution label.
     pub registration_id: Option<String>,
 
     /// Lifetime of the signed connection token.
@@ -64,7 +64,7 @@ impl ClientConfig {
         }
     }
 
-    /// Set the registration id used when connecting as the proposer.
+    /// Set the registration id sent to the relay.
     pub fn with_registration_id(mut self, registration_id: impl Into<String>) -> Self {
         self.registration_id = Some(registration_id.into());
         self

@@ -15,12 +15,7 @@ use wallet_session_core::{
     message::Topic,
 };
 
-use crate::{
-    config::ClientConfig,
-    error::{ClientError, Result},
-    identity::IdentityKey,
-    random,
-};
+use crate::{config::ClientConfig, error::Result, identity::IdentityKey, random};
 
 /// Client-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -151,21 +146,11 @@ async fn connect_once(
     let session_id = random::id()?;
     let token = identity.connection_token(&session_id, &config.audience, config.token_ttl)?;
 
-    let registration_id = if role == Role::Proposer {
-        Some(
-            config
-                .registration_id
-                .clone()
-                .ok_or(ClientError::MissingRegistrationId)?,
-        )
-    } else {
-        None
-    };
     let query = ConnectionQuery {
         auth: token,
         role,
         topic: topic.clone(),
-        registration_id,
+        registration_id: config.registration_id.clone(),
     };
     let query = serde_urlencoded::to_string(&query)?;
 

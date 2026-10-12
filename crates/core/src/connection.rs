@@ -48,7 +48,7 @@ pub struct ConnectionQuery {
     /// Topic to subscribe to.
     pub topic: Topic,
 
-    /// Registration id; required for proposers.
+    /// Optional registration id; an attribution label only, not authorization.
     /// TODO: should be it's own struct
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registration_id: Option<String>,

@@ -116,8 +116,15 @@ fn parse_connection(
     let query: ConnectionQuery = serde_urlencoded::from_str(query)?;
 
     let identity = Identity::verify_token(&query.auth, audience, now)?;
-    if query.role == Role::Proposer && query.registration_id.is_none() {
-        return Err(ConnectionError::MissingParameter("registrationId"));
+
+    // TODO: `registrationId` is client-asserted and not covered by the token
+    // signature, so it is an attribution label only. Do not rate-limit or ban
+    // on it until it is bound to the identity (e.g. as a signed claim).
+    if let Some(registration_id) = &query.registration_id {
+        log::debug!(
+            "connection from {} carries registrationId {registration_id}",
+            identity.did
+        );
     }
 
     Ok((query, identity))
@@ -487,12 +494,12 @@ mod tests {
     }
 
     #[test]
-    fn proposer_requires_registration_id() -> TestResult {
+    fn proposer_registration_id_is_optional() -> TestResult {
         let query = format!("auth={}&role=proposer&topic={}", token(), topic()?);
-        assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::MissingParameter("registrationId"))
-        ));
+        let (query, _identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
+
+        assert_eq!(query.role, Role::Proposer);
+        assert_eq!(query.registration_id, None);
         Ok(())
     }
 

@@ -176,7 +176,9 @@ where
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         loop {
             let frame = self.next_frame().await?;
-            let RelayFrame { id, topic, body, .. } = frame;
+            let RelayFrame {
+                id, topic, body, ..
+            } = frame;
 
             match body {
                 RelayFrameBody::Message { payload } => {

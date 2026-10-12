@@ -62,16 +62,18 @@ The identity key is used to sign the connection token presented to the relay. It
 
 ## 5. Connection authorization
 
-Every client authenticates its WebSocket connection to the relay with a signed JWT by it's identity key, and a registration id, which should be registered in relay beforehand. Both are sent once, as query parameters on the connection URL, which establish a WebSocket connection.
+Every client authenticates its WebSocket connection to the relay with a signed JWT by its identity key. The JWT is sent once, as a query parameter on the connection URL, which establishes a WebSocket connection.
+
+A client may also send an optional `registrationId` query parameter. It is a client-asserted label reserved for relay-operator attribution and future quotas. It is not covered by the JWT signature, so it is **not an authorization mechanism** and the relay must not rate-limit, ban, or otherwise act on it until it is bound to the client identity (for example as a signed claim). Relays accept connections with or without it.
 
 URI scheme for proposer:
 ```
-wss://relay.example.com/?auth=<JWT>&registrationId=<registration-id>&role=proposer&topic=<topic>
+wss://relay.example.com/?auth=<JWT>&role=proposer&topic=<topic>[&registrationId=<registration-id>]
 ```
 
 URI scheme for responder:
 ```
-wss://relay.example.com/?auth=<JWT>&role=responder&topic=<topic>
+wss://relay.example.com/?auth=<JWT>&role=responder&topic=<topic>[&registrationId=<registration-id>]
 ```
 
 JWT scheme:
@@ -93,7 +95,7 @@ Proposer (dApp) -- Initiates a session, creates a pairing, generates a proposal,
 
 Responder (wallet) -- Scans the pairing QR-code, approves or rejects proposals, and signs user requests.
 
-Roles are not permanent: a client can be a proposer in one session and a responder in another. Both roles run the same client implementation and differ only in which side initiates. Note that the proposer should have a registration id in order to use the relay server.
+Roles are not permanent: a client can be a proposer in one session and a responder in another. Both roles run the same client implementation and differ only in which side initiates.
 
 ## 7. Topic
 

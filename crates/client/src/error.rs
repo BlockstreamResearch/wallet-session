@@ -42,9 +42,6 @@ pub enum ClientError {
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),
 
-    #[error("a registration id is required for the proposer")]
-    MissingRegistrationId,
-
     #[error("session is not active")]
     SessionNotActive,
 }
