@@ -951,4 +951,86 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn pong_timeout_drops_peer_and_allows_reconnect() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_ping_interval(Duration::from_millis(100))
+                .with_pong_timeout(Duration::from_millis(200))
+                .with_idle_timeout(Duration::from_secs(30))
+                .with_session_grace(Duration::from_millis(100)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        // Keep the responder object alive but never poll it, so it never answers pings.
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // The proposer keeps answering pings while waiting for the liveness verdict.
+        let notified = read_frame(&mut proposer).await?;
+        assert!(
+            matches!(notified.body, RelayFrameBody::PeerDisconnected),
+            "expected PeerDisconnected after pong timeout, got {:?}",
+            notified.body
+        );
+
+        // The reserved slot is released, so the same identity can reconnect.
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_frames_expire_after_ttl() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_secs(5))
+                .with_session_buffer_ttl(Duration::from_millis(200)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        send(&mut proposer, &message(&topic, "stale", "old")).await?;
+        // Wait past the per-frame TTL but still inside the grace window.
+        sleep(Duration::from_millis(300)).await;
+
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut responder))
+                .await
+                .is_err(),
+            "expired buffered frame must not be redelivered"
+        );
+        Ok(())
+    }
 }

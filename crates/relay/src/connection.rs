@@ -7,7 +7,7 @@ use futures_util::{
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
@@ -39,11 +39,20 @@ pub const DEFAULT_SESSION_GRACE: Duration = Duration::from_secs(10);
 /// Default maximum frames buffered per disconnected peer.
 pub const DEFAULT_SESSION_BUFFER_MAX_MESSAGES: usize = 256;
 
+/// Default time a buffered frame remains deliverable.
+pub const DEFAULT_SESSION_BUFFER_TTL: Duration = Duration::from_secs(60);
+
 /// Default interval between relay keepalive pings.
 pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Default time to wait for a pong after a keepalive ping.
+pub const DEFAULT_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Default maximum time without any inbound traffic before a peer is dropped.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Time to let the writer flush before aborting it on connection teardown.
+const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Default maximum time for the WebSocket handshake to complete.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,8 +84,14 @@ pub struct NativeRelayTransportConfig {
     /// Maximum frames buffered per disconnected peer.
     pub session_buffer_max_messages: usize,
 
+    /// How long a buffered frame remains deliverable.
+    pub session_buffer_ttl: Duration,
+
     /// Interval between relay keepalive pings.
     pub ping_interval: Duration,
+
+    /// Time to wait for a pong after a keepalive ping.
+    pub pong_timeout: Duration,
 
     /// Maximum time without any inbound traffic before a peer is dropped.
     pub idle_timeout: Duration,
@@ -102,7 +117,9 @@ impl NativeRelayTransportConfig {
             max_incoming_frame_bytes: DEFAULT_MAX_INCOMING_FRAME_BYTES,
             session_grace: DEFAULT_SESSION_GRACE,
             session_buffer_max_messages: DEFAULT_SESSION_BUFFER_MAX_MESSAGES,
+            session_buffer_ttl: DEFAULT_SESSION_BUFFER_TTL,
             ping_interval: DEFAULT_PING_INTERVAL,
+            pong_timeout: DEFAULT_PONG_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
@@ -123,9 +140,21 @@ impl NativeRelayTransportConfig {
         self
     }
 
+    /// Set the per-frame buffer TTL.
+    pub fn with_session_buffer_ttl(mut self, ttl: Duration) -> Self {
+        self.session_buffer_ttl = ttl;
+        self
+    }
+
     /// Set the keepalive ping interval.
     pub fn with_ping_interval(mut self, interval: Duration) -> Self {
         self.ping_interval = interval;
+        self
+    }
+
+    /// Set the pong deadline after a keepalive ping.
+    pub fn with_pong_timeout(mut self, timeout: Duration) -> Self {
+        self.pong_timeout = timeout;
         self
     }
 
@@ -323,14 +352,19 @@ impl Connection {
 
         let (sink, source) = websocket.split();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Deadline by which an outstanding keepalive ping must be answered.
+        let (ping_deadline, mut ping_deadline_rx) = watch::channel(None);
         let mut writer = tokio::spawn(write_loop(
             sink,
             self.outbound,
             shutdown_rx,
             self.config.ping_interval,
+            self.config.pong_timeout,
             self.config.write_timeout,
+            ping_deadline.clone(),
         ));
 
+        let config = &self.config;
         if both_ready {
             log::info!(
                 "session ready for topic {}, role {:?}",
@@ -346,7 +380,8 @@ impl Connection {
             let _ = self.session.route(
                 self.query.role,
                 ready.clone(),
-                self.config.session_buffer_max_messages,
+                config.session_buffer_max_messages,
+                config.session_buffer_ttl,
             );
             let _ = self.self_tx.send(ready).await;
         }
@@ -367,14 +402,23 @@ impl Connection {
             &mut writer,
             &self.query,
             &self.session,
-            self.config.session_buffer_max_messages,
-            self.config.idle_timeout,
+            config,
+            &ping_deadline,
+            &mut ping_deadline_rx,
         )
         .await;
 
         drop(self.self_tx);
         let _ = shutdown_tx.send(());
-        let _ = writer.await;
+        // Do not let a peer with a dead or stalled socket delay slot release:
+        // give the writer a moment to flush, then abort it.
+        if tokio::time::timeout(WRITER_SHUTDOWN_GRACE, &mut writer)
+            .await
+            .is_err()
+        {
+            log::debug!("connection writer did not stop promptly; aborting");
+            writer.abort();
+        }
 
         result
     }
@@ -385,7 +429,9 @@ async fn write_loop(
     mut rx: mpsc::Receiver<RelayFrame>,
     mut shutdown: oneshot::Receiver<()>,
     ping_interval: Duration,
+    pong_timeout: Duration,
     write_timeout: Duration,
+    ping_deadline: watch::Sender<Option<tokio::time::Instant>>,
 ) {
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
@@ -409,6 +455,18 @@ async fn write_loop(
                 if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), write_timeout).await {
                     break;
                 }
+                // A live peer answers with a pong (or other traffic) before this deadline.
+                // Arm only if no deadline is outstanding so repeated pings cannot
+                // indefinitely extend the window when pong_timeout > ping_interval.
+                let deadline = tokio::time::Instant::now() + pong_timeout;
+                let _ = ping_deadline.send_if_modified(|current| {
+                    if current.is_none() {
+                        *current = Some(deadline);
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             _ = &mut shutdown => break,
         }
@@ -437,8 +495,9 @@ async fn read_loop(
     writer: &mut JoinHandle<()>,
     query: &ConnectionQuery,
     session: &Session,
-    max_buffered: usize,
-    idle_timeout: Duration,
+    config: &NativeRelayTransportConfig,
+    ping_deadline: &watch::Sender<Option<tokio::time::Instant>>,
+    ping_deadline_rx: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), ConnectionError> {
     loop {
         let message = tokio::select! {
@@ -446,19 +505,27 @@ async fn read_loop(
                 log::debug!("connection writer stopped for topic {}; closing", query.topic);
                 break;
             }
-            incoming = tokio::time::timeout(idle_timeout, source.next()) => match incoming {
+            _ = wait_pong_deadline(ping_deadline_rx) => {
+                log::debug!("peer on topic {} missed a keepalive pong; dropping", query.topic);
+                return Err(ConnectionError::PongTimeout);
+            }
+            incoming = tokio::time::timeout(config.idle_timeout, source.next()) => match incoming {
                 Ok(Some(Ok(message))) => message,
                 Ok(Some(Err(error))) => return Err(error.into()),
                 Ok(None) => break,
                 Err(_) => {
                     log::debug!(
-                        "peer on topic {} idle for {idle_timeout:?}; dropping",
-                        query.topic
+                        "peer on topic {} idle for {:?}; dropping",
+                        query.topic,
+                        config.idle_timeout
                     );
                     return Err(ConnectionError::IdleTimeout);
                 }
             },
         };
+
+        // Any inbound frame proves the peer is alive; clear the pong deadline.
+        let _ = ping_deadline.send(None);
 
         let frame = match message {
             Message::Text(text) => {
@@ -498,7 +565,12 @@ async fn read_loop(
             return Err(ConnectionError::ClientSessionReady);
         }
 
-        match session.route(query.role, frame, max_buffered) {
+        match session.route(
+            query.role,
+            frame,
+            config.session_buffer_max_messages,
+            config.session_buffer_ttl,
+        ) {
             Ok(()) => {}
             Err(SessionError::NoCounterpart) => {
                 log::trace!(
@@ -510,6 +582,26 @@ async fn read_loop(
         }
     }
     Ok(())
+}
+
+/// Resolves when an outstanding keepalive ping is not answered in time.
+async fn wait_pong_deadline(rx: &mut watch::Receiver<Option<tokio::time::Instant>>) {
+    loop {
+        let deadline = *rx.borrow_and_update();
+        match deadline {
+            Some(deadline) => {
+                tokio::time::sleep_until(deadline).await;
+                if *rx.borrow_and_update() == Some(deadline) {
+                    return;
+                }
+            }
+            None => {
+                if rx.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
 }
 
 /// Connection handler failures.
@@ -556,6 +648,9 @@ pub enum ConnectionError {
 
     #[error("peer idle timeout")]
     IdleTimeout,
+
+    #[error("peer missed a keepalive pong")]
+    PongTimeout,
 
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),

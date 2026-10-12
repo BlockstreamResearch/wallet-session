@@ -53,8 +53,14 @@ enum Slot {
     Disconnected {
         identity: DidKey,
         deadline: Instant,
-        buffered: VecDeque<RelayFrame>,
+        buffered: VecDeque<BufferedFrame>,
     },
+}
+
+/// A frame buffered for a disconnected peer, with its expiry time.
+struct BufferedFrame {
+    frame: RelayFrame,
+    expires_at: Instant,
 }
 
 /// The two role slots for one topic.
@@ -124,7 +130,11 @@ impl Session {
         }
 
         let buffered = match slots.get_mut(role).take() {
-            Some(Slot::Disconnected { buffered, .. }) => buffered.into_iter().collect(),
+            Some(Slot::Disconnected { buffered, .. }) => buffered
+                .into_iter()
+                .filter(|entry| entry.expires_at > now)
+                .map(|entry| entry.frame)
+                .collect(),
             _ => Vec::new(),
         };
         *slots.get_mut(role) = Some(Slot::Connected(peer));
@@ -177,11 +187,14 @@ impl Session {
     }
 
     /// Forward a frame to the counterpart, buffering while it is disconnected.
+    ///
+    /// Buffered frames expire after `buffer_ttl`; a zero TTL drops them immediately.
     pub(crate) fn route(
         &self,
         from: Role,
         frame: RelayFrame,
         max_buffered: usize,
+        buffer_ttl: Duration,
     ) -> Result<(), SessionError> {
         let mut slots = self.lock()?;
         let target = from.counterpart();
@@ -199,11 +212,14 @@ impl Session {
 
         match slots.get_mut(target) {
             Some(Slot::Disconnected { buffered, .. }) => {
-                if max_buffered > 0 {
+                if max_buffered > 0 && !buffer_ttl.is_zero() {
                     if buffered.len() >= max_buffered {
                         buffered.pop_front();
                     }
-                    buffered.push_back(frame);
+                    buffered.push_back(BufferedFrame {
+                        frame,
+                        expires_at: Instant::now() + buffer_ttl,
+                    });
                 }
                 Ok(())
             }
@@ -222,6 +238,9 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const MAX_BUFFERED: usize = 8;
+
+    /// Buffer TTL used by these tests.
+    const BUFFER_TTL: Duration = Duration::from_secs(60);
 
     /// Outbound queue capacity used by peer handles in these tests.
     const PEER_QUEUE: usize = 8;
@@ -289,7 +308,7 @@ mod tests {
         session.register(Role::Proposer, proposer)?;
         session.register(Role::Responder, responder)?;
 
-        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
 
         let received = responder_rx.try_recv()?;
         assert!(matches!(received.body, RelayFrameBody::Message { .. }));
@@ -303,7 +322,7 @@ mod tests {
         session.register(Role::Proposer, proposer)?;
 
         assert!(matches!(
-            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED),
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL),
             Err(SessionError::NoCounterpart)
         ));
         Ok(())
@@ -319,7 +338,7 @@ mod tests {
 
         // bounded queue only holds PEER_QUEUE frames; extra frames are dropped.
         for _ in 0..PEER_QUEUE + 3 {
-            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
         }
 
         let mut delivered = 0;
@@ -341,7 +360,7 @@ mod tests {
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         // frames to the disconnected peer are buffered, not dropped
-        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
         assert!(responder_rx.try_recv().is_err());
 
         // same identity reconnects within grace and receives the buffer
@@ -370,6 +389,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn expired_buffered_frames_are_not_redelivered() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
+        session.register(Role::Proposer, proposer)?;
+        session.register(Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        let ttl = Duration::from_secs(5);
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
+
+        let (responder, _) = peer(2);
+        let (_, buffered) = session.register(Role::Responder, responder)?;
+        assert_eq!(buffered.len(), 1, "only the unexpired frame is redelivered");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn overflow_drops_oldest() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer(1);
@@ -379,7 +418,7 @@ mod tests {
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         for _ in 0..3 {
-            session.route(Role::Proposer, frame(&topic()?), 2)?;
+            session.route(Role::Proposer, frame(&topic()?), 2, BUFFER_TTL)?;
         }
 
         let (responder, _) = peer(2);
@@ -433,7 +472,7 @@ mod tests {
         assert!(outcome.is_err());
 
         assert!(matches!(
-            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED),
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL),
             Err(SessionError::LockPoisoned)
         ));
         Ok(())

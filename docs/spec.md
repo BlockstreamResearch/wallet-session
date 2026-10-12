@@ -48,9 +48,19 @@ Relay is a web socket server. A client connects to the Relay by providing the to
 
 Once both parties are connected, the Relay sends `session_ready` to both. Neither party sends application messages before receiving that signal.
 
-Messages send by the `Proposer` is send to the `Responder`. Messages send by the `Responder` is send to the `Proposer`.  
+Messages send by the `Proposer` is send to the `Responder`. Messages send by the `Responder` is send to the `Proposer`.
 
-Relay maintains a FIFO queue of un-ACKed messages for both sides up to a maximum number of messages and a specific TTL. Upon reconnection, the Relay sent queued messages to the client, removing messages from the queue.
+While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL. On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue.
+
+The Relay cannot observe end-to-end acknowledgements (§13): `ack` is an application message encrypted between the peers. Relay buffering is therefore best-effort and scoped to the observed-disconnected window. Frames written to a connection that is silently dead may be lost before the Relay notices; recovery is the responsibility of the sender's ack retry (§13).
+
+Relay enforces resource limits to protect itself and its tenants: a bounded handshake deadline, a bounded per-connection outbound queue with a write deadline, keepalive pings with a pong deadline, maximum total and per-identity concurrent connections, a per-identity connection-attempt rate, and a maximum number of concurrent sessions. A peer that stops reading has its outbound queue drained by dropping frames (clients retransmit un-ACKed messages) rather than growing relay memory without bound; a peer that fails the write or pong deadline is disconnected and its slot enters the reconnection grace, so a silently dead (half-open) peer is detected before the idle timeout and can reconnect sooner.
+
+### 3.1 Threat model notes
+
+Slot ownership is first-come, first-served per topic and role. A party that learns a topic before its counterpart connects can claim the role slot and block the intended peer; the relay does not know which identity is expected on a slot. Pairing topics and URIs are therefore bearer secrets and must be short-lived. The connection caps above bound but do not eliminate this risk.
+
+Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting and banning by identity raise the cost of abuse but are not a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
 
 ## 4. Network identity
 
