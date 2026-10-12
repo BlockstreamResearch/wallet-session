@@ -7,7 +7,10 @@ use wallet_session_client::{
     XChaCha20Poly1305Cipher,
 };
 use wallet_session_relay::{
-    connection::NativeRelayTransportConfig, registry::Registry, server::serve,
+    connection::NativeRelayTransportConfig,
+    limits::{Limiter, RelayLimits},
+    registry::Registry,
+    server::serve,
 };
 
 const AUDIENCE: &str = "wss://relay.example.com";
@@ -32,6 +35,7 @@ async fn run() -> TestResult {
     tokio::spawn(serve(
         listener,
         Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimits::default())),
         NativeRelayTransportConfig::new(AUDIENCE),
     ));
 

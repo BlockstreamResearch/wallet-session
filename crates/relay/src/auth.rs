@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
@@ -9,6 +9,12 @@ const JWT_ALGORITHM: &str = "EdDSA";
 
 /// Tolerance applied to `iat`/`exp` checks, in seconds
 const TOKEN_LEEWAY_SECS: u64 = 60;
+
+/// Maximum accepted length of the auth token string.
+pub const MAX_TOKEN_BYTES: usize = 4096;
+
+/// Default maximum accepted lifetime of an auth token.
+pub const DEFAULT_MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Identity established by a verified connection token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +53,14 @@ pub enum IdentityError {
     #[error("token has expired")]
     Expired,
 
+    #[error("token lifetime exceeds the allowed maximum")]
+    ExpiryTooLong,
+
     #[error("token is not yet valid")]
     NotYetValid,
+
+    #[error("auth token exceeds the maximum length")]
+    TooLong,
 }
 
 /// Current Unix time in seconds, saturating at 0 before the epoch.
@@ -62,6 +74,20 @@ pub fn unix_now() -> u64 {
 impl Identity {
     /// Verify a signed JWT and build the peer identity.
     pub fn verify_token(auth: &str, audience: &str, now: u64) -> Result<Self, IdentityError> {
+        Self::verify_token_with_lifetime(auth, audience, now, DEFAULT_MAX_TOKEN_LIFETIME)
+    }
+
+    /// Verify a signed JWT, rejecting tokens whose lifetime exceeds `max_lifetime`.
+    pub fn verify_token_with_lifetime(
+        auth: &str,
+        audience: &str,
+        now: u64,
+        max_lifetime: Duration,
+    ) -> Result<Self, IdentityError> {
+        if auth.len() > MAX_TOKEN_BYTES {
+            return Err(IdentityError::TooLong);
+        }
+
         let mut segments = auth.split('.');
         let header_b64 = segments.next().ok_or(IdentityError::MalformedToken)?;
         let payload_b64 = segments.next().ok_or(IdentityError::MalformedToken)?;
@@ -89,6 +115,9 @@ impl Identity {
         }
         if token.exp <= now {
             return Err(IdentityError::Expired);
+        }
+        if token.exp.saturating_sub(now) > max_lifetime.as_secs() {
+            return Err(IdentityError::ExpiryTooLong);
         }
         if token.iat > now.saturating_add(TOKEN_LEEWAY_SECS) {
             return Err(IdentityError::NotYetValid);
@@ -293,6 +322,30 @@ mod tests {
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
             Err(IdentityError::Signature(..))
+        ));
+    }
+
+    #[test]
+    fn rejects_token_lifetime_over_cap() {
+        let token = test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 7 * 24 * 3600);
+        assert!(matches!(
+            Identity::verify_token(&token, AUDIENCE, NOW),
+            Err(IdentityError::ExpiryTooLong)
+        ));
+    }
+
+    #[test]
+    fn accepts_token_within_lifetime_cap() {
+        let token = test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 23 * 3600);
+        assert!(Identity::verify_token(&token, AUDIENCE, NOW).is_ok());
+    }
+
+    #[test]
+    fn rejects_oversized_token() {
+        let token = "a".repeat(MAX_TOKEN_BYTES + 1);
+        assert!(matches!(
+            Identity::verify_token(&token, AUDIENCE, NOW),
+            Err(IdentityError::TooLong)
         ));
     }
 

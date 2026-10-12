@@ -8,6 +8,7 @@ use thiserror::Error;
 use tokio::{
     net::TcpStream,
     sync::{mpsc, oneshot},
+    task::JoinHandle,
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async_with_config,
@@ -21,13 +22,13 @@ use tokio_tungstenite::{
 use wallet_session_core::{codec, connection::ConnectionQuery};
 
 use crate::{
-    auth::{Identity, IdentityError, unix_now},
+    auth::{DEFAULT_MAX_TOKEN_LIFETIME, Identity, IdentityError, unix_now},
     session::{Registration, Role, Session, SessionError},
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
 /// Server-side relay WebSocket stream.
-type RelayStream = WebSocketStream<TcpStream>;
+pub(crate) type RelayStream = WebSocketStream<TcpStream>;
 
 /// Default maximum WebSocket text or binary frame size accepted from a client.
 pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
@@ -43,6 +44,21 @@ pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default maximum time without any inbound traffic before a peer is dropped.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Default maximum time for the WebSocket handshake to complete.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default maximum time for a single outbound WebSocket write.
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default number of frames queued for a connected peer.
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum accepted query-string length before parsing.
+pub const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Relay frame protocol version accepted from clients.
+pub(crate) const RELAY_FRAME_VERSION: u8 = 1;
 
 /// Runtime limits for the relay connection handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +80,18 @@ pub struct NativeRelayTransportConfig {
 
     /// Maximum time without any inbound traffic before a peer is dropped.
     pub idle_timeout: Duration,
+
+    /// Maximum time for the WebSocket handshake to complete.
+    pub handshake_timeout: Duration,
+
+    /// Maximum time for a single outbound WebSocket write.
+    pub write_timeout: Duration,
+
+    /// Maximum frames queued for a connected peer that is not reading.
+    pub outbound_queue_capacity: usize,
+
+    /// Maximum accepted lifetime of an auth token.
+    pub max_token_lifetime: Duration,
 }
 
 impl NativeRelayTransportConfig {
@@ -76,6 +104,10 @@ impl NativeRelayTransportConfig {
             session_buffer_max_messages: DEFAULT_SESSION_BUFFER_MAX_MESSAGES,
             ping_interval: DEFAULT_PING_INTERVAL,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+            outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            max_token_lifetime: DEFAULT_MAX_TOKEN_LIFETIME,
         }
     }
 
@@ -102,6 +134,30 @@ impl NativeRelayTransportConfig {
         self.idle_timeout = timeout;
         self
     }
+
+    /// Set the WebSocket handshake timeout.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Set the outbound write timeout.
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout;
+        self
+    }
+
+    /// Set the per-connection outbound queue capacity.
+    pub fn with_outbound_queue_capacity(mut self, capacity: usize) -> Self {
+        self.outbound_queue_capacity = capacity;
+        self
+    }
+
+    /// Set the maximum accepted auth-token lifetime.
+    pub fn with_max_token_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_token_lifetime = lifetime;
+        self
+    }
 }
 
 /// Parse and verify the handshake query, returning the params and peer identity.
@@ -109,17 +165,21 @@ fn parse_connection(
     uri: &Uri,
     audience: &str,
     now: u64,
+    max_token_lifetime: Duration,
 ) -> Result<(ConnectionQuery, Identity), ConnectionError> {
     let query = uri
         .query()
         .ok_or(ConnectionError::MissingParameter("query"))?;
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(ConnectionError::QueryTooLarge);
+    }
     let query: ConnectionQuery = serde_urlencoded::from_str(query)?;
 
-    let identity = Identity::verify_token(&query.auth, audience, now)?;
+    let identity =
+        Identity::verify_token_with_lifetime(&query.auth, audience, now, max_token_lifetime)?;
 
     // TODO: `registrationId` is client-asserted and not covered by the token
-    // signature, so it is an attribution label only. Do not rate-limit or ban
-    // on it until it is bound to the identity (e.g. as a signed claim).
+    // signature, so it is an attribution label only
     if let Some(registration_id) = &query.registration_id {
         log::debug!(
             "connection from {} carries registrationId {registration_id}",
@@ -154,8 +214,8 @@ pub struct Connection {
     query: ConnectionQuery,
     identity: Identity,
     session: Arc<Session>,
-    outbound: mpsc::UnboundedReceiver<RelayFrame>,
-    self_tx: mpsc::UnboundedSender<RelayFrame>,
+    outbound: mpsc::Receiver<RelayFrame>,
+    self_tx: mpsc::Sender<RelayFrame>,
     config: NativeRelayTransportConfig,
 }
 
@@ -169,10 +229,11 @@ impl Connection {
         let audience = config.audience.as_str();
         let now = unix_now();
         let mut parsed: Option<Result<(ConnectionQuery, Identity), ConnectionError>> = None;
-        let handshake = accept_hdr_async_with_config(
+        let request = accept_hdr_async_with_config(
             stream,
             |request: &Request, response: Response| {
-                let params = parse_connection(request.uri(), audience, now);
+                let params =
+                    parse_connection(request.uri(), audience, now, config.max_token_lifetime);
                 let accepted = params.is_ok();
                 parsed = Some(params);
                 if accepted {
@@ -182,8 +243,14 @@ impl Connection {
                 }
             },
             Some(websocket_config(&config)),
-        )
-        .await;
+        );
+        let handshake = match tokio::time::timeout(config.handshake_timeout, request).await {
+            Ok(handshake) => handshake,
+            Err(_) => {
+                log::debug!("websocket handshake timed out");
+                return Err(ConnectionError::HandshakeTimeout);
+            }
+        };
 
         let (query, identity) = match parsed {
             Some(Ok(parsed)) => parsed,
@@ -209,8 +276,8 @@ impl Connection {
         query: ConnectionQuery,
         identity: Identity,
         session: Arc<Session>,
-        outbound: mpsc::UnboundedReceiver<RelayFrame>,
-        self_tx: mpsc::UnboundedSender<RelayFrame>,
+        outbound: mpsc::Receiver<RelayFrame>,
+        self_tx: mpsc::Sender<RelayFrame>,
         config: NativeRelayTransportConfig,
     ) -> Self {
         Self {
@@ -256,11 +323,12 @@ impl Connection {
 
         let (sink, source) = websocket.split();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let writer = tokio::spawn(write_loop(
+        let mut writer = tokio::spawn(write_loop(
             sink,
             self.outbound,
             shutdown_rx,
             self.config.ping_interval,
+            self.config.write_timeout,
         ));
 
         if both_ready {
@@ -270,7 +338,7 @@ impl Connection {
                 self.query.role
             );
             let ready = RelayFrame {
-                v: 1,
+                v: RELAY_FRAME_VERSION,
                 id: random_id()?,
                 topic: self.query.topic.clone(),
                 body: RelayFrameBody::SessionReady,
@@ -280,7 +348,7 @@ impl Connection {
                 ready.clone(),
                 self.config.session_buffer_max_messages,
             );
-            let _ = self.self_tx.send(ready);
+            let _ = self.self_tx.send(ready).await;
         }
 
         if !buffered.is_empty() {
@@ -290,12 +358,13 @@ impl Connection {
                 self.identity.did
             );
             for frame in buffered {
-                let _ = self.self_tx.send(frame);
+                let _ = self.self_tx.send(frame).await;
             }
         }
 
         let result = read_loop(
             source,
+            &mut writer,
             &self.query,
             &self.session,
             self.config.session_buffer_max_messages,
@@ -313,9 +382,10 @@ impl Connection {
 
 async fn write_loop(
     mut sink: SplitSink<RelayStream, Message>,
-    mut rx: mpsc::UnboundedReceiver<RelayFrame>,
+    mut rx: mpsc::Receiver<RelayFrame>,
     mut shutdown: oneshot::Receiver<()>,
     ping_interval: Duration,
+    write_timeout: Duration,
 ) {
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
@@ -325,19 +395,18 @@ async fn write_loop(
         tokio::select! {
             received = rx.recv() => match received {
                 Some(frame) => {
-                    let text = match serde_json::to_string(&frame) {
-                        Ok(text) => text,
-                        Err(_) => break,
+                    let Ok(text) = serde_json::to_string(&frame) else {
+                        break;
                     };
                     log::trace!("relay -> topic={} frame={text}", frame.topic);
-                    if sink.send(Message::text(text)).await.is_err() {
+                    if !send_with_timeout(&mut sink, Message::text(text), write_timeout).await {
                         break;
                     }
                 }
                 None => break,
             },
             _ = ping.tick() => {
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), write_timeout).await {
                     break;
                 }
             }
@@ -347,25 +416,48 @@ async fn write_loop(
     let _ = sink.close().await;
 }
 
+/// Send one message, returning whether the socket is still usable.
+async fn send_with_timeout(
+    sink: &mut SplitSink<RelayStream, Message>,
+    message: Message,
+    write_timeout: Duration,
+) -> bool {
+    match tokio::time::timeout(write_timeout, sink.send(message)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            log::warn!("outbound websocket write timed out; closing connection");
+            false
+        }
+    }
+}
+
 async fn read_loop(
     mut source: SplitStream<RelayStream>,
+    writer: &mut JoinHandle<()>,
     query: &ConnectionQuery,
     session: &Session,
     max_buffered: usize,
     idle_timeout: Duration,
 ) -> Result<(), ConnectionError> {
     loop {
-        let message = match tokio::time::timeout(idle_timeout, source.next()).await {
-            Ok(Some(Ok(message))) => message,
-            Ok(Some(Err(error))) => return Err(error.into()),
-            Ok(None) => break,
-            Err(_) => {
-                log::debug!(
-                    "peer on topic {} idle for {idle_timeout:?}; dropping",
-                    query.topic
-                );
-                return Err(ConnectionError::IdleTimeout);
+        let message = tokio::select! {
+            _ = &mut *writer => {
+                log::debug!("connection writer stopped for topic {}; closing", query.topic);
+                break;
             }
+            incoming = tokio::time::timeout(idle_timeout, source.next()) => match incoming {
+                Ok(Some(Ok(message))) => message,
+                Ok(Some(Err(error))) => return Err(error.into()),
+                Ok(None) => break,
+                Err(_) => {
+                    log::debug!(
+                        "peer on topic {} idle for {idle_timeout:?}; dropping",
+                        query.topic
+                    );
+                    return Err(ConnectionError::IdleTimeout);
+                }
+            },
         };
 
         let frame = match message {
@@ -382,6 +474,22 @@ async fn read_loop(
             }
         };
 
+        if frame.v != RELAY_FRAME_VERSION {
+            log::warn!(
+                "unsupported relay frame version {} on topic {}",
+                frame.v,
+                query.topic
+            );
+            return Err(ConnectionError::InvalidVersion(frame.v));
+        }
+        if frame.topic != query.topic {
+            log::warn!(
+                "frame topic {} does not match subscription {}",
+                frame.topic,
+                query.topic
+            );
+            return Err(ConnectionError::TopicMismatch);
+        }
         if matches!(&frame.body, RelayFrameBody::SessionReady) {
             log::warn!(
                 "client sent relay-only session_ready on topic {}",
@@ -434,6 +542,18 @@ pub enum ConnectionError {
     #[error("websocket handshake failed")]
     HandshakeFailed,
 
+    #[error("websocket handshake timed out")]
+    HandshakeTimeout,
+
+    #[error("handshake query is too large")]
+    QueryTooLarge,
+
+    #[error("unsupported relay frame version: {0}")]
+    InvalidVersion(u8),
+
+    #[error("frame topic does not match the subscription")]
+    TopicMismatch,
+
     #[error("peer idle timeout")]
     IdleTimeout,
 
@@ -450,6 +570,7 @@ mod tests {
 
     const AUDIENCE: &str = "wss://relay.example.com";
     const NOW: u64 = 1_700_000_000;
+    const MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -465,6 +586,15 @@ mod tests {
         Topic::new([1u8; 32])
     }
 
+    fn parse(query: &str) -> Result<(ConnectionQuery, Identity), ConnectionError> {
+        parse_connection(
+            &uri(query).map_err(|_| ConnectionError::HandshakeFailed)?,
+            AUDIENCE,
+            NOW,
+            MAX_LIFETIME,
+        )
+    }
+
     #[test]
     fn proposer_params_parse() -> TestResult {
         let topic = topic()?;
@@ -473,7 +603,7 @@ mod tests {
             token(),
             topic
         );
-        let (query, identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
+        let (query, identity) = parse(&query)?;
 
         assert_eq!(query.role, Role::Proposer);
         assert_eq!(query.topic, topic);
@@ -486,7 +616,7 @@ mod tests {
     #[test]
     fn responder_params_parse_without_registration_id() -> TestResult {
         let query = format!("auth={}&role=responder&topic={}", token(), topic()?);
-        let (query, _identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
+        let (query, _identity) = parse(&query)?;
 
         assert_eq!(query.role, Role::Responder);
         assert_eq!(query.registration_id, None);
@@ -496,7 +626,7 @@ mod tests {
     #[test]
     fn proposer_registration_id_is_optional() -> TestResult {
         let query = format!("auth={}&role=proposer&topic={}", token(), topic()?);
-        let (query, _identity) = parse_connection(&uri(&query)?, AUDIENCE, NOW)?;
+        let (query, _identity) = parse(&query)?;
 
         assert_eq!(query.role, Role::Proposer);
         assert_eq!(query.registration_id, None);
@@ -506,30 +636,21 @@ mod tests {
     #[test]
     fn invalid_role_is_rejected() -> TestResult {
         let query = format!("auth={}&role=observer&topic={}", token(), topic()?);
-        assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::Query(_))
-        ));
+        assert!(matches!(parse(&query), Err(ConnectionError::Query(_))));
         Ok(())
     }
 
     #[test]
     fn invalid_topic_is_rejected() -> TestResult {
         let query = format!("auth={}&role=responder&topic=not-a-topic", token());
-        assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::Query(_))
-        ));
+        assert!(matches!(parse(&query), Err(ConnectionError::Query(_))));
         Ok(())
     }
 
     #[test]
     fn missing_auth_is_rejected() -> TestResult {
         let query = format!("role=responder&topic={}", topic()?);
-        assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
-            Err(ConnectionError::Query(_))
-        ));
+        assert!(matches!(parse(&query), Err(ConnectionError::Query(_))));
         Ok(())
     }
 
@@ -537,7 +658,7 @@ mod tests {
     fn malformed_auth_token_is_rejected() -> TestResult {
         let query = format!("auth=no-dots&role=responder&topic={}", topic()?);
         assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
+            parse(&query),
             Err(ConnectionError::Identity(IdentityError::MalformedToken))
         ));
         Ok(())
@@ -548,9 +669,59 @@ mod tests {
         let token = test_utils::token(&signing_key(1), "wss://other", NOW, NOW + 3600);
         let query = format!("auth={}&role=responder&topic={}", token, topic()?);
         assert!(matches!(
-            parse_connection(&uri(&query)?, AUDIENCE, NOW),
+            parse(&query),
             Err(ConnectionError::Identity(IdentityError::Audience))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_query_is_rejected() -> TestResult {
+        let query = "a".repeat(MAX_QUERY_BYTES + 1);
+        assert!(matches!(
+            parse_connection(&uri(&query)?, AUDIENCE, NOW, MAX_LIFETIME),
+            Err(ConnectionError::QueryTooLarge)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_auth_token_is_rejected() -> TestResult {
+        let query = format!(
+            "auth={}&role=responder&topic={}",
+            "a".repeat(crate::auth::MAX_TOKEN_BYTES + 1),
+            topic()?
+        );
+        assert!(matches!(
+            parse_connection(&uri(&query)?, AUDIENCE, NOW, MAX_LIFETIME),
+            Err(ConnectionError::Identity(IdentityError::TooLong))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn token_lifetime_over_cap_is_rejected() -> TestResult {
+        let token = test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 7200);
+        let query = format!("auth={token}&role=responder&topic={}", topic()?);
+        assert!(matches!(
+            parse_connection(&uri(&query)?, AUDIENCE, NOW, Duration::from_secs(3600)),
+            Err(ConnectionError::Identity(IdentityError::ExpiryTooLong))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_handshake_times_out() -> TestResult {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        // keep the client socket open but never send the HTTP upgrade request.
+        let _client = TcpStream::connect(addr).await?;
+        let (server, _) = listener.accept().await?;
+
+        let config = NativeRelayTransportConfig::new(AUDIENCE)
+            .with_handshake_timeout(Duration::from_millis(100));
+        let outcome = Connection::handshake(server, config).await;
+        assert!(matches!(outcome, Err(ConnectionError::HandshakeTimeout)));
         Ok(())
     }
 }

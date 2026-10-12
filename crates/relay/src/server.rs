@@ -6,17 +6,24 @@ use tokio::{
     sync::mpsc,
     time::sleep,
 };
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
 use crate::{
-    connection::{Connection, ConnectionError, NativeRelayTransportConfig, random_id},
+    connection::{
+        Connection, ConnectionError, NativeRelayTransportConfig, RELAY_FRAME_VERSION, RelayStream,
+        random_id,
+    },
+    limits::Limiter,
     registry::{Registry, RegistryError},
     session::{PeerHandle, Registration},
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
+/// Serve relay connections until the listener fails.
 pub async fn serve(
     listener: TcpListener,
     registry: Arc<Registry>,
+    limiter: Arc<Limiter>,
     config: NativeRelayTransportConfig,
 ) -> io::Result<()> {
     match listener.local_addr() {
@@ -29,9 +36,10 @@ pub async fn serve(
             Ok((stream, addr)) => {
                 log::debug!("accepted connection from {addr}");
                 let registry = Arc::clone(&registry);
+                let limiter = Arc::clone(&limiter);
                 let config = config.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle(stream, registry, config).await {
+                    if let Err(error) = handle(stream, registry, limiter, config).await {
                         log::debug!("relay connection ended with error: {error}");
                     }
                 });
@@ -44,23 +52,48 @@ pub async fn serve(
     }
 }
 
+/// Handle one accepted connection, enforcing connection and session limits.
 pub async fn handle(
     stream: TcpStream,
     registry: Arc<Registry>,
+    limiter: Arc<Limiter>,
     config: NativeRelayTransportConfig,
 ) -> Result<(), ServerError> {
+    let Some(_total) = limiter.acquire_total() else {
+        log::warn!("relay connection limit reached; dropping new connection");
+        return Err(ServerError::ConnectionLimit);
+    };
+
     let grace = config.session_grace;
-    let (query, identity, websocket) = Connection::handshake(stream, config.clone()).await?;
+    let (query, identity, mut websocket) = Connection::handshake(stream, config.clone()).await?;
+
+    if !limiter.allow_connect(&identity.did) {
+        log::warn!("connect rate limit exceeded for {}", identity.did);
+        close_with(&mut websocket, "connection rate limit").await;
+        return Err(ServerError::RateLimited);
+    }
+    let Some(_identity_slot) = limiter.acquire_identity(&identity.did) else {
+        log::warn!("connection limit reached for {}", identity.did);
+        close_with(&mut websocket, "connection limit").await;
+        return Err(ServerError::ConnectionLimit);
+    };
 
     let topic = query.topic.clone();
     let role = query.role;
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(config.outbound_queue_capacity);
     let peer = PeerHandle {
         identity: identity.did.clone(),
         tx: tx.clone(),
     };
 
-    let (session, registration, buffered) = registry.register(&topic, role, peer)?;
+    let (session, registration, buffered) =
+        match registry.register(&topic, role, peer, limiter.max_sessions()) {
+            Ok(registered) => registered,
+            Err(error) => {
+                close_with(&mut websocket, "session limit").await;
+                return Err(error.into());
+            }
+        };
 
     // `RoleTaken` leaves the existing peer's slot intact, so only reserve/release
     // the slot when this connection actually took it.
@@ -83,17 +116,28 @@ pub async fn handle(
                     return;
                 };
                 let frame = RelayFrame {
-                    v: 1,
+                    v: RELAY_FRAME_VERSION,
                     id,
                     topic: notify_topic,
                     body: RelayFrameBody::PeerDisconnected,
                 };
-                let _ = counterpart.tx.send(frame);
+                if counterpart.tx.try_send(frame).is_err() {
+                    log::warn!("dropping peer_disconnected: outbound queue unavailable");
+                }
             }
         });
     }
 
     Ok(result?)
+}
+
+/// Close the WebSocket with a policy close frame.
+async fn close_with(websocket: &mut RelayStream, reason: &str) {
+    let frame = CloseFrame {
+        code: CloseCode::Policy,
+        reason: reason.into(),
+    };
+    let _ = websocket.close(Some(frame)).await;
 }
 
 #[derive(Debug, Error)]
@@ -103,12 +147,19 @@ pub enum ServerError {
 
     #[error(transparent)]
     Registry(#[from] RegistryError),
+
+    #[error("relay connection limit reached")]
+    ConnectionLimit,
+
+    #[error("relay connection rate limit exceeded")]
+    RateLimited,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::test_utils::{self, signing_key};
+    use crate::limits::{Limiter, RateLimit, RelayLimits};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
@@ -120,6 +171,10 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    fn limiter() -> Arc<Limiter> {
+        Arc::new(Limiter::new(RelayLimits::default()))
+    }
 
     fn token_with(seed: u8) -> String {
         let now = crate::auth::unix_now();
@@ -182,6 +237,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             Arc::new(Registry::new()),
+            limiter(),
             NativeRelayTransportConfig::new(AUDIENCE),
         ));
 
@@ -199,7 +255,7 @@ mod tests {
         ));
 
         let message = RelayFrame {
-            v: 1,
+            v: RELAY_FRAME_VERSION,
             id: "m1".to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
@@ -235,6 +291,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             Arc::new(Registry::new()),
+            limiter(),
             NativeRelayTransportConfig::new(AUDIENCE),
         ));
 
@@ -279,6 +336,7 @@ mod tests {
         tokio::spawn(serve(
             listener,
             Arc::new(Registry::new()),
+            limiter(),
             NativeRelayTransportConfig::new(AUDIENCE),
         ));
 
@@ -291,9 +349,21 @@ mod tests {
     async fn serve_with(
         config: NativeRelayTransportConfig,
     ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+        serve_with_limits(config, RelayLimits::default()).await
+    }
+
+    async fn serve_with_limits(
+        config: NativeRelayTransportConfig,
+        limits: RelayLimits,
+    ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(serve(listener, Arc::new(Registry::new()), config));
+        tokio::spawn(serve(
+            listener,
+            Arc::new(Registry::new()),
+            Arc::new(Limiter::new(limits)),
+            config,
+        ));
         Ok(addr)
     }
 
@@ -352,7 +422,7 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         let message = RelayFrame {
-            v: 1,
+            v: RELAY_FRAME_VERSION,
             id: "buffered".to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
@@ -426,7 +496,10 @@ mod tests {
         };
         matches!(
             timeout(Duration::from_secs(1), read_frame(&mut client)).await,
-            Ok(Ok(RelayFrame { body: RelayFrameBody::SessionReady, .. }))
+            Ok(Ok(RelayFrame {
+                body: RelayFrameBody::SessionReady,
+                ..
+            }))
         )
     }
 
@@ -443,7 +516,7 @@ mod tests {
 
     fn message(topic: &Topic, id: &str, payload: &str) -> RelayFrame {
         RelayFrame {
-            v: 1,
+            v: RELAY_FRAME_VERSION,
             id: id.to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
@@ -674,7 +747,7 @@ mod tests {
 
         // Clients must not forge the relay-only session_ready frame.
         let rogue = RelayFrame {
-            v: 1,
+            v: RELAY_FRAME_VERSION,
             id: "rogue".to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::SessionReady,
@@ -726,6 +799,155 @@ mod tests {
         assert!(
             try_connect(addr, &other_auth, "responder", &topic, None).await,
             "slot should be claimable after the grace window expires"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_topic_mismatch_closes_connection() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let other = Topic::new([8u8; 32])?;
+        send(&mut proposer, &message(&other, "rogue", "cross-topic")).await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "a frame stamped with another topic should close the connection"
+        );
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut responder))
+                .await
+                .is_err(),
+            "the mismatched frame must not be delivered"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_frame_version_closes_connection() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let rogue = RelayFrame {
+            v: 2,
+            id: "rogue".to_owned(),
+            topic: topic.clone(),
+            body: RelayFrameBody::Message {
+                payload: "future".to_owned(),
+            },
+        };
+        send(&mut proposer, &rogue).await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "an unsupported frame version should close the connection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_identity_connection_limit_is_enforced() -> TestResult {
+        let limits = RelayLimits {
+            max_connections_per_identity: 1,
+            ..RelayLimits::default()
+        };
+        let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
+
+        let topic = topic()?;
+        let mut first = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut first))
+                .await
+                .is_err(),
+            "first connection should stay open while waiting for a counterpart"
+        );
+
+        let mut second = connect(addr, "responder", &topic, None).await?;
+        assert!(
+            expect_closed(&mut second).await,
+            "a second connection for the same identity should be rejected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_rate_limit_is_enforced() -> TestResult {
+        let limits = RelayLimits {
+            connect_rate: RateLimit {
+                burst: 1,
+                interval: Duration::from_secs(60),
+            },
+            max_connections_per_identity: 100,
+            ..RelayLimits::default()
+        };
+        let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
+
+        let topic = topic()?;
+        let mut first = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut first))
+                .await
+                .is_err(),
+            "first connection should stay open while waiting for a counterpart"
+        );
+
+        let mut second = connect(addr, "responder", &topic, None).await?;
+        assert!(
+            expect_closed(&mut second).await,
+            "a connection above the connect rate should be rejected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_limit_is_enforced() -> TestResult {
+        let limits = RelayLimits {
+            max_sessions: 1,
+            ..RelayLimits::default()
+        };
+        let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
+
+        let first_topic = Topic::new([6u8; 32])?;
+        let mut first = connect(addr, "proposer", &first_topic, Some("reg-1")).await?;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut first))
+                .await
+                .is_err(),
+            "first session should stay open while waiting for a counterpart"
+        );
+
+        let second_topic = Topic::new([7u8; 32])?;
+        let mut second = connect(addr, "responder", &second_topic, None).await?;
+        assert!(
+            expect_closed(&mut second).await,
+            "a session above the session cap should be rejected"
         );
         Ok(())
     }

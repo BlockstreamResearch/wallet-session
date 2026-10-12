@@ -15,7 +15,7 @@ pub struct PeerHandle {
     pub identity: DidKey,
 
     /// Channel to the peer's writer task.
-    pub tx: mpsc::UnboundedSender<RelayFrame>,
+    pub tx: mpsc::Sender<RelayFrame>,
 }
 
 /// Outcome of binding a connection to a topic slot.
@@ -187,7 +187,14 @@ impl Session {
         let target = from.counterpart();
 
         if let Some(Slot::Connected(peer)) = slots.get(target) {
-            return peer.tx.send(frame).map_err(|_| SessionError::NoCounterpart);
+            return match peer.tx.try_send(frame) {
+                Ok(()) => Ok(()),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::debug!("dropping frame for peer whose outbound queue is full");
+                    Ok(())
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionError::NoCounterpart),
+            };
         }
 
         match slots.get_mut(target) {
@@ -208,6 +215,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::RELAY_FRAME_VERSION;
     use wallet_session_core::frame::RelayFrameBody;
     use wallet_session_core::message::Topic;
 
@@ -215,12 +223,15 @@ mod tests {
 
     const MAX_BUFFERED: usize = 8;
 
+    /// Outbound queue capacity used by peer handles in these tests.
+    const PEER_QUEUE: usize = 8;
+
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([1u8; 32])
     }
 
-    fn peer(seed: u8) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<RelayFrame>) {
+        let (tx, rx) = mpsc::channel(PEER_QUEUE);
         (
             PeerHandle {
                 identity: DidKey::from_ed25519_bytes([seed; 32]),
@@ -232,7 +243,7 @@ mod tests {
 
     fn frame(topic: &Topic) -> RelayFrame {
         RelayFrame {
-            v: 1,
+            v: RELAY_FRAME_VERSION,
             id: "frame-id".to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
@@ -298,6 +309,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn route_drops_frames_when_outbound_queue_is_full() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, mut responder_rx) = peer(2);
+        session.register(Role::Proposer, proposer)?;
+        session.register(Role::Responder, responder)?;
+
+        // bounded queue only holds PEER_QUEUE frames; extra frames are dropped.
+        for _ in 0..PEER_QUEUE + 3 {
+            session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
+        }
+
+        let mut delivered = 0;
+        while responder_rx.try_recv().is_ok() {
+            delivered += 1;
+        }
+        assert_eq!(delivered, PEER_QUEUE);
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn disconnect_buffers_and_same_identity_reclaims() -> TestResult {
         let session = Session::default();
@@ -308,11 +340,11 @@ mod tests {
 
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
-        // Frames to the disconnected peer are buffered, not dropped.
+        // frames to the disconnected peer are buffered, not dropped
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED)?;
         assert!(responder_rx.try_recv().is_err());
 
-        // Same identity reconnects within grace and receives the buffer.
+        // same identity reconnects within grace and receives the buffer
         let (responder, _) = peer(2);
         let (registration, buffered) = session.register(Role::Responder, responder)?;
         assert!(matches!(registration, Registration::BothReady));

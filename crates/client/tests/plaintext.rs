@@ -13,7 +13,10 @@ use wallet_session_client::{
     SessionState,
 };
 use wallet_session_relay::{
-    connection::NativeRelayTransportConfig, registry::Registry, server::serve,
+    connection::NativeRelayTransportConfig,
+    limits::{Limiter, RelayLimits},
+    registry::Registry,
+    server::serve,
 };
 
 use wallet_session_client::crypto::{CipherError, NONCE_LEN, SENDER_PREFIX_LEN, SealedPayload};
@@ -98,6 +101,7 @@ async fn run() -> TestResult {
     tokio::spawn(serve(
         listener,
         Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimits::default())),
         NativeRelayTransportConfig::new(AUDIENCE),
     ));
 
@@ -198,6 +202,7 @@ async fn run_reconnect() -> TestResult {
     tokio::spawn(serve(
         listener,
         Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimits::default())),
         NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
     ));
 
@@ -295,6 +300,7 @@ async fn run_expiry() -> TestResult {
     tokio::spawn(serve(
         listener,
         Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimits::default())),
         NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(200)),
     ));
 

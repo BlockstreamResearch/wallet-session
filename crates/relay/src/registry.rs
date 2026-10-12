@@ -31,16 +31,24 @@ impl Registry {
 
     /// Bind a peer to its topic/role slot, returning the shared session and any
     /// frames buffered for it while it was disconnected.
+    ///
+    /// `max_sessions` caps the number of concurrent topics; pass `usize::MAX`
+    /// for no limit.
     pub fn register(
         &self,
         topic: &Topic,
         role: Role,
         peer: PeerHandle,
+        max_sessions: usize,
     ) -> Result<(Arc<Session>, Registration, Vec<RelayFrame>), RegistryError> {
         let identity = peer.identity.clone();
         let (session, created) = {
             let mut sessions = self.lock()?;
             let created = !sessions.contains_key(topic);
+            if created && sessions.len() >= max_sessions {
+                log::warn!("rejecting new session for topic {topic}: session limit reached");
+                return Err(RegistryError::TooManySessions);
+            }
             (sessions.entry(topic.clone()).or_default().clone(), created)
         };
         if created {
@@ -100,6 +108,9 @@ pub enum RegistryError {
 
     #[error(transparent)]
     Session(#[from] SessionError),
+
+    #[error("maximum concurrent sessions reached")]
+    TooManySessions,
 }
 
 #[cfg(test)]
@@ -111,8 +122,11 @@ mod tests {
         Topic::new([0u8; 32])
     }
 
-    fn peer(seed: u8) -> (PeerHandle, mpsc::UnboundedReceiver<RelayFrame>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// Outbound queue capacity used by peer handles in these tests.
+    const PEER_QUEUE: usize = 8;
+
+    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<RelayFrame>) {
+        let (tx, rx) = mpsc::channel(PEER_QUEUE);
         (
             PeerHandle {
                 identity: wallet_session_core::did::DidKey::from_ed25519_bytes([seed; 32]),
@@ -128,7 +142,8 @@ mod tests {
     fn first_registration_waits() -> TestResult {
         let registry = Registry::new();
         let (proposer, _) = peer(1);
-        let (_, registration, buffered) = registry.register(&topic()?, Role::Proposer, proposer)?;
+        let (_, registration, buffered) =
+            registry.register(&topic()?, Role::Proposer, proposer, usize::MAX)?;
         assert!(matches!(registration, Registration::Waiting));
         assert!(buffered.is_empty());
         Ok(())
@@ -140,9 +155,9 @@ mod tests {
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
         let topic = topic()?;
-        let (_, first, _) = registry.register(&topic, Role::Proposer, proposer)?;
+        let (_, first, _) = registry.register(&topic, Role::Proposer, proposer, usize::MAX)?;
         assert!(matches!(first, Registration::Waiting));
-        let (_, second, _) = registry.register(&topic, Role::Responder, responder)?;
+        let (_, second, _) = registry.register(&topic, Role::Responder, responder, usize::MAX)?;
         assert!(matches!(second, Registration::BothReady));
         Ok(())
     }
@@ -153,8 +168,8 @@ mod tests {
         let (first, _) = peer(1);
         let (second, _) = peer(2);
         let topic = topic()?;
-        registry.register(&topic, Role::Proposer, first)?;
-        let (_, registration, _) = registry.register(&topic, Role::Proposer, second)?;
+        registry.register(&topic, Role::Proposer, first, usize::MAX)?;
+        let (_, registration, _) = registry.register(&topic, Role::Proposer, second, usize::MAX)?;
         assert!(matches!(
             registration,
             Registration::RoleTaken(Role::Proposer)
@@ -167,7 +182,7 @@ mod tests {
         let registry = Registry::new();
         let topic = topic()?;
         let (proposer, _) = peer(1);
-        let (session, _, _) = registry.register(&topic, Role::Proposer, proposer)?;
+        let (session, _, _) = registry.register(&topic, Role::Proposer, proposer, usize::MAX)?;
 
         registry.disconnect(&topic, Role::Proposer, Duration::from_secs(10))?;
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
@@ -176,7 +191,7 @@ mod tests {
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
 
         let (replacement, _) = peer(3);
-        let (again, _, _) = registry.register(&topic, Role::Proposer, replacement)?;
+        let (again, _, _) = registry.register(&topic, Role::Proposer, replacement, usize::MAX)?;
         assert!(!Arc::ptr_eq(&session, &again));
         Ok(())
     }
@@ -195,8 +210,22 @@ mod tests {
 
         let (proposer, _) = peer(1);
         assert!(matches!(
-            registry.register(&topic()?, Role::Proposer, proposer),
+            registry.register(&topic()?, Role::Proposer, proposer, usize::MAX),
             Err(RegistryError::LockPoisoned)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn new_session_over_cap_is_rejected() -> TestResult {
+        let registry = Registry::new();
+        let (first, _) = peer(1);
+        let (second, _) = peer(2);
+
+        registry.register(&topic()?, Role::Proposer, first, 1)?;
+        assert!(matches!(
+            registry.register(&Topic::new([7u8; 32])?, Role::Proposer, second, 1),
+            Err(RegistryError::TooManySessions)
         ));
         Ok(())
     }
