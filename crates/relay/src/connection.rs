@@ -410,17 +410,22 @@ impl Connection {
 
         drop(self.self_tx);
         let _ = shutdown_tx.send(());
-        // Do not let a peer with a dead or stalled socket delay slot release:
-        // give the writer a moment to flush, then abort it.
-        if tokio::time::timeout(WRITER_SHUTDOWN_GRACE, &mut writer)
-            .await
-            .is_err()
-        {
-            log::debug!("connection writer did not stop promptly; aborting");
-            writer.abort();
-        }
+        stop_writer(&mut writer).await;
 
         result
+    }
+}
+
+async fn stop_writer(writer: &mut JoinHandle<()>) {
+    if writer.is_finished() {
+        return;
+    }
+    if tokio::time::timeout(WRITER_SHUTDOWN_GRACE, &mut *writer)
+        .await
+        .is_err()
+    {
+        log::debug!("connection writer did not stop promptly; aborting");
+        writer.abort();
     }
 }
 
@@ -818,5 +823,21 @@ mod tests {
         let outcome = Connection::handshake(server, config).await;
         assert!(matches!(outcome, Err(ConnectionError::HandshakeTimeout)));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_writer_tolerates_an_already_joined_writer() -> TestResult {
+        let mut writer = tokio::spawn(async {});
+        // mirrors `read_loop` observing the writer finish.
+        (&mut writer).await?;
+        stop_writer(&mut writer).await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_writer_aborts_a_stalled_writer() {
+        let mut writer = tokio::spawn(std::future::pending::<()>());
+        stop_writer(&mut writer).await;
+        assert!(writer.await.is_err_and(|error| error.is_cancelled()));
     }
 }
