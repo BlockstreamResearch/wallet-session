@@ -44,31 +44,41 @@ Identity keys and connection token signatures: Ed25519
 
 Relay is a main connection point between dApp and wallet.
 
-Relay is a web socket server. A client connects to the Relay by providing the topic and its role in the connection URL. The proposer connects with the `Proposer` role specified; the responder connects with the `Responder` role specified. Once the session is established, any further attempt to connect to the same topic is rejected.
+Relay is a web socket server. A client connects to the Relay by providing the topic and its role in the connection URL. The proposer connects with the `Proposer` role specified; the responder connects with the `Responder` role specified.
+
+A connection that presents a different identity than the one holding the slot is rejected while that slot is live or reserved for reconnection. A connection that presents the same identity replaces the holder: the Relay closes the replaced connection and signals `session_ready` to both peers again, so a peer may observe `session_ready` more than once per session. This lets a peer whose socket is half-open reconnect immediately instead of waiting for the Relay to reap the dead connection.
+
+The Relay protocol is JSON text frames only. A peer that sends a binary frame is disconnected.
 
 Once both parties are connected, the Relay sends `session_ready` to both. Neither party sends application messages before receiving that signal.
 
 Messages send by the `Proposer` is send to the `Responder`. Messages send by the `Responder` is send to the `Proposer`.
 
-While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL. On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue.
+While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL (defaults: 256 frames, 60 seconds, inside a 10 second grace window). On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue. Buffered frames belong to the identity that owned the slot: a reservation claimed by a different identity after the grace window starts empty.
 
 The Relay cannot observe end-to-end acknowledgements (§13): `ack` is an application message encrypted between the peers. Relay buffering is therefore best-effort and scoped to the observed-disconnected window. Frames written to a connection that is silently dead may be lost before the Relay notices; recovery is the responsibility of the sender's ack retry (§13).
 
-Relay enforces resource limits to protect itself and its tenants: a bounded handshake deadline, a bounded per-connection outbound queue with a write deadline, keepalive pings with a pong deadline, maximum total and per-identity concurrent connections, a per-identity connection-attempt rate, and a maximum number of concurrent sessions. A peer that stops reading has its outbound queue drained by dropping frames (clients retransmit un-ACKed messages) rather than growing relay memory without bound; a peer that fails the write or pong deadline is disconnected and its slot enters the reconnection grace, so a silently dead (half-open) peer is detected before the idle timeout and can reconnect sooner.
+Relay enforces resource limits to protect itself and its tenants: a bounded handshake deadline, a bounded per-connection outbound queue with a write deadline, keepalive pings with a pong deadline, maximum total and per-identity concurrent connections, a per-identity connection-attempt rate, and a maximum number of concurrent sessions. A peer that stops reading has its outbound queue drained by dropping frames (clients retransmit un-ACKed messages) rather than growing relay memory without bound; a peer that fails the write or pong deadline is disconnected and its slot enters the reconnection grace, so a silently half-open peer is detected before the idle timeout.
+
+TLS is terminated in front of the Relay. The Relay itself speaks plain WebSocket behind that terminator, so the connection URL (including the JWT) is visible to it and to its logs.
 
 ### 3.1 Threat model notes
 
 Slot ownership is first-come, first-served per topic and role. A party that learns a topic before its counterpart connects can claim the role slot and block the intended peer; the relay does not know which identity is expected on a slot. Pairing topics and URIs are therefore bearer secrets and must be short-lived. The connection caps above bound but do not eliminate this risk.
 
-Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting and banning by identity raise the cost of abuse but are not a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
+Slot takeover means a valid token for an identity is enough to evict that identity's live connection, not just to claim an empty slot. A leaked, logged or replayed token therefore displaces the legitimate peer until it reconnects. This is the reason the relay caps token lifetime (§5); the cap, not the identity check, is what bounds the exposure.
+
+Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting by identity raises the cost of abuse, and so would an operator-side ban list, but neither is a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
 
 ## 4. Network identity
 
 Each client derives a long-term identity as a Ed25519 key.
 
-The identity key is stable across reconnects and app restarts, because it is derived from the persisted seed. The relay uses this identity to rate-limit, attribute, and ban clients.
+The identity key is stable across reconnects and app restarts, because it is derived from the persisted seed. The relay uses this identity to rate-limit and attribute clients.
 
 The identity key is used to sign the connection token presented to the relay. It is not used to encrypt application messages.
+
+The relay does not ban clients by identity. Banning would require an operator-side allow or deny list, and self-issued identities make a relay-side ban list weak on its own.
 
 ## 5. Connection authorization
 
@@ -98,6 +108,15 @@ struct RelayAuthToken {
 ```
 
 In case of reconnection to the same topic, client should authenticate again by the same identity key.
+
+The relay validates the token before the WebSocket upgrade completes:
+
+- the `alg` header must be `EdDSA`, and the signature must verify against the Ed25519 key embedded in `iss`;
+- `aud` must equal the relay's configured audience;
+- `exp` must be in the future and `iat` may be at most 60 seconds in the future, allowing for clock skew;
+- the remaining lifetime must not exceed the relay's maximum accepted token lifetime, default 10 minutes, and the token must be at most 4096 bytes.
+
+The relay does not use `sub`; it is available for the client's own session bookkeeping. A handshake whose query is malformed, longer than 8 KiB, or whose token fails validation is answered with `400 Bad Request` and no upgrade.
 
 ## 6. Network participants
 
@@ -153,14 +172,26 @@ Session establishment flow:
 
 ## 10. Message envelope
 
-The encrypted envelope is the only application message unit and is sent directly over the relay connection. The relay reads the plaintext `topic` header to route and forwards the envelope verbatim to the peer; it does not wrap or re-encode it.
+Every application message travels inside a relay frame. The relay reads the plaintext `topic` to route and forwards the frame, including its `id`, to the peer; it does not decrypt or re-encode the envelope inside `payload`. The outer frame is re-serialized from its parsed fields, so byte-for-byte equality of the outer JSON is not guaranteed, while the `payload` string is forwarded unchanged.
+
+Relay frame:
 
 ```
 {
   "v": 1,
   "id": "<16 random bytes, base64url>",
-  "type": "<catalog message type>",
+  "type": "message",                    // message | session_ready | peer_disconnected
   "topic": "<32 bytes, base64url>",
+  "payload": "<envelope JSON, present on `message` frames only>"
+}
+```
+
+The encrypted envelope carried in `payload`:
+
+```
+{
+  "version": 1,
+  "kind": "<catalog message type>",
   "from": "did:key:<identity>",
   "ts": <unix seconds>,
   "nonce": "<24 bytes, base64url>",
@@ -168,20 +199,13 @@ The encrypted envelope is the only application message unit and is sent directly
 }
 ```
 
+The envelope `id` and `topic` are those of the enclosing relay frame and are not repeated inside it. The envelope's message type field is named `kind` so it does not collide with the relay frame's `type` field.
+
+`session_ready` and `peer_disconnected` are relay-generated control frames: they carry no payload and are never forwarded to peers. Clients must not send them; the relay closes the connection of a peer that does.
+
 Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a reused nonce.
 
-Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Clients must maintain an list of `id`s which was sent for the last 5 minutes and silently drop any duplicates.
-
-Relay control frames are plaintext because the relay must read them. They carry an `op` field instead of message data and are never forwarded to peers:
-
-```
-{
-  "v": 1,
-  "id": "<16 random bytes, base64url>",
-  "op": "ping",                         // ping | pong | ack
-  "topic": "<32 bytes, base64url>"
-}
-```
+Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Clients must maintain a list of the frame `id`s received in the last 5 minutes and silently drop any duplicates.
 
 ## 11. AEAD AAD and nonce generation
 
@@ -193,7 +217,7 @@ Nonce scheme:
 nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
 ```
 
-The AEAD AAD must be constructed by concatenating the envelope's plaintext fields as UTF-8 bytes: `AAD = version || id || type || topic || from`. The receiver must reconstruct this exact AAD string and pass it to the cipher during decryption. If the relay tampered with the topic or sender ID, the decryption tag will fail to authenticate.
+The AEAD AAD must be constructed by concatenating the plaintext fields as UTF-8 bytes, without separators or length prefixes: `AAD = version || id || type || topic || from`. Here `version` is the envelope version as a decimal string, `id` and `topic` come from the enclosing relay frame, `type` is the envelope `kind` in snake_case, and `from` is the sender's `did:key`. The receiver must reconstruct this exact AAD byte string and pass it to the cipher during decryption. If the relay tampered with the frame's `id` or `topic`, or with the envelope's `from`, the decryption tag will fail to authenticate.
 
 ## 12. Message types
 
@@ -202,12 +226,13 @@ The AEAD AAD must be constructed by concatenating the envelope's plaintext field
 `reject` -- Reject the proposal. 
 `request` -- Application request. 
 `response` -- Application response to a request. 
-`ack` -- Acknowledge receipt of a message. 
-`ping` -- Liveness check. 
-`pong` -- Reply to `ping`. 
+`ack` -- Acknowledge receipt of a message. An application message, E2E encrypted like any other: the relay cannot observe it. 
 `disconnect`-- Gracefully close the session. 
 `session_delete` -- Notify the peer that the session was deleted. 
-`session_ready` -- notifies that both Proposer and Responder have connected
+
+`ping` and `pong` -- reserved and not implemented. Liveness is handled by WebSocket ping/pong control frames (§14). 
+
+`session_ready` -- a relay control frame, not an application message (§10).
 
 Payload shapes:
 
@@ -217,22 +242,24 @@ Payload shapes:
 - `request`: `{ requestId, request }`
 - `response`: `{ requestId, response }` or `{ requestId, error }`
 - `ack`: `{ ackId }`, where `ackId` is the id of the message being acknowledged
-- `ping`, `pong`: `{}`
 - `disconnect`: `{ reason, code, message }`
 - `session_delete`: `{ code, message }`
-- `session_ready`:  `{}`
 
 `proposal` and `approval` are opaque application data.
 
 ## 13. Reliability
 
-Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the received envelope id. The `ack`, `ping`, and `pong` messages are not acknowledged. The receiver sends the `ack` after successfully decrypting and validating the message.
+Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the received envelope id. The `ack` message is not itself acknowledged. The receiver sends the `ack` after successfully decrypting and validating the message.
 
 
-If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff up to a maximum of 5 attempts. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection.
+If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. When the last attempt fails the sender gives up and reports the failure to the application. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection.
 
 ## 14. Connection lifecycle
 
-The client sends `ping` every 30 seconds; if no `pong` is received within 10 seconds, the connection is considered dead and the client reconnects.
+Liveness is handled with WebSocket ping and pong control frames, not with application messages.
+
+The client sends a WebSocket ping every 30 seconds and requires a WebSocket pong within 10 seconds. If the pong does not arrive, the connection is considered dead and the client reconnects, starting at 250 ms and backing off up to 5 seconds for at most 5 attempts.
+
+The relay pings every 30 seconds and requires traffic from the peer within 10 seconds, after which the peer is disconnected and its slot enters the reconnection grace. Any inbound frame counts as activity, including the peer's own pings and pongs. A peer with no inbound traffic at all for 45 seconds is dropped regardless.
 
 
