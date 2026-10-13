@@ -1,0 +1,440 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+
+use tokio::time::Instant;
+use wallet_session_core::did::DidKey;
+
+/// Maximum number of identities tracked by the connect rate limiter.
+const MAX_RATE_KEYS: usize = 65_536;
+
+/// Token-bucket parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    /// Maximum cost (attempts, messages or bytes) available at once.
+    pub burst: u32,
+
+    /// Interval over which the burst refills.
+    pub interval: Duration,
+}
+
+/// Static relay resource limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimitsConfig {
+    /// Maximum concurrent connections across all identities.
+    pub max_connections: usize,
+
+    /// Maximum concurrent connections per identity.
+    pub max_connections_per_identity: usize,
+
+    /// Maximum concurrent sessions (topics).
+    pub max_sessions: usize,
+
+    /// Connection attempt rate per identity.
+    pub connect_rate: RateLimit,
+
+    /// Inbound message rate per connection.
+    pub inbound_message_rate: RateLimit,
+
+    /// Inbound byte rate per connection.
+    pub inbound_byte_rate: RateLimit,
+
+    /// Inbound byte rate across all connections.
+    pub global_inbound_byte_rate: RateLimit,
+}
+
+impl Default for RelayLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10_000,
+            max_connections_per_identity: 16,
+            max_sessions: 50_000,
+            connect_rate: RateLimit {
+                burst: 30,
+                interval: Duration::from_secs(60),
+            },
+            inbound_message_rate: RateLimit {
+                burst: 32,
+                interval: Duration::from_secs(2),
+            },
+            inbound_byte_rate: RateLimit {
+                burst: 512 * 1024,
+                interval: Duration::from_secs(2),
+            },
+            global_inbound_byte_rate: RateLimit {
+                burst: 16 * 1024 * 1024,
+                interval: Duration::from_secs(1),
+            },
+        }
+    }
+}
+
+/// Lock a mutex, recovering the guard if it was poisoned.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// A token bucket.
+#[derive(Debug)]
+pub(crate) struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl Bucket {
+    pub(crate) fn full(burst: u32, now: Instant) -> Self {
+        Self {
+            tokens: f64::from(burst),
+            last: now,
+        }
+    }
+
+    /// Refill and consume one token, returning whether the attempt is allowed.
+    fn allow(&mut self, rate: RateLimit, now: Instant) -> bool {
+        self.allow_n(1, rate, now)
+    }
+
+    /// Refill and consume `cost` tokens, returning whether the attempt is allowed.
+    pub(crate) fn allow_n(&mut self, cost: u32, rate: RateLimit, now: Instant) -> bool {
+        let cost = f64::from(cost.clamp(1, rate.burst.max(1)));
+        let elapsed = now.saturating_duration_since(self.last);
+        let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
+        let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
+        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
+        self.last = now;
+
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-identity connect buckets, with the time of the last full prune.
+#[derive(Debug)]
+struct ConnectRate {
+    buckets: HashMap<DidKey, Bucket>,
+    last_prune: Instant,
+}
+
+/// Shared runtime counters and rate limiters.
+#[derive(Debug)]
+pub struct Limiter {
+    limits: RelayLimitsConfig,
+    total: Mutex<usize>,
+    per_identity: Mutex<HashMap<DidKey, usize>>,
+    connect_rate: Mutex<ConnectRate>,
+    inbound_bytes: Mutex<Bucket>,
+}
+
+impl Limiter {
+    /// Build a limiter with the given static limits.
+    pub fn new(limits: RelayLimitsConfig) -> Self {
+        let now = Instant::now();
+        Self {
+            limits,
+            total: Mutex::new(0),
+            per_identity: Mutex::new(HashMap::new()),
+            connect_rate: Mutex::new(ConnectRate {
+                buckets: HashMap::new(),
+                last_prune: now,
+            }),
+            inbound_bytes: Mutex::new(Bucket::full(limits.global_inbound_byte_rate.burst, now)),
+        }
+    }
+
+    /// Static limits configured for this limiter.
+    pub fn limits(&self) -> RelayLimitsConfig {
+        self.limits
+    }
+
+    /// Maximum concurrent sessions, passed through to the registry.
+    pub fn max_sessions(&self) -> usize {
+        self.limits.max_sessions
+    }
+
+    /// Current number of connections holding a global slot.
+    pub fn active_connections(&self) -> usize {
+        *lock(&self.total)
+    }
+
+    /// Acquire a global connection slot, if capacity remains.
+    pub fn acquire_total(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut total = lock(&self.total);
+        if *total >= self.limits.max_connections {
+            return None;
+        }
+        *total += 1;
+        drop(total);
+
+        Some(ConnectionPermit {
+            limiter: Arc::clone(self),
+            identity: None,
+        })
+    }
+
+    /// Acquire a per-identity connection slot, if capacity remains.
+    pub fn acquire_identity(self: &Arc<Self>, identity: &DidKey) -> Option<ConnectionPermit> {
+        let mut counts = lock(&self.per_identity);
+        let count = counts.entry(identity.clone()).or_insert(0);
+        if *count >= self.limits.max_connections_per_identity {
+            return None;
+        }
+        *count += 1;
+        drop(counts);
+
+        Some(ConnectionPermit {
+            limiter: Arc::clone(self),
+            identity: Some(identity.clone()),
+        })
+    }
+
+    /// Consume `bytes` from the relay-wide inbound byte budget.
+    pub fn allow_inbound_bytes(&self, bytes: usize) -> bool {
+        let cost = u32::try_from(bytes).unwrap_or(u32::MAX);
+        lock(&self.inbound_bytes).allow_n(
+            cost,
+            self.limits.global_inbound_byte_rate,
+            Instant::now(),
+        )
+    }
+
+    /// Consume one connection-attempt token for `identity`.
+    pub fn allow_connect(&self, identity: &DidKey) -> bool {
+        self.allow_connect_at(identity, Instant::now())
+    }
+
+    fn allow_connect_at(&self, identity: &DidKey, now: Instant) -> bool {
+        let rate = self.limits.connect_rate;
+        let mut state = lock(&self.connect_rate);
+
+        if state.buckets.len() >= MAX_RATE_KEYS {
+            // Pruning is an O(n) scan, so it runs at most once per interval
+            // instead of on every attempt once the map is full. Between prunes
+            // an arbitrary entry is evicted to keep the map bounded. Identities
+            // are cheap to mint, so no eviction policy makes this map usable as
+            // anything but a rate limit.
+            if now.saturating_duration_since(state.last_prune) >= rate.interval {
+                state
+                    .buckets
+                    .retain(|_, bucket| now.saturating_duration_since(bucket.last) < rate.interval);
+                state.last_prune = now;
+            }
+            while state.buckets.len() >= MAX_RATE_KEYS {
+                let Some(key) = state.buckets.keys().next().cloned() else {
+                    break;
+                };
+                state.buckets.remove(&key);
+            }
+        }
+
+        let bucket = state
+            .buckets
+            .entry(identity.clone())
+            .or_insert_with(|| Bucket::full(rate.burst, now));
+        bucket.allow(rate, now)
+    }
+
+    /// Number of identities the connect limiter is tracking.
+    #[cfg(test)]
+    fn tracked_identities(&self) -> usize {
+        lock(&self.connect_rate).buckets.len()
+    }
+}
+
+/// A held connection slot; released when dropped.
+pub struct ConnectionPermit {
+    limiter: Arc<Limiter>,
+    identity: Option<DidKey>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        if let Some(identity) = &self.identity {
+            let mut counts = lock(&self.limiter.per_identity);
+            if let Some(count) = counts.get_mut(identity) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(identity);
+                }
+            }
+        } else {
+            let mut total = lock(&self.limiter.total);
+            *total = total.saturating_sub(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(seed: u8) -> DidKey {
+        DidKey::from_ed25519_bytes([seed; 32])
+    }
+
+    fn limits() -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            max_connections: 2,
+            max_connections_per_identity: 1,
+            max_sessions: 10,
+            connect_rate: RateLimit {
+                burst: 2,
+                interval: Duration::from_secs(10),
+            },
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    #[test]
+    fn identity_slot_is_released_on_drop() {
+        let limiter = Arc::new(Limiter::new(limits()));
+        let identity = key(1);
+
+        let first = limiter.acquire_identity(&identity);
+        assert!(first.is_some());
+        assert!(limiter.acquire_identity(&identity).is_none());
+
+        drop(first);
+        assert!(limiter.acquire_identity(&identity).is_some());
+    }
+
+    #[test]
+    fn total_slots_are_capped_across_identities() {
+        let limiter = Arc::new(Limiter::new(limits()));
+
+        let a = limiter.acquire_total();
+        let b = limiter.acquire_total();
+        assert!(a.is_some() && b.is_some());
+        assert_eq!(limiter.active_connections(), 2);
+        assert!(limiter.acquire_total().is_none());
+
+        drop(a);
+        assert_eq!(limiter.active_connections(), 1);
+        assert!(limiter.acquire_total().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_rate_refills_over_time() {
+        let limiter = Limiter::new(RelayLimitsConfig {
+            connect_rate: RateLimit {
+                burst: 1,
+                interval: Duration::from_secs(10),
+            },
+            ..RelayLimitsConfig::default()
+        });
+        let identity = key(1);
+
+        assert!(limiter.allow_connect(&identity));
+        assert!(!limiter.allow_connect(&identity));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(limiter.allow_connect(&identity));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_charges_cost_and_refills() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert!(bucket.allow_n(60, rate, Instant::now()));
+        assert!(!bucket.allow_n(60, rate, Instant::now()));
+        assert!(bucket.allow_n(40, rate, Instant::now()));
+
+        // 10 tokens per second.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(!bucket.allow_n(31, rate, Instant::now()));
+        assert!(bucket.allow_n(30, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_cost_is_clamped_to_burst() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert!(bucket.allow_n(1_000, rate, Instant::now()));
+        assert!(!bucket.allow_n(1, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_burst_denies_everything() {
+        let rate = RateLimit {
+            burst: 0,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+        assert!(!bucket.allow_n(1, rate, Instant::now()));
+    }
+
+    fn key_from_u32(value: u32) -> DidKey {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&value.to_le_bytes());
+        DidKey::from_ed25519_bytes(bytes)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_rate_map_stays_bounded() {
+        let limiter = Limiter::new(RelayLimitsConfig::default());
+
+        for seed in 0..MAX_RATE_KEYS as u32 + 128 {
+            limiter.allow_connect(&key_from_u32(seed));
+        }
+
+        assert!(limiter.tracked_identities() <= MAX_RATE_KEYS);
+        // A fresh identity can still attempt a connection.
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_rate_prunes_stale_identities() {
+        let interval = Duration::from_secs(10);
+        let limiter = Limiter::new(RelayLimitsConfig {
+            connect_rate: RateLimit { burst: 1, interval },
+            ..RelayLimitsConfig::default()
+        });
+
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            limiter.allow_connect(&key_from_u32(seed));
+        }
+        assert_eq!(limiter.tracked_identities(), MAX_RATE_KEYS);
+
+        tokio::time::advance(interval + Duration::from_secs(1)).await;
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+        assert_eq!(
+            limiter.tracked_identities(),
+            1,
+            "stale buckets are pruned once the interval has passed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn global_inbound_bytes_are_shared_and_refill() {
+        let limiter = Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 1_000,
+                interval: Duration::from_secs(10),
+            },
+            ..RelayLimitsConfig::default()
+        });
+
+        assert!(limiter.allow_inbound_bytes(600));
+        assert!(!limiter.allow_inbound_bytes(600));
+        assert!(limiter.allow_inbound_bytes(400));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(limiter.allow_inbound_bytes(1_000));
+    }
+}

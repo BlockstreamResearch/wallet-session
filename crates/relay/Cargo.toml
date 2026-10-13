@@ -1,0 +1,30 @@
+[package]
+name = "wallet-session-relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wallet-session-core = { path = "../core" }
+
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+] }
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
+url = "2"
+getrandom = "0.4"
+
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+thiserror.workspace = true
+log = "0.4"
+
+ed25519-dalek = "3.0.0"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
