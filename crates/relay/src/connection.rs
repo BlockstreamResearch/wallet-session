@@ -24,6 +24,7 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
+    limits::{Bucket, Limiter},
     session::{Registration, Role, Session, SessionError},
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
@@ -36,6 +37,10 @@ pub(crate) const RELAY_FRAME_VERSION: u8 = 1;
 
 /// Time to let the writer flush before aborting it on connection teardown.
 const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
+/// Consecutive frames a connection may have rejected by its own inbound rate
+/// limits before it is disconnected.
+const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
 
 /// Maximum accepted query-string length before parsing.
 pub const MAX_QUERY_BYTES: usize = 8 * 1024;
@@ -93,6 +98,7 @@ pub struct Connection {
     outbound: mpsc::Receiver<RelayFrame>,
     self_tx: mpsc::Sender<RelayFrame>,
     config: NativeRelayTransportConfig,
+    limiter: Arc<Limiter>,
 }
 
 impl Connection {
@@ -136,6 +142,7 @@ impl Connection {
                 None => return Err(ConnectionError::HandshakeFailed),
             },
         };
+
         let websocket = handshake.map_err(ConnectionError::from)?;
         log::debug!(
             "handshake accepted for topic {} as {:?} ({})",
@@ -155,6 +162,7 @@ impl Connection {
         outbound: mpsc::Receiver<RelayFrame>,
         self_tx: mpsc::Sender<RelayFrame>,
         config: NativeRelayTransportConfig,
+        limiter: Arc<Limiter>,
     ) -> Self {
         Self {
             query,
@@ -163,6 +171,7 @@ impl Connection {
             outbound,
             self_tx,
             config,
+            limiter,
         }
     }
 
@@ -199,6 +208,7 @@ impl Connection {
 
         let (sink, source) = websocket.split();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
         // Deadline by which an outstanding keepalive ping must be answered.
         let (ping_deadline, mut ping_deadline_rx) = watch::channel(None);
         let mut writer = tokio::spawn(write_loop(
@@ -244,12 +254,16 @@ impl Connection {
             }
         }
 
+        let context = ReadContext {
+            query: &self.query,
+            session: &self.session,
+            config,
+            limiter: &self.limiter,
+        };
         let result = read_loop(
             source,
             &mut writer,
-            &self.query,
-            &self.session,
-            config,
+            &context,
             &ping_deadline,
             &mut ping_deadline_rx,
         )
@@ -347,15 +361,34 @@ async fn send_with_timeout(
     }
 }
 
+/// Shared, read-only state a connection's read loop works against.
+struct ReadContext<'a> {
+    query: &'a ConnectionQuery,
+    session: &'a Session,
+    config: &'a NativeRelayTransportConfig,
+    limiter: &'a Limiter,
+}
+
 async fn read_loop(
     mut source: SplitStream<RelayStream>,
     writer: &mut JoinHandle<()>,
-    query: &ConnectionQuery,
-    session: &Session,
-    config: &NativeRelayTransportConfig,
+    context: &ReadContext<'_>,
     ping_deadline: &watch::Sender<Option<tokio::time::Instant>>,
     ping_deadline_rx: &mut watch::Receiver<Option<tokio::time::Instant>>,
 ) -> Result<(), ConnectionError> {
+    let ReadContext {
+        query,
+        session,
+        config,
+        limiter,
+    } = *context;
+
+    let limits = limiter.limits();
+    let now = tokio::time::Instant::now();
+    let mut message_bucket = Bucket::full(limits.inbound_message_rate.burst, now);
+    let mut byte_bucket = Bucket::full(limits.inbound_byte_rate.burst, now);
+    let mut consecutive_drops = 0u32;
+
     loop {
         let message = tokio::select! {
             _ = &mut *writer => {
@@ -381,11 +414,47 @@ async fn read_loop(
             },
         };
 
-        // Any inbound frame proves the peer is alive; clear the pong deadline.
         let _ = ping_deadline.send(None);
 
         let frame = match message {
             Message::Text(text) => {
+                // Charged before parsing so a flood cannot force JSON work or
+                // grow the counterpart's queue and buffer faster than the limits.
+                let now = tokio::time::Instant::now();
+                let within_connection_limits =
+                    message_bucket.allow_n(1, limits.inbound_message_rate, now)
+                        && byte_bucket.allow_n(
+                            u32::try_from(text.len()).unwrap_or(u32::MAX),
+                            limits.inbound_byte_rate,
+                            now,
+                        );
+                if !within_connection_limits {
+                    consecutive_drops += 1;
+                    log::debug!(
+                        "dropping frame on topic {}: inbound rate limit exceeded",
+                        query.topic
+                    );
+                    if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+                        log::warn!(
+                            "peer on topic {} keeps exceeding its inbound rate limit; dropping",
+                            query.topic
+                        );
+                        return Err(ConnectionError::RateLimited);
+                    }
+                    continue;
+                }
+                consecutive_drops = 0;
+
+                // Shared budget: a drop here is not this peer's fault, so it
+                // does not count toward disconnecting it.
+                if !limiter.allow_inbound_bytes(text.len()) {
+                    log::debug!(
+                        "dropping frame on topic {}: relay inbound byte budget exhausted",
+                        query.topic
+                    );
+                    continue;
+                }
+
                 log::trace!("relay <- topic={} frame={text}", query.topic);
                 serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
                     log::warn!("invalid relay frame on topic {}: {error}", query.topic);
@@ -487,6 +556,9 @@ pub enum ConnectionError {
 
     #[error("clients may not send session_ready")]
     ClientSessionReady,
+
+    #[error("inbound rate limit exceeded")]
+    RateLimited,
 
     #[error("websocket handshake failed")]
     HandshakeFailed,

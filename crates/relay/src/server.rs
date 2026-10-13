@@ -100,9 +100,17 @@ pub async fn handle(
         };
 
     let holds_slot = !matches!(registration, Registration::RoleTaken(_));
-    let result = Connection::new(query, identity, session, rx, tx, config)
-        .run(websocket, registration, buffered)
-        .await;
+    let result = Connection::new(
+        query,
+        identity,
+        session,
+        rx,
+        tx,
+        config,
+        Arc::clone(&limiter),
+    )
+    .run(websocket, registration, buffered)
+    .await;
 
     if holds_slot {
         let _ = registry.disconnect(&topic, role, grace);
@@ -1038,10 +1046,22 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_reader_is_dropped_by_write_deadline() -> TestResult {
-        let addr = serve_with(
+        // Inbound limits would stop the flood needed to fill the socket buffers.
+        let unlimited = RateLimit {
+            burst: u32::MAX,
+            interval: Duration::from_secs(1),
+        };
+        let addr = serve_with_limits(
             NativeRelayTransportConfig::new(AUDIENCE)
+                .with_max_incoming_frame_bytes(1024 * 1024)
                 .with_write_timeout(Duration::from_millis(300))
                 .with_session_grace(Duration::from_millis(300)),
+            RelayLimitsConfig {
+                inbound_message_rate: unlimited,
+                inbound_byte_rate: unlimited,
+                global_inbound_byte_rate: unlimited,
+                ..RelayLimitsConfig::default()
+            },
         )
         .await?;
 
@@ -1077,6 +1097,152 @@ mod tests {
         }
         drop(responder);
         assert!(released, "stalled responder kept its slot");
+        Ok(())
+    }
+
+    fn tight_inbound_limits() -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            inbound_message_rate: RateLimit {
+                burst: 3,
+                interval: Duration::from_secs(3600),
+            },
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    async fn ready_pair(
+        addr: SocketAddr,
+        topic: &Topic,
+    ) -> Result<(Client, Client), Box<dyn std::error::Error>> {
+        let mut proposer = connect(addr, "proposer", topic, None).await?;
+        let mut responder = connect(addr, "responder", topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+        Ok((proposer, responder))
+    }
+
+    #[tokio::test]
+    async fn inbound_message_rate_limit_drops_excess_frames() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            tight_inbound_limits(),
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+
+        for i in 0..6 {
+            send(&mut proposer, &message(&topic, &format!("m{i}"), "x")).await?;
+        }
+
+        let mut delivered = Vec::new();
+        while let Ok(Ok(frame)) =
+            timeout(Duration::from_millis(500), read_frame(&mut responder)).await
+        {
+            delivered.push(frame.id);
+        }
+        assert_eq!(delivered, ["m0", "m1", "m2"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inbound_byte_rate_limit_drops_oversized_burst() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                inbound_byte_rate: RateLimit {
+                    burst: 4096,
+                    interval: Duration::from_secs(3600),
+                },
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+
+        let payload = "a".repeat(1500);
+        for i in 0..4 {
+            send(&mut proposer, &message(&topic, &format!("m{i}"), &payload)).await?;
+        }
+
+        let mut delivered = 0;
+        while let Ok(Ok(_)) = timeout(Duration::from_millis(500), read_frame(&mut responder)).await
+        {
+            delivered += 1;
+        }
+        assert_eq!(delivered, 2, "4096 byte burst fits two ~1.6 KB frames");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_inbound_byte_budget_is_shared_across_sessions() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                global_inbound_byte_rate: RateLimit {
+                    burst: 1200,
+                    interval: Duration::from_secs(3600),
+                },
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let payload = "a".repeat(300);
+        let mut delivered = 0;
+        // Each session stays well inside its own per-connection limits.
+        for n in 0..4u8 {
+            let topic = Topic::new([40 + n; 32])?;
+            let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+            send(&mut proposer, &message(&topic, "m", &payload)).await?;
+            if timeout(Duration::from_millis(500), read_frame(&mut responder))
+                .await
+                .is_ok_and(|frame| frame.is_ok())
+            {
+                delivered += 1;
+            }
+        }
+        assert!(
+            (1..4).contains(&delivered),
+            "shared budget should admit some but not all, got {delivered}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sustained_rate_limit_violations_disconnect_peer() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            tight_inbound_limits(),
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, _responder) = ready_pair(addr, &topic).await?;
+
+        for i in 0..64 {
+            if send(&mut proposer, &message(&topic, &format!("m{i}"), "x"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        assert!(expect_closed(&mut proposer).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frame_over_incoming_size_cap_closes_connection() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_max_incoming_frame_bytes(2048),
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, _responder) = ready_pair(addr, &topic).await?;
+
+        let _ = send(&mut proposer, &message(&topic, "big", &"a".repeat(4096))).await;
+        assert!(expect_closed(&mut proposer).await);
         Ok(())
     }
 }

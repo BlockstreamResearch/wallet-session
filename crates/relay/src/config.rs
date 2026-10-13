@@ -5,7 +5,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use crate::auth::DEFAULT_MAX_TOKEN_LIFETIME;
 
 /// Default maximum WebSocket text or binary frame size accepted from a client.
-pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 256 * 1024;
 
 /// Default time a disconnected peer's slot is reserved for reconnection.
 pub const DEFAULT_SESSION_GRACE: Duration = Duration::from_secs(10);
@@ -91,6 +91,12 @@ impl NativeRelayTransportConfig {
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
             max_token_lifetime: DEFAULT_MAX_TOKEN_LIFETIME,
         }
+    }
+
+    /// Set the maximum accepted incoming frame size.
+    pub fn with_max_incoming_frame_bytes(mut self, max: usize) -> Self {
+        self.max_incoming_frame_bytes = max;
+        self
     }
 
     /// Set the reconnection grace window.

@@ -10,10 +10,10 @@ use wallet_session_core::did::DidKey;
 /// Maximum number of identities tracked by the connect rate limiter.
 const MAX_RATE_KEYS: usize = 65_536;
 
-/// Token-bucket parameters for connection attempts.
+/// Token-bucket parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimit {
-    /// Maximum number of connection attempts available at once.
+    /// Maximum cost (attempts, messages or bytes) available at once.
     pub burst: u32,
 
     /// Interval over which the burst refills.
@@ -34,6 +34,15 @@ pub struct RelayLimitsConfig {
 
     /// Connection attempt rate per identity.
     pub connect_rate: RateLimit,
+
+    /// Inbound message rate per connection.
+    pub inbound_message_rate: RateLimit,
+
+    /// Inbound byte rate per connection.
+    pub inbound_byte_rate: RateLimit,
+
+    /// Inbound byte rate across all connections.
+    pub global_inbound_byte_rate: RateLimit,
 }
 
 impl Default for RelayLimitsConfig {
@@ -45,6 +54,18 @@ impl Default for RelayLimitsConfig {
             connect_rate: RateLimit {
                 burst: 30,
                 interval: Duration::from_secs(60),
+            },
+            inbound_message_rate: RateLimit {
+                burst: 32,
+                interval: Duration::from_secs(2),
+            },
+            inbound_byte_rate: RateLimit {
+                burst: 512 * 1024,
+                interval: Duration::from_secs(2),
+            },
+            global_inbound_byte_rate: RateLimit {
+                burst: 16 * 1024 * 1024,
+                interval: Duration::from_secs(1),
             },
         }
     }
@@ -58,15 +79,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// A token bucket for one identity.
+/// A token bucket.
 #[derive(Debug)]
-struct Bucket {
+pub(crate) struct Bucket {
     tokens: f64,
     last: Instant,
 }
 
 impl Bucket {
-    fn full(burst: u32, now: Instant) -> Self {
+    pub(crate) fn full(burst: u32, now: Instant) -> Self {
         Self {
             tokens: f64::from(burst),
             last: now,
@@ -75,14 +96,20 @@ impl Bucket {
 
     /// Refill and consume one token, returning whether the attempt is allowed.
     fn allow(&mut self, rate: RateLimit, now: Instant) -> bool {
+        self.allow_n(1, rate, now)
+    }
+
+    /// Refill and consume `cost` tokens, returning whether the attempt is allowed.
+    pub(crate) fn allow_n(&mut self, cost: u32, rate: RateLimit, now: Instant) -> bool {
+        let cost = f64::from(cost.clamp(1, rate.burst.max(1)));
         let elapsed = now.saturating_duration_since(self.last);
         let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
         let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
         self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
         self.last = now;
 
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
@@ -97,6 +124,7 @@ pub struct Limiter {
     total: Mutex<usize>,
     per_identity: Mutex<HashMap<DidKey, usize>>,
     connect_rate: Mutex<HashMap<DidKey, Bucket>>,
+    inbound_bytes: Mutex<Bucket>,
 }
 
 impl Limiter {
@@ -107,6 +135,10 @@ impl Limiter {
             total: Mutex::new(0),
             per_identity: Mutex::new(HashMap::new()),
             connect_rate: Mutex::new(HashMap::new()),
+            inbound_bytes: Mutex::new(Bucket::full(
+                limits.global_inbound_byte_rate.burst,
+                Instant::now(),
+            )),
         }
     }
 
@@ -154,6 +186,16 @@ impl Limiter {
             limiter: Arc::clone(self),
             identity: Some(identity.clone()),
         })
+    }
+
+    /// Consume `bytes` from the relay-wide inbound byte budget.
+    pub fn allow_inbound_bytes(&self, bytes: usize) -> bool {
+        let cost = u32::try_from(bytes).unwrap_or(u32::MAX);
+        lock(&self.inbound_bytes).allow_n(
+            cost,
+            self.limits.global_inbound_byte_rate,
+            Instant::now(),
+        )
     }
 
     /// Consume one connection-attempt token for `identity`.
@@ -221,6 +263,7 @@ mod tests {
                 burst: 2,
                 interval: Duration::from_secs(10),
             },
+            ..RelayLimitsConfig::default()
         }
     }
 
@@ -268,5 +311,63 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(limiter.allow_connect(&identity));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_charges_cost_and_refills() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert!(bucket.allow_n(60, rate, Instant::now()));
+        assert!(!bucket.allow_n(60, rate, Instant::now()));
+        assert!(bucket.allow_n(40, rate, Instant::now()));
+
+        // 10 tokens per second.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(!bucket.allow_n(31, rate, Instant::now()));
+        assert!(bucket.allow_n(30, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_cost_is_clamped_to_burst() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert!(bucket.allow_n(1_000, rate, Instant::now()));
+        assert!(!bucket.allow_n(1, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_burst_denies_everything() {
+        let rate = RateLimit {
+            burst: 0,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+        assert!(!bucket.allow_n(1, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn global_inbound_bytes_are_shared_and_refill() {
+        let limiter = Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 1_000,
+                interval: Duration::from_secs(10),
+            },
+            ..RelayLimitsConfig::default()
+        });
+
+        assert!(limiter.allow_inbound_bytes(600));
+        assert!(!limiter.allow_inbound_bytes(600));
+        assert!(limiter.allow_inbound_bytes(400));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(limiter.allow_inbound_bytes(1_000));
     }
 }
