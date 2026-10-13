@@ -9,10 +9,8 @@ use tokio::{
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 
 use crate::{
-    connection::{
-        Connection, ConnectionError, NativeRelayTransportConfig, RELAY_FRAME_VERSION, RelayStream,
-        random_id,
-    },
+    config::NativeRelayTransportConfig,
+    connection::{Connection, ConnectionError, RELAY_FRAME_VERSION, RelayStream, random_id},
     limits::Limiter,
     registry::{Registry, RegistryError},
     session::{PeerHandle, Registration},
@@ -35,9 +33,11 @@ pub async fn serve(
         match listener.accept().await {
             Ok((stream, addr)) => {
                 log::debug!("accepted connection from {addr}");
+
                 let registry = Arc::clone(&registry);
                 let limiter = Arc::clone(&limiter);
                 let config = config.clone();
+
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, registry, limiter, config).await {
                         log::debug!("relay connection ended with error: {error}");
@@ -70,16 +70,20 @@ pub async fn handle(
     if !limiter.allow_connect(&identity.did) {
         log::warn!("connect rate limit exceeded for {}", identity.did);
         close_with(&mut websocket, "connection rate limit").await;
+
         return Err(ServerError::RateLimited);
     }
+
     let Some(_identity_slot) = limiter.acquire_identity(&identity.did) else {
         log::warn!("connection limit reached for {}", identity.did);
         close_with(&mut websocket, "connection limit").await;
+
         return Err(ServerError::ConnectionLimit);
     };
 
     let topic = query.topic.clone();
     let role = query.role;
+
     let (tx, rx) = mpsc::channel(config.outbound_queue_capacity);
     let peer = PeerHandle {
         identity: identity.did.clone(),
@@ -95,8 +99,6 @@ pub async fn handle(
             }
         };
 
-    // `RoleTaken` leaves the existing peer's slot intact, so only reserve/release
-    // the slot when this connection actually took it.
     let holds_slot = !matches!(registration, Registration::RoleTaken(_));
     let result = Connection::new(query, identity, session, rx, tx, config)
         .run(websocket, registration, buffered)
@@ -159,7 +161,7 @@ pub enum ServerError {
 mod tests {
     use super::*;
     use crate::auth::test_utils::{self, signing_key};
-    use crate::limits::{Limiter, RateLimit, RelayLimits};
+    use crate::limits::{Limiter, RateLimit, RelayLimitsConfig};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
@@ -173,7 +175,7 @@ mod tests {
     type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     fn limiter() -> Arc<Limiter> {
-        Arc::new(Limiter::new(RelayLimits::default()))
+        Arc::new(Limiter::new(RelayLimitsConfig::default()))
     }
 
     fn token_with(seed: u8) -> String {
@@ -349,12 +351,12 @@ mod tests {
     async fn serve_with(
         config: NativeRelayTransportConfig,
     ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-        serve_with_limits(config, RelayLimits::default()).await
+        serve_with_limits(config, RelayLimitsConfig::default()).await
     }
 
     async fn serve_with_limits(
         config: NativeRelayTransportConfig,
-        limits: RelayLimits,
+        limits: RelayLimitsConfig,
     ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -874,9 +876,9 @@ mod tests {
 
     #[tokio::test]
     async fn per_identity_connection_limit_is_enforced() -> TestResult {
-        let limits = RelayLimits {
+        let limits = RelayLimitsConfig {
             max_connections_per_identity: 1,
-            ..RelayLimits::default()
+            ..RelayLimitsConfig::default()
         };
         let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
 
@@ -899,13 +901,13 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rate_limit_is_enforced() -> TestResult {
-        let limits = RelayLimits {
+        let limits = RelayLimitsConfig {
             connect_rate: RateLimit {
                 burst: 1,
                 interval: Duration::from_secs(60),
             },
             max_connections_per_identity: 100,
-            ..RelayLimits::default()
+            ..RelayLimitsConfig::default()
         };
         let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
 
@@ -928,9 +930,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_limit_is_enforced() -> TestResult {
-        let limits = RelayLimits {
+        let limits = RelayLimitsConfig {
             max_sessions: 1,
-            ..RelayLimits::default()
+            ..RelayLimitsConfig::default()
         };
         let addr = serve_with_limits(NativeRelayTransportConfig::new(AUDIENCE), limits).await?;
 

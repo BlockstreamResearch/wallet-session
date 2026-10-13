@@ -22,7 +22,7 @@ pub struct RateLimit {
 
 /// Static relay resource limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RelayLimits {
+pub struct RelayLimitsConfig {
     /// Maximum concurrent connections across all identities.
     pub max_connections: usize,
 
@@ -36,7 +36,7 @@ pub struct RelayLimits {
     pub connect_rate: RateLimit,
 }
 
-impl Default for RelayLimits {
+impl Default for RelayLimitsConfig {
     fn default() -> Self {
         Self {
             max_connections: 10_000,
@@ -93,7 +93,7 @@ impl Bucket {
 /// Shared runtime counters and rate limiters.
 #[derive(Debug)]
 pub struct Limiter {
-    limits: RelayLimits,
+    limits: RelayLimitsConfig,
     total: Mutex<usize>,
     per_identity: Mutex<HashMap<DidKey, usize>>,
     connect_rate: Mutex<HashMap<DidKey, Bucket>>,
@@ -101,7 +101,7 @@ pub struct Limiter {
 
 impl Limiter {
     /// Build a limiter with the given static limits.
-    pub fn new(limits: RelayLimits) -> Self {
+    pub fn new(limits: RelayLimitsConfig) -> Self {
         Self {
             limits,
             total: Mutex::new(0),
@@ -111,7 +111,7 @@ impl Limiter {
     }
 
     /// Static limits configured for this limiter.
-    pub fn limits(&self) -> RelayLimits {
+    pub fn limits(&self) -> RelayLimitsConfig {
         self.limits
     }
 
@@ -212,8 +212,8 @@ mod tests {
         DidKey::from_ed25519_bytes([seed; 32])
     }
 
-    fn limits() -> RelayLimits {
-        RelayLimits {
+    fn limits() -> RelayLimitsConfig {
+        RelayLimitsConfig {
             max_connections: 2,
             max_connections_per_identity: 1,
             max_sessions: 10,
@@ -254,12 +254,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn connect_rate_refills_over_time() {
-        let limiter = Limiter::new(RelayLimits {
+        let limiter = Limiter::new(RelayLimitsConfig {
             connect_rate: RateLimit {
                 burst: 1,
                 interval: Duration::from_secs(10),
             },
-            ..RelayLimits::default()
+            ..RelayLimitsConfig::default()
         });
         let identity = key(1);
 

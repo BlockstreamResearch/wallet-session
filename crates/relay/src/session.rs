@@ -152,15 +152,19 @@ impl Session {
     /// Reserve a peer's slot for `grace`, buffering frames addressed to it.
     pub(crate) fn disconnect(&self, role: Role, grace: Duration) -> Result<(), SessionError> {
         let mut slots = self.lock()?;
+
         let Some(Slot::Connected(peer)) = slots.get(role) else {
             return Ok(());
         };
+
         let identity = peer.identity.clone();
+
         *slots.get_mut(role) = Some(Slot::Disconnected {
             identity,
             deadline: Instant::now() + grace,
             buffered: VecDeque::new(),
         });
+
         Ok(())
     }
 

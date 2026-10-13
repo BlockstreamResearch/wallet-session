@@ -41,22 +41,23 @@ impl Registry {
         peer: PeerHandle,
         max_sessions: usize,
     ) -> Result<(Arc<Session>, Registration, Vec<RelayFrame>), RegistryError> {
-        let identity = peer.identity.clone();
-        let (session, created) = {
-            let mut sessions = self.lock()?;
-            let created = !sessions.contains_key(topic);
-            if created && sessions.len() >= max_sessions {
-                log::warn!("rejecting new session for topic {topic}: session limit reached");
-                return Err(RegistryError::TooManySessions);
-            }
-            (sessions.entry(topic.clone()).or_default().clone(), created)
-        };
-        if created {
+        let mut sessions = self.lock()?;
+
+        let created = !sessions.contains_key(topic);
+        if created && sessions.len() >= max_sessions {
+            log::warn!("rejecting new session for topic {topic}: session limit reached");
+            return Err(RegistryError::TooManySessions);
+        } else if created {
             log::debug!("created session for topic {topic}");
         }
 
+        let session = sessions.entry(topic.clone()).or_default().clone();
+        let identity = peer.identity.clone();
+
         let (registration, buffered) = session.register(role, peer)?;
+
         log::debug!("registered peer {identity} on topic {topic} as {role:?}");
+
         Ok((session, registration, buffered))
     }
 
@@ -68,12 +69,15 @@ impl Registry {
         grace: Duration,
     ) -> Result<(), RegistryError> {
         let sessions = self.lock()?;
+
         let Some(session) = sessions.get(topic) else {
             return Ok(());
         };
-        let session = session.clone();
+
         session.disconnect(role, grace)?;
+
         log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
+
         Ok(())
     }
 
@@ -81,10 +85,10 @@ impl Registry {
     /// remaining peer to notify.
     pub fn expire(&self, topic: &Topic, role: Role) -> Result<Option<PeerHandle>, RegistryError> {
         let mut sessions = self.lock()?;
+
         let Some(session) = sessions.get(topic) else {
             return Ok(None);
         };
-        let session = session.clone();
 
         match session.expire(role)? {
             Some(expiry) => {
