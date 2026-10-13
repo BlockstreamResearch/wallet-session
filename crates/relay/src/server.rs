@@ -1033,4 +1033,48 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn stalled_reader_is_dropped_by_write_deadline() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_write_timeout(Duration::from_millis(300))
+                .with_session_grace(Duration::from_millis(300)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+
+        let payload = "a".repeat(900 * 1024);
+        let flood_until = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut sent = 0;
+        while tokio::time::Instant::now() < flood_until {
+            let frame = message(&topic, &format!("m{sent}"), &payload);
+            let send = proposer.send(Message::text(serde_json::to_string(&frame)?));
+            if let Ok(Ok(())) = timeout(Duration::from_millis(500), send).await {
+                sent += 1;
+            }
+        }
+
+        let mut released = false;
+        for _ in 0..20 {
+            if let Ok(mut client) = connect(addr, "responder", &topic, None).await
+                && !matches!(
+                    timeout(Duration::from_secs(1), client.next()).await,
+                    Ok(Some(Ok(Message::Close(_))))
+                )
+            {
+                released = true;
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        drop(responder);
+        assert!(released, "stalled responder kept its slot");
+        Ok(())
+    }
 }

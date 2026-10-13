@@ -476,7 +476,12 @@ async fn write_loop(
             _ = &mut shutdown => break,
         }
     }
-    let _ = sink.close().await;
+    if tokio::time::timeout(WRITER_SHUTDOWN_GRACE, sink.close())
+        .await
+        .is_err()
+    {
+        log::debug!("outbound websocket close timed out");
+    }
 }
 
 /// Send one message, returning whether the socket is still usable.
