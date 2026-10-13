@@ -90,8 +90,14 @@ pub async fn handle(
         tx: tx.clone(),
     };
 
-    let (session, registration, buffered) =
-        match registry.register(&topic, role, peer, limiter.max_sessions()) {
+    let ready = RelayFrame {
+        v: RELAY_FRAME_VERSION,
+        id: random_id()?,
+        topic: topic.clone(),
+        body: RelayFrameBody::SessionReady,
+    };
+    let (session, registration) =
+        match registry.register(&topic, role, peer, &ready, limiter.max_sessions()) {
             Ok(registered) => registered,
             Err(error) => {
                 close_with(&mut websocket, "session limit").await;
@@ -109,7 +115,7 @@ pub async fn handle(
         config,
         Arc::clone(&limiter),
     )
-    .run(websocket, registration, buffered)
+    .run(websocket, registration)
     .await;
 
     if holds_slot {

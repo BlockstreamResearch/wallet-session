@@ -180,7 +180,6 @@ impl Connection {
         self,
         websocket: RelayStream,
         registration: Registration,
-        buffered: Vec<RelayFrame>,
     ) -> Result<(), ConnectionError> {
         let mut websocket = websocket;
         log::debug!(
@@ -228,31 +227,11 @@ impl Connection {
                 self.query.topic,
                 self.query.role
             );
-            let ready = RelayFrame {
-                v: RELAY_FRAME_VERSION,
-                id: random_id()?,
-                topic: self.query.topic.clone(),
-                body: RelayFrameBody::SessionReady,
-            };
-            let _ = self.session.route(
-                self.query.role,
-                ready.clone(),
-                config.session_buffer_max_messages,
-                config.session_buffer_ttl,
-            );
-            let _ = self.self_tx.send(ready).await;
         }
 
-        if !buffered.is_empty() {
-            log::debug!(
-                "redelivering {} buffered frame(s) to {}",
-                buffered.len(),
-                self.identity.did
-            );
-            for frame in buffered {
-                let _ = self.self_tx.send(frame).await;
-            }
-        }
+        self.session
+            .drain_backlog(self.query.role, &self.self_tx)
+            .await?;
 
         let context = ReadContext {
             query: &self.query,

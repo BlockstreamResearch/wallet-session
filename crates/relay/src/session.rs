@@ -49,7 +49,10 @@ pub struct Session {
 
 /// A role slot: either a live peer or a disconnected peer's reservation.
 enum Slot {
-    Connected(PeerHandle),
+    Connected {
+        peer: PeerHandle,
+        backlog: VecDeque<RelayFrame>,
+    },
     Disconnected {
         identity: DidKey,
         deadline: Instant,
@@ -86,7 +89,7 @@ impl Slots {
     }
 
     fn is_connected(&self, role: Role) -> bool {
-        matches!(self.get(role), Some(Slot::Connected(_)))
+        matches!(self.get(role), Some(Slot::Connected { .. }))
     }
 }
 
@@ -107,53 +110,98 @@ impl Session {
 
     /// Bind a peer to its role slot, reclaiming a same-identity reservation.
     ///
-    /// Returns the registration result and any frames buffered for this peer
-    /// while it was disconnected.
+    /// When the counterpart is already connected, `ready` is enqueued for both
+    /// peers while the slot lock is held, so it precedes anything
+    /// [`Session::route`] can send afterwards. Frames buffered for this peer
+    /// while it was disconnected become the slot's backlog; hand them over with
+    /// [`Session::drain_backlog`].
     pub(crate) fn register(
         &self,
         role: Role,
         peer: PeerHandle,
-    ) -> Result<(Registration, Vec<RelayFrame>), SessionError> {
+        ready: &RelayFrame,
+    ) -> Result<Registration, SessionError> {
         let mut slots = self.lock()?;
         let now = Instant::now();
 
         match slots.get(role) {
-            Some(Slot::Connected(_)) => {
-                return Ok((Registration::RoleTaken(role), Vec::new()));
+            Some(Slot::Connected { .. }) => {
+                return Ok(Registration::RoleTaken(role));
             }
             Some(Slot::Disconnected {
                 identity, deadline, ..
             }) if now < *deadline && *identity != peer.identity => {
-                return Ok((Registration::RoleTaken(role), Vec::new()));
+                return Ok(Registration::RoleTaken(role));
             }
             _ => {}
         }
 
-        let buffered = match slots.get_mut(role).take() {
+        let backlog: VecDeque<RelayFrame> = match slots.get_mut(role).take() {
             Some(Slot::Disconnected { buffered, .. }) => buffered
                 .into_iter()
                 .filter(|entry| entry.expires_at > now)
                 .map(|entry| entry.frame)
                 .collect(),
-            _ => Vec::new(),
+            _ => VecDeque::new(),
         };
-        *slots.get_mut(role) = Some(Slot::Connected(peer));
+        if !backlog.is_empty() {
+            log::debug!(
+                "redelivering {} buffered frame(s) to {}",
+                backlog.len(),
+                peer.identity
+            );
+        }
 
-        let counterpart_connected = slots.is_connected(role.counterpart());
-        let registration = if counterpart_connected {
+        let both_ready = slots.is_connected(role.counterpart());
+        if both_ready {
+            if peer.tx.try_send(ready.clone()).is_err() {
+                log::warn!("could not enqueue session_ready for {}", peer.identity);
+            }
+            if let Some(Slot::Connected { peer: other, .. }) = slots.get(role.counterpart())
+                && other.tx.try_send(ready.clone()).is_err()
+            {
+                log::warn!("could not enqueue session_ready for {}", other.identity);
+            }
+        }
+        *slots.get_mut(role) = Some(Slot::Connected { peer, backlog });
+
+        Ok(if both_ready {
             Registration::BothReady
         } else {
             Registration::Waiting
-        };
+        })
+    }
 
-        Ok((registration, buffered))
+    /// Hand the slot's backlog to the peer's outbound queue.
+    pub(crate) async fn drain_backlog(
+        &self,
+        role: Role,
+        tx: &mpsc::Sender<RelayFrame>,
+    ) -> Result<(), SessionError> {
+        loop {
+            let Ok(permit) = tx.reserve().await else {
+                return Ok(());
+            };
+
+            let mut slots = self.lock()?;
+            let Some(Slot::Connected { peer, backlog }) = slots.get_mut(role) else {
+                return Ok(());
+            };
+            if !peer.tx.same_channel(tx) {
+                return Ok(());
+            }
+            let Some(frame) = backlog.pop_front() else {
+                return Ok(());
+            };
+            permit.send(frame);
+        }
     }
 
     /// Reserve a peer's slot for `grace`, buffering frames addressed to it.
     pub(crate) fn disconnect(&self, role: Role, grace: Duration) -> Result<(), SessionError> {
         let mut slots = self.lock()?;
 
-        let Some(Slot::Connected(peer)) = slots.get(role) else {
+        let Some(Slot::Connected { peer, .. }) = slots.get(role) else {
             return Ok(());
         };
 
@@ -182,7 +230,7 @@ impl Session {
         *slots.get_mut(role) = None;
 
         let counterpart = match slots.get(role.counterpart()) {
-            Some(Slot::Connected(peer)) => Some(peer.clone()),
+            Some(Slot::Connected { peer, .. }) => Some(peer.clone()),
             _ => None,
         };
         let empty = slots.proposer.is_none() && slots.responder.is_none();
@@ -203,7 +251,14 @@ impl Session {
         let mut slots = self.lock()?;
         let target = from.counterpart();
 
-        if let Some(Slot::Connected(peer)) = slots.get(target) {
+        if let Some(Slot::Connected { peer, backlog }) = slots.get_mut(target) {
+            if !backlog.is_empty() {
+                while backlog.len() >= max_buffered.max(1) {
+                    backlog.pop_front();
+                }
+                backlog.push_back(frame);
+                return Ok(());
+            }
             return match peer.tx.try_send(frame) {
                 Ok(()) => Ok(()),
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -275,17 +330,56 @@ mod tests {
         }
     }
 
+    fn ready(topic: &Topic) -> RelayFrame {
+        RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: "ready".to_owned(),
+            topic: topic.clone(),
+            body: RelayFrameBody::SessionReady,
+        }
+    }
+
+    fn frame_with_id(topic: &Topic, id: &str) -> RelayFrame {
+        RelayFrame {
+            id: id.to_owned(),
+            ..frame(topic)
+        }
+    }
+
+    /// Ids a freshly registered peer receives: queued frames, then the backlog.
+    async fn received_ids(
+        session: &Session,
+        role: Role,
+        tx: &mpsc::Sender<RelayFrame>,
+        rx: &mut mpsc::Receiver<RelayFrame>,
+    ) -> Result<Vec<String>, SessionError> {
+        session.drain_backlog(role, tx).await?;
+        let mut ids = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            ids.push(frame.id);
+        }
+        Ok(ids)
+    }
+
+    fn register(
+        session: &Session,
+        role: Role,
+        peer: PeerHandle,
+    ) -> Result<Registration, SessionError> {
+        session.register(role, peer, &ready(&topic().expect("topic")))
+    }
+
     #[test]
     fn second_registration_signals_both_ready() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
         assert!(matches!(
-            session.register(Role::Proposer, proposer)?.0,
+            register(&session, Role::Proposer, proposer)?,
             Registration::Waiting
         ));
         assert!(matches!(
-            session.register(Role::Responder, responder)?.0,
+            register(&session, Role::Responder, responder)?,
             Registration::BothReady
         ));
         Ok(())
@@ -296,9 +390,9 @@ mod tests {
         let session = Session::default();
         let (first, _) = peer(1);
         let (second, _) = peer(2);
-        session.register(Role::Proposer, first)?;
+        register(&session, Role::Proposer, first)?;
         assert!(matches!(
-            session.register(Role::Proposer, second)?.0,
+            register(&session, Role::Proposer, second)?,
             Registration::RoleTaken(Role::Proposer)
         ));
         Ok(())
@@ -309,11 +403,15 @@ mod tests {
         let session = Session::default();
         let (proposer, _proposer_rx) = peer(1);
         let (responder, mut responder_rx) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
 
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
 
+        assert!(matches!(
+            responder_rx.try_recv()?.body,
+            RelayFrameBody::SessionReady
+        ));
         let received = responder_rx.try_recv()?;
         assert!(matches!(received.body, RelayFrameBody::Message { .. }));
         Ok(())
@@ -323,7 +421,7 @@ mod tests {
     fn route_without_counterpart_errors() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer(1);
-        session.register(Role::Proposer, proposer)?;
+        register(&session, Role::Proposer, proposer)?;
 
         assert!(matches!(
             session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL),
@@ -337,8 +435,8 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, mut responder_rx) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
 
         // bounded queue only holds PEER_QUEUE frames; extra frames are dropped.
         for _ in 0..PEER_QUEUE + 3 {
@@ -358,20 +456,26 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, mut responder_rx) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
 
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         // frames to the disconnected peer are buffered, not dropped
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+        assert_eq!(responder_rx.try_recv()?.id, "ready");
         assert!(responder_rx.try_recv().is_err());
 
-        // same identity reconnects within grace and receives the buffer
-        let (responder, _) = peer(2);
-        let (registration, buffered) = session.register(Role::Responder, responder)?;
+        // same identity reconnects within grace and receives session_ready,
+        // then the buffer
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        let registration = register(&session, Role::Responder, responder)?;
         assert!(matches!(registration, Registration::BothReady));
-        assert_eq!(buffered.len(), 1);
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["ready", "frame-id"]
+        );
         Ok(())
     }
 
@@ -380,13 +484,13 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         let (impostor, _) = peer(3);
         assert!(matches!(
-            session.register(Role::Responder, impostor)?.0,
+            register(&session, Role::Responder, impostor)?,
             Registration::RoleTaken(Role::Responder)
         ));
         Ok(())
@@ -397,8 +501,8 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         let ttl = Duration::from_secs(5);
@@ -406,9 +510,15 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
 
-        let (responder, _) = peer(2);
-        let (_, buffered) = session.register(Role::Responder, responder)?;
-        assert_eq!(buffered.len(), 1, "only the unexpired frame is redelivered");
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+        let ids = received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?;
+        assert_eq!(
+            ids,
+            ["ready", "frame-id"],
+            "only the unexpired frame is redelivered"
+        );
         Ok(())
     }
 
@@ -417,17 +527,19 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         for _ in 0..3 {
             session.route(Role::Proposer, frame(&topic()?), 2, BUFFER_TTL)?;
         }
 
-        let (responder, _) = peer(2);
-        let (_, buffered) = session.register(Role::Responder, responder)?;
-        assert_eq!(buffered.len(), 2);
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+        let ids = received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?;
+        assert_eq!(ids, ["ready", "frame-id", "frame-id"]);
         Ok(())
     }
 
@@ -436,8 +548,8 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
-        session.register(Role::Proposer, proposer)?;
-        session.register(Role::Responder, responder)?;
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
         session.disconnect(Role::Responder, Duration::from_secs(10))?;
 
         assert!(session.expire(Role::Responder)?.is_none());
@@ -453,7 +565,7 @@ mod tests {
     async fn expire_prunes_when_both_gone() -> TestResult {
         let session = Session::default();
         let (proposer, _) = peer(1);
-        session.register(Role::Proposer, proposer)?;
+        register(&session, Role::Proposer, proposer)?;
         session.disconnect(Role::Proposer, Duration::from_secs(10))?;
 
         tokio::time::advance(Duration::from_secs(11)).await;
@@ -479,6 +591,153 @@ mod tests {
             session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL),
             Err(SessionError::LockPoisoned)
         ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_ready_is_enqueued_before_frames_routed_after_register() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, mut responder_rx) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+
+        // Nothing else can slip in between registration and the first route.
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic()?, "m1"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+
+        assert_eq!(responder_rx.try_recv()?.id, "ready");
+        assert_eq!(responder_rx.try_recv()?.id, "m1");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frames_routed_during_reconnect_queue_behind_the_backlog() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        for id in ["old1", "old2"] {
+            session.route(
+                Role::Proposer,
+                frame_with_id(&topic, id),
+                MAX_BUFFERED,
+                BUFFER_TTL,
+            )?;
+        }
+
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+
+        // The counterpart sends before the new connection has drained its backlog.
+        for id in ["new1", "new2"] {
+            session.route(
+                Role::Proposer,
+                frame_with_id(&topic, id),
+                MAX_BUFFERED,
+                BUFFER_TTL,
+            )?;
+        }
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["ready", "old1", "old2", "new1", "new2"]
+        );
+
+        // Once drained, frames go straight to the queue again.
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "live"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+        assert_eq!(responder_rx.try_recv()?.id, "live");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_larger_than_the_queue_is_delivered_in_order() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        let total = PEER_QUEUE * 3;
+        for i in 0..total {
+            session.route(
+                Role::Proposer,
+                frame_with_id(&topic, &format!("m{i:02}")),
+                total,
+                BUFFER_TTL,
+            )?;
+        }
+
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+
+        let drain = session.drain_backlog(Role::Responder, &tx);
+        let collect = async {
+            let mut ids = Vec::new();
+            while ids.len() < total + 1 {
+                match responder_rx.recv().await {
+                    Some(frame) => ids.push(frame.id),
+                    None => break,
+                }
+            }
+            ids
+        };
+        let (drained, ids) = tokio::join!(drain, collect);
+        drained?;
+
+        let mut expected = vec!["ready".to_owned()];
+        expected.extend((0..total).map(|i| format!("m{i:02}")));
+        assert_eq!(ids, expected);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_backlog_stops_when_slot_was_taken_over() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        // The first reconnect dies before it drains anything.
+        let (first, mut first_rx) = peer(2);
+        let first_tx = first.tx.clone();
+        register(&session, Role::Responder, first)?;
+        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+        let (second, mut second_rx) = peer(2);
+        let second_tx = second.tx.clone();
+        register(&session, Role::Responder, second)?;
+
+        // The stale connection finally gets to run.
+        assert_eq!(
+            received_ids(&session, Role::Responder, &first_tx, &mut first_rx).await?,
+            ["ready"],
+            "a stale connection must not consume the new connection's backlog"
+        );
+        assert_eq!(
+            received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
+            ["ready", "frame-id"]
+        );
         Ok(())
     }
 }
