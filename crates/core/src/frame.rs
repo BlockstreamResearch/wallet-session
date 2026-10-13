@@ -32,3 +32,13 @@ pub enum RelayFrameBody {
     /// Opaque application envelope routed to the counterpart.
     Message { payload: String },
 }
+
+impl RelayFrameBody {
+    pub fn relay_only_body(&self) -> Option<&'static str> {
+        match self {
+            RelayFrameBody::SessionReady => Some("session_ready"),
+            RelayFrameBody::PeerDisconnected => Some("peer_disconnected"),
+            RelayFrameBody::Message { .. } => None,
+        }
+    }
+}

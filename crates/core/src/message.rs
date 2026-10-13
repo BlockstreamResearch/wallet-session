@@ -134,7 +134,7 @@ impl From<&Payload> for MessageType {
             Payload::Pong => MessageType::Pong,
             Payload::SessionReady => MessageType::SessionReady,
             Payload::Disconnect(_) => MessageType::Disconnect,
-            Payload::SessionDelete => MessageType::SessionDelete,
+            Payload::SessionDelete(_) => MessageType::SessionDelete,
         }
     }
 }

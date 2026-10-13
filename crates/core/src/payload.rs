@@ -89,9 +89,23 @@ pub struct DisconnectPayload {
     pub message: String,
 }
 
-/// Typed wrapper over the possible message bodies.
+/// Body of a `session_delete` message.
 #[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+pub struct SessionDeletePayload {
+    /// Machine-readable close code.
+    pub code: u32,
+
+    /// Human-readable detail.
+    pub message: String,
+}
+
+/// Typed wrapper over the possible message bodies.
+///
+/// Tagged by the `type` field, because several bodies (`reject`,
+/// `disconnect`, `session_delete`) carry the same fields and an untagged
+/// representation decodes one of them as another.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Payload {
     /// Session proposal.
     Proposal(ProposalPayload),
@@ -124,5 +138,63 @@ pub enum Payload {
     Disconnect(DisconnectPayload),
 
     /// Session deletion notice.
-    SessionDelete,
+    SessionDelete(SessionDeletePayload),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::MessageType;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn bodies_with_the_same_shape_are_distinguished() -> TestResult {
+        let rejected: Payload =
+            serde_json::from_str(r#"{"type":"reject","code":1,"message":"no"}"#)?;
+        assert!(matches!(rejected, Payload::Reject(_)));
+
+        let disconnected: Payload = serde_json::from_str(
+            r#"{"type":"disconnect","reason":"bye","code":1,"message":"no"}"#,
+        )?;
+        assert!(matches!(disconnected, Payload::Disconnect(_)));
+
+        let deleted: Payload =
+            serde_json::from_str(r#"{"type":"session_delete","code":1,"message":"gone"}"#)?;
+        assert!(matches!(deleted, Payload::SessionDelete(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_bodies_round_trip() -> TestResult {
+        for payload in [Payload::Ping, Payload::Pong, Payload::SessionReady] {
+            let json = serde_json::to_string(&payload)?;
+            let expected = format!("\"type\":\"{}\"", MessageType::from(&payload).as_str());
+            assert!(json.contains(&expected), "{json}");
+
+            let decoded: Payload = serde_json::from_str(&json)?;
+            assert_eq!(MessageType::from(&decoded), MessageType::from(&payload));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_delete_carries_code_and_message() -> TestResult {
+        let payload = Payload::SessionDelete(SessionDeletePayload {
+            code: 7,
+            message: "deleted".to_owned(),
+        });
+
+        let json = serde_json::to_string(&payload)?;
+        assert!(json.contains("\"type\":\"session_delete\""), "{json}");
+        assert!(json.contains("\"code\":7"), "{json}");
+        assert!(json.contains("\"message\":\"deleted\""), "{json}");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_type_is_rejected() {
+        let result: Result<Payload, _> = serde_json::from_str(r#"{"type":"sneaky"}"#);
+        assert!(result.is_err());
+    }
 }

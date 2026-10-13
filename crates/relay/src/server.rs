@@ -85,6 +85,7 @@ pub async fn handle(
     let role = query.role;
 
     let (tx, rx) = mpsc::channel(config.outbound_queue_capacity);
+    let weak_tx = tx.downgrade();
     let peer = PeerHandle {
         identity: identity.did.clone(),
         tx: tx.clone(),
@@ -118,9 +119,11 @@ pub async fn handle(
     .run(websocket, registration)
     .await;
 
-    if holds_slot {
-        let _ = registry.disconnect(&topic, role, grace);
-
+    if holds_slot
+        && registry
+            .disconnect(&topic, role, &weak_tx, grace)
+            .unwrap_or(false)
+    {
         // After the grace window, expire the reservation and tell the
         // counterpart its peer is gone.
         let registry = Arc::clone(&registry);
@@ -179,7 +182,10 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
-    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+    use tokio_tungstenite::{
+        MaybeTlsStream, WebSocketStream, connect_async,
+        tungstenite::{Bytes, Message},
+    };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
     use wallet_session_core::message::Topic;
 
@@ -194,7 +200,7 @@ mod tests {
 
     fn token_with(seed: u8) -> String {
         let now = crate::auth::unix_now();
-        test_utils::token(&signing_key(seed), AUDIENCE, now, now + 3600)
+        test_utils::token(&signing_key(seed), AUDIENCE, now, now + 300)
     }
 
     fn token() -> String {
@@ -712,6 +718,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_identity_reconnects_while_old_connection_is_still_open() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(300)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        // The old responder stays open and unpolled, like a half-open socket
+        // the relay has not yet noticed is dead.
+        let mut old = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut old).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let mut new = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut new).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // The replaced connection is closed by the relay.
+        assert!(
+            expect_closed(&mut old).await,
+            "the replaced connection should be closed"
+        );
+
+        // Wait past the grace window: the old connection's teardown must not
+        // have reserved or expired the new connection's slot.
+        sleep(Duration::from_millis(600)).await;
+
+        send(&mut proposer, &message(&topic, "after", "to-new")).await?;
+        let routed = read_frame(&mut new).await?;
+        assert!(
+            matches!(routed.body, RelayFrameBody::Message { ref payload } if payload == "to-new"),
+            "expected routing to the new connection, got {:?}",
+            routed.body
+        );
+
+        send(&mut new, &message(&topic, "back", "to-proposer")).await?;
+        let routed = read_frame(&mut proposer).await?;
+        assert!(
+            matches!(
+                routed.body,
+                RelayFrameBody::Message { ref payload } if payload == "to-proposer"
+            ),
+            "expected no peer_disconnected, got {:?}",
+            routed.body
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn different_identity_cannot_replace_live_connection() -> TestResult {
+        let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
+
+        let topic = topic()?;
+        let mut proposer =
+            connect_auth(addr, &token_with(1), "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect_auth(addr, &token_with(2), "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let mut impostor = connect_auth(addr, &token_with(3), "responder", &topic, None).await?;
+        assert!(
+            expect_closed(&mut impostor).await,
+            "a different identity must not take over a live slot"
+        );
+
+        // The owner is unaffected.
+        send(&mut proposer, &message(&topic, "keep", "alive")).await?;
+        let routed = read_frame(&mut responder).await?;
+        assert!(
+            matches!(routed.body, RelayFrameBody::Message { ref payload } if payload == "alive"),
+            "expected the owner to keep receiving, got {:?}",
+            routed.body
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn duplicate_role_connection_is_closed() -> TestResult {
         let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
 
@@ -727,8 +830,9 @@ mod tests {
             RelayFrameBody::SessionReady
         ));
 
-        // A second proposer for the same topic must be refused.
-        let mut second = connect(addr, "proposer", &topic, Some("reg-2")).await?;
+        // A second proposer with a different identity must be refused.
+        let mut second =
+            connect_auth(addr, &token_with(8), "proposer", &topic, Some("reg-2")).await?;
         assert!(
             expect_closed(&mut second).await,
             "second connection for an occupied role should be closed"
@@ -815,6 +919,69 @@ mod tests {
         assert!(
             try_connect(addr, &other_auth, "responder", &topic, None).await,
             "slot should be claimable after the grace window expires"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_sent_peer_disconnected_is_rejected() -> TestResult {
+        let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let forged = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: "forged".to_owned(),
+            topic: topic.clone(),
+            body: RelayFrameBody::PeerDisconnected,
+        };
+        send(&mut responder, &forged).await?;
+        assert!(
+            expect_closed(&mut responder).await,
+            "clients may not send peer_disconnected"
+        );
+
+        // The counterpart must not be told its peer is gone, and the session
+        // keeps running for whoever is left.
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut proposer))
+                .await
+                .is_err(),
+            "a forged peer_disconnected must not reach the counterpart"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_frame_closes_connection() -> TestResult {
+        let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        proposer.send(Message::Binary(vec![0u8; 8].into())).await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "binary frames are not part of the relay protocol"
         );
         Ok(())
     }
@@ -1235,6 +1402,36 @@ mod tests {
             }
         }
         assert!(expect_closed(&mut proposer).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_frame_flood_is_charged_and_disconnects_peer() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(300)),
+            tight_inbound_limits(),
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+
+        // Pings are not data, but they are charged to the same budget, so a
+        // peer cannot use them as unlimited keepalive traffic.
+        for _ in 0..64 {
+            if proposer.send(Message::Ping(Bytes::new())).await.is_err() {
+                break;
+            }
+        }
+
+        // The verdict is observed on the quiet counterpart: the relay drops the
+        // flooder, and tells its peer once the grace window has passed.
+        let notified = read_frame(&mut responder).await?;
+        assert!(
+            matches!(notified.body, RelayFrameBody::PeerDisconnected),
+            "expected PeerDisconnected after a control-frame flood, got {:?}",
+            notified.body
+        );
         Ok(())
     }
 

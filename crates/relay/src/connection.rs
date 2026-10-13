@@ -24,10 +24,10 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, Limiter},
+    limits::{Bucket, Limiter, RelayLimitsConfig},
     session::{Registration, Role, Session, SessionError},
 };
-use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
+use wallet_session_core::{frame::RelayFrame, message::Topic};
 
 /// Server-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<TcpStream>;
@@ -44,6 +44,19 @@ const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
 
 /// Maximum accepted query-string length before parsing.
 pub const MAX_QUERY_BYTES: usize = 8 * 1024;
+
+/// Maximum number of characters of a client-supplied `registrationId` echoed
+/// into logs.
+const MAX_LOGGED_REGISTRATION_ID: usize = 64;
+
+/// Truncate a client-supplied registration id for logging.
+// TODO: remove once `registration_id` is properly integrated.
+fn described_registration_id(registration_id: &str) -> String {
+    registration_id
+        .chars()
+        .take(MAX_LOGGED_REGISTRATION_ID)
+        .collect()
+}
 
 /// Parse and verify the handshake query, returning the params and peer identity.
 fn parse_connection(
@@ -67,8 +80,9 @@ fn parse_connection(
     // signature, so it is an attribution label only
     if let Some(registration_id) = &query.registration_id {
         log::debug!(
-            "connection from {} carries registrationId {registration_id}",
-            identity.did
+            "connection from {} carries registrationId {:?}",
+            identity.did,
+            described_registration_id(registration_id)
         );
     }
 
@@ -229,9 +243,20 @@ impl Connection {
             );
         }
 
-        self.session
+        let drained = self
+            .session
             .drain_backlog(self.query.role, &self.self_tx)
-            .await?;
+            .await;
+
+        // The slot's handle must be the only sender left: when a same-identity
+        // reconnect replaces this connection, dropping that handle closes the
+        // outbound queue, which stops the writer and ends this connection.
+        drop(self.self_tx);
+        if let Err(error) = drained {
+            let _ = shutdown_tx.send(());
+            stop_writer(&mut writer).await;
+            return Err(error.into());
+        }
 
         let context = ReadContext {
             query: &self.query,
@@ -248,7 +273,6 @@ impl Connection {
         )
         .await;
 
-        drop(self.self_tx);
         let _ = shutdown_tx.send(());
         stop_writer(&mut writer).await;
 
@@ -322,6 +346,40 @@ async fn write_loop(
     {
         log::debug!("outbound websocket close timed out");
     }
+}
+
+/// Charge an inbound control frame to the connection's inbound budget.
+///
+/// The frame is dropped when the budget is exhausted, and a peer that keeps
+/// exceeding it is disconnected like any other flooder. Returns `Err` only to
+/// disconnect the peer.
+fn charge_control_frame(
+    bytes: usize,
+    message_bucket: &mut Bucket,
+    byte_bucket: &mut Bucket,
+    limits: &RelayLimitsConfig,
+    consecutive_drops: &mut u32,
+    topic: &Topic,
+) -> Result<(), ConnectionError> {
+    let now = tokio::time::Instant::now();
+    let within_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
+        && byte_bucket.allow_n(
+            u32::try_from(bytes).unwrap_or(u32::MAX),
+            limits.inbound_byte_rate,
+            now,
+        );
+    if within_limits {
+        *consecutive_drops = 0;
+        return Ok(());
+    }
+
+    *consecutive_drops += 1;
+    log::debug!("dropping control frame on topic {topic}: inbound rate limit exceeded");
+    if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+        log::warn!("peer on topic {topic} keeps exceeding its inbound rate limit; dropping");
+        return Err(ConnectionError::RateLimited);
+    }
+    Ok(())
 }
 
 /// Send one message, returning whether the socket is still usable.
@@ -440,8 +498,37 @@ async fn read_loop(
                 })?
             }
             Message::Close(_) => break,
-            // Keepalive pongs and other control frames count as activity.
-            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+            // The relay protocol is JSON text only.
+            Message::Binary(_) => {
+                log::warn!(
+                    "binary frame on topic {} is not part of the relay protocol",
+                    query.topic
+                );
+                return Err(ConnectionError::UnexpectedBinary);
+            }
+            // Keepalive pongs and other control frames count as activity, but
+            // they are charged to the same budget as data frames so a peer
+            // cannot hold the connection open with unmetered traffic.
+            Message::Ping(payload) | Message::Pong(payload) => {
+                charge_control_frame(
+                    payload.len(),
+                    &mut message_bucket,
+                    &mut byte_bucket,
+                    &limits,
+                    &mut consecutive_drops,
+                    &query.topic,
+                )?;
+                continue;
+            }
+            Message::Frame(frame) => {
+                charge_control_frame(
+                    frame.payload().len(),
+                    &mut message_bucket,
+                    &mut byte_bucket,
+                    &limits,
+                    &mut consecutive_drops,
+                    &query.topic,
+                )?;
                 continue;
             }
         };
@@ -462,12 +549,12 @@ async fn read_loop(
             );
             return Err(ConnectionError::TopicMismatch);
         }
-        if matches!(&frame.body, RelayFrameBody::SessionReady) {
+        if let Some(kind) = frame.body.relay_only_body() {
             log::warn!(
-                "client sent relay-only session_ready on topic {}",
+                "client sent relay-only {kind} frame on topic {}",
                 query.topic
             );
-            return Err(ConnectionError::ClientSessionReady);
+            return Err(ConnectionError::ClientControlFrame(kind));
         }
 
         match session.route(
@@ -533,8 +620,11 @@ pub enum ConnectionError {
     #[error("role already taken: {0:?}")]
     RoleTaken(Role),
 
-    #[error("clients may not send session_ready")]
-    ClientSessionReady,
+    #[error("clients may not send {0} frames")]
+    ClientControlFrame(&'static str),
+
+    #[error("binary frames are not part of the relay protocol")]
+    UnexpectedBinary,
 
     #[error("inbound rate limit exceeded")]
     RateLimited,
@@ -596,6 +686,21 @@ mod tests {
             NOW,
             MAX_LIFETIME,
         )
+    }
+
+    #[test]
+    fn registration_id_is_truncated_and_quoted_for_logs() {
+        let long = "a".repeat(MAX_LOGGED_REGISTRATION_ID + 10);
+        assert_eq!(
+            described_registration_id(&long).chars().count(),
+            MAX_LOGGED_REGISTRATION_ID
+        );
+
+        // Control characters are escaped, so they cannot forge log lines.
+        assert_eq!(
+            format!("{:?}", described_registration_id("a\nb")),
+            r#""a\nb""#
+        );
     }
 
     #[test]

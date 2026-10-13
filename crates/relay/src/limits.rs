@@ -117,28 +117,36 @@ impl Bucket {
     }
 }
 
+/// Per-identity connect buckets, with the time of the last full prune.
+#[derive(Debug)]
+struct ConnectRate {
+    buckets: HashMap<DidKey, Bucket>,
+    last_prune: Instant,
+}
+
 /// Shared runtime counters and rate limiters.
 #[derive(Debug)]
 pub struct Limiter {
     limits: RelayLimitsConfig,
     total: Mutex<usize>,
     per_identity: Mutex<HashMap<DidKey, usize>>,
-    connect_rate: Mutex<HashMap<DidKey, Bucket>>,
+    connect_rate: Mutex<ConnectRate>,
     inbound_bytes: Mutex<Bucket>,
 }
 
 impl Limiter {
     /// Build a limiter with the given static limits.
     pub fn new(limits: RelayLimitsConfig) -> Self {
+        let now = Instant::now();
         Self {
             limits,
             total: Mutex::new(0),
             per_identity: Mutex::new(HashMap::new()),
-            connect_rate: Mutex::new(HashMap::new()),
-            inbound_bytes: Mutex::new(Bucket::full(
-                limits.global_inbound_byte_rate.burst,
-                Instant::now(),
-            )),
+            connect_rate: Mutex::new(ConnectRate {
+                buckets: HashMap::new(),
+                last_prune: now,
+            }),
+            inbound_bytes: Mutex::new(Bucket::full(limits.global_inbound_byte_rate.burst, now)),
         }
     }
 
@@ -205,21 +213,39 @@ impl Limiter {
 
     fn allow_connect_at(&self, identity: &DidKey, now: Instant) -> bool {
         let rate = self.limits.connect_rate;
-        let mut buckets = lock(&self.connect_rate);
+        let mut state = lock(&self.connect_rate);
 
-        if buckets.len() >= MAX_RATE_KEYS {
-            buckets.retain(|_, bucket| now.saturating_duration_since(bucket.last) < rate.interval);
-            if buckets.len() >= MAX_RATE_KEYS
-                && let Some(key) = buckets.keys().next().cloned()
-            {
-                buckets.remove(&key);
+        if state.buckets.len() >= MAX_RATE_KEYS {
+            // Pruning is an O(n) scan, so it runs at most once per interval
+            // instead of on every attempt once the map is full. Between prunes
+            // an arbitrary entry is evicted to keep the map bounded. Identities
+            // are cheap to mint, so no eviction policy makes this map usable as
+            // anything but a rate limit.
+            if now.saturating_duration_since(state.last_prune) >= rate.interval {
+                state
+                    .buckets
+                    .retain(|_, bucket| now.saturating_duration_since(bucket.last) < rate.interval);
+                state.last_prune = now;
+            }
+            while state.buckets.len() >= MAX_RATE_KEYS {
+                let Some(key) = state.buckets.keys().next().cloned() else {
+                    break;
+                };
+                state.buckets.remove(&key);
             }
         }
 
-        let bucket = buckets
+        let bucket = state
+            .buckets
             .entry(identity.clone())
             .or_insert_with(|| Bucket::full(rate.burst, now));
         bucket.allow(rate, now)
+    }
+
+    /// Number of identities the connect limiter is tracking.
+    #[cfg(test)]
+    fn tracked_identities(&self) -> usize {
+        lock(&self.connect_rate).buckets.len()
     }
 }
 
@@ -239,10 +265,10 @@ impl Drop for ConnectionPermit {
                     counts.remove(identity);
                 }
             }
+        } else {
+            let mut total = lock(&self.limiter.total);
+            *total = total.saturating_sub(1);
         }
-
-        let mut total = lock(&self.limiter.total);
-        *total = total.saturating_sub(1);
     }
 }
 
@@ -351,6 +377,47 @@ mod tests {
         };
         let mut bucket = Bucket::full(rate.burst, Instant::now());
         assert!(!bucket.allow_n(1, rate, Instant::now()));
+    }
+
+    fn key_from_u32(value: u32) -> DidKey {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&value.to_le_bytes());
+        DidKey::from_ed25519_bytes(bytes)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_rate_map_stays_bounded() {
+        let limiter = Limiter::new(RelayLimitsConfig::default());
+
+        for seed in 0..MAX_RATE_KEYS as u32 + 128 {
+            limiter.allow_connect(&key_from_u32(seed));
+        }
+
+        assert!(limiter.tracked_identities() <= MAX_RATE_KEYS);
+        // A fresh identity can still attempt a connection.
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_rate_prunes_stale_identities() {
+        let interval = Duration::from_secs(10);
+        let limiter = Limiter::new(RelayLimitsConfig {
+            connect_rate: RateLimit { burst: 1, interval },
+            ..RelayLimitsConfig::default()
+        });
+
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            limiter.allow_connect(&key_from_u32(seed));
+        }
+        assert_eq!(limiter.tracked_identities(), MAX_RATE_KEYS);
+
+        tokio::time::advance(interval + Duration::from_secs(1)).await;
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+        assert_eq!(
+            limiter.tracked_identities(),
+            1,
+            "stale buckets are pruned once the interval has passed"
+        );
     }
 
     #[tokio::test(start_paused = true)]

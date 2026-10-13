@@ -14,7 +14,7 @@ const TOKEN_LEEWAY_SECS: u64 = 60;
 pub const MAX_TOKEN_BYTES: usize = 4096;
 
 /// Default maximum accepted lifetime of an auth token.
-pub const DEFAULT_MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
 /// Identity established by a verified connection token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +214,7 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
 
     fn valid_token() -> String {
-        test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 3600)
+        test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 300)
     }
 
     #[test]
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_audience() {
-        let token = test_utils::token(&signing_key(1), "wss://other", NOW, NOW + 3600);
+        let token = test_utils::token(&signing_key(1), "wss://other", NOW, NOW + 300);
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
             Err(IdentityError::Audience)
@@ -254,7 +254,7 @@ mod tests {
             &signing_key(1),
             AUDIENCE,
             NOW + TOKEN_LEEWAY_SECS + 1,
-            NOW + 3600,
+            NOW + 300,
         );
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
@@ -268,7 +268,7 @@ mod tests {
             &signing_key(1),
             AUDIENCE,
             NOW + TOKEN_LEEWAY_SECS - 1,
-            NOW + 3600,
+            NOW + 300,
         );
         assert!(Identity::verify_token(&token, AUDIENCE, NOW).is_ok());
     }
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_algorithm() {
-        let token = test_utils::token_with_alg(&signing_key(1), "none", AUDIENCE, NOW, NOW + 3600);
+        let token = test_utils::token_with_alg(&signing_key(1), "none", AUDIENCE, NOW, NOW + 300);
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
             Err(IdentityError::UnsupportedAlgorithm(alg)) if alg == "none"
@@ -301,7 +301,7 @@ mod tests {
             "did:web:example.com",
             AUDIENCE,
             NOW,
-            NOW + 3600,
+            NOW + 300,
         );
         // The malformed issuer fails while deserializing the payload.
         assert!(matches!(
@@ -317,7 +317,7 @@ mod tests {
             &test_utils::did_key(&signing_key(2)),
             AUDIENCE,
             NOW,
-            NOW + 3600,
+            NOW + 300,
         );
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn accepts_token_within_lifetime_cap() {
-        let token = test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 23 * 3600);
+        let token = test_utils::token(&signing_key(1), AUDIENCE, NOW, NOW + 5 * 60);
         assert!(Identity::verify_token(&token, AUDIENCE, NOW).is_ok());
     }
 

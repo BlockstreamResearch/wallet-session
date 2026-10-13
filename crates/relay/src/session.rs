@@ -108,13 +108,23 @@ impl Session {
         self.slots.lock().map_err(|_| SessionError::LockPoisoned)
     }
 
-    /// Bind a peer to its role slot, reclaiming a same-identity reservation.
+    /// Bind a peer to its role slot.
+    ///
+    /// A same-identity reservation is reclaimed. A same-identity live
+    /// connection is replaced: the relay may not yet have noticed that the old
+    /// socket is half-open, and the peer must be able to reconnect without
+    /// waiting for the pong or idle deadline. The replaced connection's channel
+    /// is closed once its handle is dropped here, which makes that connection
+    /// shut down. A different identity gets [`Registration::RoleTaken`] while
+    /// the slot is live or reserved.
     ///
     /// When the counterpart is already connected, `ready` is enqueued for both
     /// peers while the slot lock is held, so it precedes anything
-    /// [`Session::route`] can send afterwards. Frames buffered for this peer
-    /// while it was disconnected become the slot's backlog; hand them over with
-    /// [`Session::drain_backlog`].
+    /// [`Session::route`] can send afterwards. Frames buffered for this
+    /// identity while it was disconnected, or not yet handed to a replaced
+    /// connection, become the slot's backlog; hand them over with
+    /// [`Session::drain_backlog`]. A reservation claimed by another identity
+    /// keeps no frames.
     pub(crate) fn register(
         &self,
         role: Role,
@@ -125,7 +135,7 @@ impl Session {
         let now = Instant::now();
 
         match slots.get(role) {
-            Some(Slot::Connected { .. }) => {
+            Some(Slot::Connected { peer: current, .. }) if current.identity != peer.identity => {
                 return Ok(Registration::RoleTaken(role));
             }
             Some(Slot::Disconnected {
@@ -137,12 +147,23 @@ impl Session {
         }
 
         let backlog: VecDeque<RelayFrame> = match slots.get_mut(role).take() {
-            Some(Slot::Disconnected { buffered, .. }) => buffered
+            // A reservation reclaimed by the same identity keeps its frames,
+            // whether or not the grace window has passed.
+            Some(Slot::Disconnected {
+                identity, buffered, ..
+            }) if identity == peer.identity => buffered
                 .into_iter()
                 .filter(|entry| entry.expires_at > now)
                 .map(|entry| entry.frame)
                 .collect(),
-            _ => VecDeque::new(),
+            // An expired reservation claimed by another identity must not leak
+            // the previous owner's frames.
+            Some(Slot::Disconnected { .. }) => VecDeque::new(),
+            Some(Slot::Connected { backlog, .. }) => {
+                log::debug!("replacing live connection of {}", peer.identity);
+                backlog
+            }
+            None => VecDeque::new(),
         };
         if !backlog.is_empty() {
             log::debug!(
@@ -198,12 +219,24 @@ impl Session {
     }
 
     /// Reserve a peer's slot for `grace`, buffering frames addressed to it.
-    pub(crate) fn disconnect(&self, role: Role, grace: Duration) -> Result<(), SessionError> {
+    ///
+    /// Only acts if the slot still belongs to the connection owning `tx`, so a
+    /// replaced connection tearing down cannot release its successor's slot.
+    pub(crate) fn disconnect(
+        &self,
+        role: Role,
+        tx: &mpsc::WeakSender<RelayFrame>,
+        grace: Duration,
+    ) -> Result<bool, SessionError> {
         let mut slots = self.lock()?;
 
         let Some(Slot::Connected { peer, .. }) = slots.get(role) else {
-            return Ok(());
+            return Ok(false);
         };
+        let owns_slot = tx.upgrade().is_some_and(|tx| peer.tx.same_channel(&tx));
+        if !owns_slot {
+            return Ok(false);
+        }
 
         let identity = peer.identity.clone();
 
@@ -213,7 +246,7 @@ impl Session {
             buffered: VecDeque::new(),
         });
 
-        Ok(())
+        Ok(true)
     }
 
     /// Clear an expired reservation, reporting the remaining peer.
@@ -317,6 +350,19 @@ mod tests {
             },
             rx,
         )
+    }
+
+    /// Disconnect whichever connection currently owns `role`'s slot.
+    fn disconnect_current(
+        session: &Session,
+        role: Role,
+        grace: Duration,
+    ) -> Result<bool, SessionError> {
+        let tx = match session.lock()?.get(role) {
+            Some(Slot::Connected { peer, .. }) => peer.tx.downgrade(),
+            _ => return Ok(false),
+        };
+        session.disconnect(role, &tx, grace)
     }
 
     fn frame(topic: &Topic) -> RelayFrame {
@@ -459,7 +505,7 @@ mod tests {
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
 
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         // frames to the disconnected peer are buffered, not dropped
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
@@ -486,7 +532,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         let (impostor, _) = peer(3);
         assert!(matches!(
@@ -503,7 +549,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         let ttl = Duration::from_secs(5);
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
@@ -529,7 +575,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         for _ in 0..3 {
             session.route(Role::Proposer, frame(&topic()?), 2, BUFFER_TTL)?;
@@ -550,7 +596,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         assert!(session.expire(Role::Responder)?.is_none());
 
@@ -566,7 +612,7 @@ mod tests {
         let session = Session::default();
         let (proposer, _) = peer(1);
         register(&session, Role::Proposer, proposer)?;
-        session.disconnect(Role::Proposer, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Proposer, Duration::from_secs(10))?;
 
         tokio::time::advance(Duration::from_secs(11)).await;
         let expiry = session.expire(Role::Proposer)?.expect("expired");
@@ -622,7 +668,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         let topic = topic()?;
         for id in ["old1", "old2"] {
@@ -671,7 +717,7 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         let topic = topic()?;
         let total = PEER_QUEUE * 3;
@@ -715,13 +761,13 @@ mod tests {
         let (responder, _) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         // The first reconnect dies before it drains anything.
         let (first, mut first_rx) = peer(2);
         let first_tx = first.tx.clone();
         register(&session, Role::Responder, first)?;
-        session.disconnect(Role::Responder, Duration::from_secs(10))?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
         let (second, mut second_rx) = peer(2);
@@ -737,6 +783,199 @@ mod tests {
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
             ["ready", "frame-id"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_identity_replaces_live_connection() -> TestResult {
+        let session = Session::default();
+        let (proposer, mut proposer_rx) = peer(1);
+        let (old, mut old_rx) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, old)?;
+        assert_eq!(proposer_rx.try_recv()?.id, "ready");
+
+        // Same identity, new connection, while the old one is still registered.
+        let (new, mut new_rx) = peer(2);
+        let new_tx = new.tx.clone();
+        assert!(matches!(
+            register(&session, Role::Responder, new)?,
+            Registration::BothReady
+        ));
+
+        // The counterpart sees the peer come back.
+        assert_eq!(proposer_rx.try_recv()?.id, "ready");
+
+        // Routing now reaches the new connection only.
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic()?, "m1"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+        assert_eq!(
+            received_ids(&session, Role::Responder, &new_tx, &mut new_rx).await?,
+            ["ready", "m1"]
+        );
+
+        // The replaced connection's queue is closed once its old frames drain.
+        while old_rx.try_recv().is_ok() {}
+        assert!(matches!(
+            old_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn different_identity_cannot_replace_live_connection() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (owner, mut owner_rx) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, owner)?;
+
+        let (impostor, _impostor_rx) = peer(3);
+        assert!(matches!(
+            register(&session, Role::Responder, impostor)?,
+            Registration::RoleTaken(Role::Responder)
+        ));
+
+        // The owner is untouched and still receives frames.
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic()?, "m1"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+        assert_eq!(owner_rx.try_recv()?.id, "ready");
+        assert_eq!(owner_rx.try_recv()?.id, "m1");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replaced_connection_cannot_disconnect_its_successor() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (old, _old_rx) = peer(2);
+        let old_weak = old.tx.downgrade();
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, old)?;
+
+        let (new, mut new_rx) = peer(2);
+        let new_tx = new.tx.clone();
+        register(&session, Role::Responder, new)?;
+
+        // The old connection finishes tearing down after being replaced.
+        assert!(!session.disconnect(Role::Responder, &old_weak, Duration::from_secs(10))?);
+
+        // The successor still owns the slot: frames reach it, not a buffer.
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic()?, "m1"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+        assert_eq!(
+            received_ids(&session, Role::Responder, &new_tx, &mut new_rx).await?,
+            ["ready", "m1"]
+        );
+
+        // And an expiry the old teardown might have scheduled is a no-op.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(session.expire(Role::Responder)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_inherits_undelivered_backlog() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "old"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+
+        // First reconnect has not drained its backlog when a second replaces it.
+        let (first, _first_rx) = peer(2);
+        register(&session, Role::Responder, first)?;
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "new"),
+            MAX_BUFFERED,
+            BUFFER_TTL,
+        )?;
+
+        let (second, mut second_rx) = peer(2);
+        let second_tx = second.tx.clone();
+        register(&session, Role::Responder, second)?;
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
+            ["ready", "old", "new"],
+            "frames not yet handed to the replaced connection must not be lost"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_reservation_does_not_leak_frames_to_another_identity() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (original, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, original)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(5))?;
+
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+
+        // The reservation expires before anyone reconnects.
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let (other, mut other_rx) = peer(3);
+        let other_tx = other.tx.clone();
+        assert!(matches!(
+            register(&session, Role::Responder, other)?,
+            Registration::BothReady
+        ));
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &other_tx, &mut other_rx).await?,
+            ["ready"],
+            "frames buffered for the previous owner must not reach another identity"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_reservation_still_redelivers_to_its_owner() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (original, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, original)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(5))?;
+
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let (reconnect, mut reconnect_rx) = peer(2);
+        let tx = reconnect.tx.clone();
+        register(&session, Role::Responder, reconnect)?;
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut reconnect_rx).await?,
+            ["ready", "frame-id"],
+            "the owner gets its frames back after the reservation expired"
         );
         Ok(())
     }

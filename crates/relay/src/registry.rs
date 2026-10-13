@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio::sync::mpsc;
 use wallet_session_core::{frame::RelayFrame, message::Topic};
 
 use crate::session::{PeerHandle, Registration, Role, Session, SessionError};
@@ -62,24 +63,29 @@ impl Registry {
         Ok((session, registration))
     }
 
-    /// Reserve a disconnected peer's slot for `grace`.
+    /// Reserve a disconnected peer's slot for `grace`, if `tx` still owns it.
+    ///
+    /// Returns whether the slot was reserved; `false` means the connection was
+    /// already replaced or the session is gone.
     pub fn disconnect(
         &self,
         topic: &Topic,
         role: Role,
+        tx: &mpsc::WeakSender<RelayFrame>,
         grace: Duration,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<bool, RegistryError> {
         let sessions = self.lock()?;
 
         let Some(session) = sessions.get(topic) else {
-            return Ok(());
+            return Ok(false);
         };
 
-        session.disconnect(role, grace)?;
+        let reserved = session.disconnect(role, tx, grace)?;
+        if reserved {
+            log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
+        }
 
-        log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
-
-        Ok(())
+        Ok(reserved)
     }
 
     /// Expire a reservation, pruning the session when empty and returning the
@@ -208,10 +214,11 @@ mod tests {
         let registry = Registry::new();
         let topic = topic()?;
         let (proposer, _) = peer(1);
+        let weak = proposer.tx.downgrade();
         let (session, _) =
             registry.register(&topic, Role::Proposer, proposer, &ready(&topic), usize::MAX)?;
 
-        registry.disconnect(&topic, Role::Proposer, Duration::from_secs(10))?;
+        assert!(registry.disconnect(&topic, Role::Proposer, &weak, Duration::from_secs(10))?);
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
 
         tokio::time::advance(Duration::from_secs(11)).await;

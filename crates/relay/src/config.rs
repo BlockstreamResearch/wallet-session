@@ -148,7 +148,16 @@ impl NativeRelayTransportConfig {
     }
 
     /// Set the per-connection outbound queue capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero: the connection handler builds its outbound
+    /// channel from this value, and a zero-capacity channel cannot be created.
     pub fn with_outbound_queue_capacity(mut self, capacity: usize) -> Self {
+        assert!(
+            capacity > 0,
+            "outbound queue capacity must be greater than zero"
+        );
         self.outbound_queue_capacity = capacity;
         self
     }
@@ -161,6 +170,20 @@ impl NativeRelayTransportConfig {
 
     /// Get WebSocketConfig from this config.
     pub fn websocket_config(&self) -> WebSocketConfig {
-        WebSocketConfig::default().max_message_size(Some(self.max_incoming_frame_bytes))
+        WebSocketConfig::default()
+            .max_message_size(Some(self.max_incoming_frame_bytes))
+            .max_frame_size(Some(self.max_incoming_frame_bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "outbound queue capacity")]
+    fn zero_outbound_queue_capacity_is_rejected() {
+        let _ = NativeRelayTransportConfig::new("wss://relay.example.com")
+            .with_outbound_queue_capacity(0);
     }
 }
