@@ -1,0 +1,46 @@
+# Relay deployment image. Build from the repository root:
+#   docker build -f deployment/Dockerfile.relay -t wallet-session-relay .
+#
+# The container renders its configuration from the templates in
+# deployment/configs/relay at startup, so environment values from
+# deployment/configs/compose.env become the running configuration. It serves
+# the relay on 8080 and its health probes on 8081; neither is TLS-terminated
+# here, so put a reverse proxy or load balancer in front of it.
+
+FROM rust:1.96-bookworm AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --locked --release -p wallet-session-relay
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gettext-base \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --create-home --uid 10001 appuser
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/wallet-session-relay /usr/local/bin/wallet-session-relay
+# Defaults, replaced by the rendered templates at startup.
+COPY crates/relay/configuration/ configuration/
+COPY deployment/configs /deployment/configs
+COPY deployment/scripts/render-relay-config.sh /deployment/render-relay-config.sh
+
+# The entrypoint renders the configuration as this user, so it must own the
+# directory it writes to.
+RUN chown -R appuser:appuser /app
+
+ENV APP_ENVIRONMENT=production
+
+USER appuser
+
+EXPOSE 8080 8081
+
+ENTRYPOINT ["/deployment/render-relay-config.sh"]
+CMD ["wallet-session-relay"]

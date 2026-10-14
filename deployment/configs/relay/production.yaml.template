@@ -1,0 +1,10 @@
+# Rendered by deployment/scripts/render-relay-config.sh at container start.
+# Both listeners accept connections on every interface inside the container:
+# nginx reaches the relay, and the orchestrator reaches the health port.
+# Neither is published directly by docker-compose.yml.
+
+application:
+  host: '0.0.0.0'
+
+health:
+  host: '0.0.0.0'

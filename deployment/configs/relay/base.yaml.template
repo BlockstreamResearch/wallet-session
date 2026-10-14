@@ -1,0 +1,45 @@
+# Rendered by deployment/scripts/render-relay-config.sh at container start.
+# Everything an operator normally tunes per environment is a placeholder; the
+# rest matches crates/relay/configuration/base.yaml. Any value can still be
+# overridden with environment variables, using `__` for nested keys.
+
+application:
+  port: ${RELAY_PORT}
+  audience: '${APPLICATION_AUDIENCE}'
+
+health:
+  port: ${HEALTH_PORT}
+
+auth:
+  max_token_lifetime_seconds: ${MAX_TOKEN_LIFETIME_SECONDS}
+
+session:
+  grace_seconds: 10
+  buffer_max_messages: 256
+  buffer_ttl_seconds: 60
+
+connection:
+  max_incoming_frame_bytes: 262144
+  handshake_timeout_seconds: 10
+  write_timeout_seconds: 10
+  outbound_queue_capacity: 64
+  ping_interval_seconds: 30
+  pong_timeout_seconds: 10
+  idle_timeout_seconds: 45
+
+limits:
+  max_connections: 10000
+  max_connections_per_identity: 16
+  max_sessions: 50000
+  connect_rate:
+    burst: 30
+    interval_seconds: 60
+  inbound_message_rate:
+    burst: 32
+    interval_seconds: 2
+  inbound_byte_rate:
+    burst: 524288
+    interval_seconds: 2
+  global_inbound_byte_rate:
+    burst: 16777216
+    interval_seconds: 1

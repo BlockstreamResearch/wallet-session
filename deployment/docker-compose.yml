@@ -1,0 +1,31 @@
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.relay
+    restart: unless-stopped
+    env_file:
+      - ./configs/compose.env
+    environment:
+      APP_ENVIRONMENT: production
+    # Neither port is published: nginx fronts the relay, and probes reach the
+    # health port from inside the container or the orchestrator's network.
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -fsS "http://127.0.0.1:$$HEALTH_PORT/ready" >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      relay:
+        condition: service_healthy
+    environment:
+      RELAY_PORT: ${RELAY_PORT}
+    volumes:
+      - ./configs/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - '${RELAY_PUBLIC_PORT}:80'
