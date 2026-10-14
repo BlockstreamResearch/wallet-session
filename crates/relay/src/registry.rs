@@ -63,6 +63,27 @@ impl Registry {
         Ok((session, registration))
     }
 
+    /// Poison the sessions lock, as a panic in a holder would.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.sessions.lock();
+            panic!("poison the registry lock");
+        }));
+        std::panic::set_hook(previous_hook);
+        assert!(outcome.is_err());
+    }
+
+    /// Number of live sessions.
+    ///
+    /// Fails once the registry lock is poisoned, after which every
+    /// registration fails too; health checks use this to notice.
+    pub fn session_count(&self) -> Result<usize, RegistryError> {
+        Ok(self.lock()?.len())
+    }
+
     /// Reserve a disconnected peer's slot for `grace`, if `tx` still owns it.
     ///
     /// Returns whether the slot was reserved; `false` means the connection was
@@ -237,16 +258,31 @@ mod tests {
     }
 
     #[test]
+    fn session_count_tracks_live_sessions() -> TestResult {
+        let registry = Registry::new();
+        assert_eq!(registry.session_count()?, 0);
+
+        let (proposer, _) = peer(1);
+        registry.register(
+            &topic()?,
+            Role::Proposer,
+            proposer,
+            &ready(&topic()?),
+            usize::MAX,
+        )?;
+        assert_eq!(registry.session_count()?, 1);
+        Ok(())
+    }
+
+    #[test]
     fn poisoned_lock_is_reported() -> TestResult {
         let registry = Registry::new();
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = registry.sessions.lock();
-            panic!("poison the registry lock");
-        }));
-        std::panic::set_hook(previous_hook);
-        assert!(outcome.is_err());
+        registry.poison_for_test();
+
+        assert!(matches!(
+            registry.session_count(),
+            Err(RegistryError::LockPoisoned)
+        ));
 
         let (proposer, _) = peer(1);
         assert!(matches!(

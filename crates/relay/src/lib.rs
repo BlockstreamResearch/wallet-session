@@ -1,7 +1,10 @@
 pub mod auth;
 pub mod config;
+pub mod configuration;
 pub mod connection;
+pub mod health;
 pub mod limits;
 pub mod registry;
 pub mod server;
 pub mod session;
+pub mod telemetry;
