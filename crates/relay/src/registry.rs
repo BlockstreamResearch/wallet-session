@@ -114,25 +114,32 @@ impl Registry {
         Ok(reserved)
     }
 
-    /// Expire a reservation, pruning the session when empty and returning the
-    /// remaining peer to notify.
-    pub fn expire(&self, topic: &Topic, role: Role) -> Result<Option<PeerHandle>, RegistryError> {
+    /// Expire a reservation, pruning the session when empty and notifying the
+    /// surviving peer with `notification`.
+    ///
+    /// Returns whether a reservation was expired.
+    pub fn expire(
+        &self,
+        topic: &Topic,
+        role: Role,
+        notification: &RelayFrame,
+    ) -> Result<bool, RegistryError> {
         let mut sessions = self.lock()?;
 
         let Some(session) = sessions.get(topic) else {
-            return Ok(None);
+            return Ok(false);
         };
 
-        match session.expire(role)? {
+        match session.expire(role, notification)? {
             Some(expiry) => {
                 if expiry.empty {
                     sessions.remove(topic);
                     log::debug!("removed empty session for topic {topic}");
                 }
                 log::debug!("expired {role:?} reservation on topic {topic}");
-                Ok(expiry.counterpart)
+                Ok(true)
             }
-            None => Ok(None),
+            None => Ok(false),
         }
     }
 }
@@ -195,6 +202,15 @@ mod tests {
     }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn notification(topic: &Topic) -> RelayFrame {
+        RelayFrame {
+            v: 1,
+            id: "gone".to_owned(),
+            topic: topic.clone(),
+            body: wallet_session_core::frame::RelayFrameBody::PeerDisconnected,
+        }
+    }
 
     fn ready(topic: &Topic) -> RelayFrame {
         RelayFrame {
@@ -293,10 +309,13 @@ mod tests {
         )?;
 
         assert!(registry.disconnect(&topic, Role::Proposer, &weak, Duration::from_secs(10))?);
-        assert!(registry.expire(&topic, Role::Proposer)?.is_none());
+        assert!(!registry.expire(&topic, Role::Proposer, &notification(&topic))?);
 
         tokio::time::advance(Duration::from_secs(11)).await;
-        assert!(registry.expire(&topic, Role::Proposer)?.is_none());
+        assert!(
+            registry.expire(&topic, Role::Proposer, &notification(&topic))?,
+            "the reservation expired"
+        );
 
         let (replacement, _) = peer(3);
         let (again, _) = register(
@@ -326,6 +345,66 @@ mod tests {
             usize::MAX,
         )?;
         assert_eq!(registry.session_count()?, 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_notification_precedes_a_later_reconnect() -> TestResult {
+        use wallet_session_core::frame::RelayFrameBody;
+
+        let registry = Registry::new();
+        let topic = topic()?;
+        let (proposer, mut proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        let weak = responder.tx.downgrade();
+
+        register(
+            &registry,
+            &topic,
+            Role::Proposer,
+            proposer,
+            &ready(&topic),
+            usize::MAX,
+        )?;
+        register(
+            &registry,
+            &topic,
+            Role::Responder,
+            responder,
+            &ready(&topic),
+            usize::MAX,
+        )?;
+        assert!(registry.disconnect(&topic, Role::Responder, &weak, Duration::from_secs(1))?);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(registry.expire(&topic, Role::Responder, &notification(&topic))?);
+
+        // The counterpart returns: its `session_ready` must follow the
+        // disconnect, because the expiry queued that disconnect before it let
+        // go of the slot.
+        let (responder, _) = peer(2);
+        register(
+            &registry,
+            &topic,
+            Role::Responder,
+            responder,
+            &ready(&topic),
+            usize::MAX,
+        )?;
+
+        let mut kinds = Vec::new();
+        while let Ok(frame) = proposer_rx.try_recv() {
+            kinds.push(match &frame.body {
+                RelayFrameBody::SessionReady => "ready",
+                RelayFrameBody::PeerDisconnected => "disconnected",
+                RelayFrameBody::Message { .. } => "message",
+            });
+        }
+        assert_eq!(
+            kinds,
+            ["ready", "disconnected", "ready"],
+            "the survivor must not be told it is gone after its peer came back"
+        );
         Ok(())
     }
 

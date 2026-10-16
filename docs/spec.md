@@ -229,7 +229,7 @@ Relay `type`s (the frame's `type` field):
 
 `message` -- Carries an encrypted envelope in `payload`. Clients send it, and the relay forwards it to the counterpart unchanged.
 `session_ready` -- The relay sends it to both `Proposer` and `Responder` after both connections are successfully established. It may be sent again when a peer reconnects with the same identity.
-`peer_disconnected` -- The relay sends it to the surviving peer after the counterpart's reconnection grace expires without a reconnect .
+`peer_disconnected` -- The relay sends it to the surviving peer after the counterpart's reconnection grace expires without a reconnect. It is queued together with the expiry, so a peer that returns later cannot have its `session_ready` delivered in front of it.
 
 WebSocket ping and pong control frames are not relay frames.
 

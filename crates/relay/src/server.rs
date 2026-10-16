@@ -137,23 +137,18 @@ pub async fn handle(
     {
         // After the grace window, expire the reservation and tell the
         // counterpart its peer is gone.
+        let notification = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: random_id()?,
+            topic: topic.clone(),
+            body: RelayFrameBody::PeerDisconnected,
+        };
         let registry = Arc::clone(&registry);
         let notify_topic = topic.clone();
         tokio::spawn(async move {
             sleep(grace).await;
-            if let Ok(Some(counterpart)) = registry.expire(&notify_topic, role) {
-                let Ok(id) = random_id() else {
-                    return;
-                };
-                let frame = RelayFrame {
-                    v: RELAY_FRAME_VERSION,
-                    id,
-                    topic: notify_topic,
-                    body: RelayFrameBody::PeerDisconnected,
-                };
-                if counterpart.tx.try_send(frame).is_err() {
-                    log::warn!("dropping peer_disconnected: outbound queue unavailable");
-                }
+            if let Err(error) = registry.expire(&notify_topic, role, &notification) {
+                log::warn!("could not expire the reservation on topic {notify_topic}: {error}");
             }
         });
     }
@@ -946,6 +941,55 @@ mod tests {
             expect_closed(&mut other).await,
             "a different identity must not take over a live slot"
         );
+        Ok(())
+    }
+
+    /// The sixth finding, over the wire: the disconnect for an expired
+    /// reservation reaches the survivor before the `session_ready` of the peer
+    /// that came back, never after it.
+    #[tokio::test]
+    async fn expiry_notification_precedes_the_reconnect_ready() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(200)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // The responder drops and its reservation expires.
+        drop(responder);
+        let expired = read_frame(&mut proposer).await?;
+        assert!(
+            matches!(expired.body, RelayFrameBody::PeerDisconnected),
+            "expected the expiry notification first, got {:?}",
+            expired.body
+        );
+
+        // Only then does it return, so the readiness that follows cannot be
+        // overtaken by a stale disconnect.
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(
+            matches!(
+                read_frame(&mut proposer).await?.body,
+                RelayFrameBody::SessionReady
+            ),
+            "the survivor must be told its peer is back after the disconnect"
+        );
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
         Ok(())
     }
 

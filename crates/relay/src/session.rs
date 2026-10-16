@@ -107,9 +107,6 @@ impl Slots {
 pub(crate) struct Expiry {
     /// Whether the session now has no peers left.
     pub empty: bool,
-
-    /// The remaining peer to notify, if any.
-    pub counterpart: Option<PeerHandle>,
 }
 
 impl Session {
@@ -288,8 +285,12 @@ impl Session {
         Ok(true)
     }
 
-    /// Clear an expired reservation, reporting the remaining peer.
-    pub(crate) fn expire(&self, role: Role) -> Result<Option<Expiry>, SessionError> {
+    /// Clear an expired reservation, notifying the surviving peer.
+    pub(crate) fn expire(
+        &self,
+        role: Role,
+        notification: &RelayFrame,
+    ) -> Result<Option<Expiry>, SessionError> {
         let mut slots = self.lock()?;
 
         let expired = matches!(
@@ -301,13 +302,17 @@ impl Session {
         }
         *slots.get_mut(role) = None;
 
-        let counterpart = match slots.get(role.counterpart()) {
-            Some(Slot::Connected { peer, .. }) => Some(peer.clone()),
-            _ => None,
-        };
+        if let Some(Slot::Connected { peer, .. }) = slots.get(role.counterpart())
+            && peer.tx.try_send(notification.clone()).is_err()
+        {
+            log::warn!(
+                "dropping peer_disconnected for {}: outbound queue unavailable",
+                peer.identity
+            );
+        }
         let empty = slots.proposer.is_none() && slots.responder.is_none();
 
-        Ok(Some(Expiry { empty, counterpart }))
+        Ok(Some(Expiry { empty }))
     }
 
     /// Forward a frame to the counterpart, buffering while it is disconnected.
@@ -424,6 +429,16 @@ mod tests {
             id: "ready".to_owned(),
             topic: topic.clone(),
             body: RelayFrameBody::SessionReady,
+        }
+    }
+
+    /// The control frame an expiry queues for the surviving peer.
+    fn notification() -> RelayFrame {
+        RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: "gone".to_owned(),
+            topic: topic().expect("topic"),
+            body: RelayFrameBody::PeerDisconnected,
         }
     }
 
@@ -651,12 +666,36 @@ mod tests {
         register(&session, Role::Responder, responder)?;
         disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
 
-        assert!(session.expire(Role::Responder)?.is_none());
+        assert!(session.expire(Role::Responder, &notification())?.is_none());
 
         tokio::time::advance(Duration::from_secs(11)).await;
-        let expiry = session.expire(Role::Responder)?.expect("expired");
+        let expiry = session
+            .expire(Role::Responder, &notification())?
+            .expect("expired");
         assert!(!expiry.empty);
-        assert!(expiry.counterpart.is_some());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expire_notifies_the_survivor_within_the_transition() -> TestResult {
+        let session = Session::default();
+        let (proposer, mut proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(1))?;
+        assert_eq!(proposer_rx.try_recv()?.id, "ready");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let notice = notification();
+        assert!(session.expire(Role::Responder, &notice)?.is_some());
+
+        let queued = proposer_rx.try_recv()?;
+        assert!(
+            matches!(queued.body, RelayFrameBody::PeerDisconnected),
+            "expected the disconnect in the survivor's queue, got {:?}",
+            queued.body
+        );
         Ok(())
     }
 
@@ -668,9 +707,10 @@ mod tests {
         disconnect_current(&session, Role::Proposer, Duration::from_secs(10))?;
 
         tokio::time::advance(Duration::from_secs(11)).await;
-        let expiry = session.expire(Role::Proposer)?.expect("expired");
+        let expiry = session
+            .expire(Role::Proposer, &notification())?
+            .expect("expired");
         assert!(expiry.empty);
-        assert!(expiry.counterpart.is_none());
         Ok(())
     }
 
@@ -937,7 +977,7 @@ mod tests {
 
         // And an expiry the old teardown might have scheduled is a no-op.
         tokio::time::advance(Duration::from_secs(11)).await;
-        assert!(session.expire(Role::Responder)?.is_none());
+        assert!(session.expire(Role::Responder, &notification())?.is_none());
         Ok(())
     }
 
