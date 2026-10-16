@@ -56,7 +56,7 @@ Messages send by the `Proposer` is send to the `Responder`. Messages send by the
 
 While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL (defaults: 256 frames, 60 seconds, inside a 10 second grace window). On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue. Buffered frames belong to the identity that owned the slot: a reservation claimed by a different identity after the grace window starts empty.
 
-The Relay cannot observe end-to-end acknowledgements (§13): `ack` is an application message encrypted between the peers. Relay buffering is therefore best-effort and scoped to the observed-disconnected window. Frames written to a connection that is silently dead may be lost before the Relay notices; recovery is the responsibility of the sender's ack retry (§13).
+The Relay cannot observe end-to-end acknowledgements: `ack` is an application message encrypted between the peers. Relay buffering is therefore best-effort and scoped to the observed-disconnected window. Frames written to a connection that is silently dead may be lost before the Relay notices; recovery is the responsibility of the sender's ack retry.
 
 Relay enforces resource limits to protect itself and its tenants: a bounded handshake deadline, a bounded per-connection outbound queue with a write deadline, keepalive pings with a pong deadline, maximum total and per-identity concurrent connections, a per-identity connection-attempt rate, and a maximum number of concurrent sessions. A peer that stops reading has its outbound queue drained by dropping frames (clients retransmit un-ACKed messages) rather than growing relay memory without bound; a peer that fails the write or pong deadline is disconnected and its slot enters the reconnection grace, so a silently half-open peer is detected before the idle timeout.
 
@@ -66,7 +66,7 @@ TLS is terminated in front of the Relay. The Relay itself speaks plain WebSocket
 
 Slot ownership is first-come, first-served per topic and role. A party that learns a topic before its counterpart connects can claim the role slot and block the intended peer; the relay does not know which identity is expected on a slot. Pairing topics and URIs are therefore bearer secrets and must be short-lived. The connection caps above bound but do not eliminate this risk.
 
-Slot takeover means a valid token for an identity is enough to evict that identity's live connection, not just to claim an empty slot. A leaked, logged or replayed token therefore displaces the legitimate peer until it reconnects. This is the reason the relay caps token lifetime (§5); the cap, not the identity check, is what bounds the exposure.
+Slot takeover means a valid token for an identity is enough to evict that identity's live connection, not just to claim an empty slot. A leaked, logged or replayed token therefore displaces the legitimate peer until it reconnects. This is the reason the relay caps token lifetime; the cap, not the identity check, is what bounds the exposure.
 
 Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting by identity raises the cost of abuse, and so would an operator-side ban list, but neither is a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
 
@@ -186,7 +186,7 @@ Relay frame:
 }
 ```
 
-The encrypted envelope carried in `payload`:
+The envelope carried in `payload`, with its ciphertext in the `data` field:
 
 ```
 {
@@ -203,16 +203,20 @@ The envelope `id` and `topic` are those of the enclosing relay frame and are not
 
 `session_ready` and `peer_disconnected` are relay-generated control frames: they carry no payload and are never forwarded to peers. Clients must not send them; the relay closes the connection of a peer that does.
 
-Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a reused nonce.
+Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a nonce reused with different content.
 
-Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Clients must maintain a list of the frame `id`s received in the last 5 minutes and silently drop any duplicates.
+Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock.
+
+Clients must maintain a list of the frame `id`s whose envelopes they have authenticated in the last 5 minutes. An envelope whose `id` was seen before, and whose authenticated fields and ciphertext are identical, is a retransmission: it is not delivered to the application again, but it is acknowledged again if its type requires an acknowledgement. An envelope that reuses a known `id` with different authenticated content is a protocol violation; the receiver must reject it and may end the session.
+
+The receiver must authenticate an envelope before comparing it with that list, and must not treat an envelope it has not authenticated as a retransmission.
 
 ## 11. AEAD AAD and nonce generation
 
 
-Each sender generates a fresh random sender prefix per key. The counter increments by one per message. A sender must not reuse a (prefix, counter) pair with the same key. Receivers reject reused nonces for the current key.
+Each sender generates a fresh random sender prefix per key. The counter increments by one per message. A sender must not reuse a (prefix, counter) pair with the same key. Receivers reject reused nonces for the current key, except when the ciphertext is identical to the one already received with that nonce: that is a retransmission of the same message. A nonce reused with any other content must be rejected, because encrypting two different plaintexts under the same key and nonce destroys the AEAD's confidentiality.
 
-Nonce scheme: 
+Nonce scheme:
 ```
 nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
 ```
@@ -221,18 +225,24 @@ The AEAD AAD must be constructed by concatenating the plaintext fields as UTF-8 
 
 ## 12. Message types
 
-`proposal` -- Propose a session; carries the ephemeral public key. 
-`approve` -- Approve the session; carries the ephemeral public key. 
-`reject` -- Reject the proposal. 
-`request` -- Application request. 
-`response` -- Application response to a request. 
-`ack` -- Acknowledge receipt of a message. An application message, E2E encrypted like any other: the relay cannot observe it. 
-`disconnect`-- Gracefully close the session. 
-`session_delete` -- Notify the peer that the session was deleted. 
+Relay `type`s (the frame's `type` field):
 
-`ping` and `pong` -- reserved and not implemented. Liveness is handled by WebSocket ping/pong control frames (§14). 
+`message` -- Carries an encrypted envelope in `payload`. Clients send it, and the relay forwards it to the counterpart unchanged.
+`session_ready` -- The relay sends it to both `Proposer` and `Responder` after both connections are successfully established. It may be sent again when a peer reconnects with the same identity.
+`peer_disconnected` -- The relay sends it to the surviving peer after the counterpart's reconnection grace expires without a reconnect .
 
-`session_ready` -- a relay control frame, not an application message (§10).
+WebSocket ping and pong control frames are not relay frames.
+
+Message `kind`s carried inside `payload`:
+
+`proposal` -- Propose a session; carries the ephemeral public key.
+`approve` -- Approve the session; carries the ephemeral public key.
+`reject` -- Reject the proposal.
+`request` -- Application request.
+`response` -- Application response to a request.
+`ack` -- Acknowledge receipt of a message. An application message, E2E encrypted like any other: the relay cannot observe it.
+`disconnect` -- Gracefully close the session.
+`session_delete` -- Notify the peer that the session was deleted.
 
 Payload shapes:
 
@@ -241,7 +251,7 @@ Payload shapes:
 - `reject`: `{ code, message }`
 - `request`: `{ requestId, request }`
 - `response`: `{ requestId, response }` or `{ requestId, error }`
-- `ack`: `{ ackId }`, where `ackId` is the id of the message being acknowledged
+- `ack`: `{ ackId }`, where `ackId` is the `id` of the frame that carried the acknowledged message
 - `disconnect`: `{ reason, code, message }`
 - `session_delete`: `{ code, message }`
 
@@ -249,10 +259,10 @@ Payload shapes:
 
 ## 13. Reliability
 
-Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the received envelope id. The `ack` message is not itself acknowledged. The receiver sends the `ack` after successfully decrypting and validating the message.
+Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the `id` of the frame that carried the message. The `ack` message is not itself acknowledged. The receiver sends the `ack` after successfully decrypting and validating the message. An `ack` is sent for every authenticated envelope whose type requires one, including a retransmission of an envelope already received: a receiver that has authenticated an envelope and then receives the identical envelope again must send the `ack` again, and must not deliver the message to the application a second time. Retransmissions must be identical: the same frame `id`, and the same authenticated envelope header and ciphertext (`kind`, `from`, `ts`, `nonce`, `data`).
 
 
-If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. When the last attempt fails the sender gives up and reports the failure to the application. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection.
+If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. When the last attempt fails the sender gives up and reports the failure to the application. The retry window must stay inside the receiver's duplicate window, so a retransmission is recognized as one; with the values here, the last attempt is about a minute after the first send. A sender must treat an `ack` for an `id` it no longer tracks as a no-op, so that a late `ack` plus a re-`ack` for the same id cannot fail a send. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection.
 
 ## 14. Connection lifecycle
 
