@@ -13,7 +13,7 @@ use crate::{
     connection::{Connection, ConnectionError, RELAY_FRAME_VERSION, RelayStream, random_id},
     limits::Limiter,
     registry::{Registry, RegistryError},
-    session::{PeerHandle, Registration},
+    session::{PeerHandle, Registration, SessionError},
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
@@ -74,12 +74,17 @@ pub async fn handle(
         return Err(ServerError::RateLimited);
     }
 
-    let Some(_identity_slot) = limiter.acquire_identity(&identity.did) else {
-        log::warn!("connection limit reached for {}", identity.did);
-        close_with(&mut websocket, "connection limit").await;
-
-        return Err(ServerError::ConnectionLimit);
-    };
+    // The permit is held by the topic slot from here on. A same-identity
+    // registration may inherit the permit of the connection it replaces, so
+    // failing to acquire one is not yet fatal: it only closes the door on a
+    // registration that has no connection to replace.
+    let permit = limiter.acquire_identity(&identity.did);
+    if permit.is_none() {
+        log::debug!(
+            "{} is at its connection limit; only a replacement can proceed",
+            identity.did
+        );
+    }
 
     let topic = query.topic.clone();
     let role = query.role;
@@ -98,8 +103,14 @@ pub async fn handle(
         body: RelayFrameBody::SessionReady,
     };
     let (session, registration) =
-        match registry.register(&topic, role, peer, &ready, limiter.max_sessions()) {
+        match registry.register(&topic, role, peer, permit, &ready, limiter.max_sessions()) {
             Ok(registered) => registered,
+            Err(RegistryError::Session(SessionError::IdentityLimit)) => {
+                log::warn!("connection limit reached for {}", identity.did);
+                close_with(&mut websocket, "connection limit").await;
+
+                return Err(ServerError::ConnectionLimit);
+            }
             Err(error) => {
                 close_with(&mut websocket, "session limit").await;
                 return Err(error.into());
@@ -760,6 +771,64 @@ mod tests {
         Ok(())
     }
 
+    /// A peer that returns before its counterpart must not receive buffered
+    /// application frames before `session_ready` (the review's fifth finding).
+    #[tokio::test]
+    async fn reconnect_waits_for_session_ready_before_the_backlog() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // The responder drops, a frame is queued for it, and the proposer drops
+        // too, so the pair can no longer become ready.
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        send(&mut proposer, &message(&topic, "buffered", "queued")).await?;
+        drop(proposer);
+        sleep(Duration::from_millis(100)).await;
+
+        // The responder returns first: it is registered, but not ready, so no
+        // frame may reach it yet.
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut responder))
+                .await
+                .is_err(),
+            "the backlog must wait for both peers"
+        );
+
+        // The counterpart returns: `session_ready` first, then the backlog.
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        let redelivered = read_frame(&mut responder).await?;
+        assert!(
+            matches!(redelivered.body, RelayFrameBody::Message { ref payload } if payload == "queued"),
+            "expected the buffered frame after session_ready, got {:?}",
+            redelivered.body
+        );
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reconnect_within_grace_suppresses_peer_disconnected() -> TestResult {
         let addr = serve_with(
@@ -795,6 +864,87 @@ mod tests {
             matches!(observed.body, RelayFrameBody::SessionReady),
             "expected a fresh session_ready, got {:?}",
             observed.body
+        );
+        Ok(())
+    }
+
+    /// At the per-identity cap, a same-identity reconnect must still replace its
+    /// half-open predecessor instead of being refused (the review's seventh
+    /// finding).
+    #[tokio::test]
+    async fn same_identity_replaces_live_connection_at_the_identity_cap() -> TestResult {
+        const IDENTITY: u8 = 7;
+
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(300)),
+            RelayLimitsConfig {
+                max_connections_per_identity: 1,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        // The wallet uses its own identity, so the pair can become ready while
+        // the proposer's identity sits at its cap of one connection.
+        let mut counterpart = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        let mut old = connect_auth(
+            addr,
+            &token_with(IDENTITY),
+            "proposer",
+            &topic,
+            Some("reg-1"),
+        )
+        .await?;
+        assert!(matches!(
+            read_frame(&mut old).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut counterpart).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        // The same identity reconnects while the old socket still looks alive.
+        let mut new = connect_auth(
+            addr,
+            &token_with(IDENTITY),
+            "proposer",
+            &topic,
+            Some("reg-1"),
+        )
+        .await?;
+        assert!(
+            matches!(
+                read_frame(&mut new).await?.body,
+                RelayFrameBody::SessionReady
+            ),
+            "a same-identity reconnect must replace its predecessor at the cap"
+        );
+        assert!(
+            expect_closed(&mut old).await,
+            "the replaced connection should be closed"
+        );
+
+        // The session keeps working: the takeover re-sent `session_ready` to
+        // both peers, so skip that and expect the routed message.
+        send(&mut new, &message(&topic, "m1", "alive")).await?;
+        let routed = loop {
+            let frame = read_frame(&mut counterpart).await?;
+            if !matches!(frame.body, RelayFrameBody::SessionReady) {
+                break frame;
+            }
+        };
+        assert!(
+            matches!(routed.body, RelayFrameBody::Message { ref payload } if payload == "alive"),
+            "expected routing after the takeover, got {:?}",
+            routed.body
+        );
+        let mut other = connect_auth(addr, &token_with(9), "proposer", &topic, None).await?;
+        assert!(
+            expect_closed(&mut other).await,
+            "a different identity must not take over a live slot"
         );
         Ok(())
     }

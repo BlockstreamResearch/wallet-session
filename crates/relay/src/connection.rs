@@ -7,7 +7,7 @@ use futures_util::{
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
@@ -27,7 +27,10 @@ use crate::{
     limits::{Bucket, Limiter, RelayLimitsConfig},
     session::{Registration, Role, Session, SessionError},
 };
-use wallet_session_core::{frame::RelayFrame, message::Topic};
+use wallet_session_core::{
+    frame::{RelayFrame, RelayFrameBody},
+    message::Topic,
+};
 
 /// Server-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<TcpStream>;
@@ -222,16 +225,20 @@ impl Connection {
         let (sink, source) = websocket.split();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
+        let backlog = BacklogDelivery {
+            ready: Arc::new(Notify::new()),
+            tx: self.self_tx.downgrade(),
+        };
+
         // Deadline by which an outstanding keepalive ping must be answered.
         let (ping_deadline, mut ping_deadline_rx) = watch::channel(None);
         let mut writer = tokio::spawn(write_loop(
             sink,
             self.outbound,
             shutdown_rx,
-            self.config.ping_interval,
-            self.config.pong_timeout,
-            self.config.write_timeout,
+            self.config.clone(),
             ping_deadline.clone(),
+            Arc::clone(&backlog.ready),
         ));
 
         let config = &self.config;
@@ -243,23 +250,11 @@ impl Connection {
             );
         }
 
-        let redelivered = self
-            .session
-            .drain_backlog(self.query.role, &self.self_tx)
-            .await;
-
-        // The slot's handle must be the only sender left: when a same-identity
-        // reconnect replaces this connection, dropping that handle closes the
-        // outbound queue, which stops the writer and ends this connection.
+        // The slot's handle must be the only strong sender left: when a
+        // same-identity reconnect replaces this connection, dropping that
+        // handle closes the outbound queue, which stops the writer and ends
+        // this connection. The read loop upgrades it again to drain a backlog.
         drop(self.self_tx);
-        let redelivered = match redelivered {
-            Ok(redelivered) => redelivered,
-            Err(error) => {
-                let _ = shutdown_tx.send(());
-                stop_writer(&mut writer).await;
-                return Err(error.into());
-            }
-        };
 
         let context = ReadContext {
             query: &self.query,
@@ -273,7 +268,7 @@ impl Connection {
             &context,
             &ping_deadline,
             &mut ping_deadline_rx,
-            redelivered,
+            backlog,
         )
         .await;
 
@@ -301,37 +296,44 @@ async fn write_loop(
     mut sink: SplitSink<RelayStream, Message>,
     mut rx: mpsc::Receiver<RelayFrame>,
     mut shutdown: oneshot::Receiver<()>,
-    ping_interval: Duration,
-    pong_timeout: Duration,
-    write_timeout: Duration,
+    config: NativeRelayTransportConfig,
     ping_deadline: watch::Sender<Option<tokio::time::Instant>>,
+    backlog_ready: Arc<Notify>,
 ) {
-    let mut ping =
-        tokio::time::interval_at(tokio::time::Instant::now() + ping_interval, ping_interval);
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.ping_interval,
+        config.ping_interval,
+    );
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             received = rx.recv() => match received {
                 Some(frame) => {
+                    let session_ready = matches!(&frame.body, RelayFrameBody::SessionReady);
                     let Ok(text) = serde_json::to_string(&frame) else {
                         break;
                     };
                     log::trace!("relay -> topic={} frame={text}", frame.topic);
-                    if !send_with_timeout(&mut sink, Message::text(text), write_timeout).await {
+                    if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
                         break;
+                    }
+                    if session_ready {
+                        // The peer has been told it is ready, so the backlog
+                        // held for it may follow.
+                        backlog_ready.notify_one();
                     }
                 }
                 None => break,
             },
             _ = ping.tick() => {
-                if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), write_timeout).await {
+                if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), config.write_timeout).await {
                     break;
                 }
                 // A live peer answers with a pong (or other traffic) before this deadline.
                 // Arm only if no deadline is outstanding so repeated pings cannot
                 // indefinitely extend the window when pong_timeout > ping_interval.
-                let deadline = tokio::time::Instant::now() + pong_timeout;
+                let deadline = tokio::time::Instant::now() + config.pong_timeout;
                 let _ = ping_deadline.send_if_modified(|current| {
                     if current.is_none() {
                         *current = Some(deadline);
@@ -423,13 +425,23 @@ struct ReadContext<'a> {
     limiter: &'a Limiter,
 }
 
+/// Everything a read loop needs to deliver a peer's backlog.
+struct BacklogDelivery {
+    /// Armed by the writer after `session_ready` has been written.
+    ready: Arc<Notify>,
+
+    /// The slot's channel. It is weak because the slot's handle must stay the
+    /// only strong sender, so a replaced connection closes its queue
+    tx: mpsc::WeakSender<RelayFrame>,
+}
+
 async fn read_loop(
     mut source: SplitStream<RelayStream>,
     writer: &mut JoinHandle<()>,
     context: &ReadContext<'_>,
     ping_deadline: &watch::Sender<Option<tokio::time::Instant>>,
     ping_deadline_rx: &mut watch::Receiver<Option<tokio::time::Instant>>,
-    redelivered: usize,
+    backlog: BacklogDelivery,
 ) -> Result<(), ConnectionError> {
     let ReadContext {
         query,
@@ -444,10 +456,12 @@ async fn read_loop(
     let mut byte_bucket = Bucket::full(limits.inbound_byte_rate.burst, now);
     let mut consecutive_drops = 0u32;
 
-    let mut redelivery_credit = u32::try_from(redelivered).unwrap_or(u32::MAX);
+    let mut redelivery_credit = 0u32;
 
     loop {
         let message = tokio::select! {
+            biased;
+
             _ = &mut *writer => {
                 log::debug!("connection writer stopped for topic {}; closing", query.topic);
                 break;
@@ -455,6 +469,14 @@ async fn read_loop(
             _ = wait_pong_deadline(ping_deadline_rx) => {
                 log::debug!("peer on topic {} missed a keepalive pong; dropping", query.topic);
                 return Err(ConnectionError::PongTimeout);
+            }
+            () = backlog.ready.notified() => {
+                if let Some(tx) = backlog.tx.upgrade() {
+                    let drained = session.drain_backlog(query.role, &tx).await?;
+                    redelivery_credit = redelivery_credit
+                        .saturating_add(u32::try_from(drained).unwrap_or(u32::MAX));
+                }
+                continue;
             }
             incoming = tokio::time::timeout(config.idle_timeout, source.next()) => match incoming {
                 Ok(Some(Ok(message))) => message,

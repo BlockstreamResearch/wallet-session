@@ -6,6 +6,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use wallet_session_core::{frame::RelayFrame, message::Topic};
 
+use crate::limits::ConnectionPermit;
 use crate::session::{PeerHandle, Registration, Role, Session, SessionError};
 
 /// Directory of live sessions, keyed by topic.
@@ -33,6 +34,9 @@ impl Registry {
     /// Bind a peer to its topic/role slot, returning the shared session and any
     /// frames buffered for it while it was disconnected.
     ///
+    /// `permit` is the connection's per-identity permit, which the slot then
+    /// holds; a same-identity replacement inherits the incumbent's.
+    ///
     /// `max_sessions` caps the number of concurrent topics; pass `usize::MAX`
     /// for no limit.
     pub fn register(
@@ -40,6 +44,7 @@ impl Registry {
         topic: &Topic,
         role: Role,
         peer: PeerHandle,
+        permit: Option<ConnectionPermit>,
         ready: &RelayFrame,
         max_sessions: usize,
     ) -> Result<(Arc<Session>, Registration), RegistryError> {
@@ -56,7 +61,7 @@ impl Registry {
         let session = sessions.entry(topic.clone()).or_default().clone();
         let identity = peer.identity.clone();
 
-        let registration = session.register(role, peer, ready)?;
+        let registration = session.register(role, peer, ready, permit)?;
 
         log::debug!("registered peer {identity} on topic {topic} as {role:?}");
 
@@ -150,6 +155,27 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
+    use crate::limits::{Limiter, RelayLimitsConfig};
+
+    /// A permit for `identity`, from a limiter that is never shared: these
+    /// tests do not exercise the per-identity cap.
+    fn permit(identity: &wallet_session_core::did::DidKey) -> Option<ConnectionPermit> {
+        Arc::new(Limiter::new(RelayLimitsConfig::default())).acquire_identity(identity)
+    }
+
+    /// Register a peer that brings a permit of its own.
+    fn register(
+        registry: &Registry,
+        topic: &Topic,
+        role: Role,
+        peer: PeerHandle,
+        ready: &RelayFrame,
+        max_sessions: usize,
+    ) -> Result<(Arc<Session>, Registration), RegistryError> {
+        let permit = permit(&peer.identity);
+        registry.register(topic, role, peer, permit, ready, max_sessions)
+    }
+
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([0u8; 32])
     }
@@ -183,7 +209,8 @@ mod tests {
     fn first_registration_waits() -> TestResult {
         let registry = Registry::new();
         let (proposer, _) = peer(1);
-        let (_, registration) = registry.register(
+        let (_, registration) = register(
+            &registry,
             &topic()?,
             Role::Proposer,
             proposer,
@@ -200,10 +227,17 @@ mod tests {
         let (proposer, _) = peer(1);
         let (responder, _) = peer(2);
         let topic = topic()?;
-        let (_, first) =
-            registry.register(&topic, Role::Proposer, proposer, &ready(&topic), usize::MAX)?;
+        let (_, first) = register(
+            &registry,
+            &topic,
+            Role::Proposer,
+            proposer,
+            &ready(&topic),
+            usize::MAX,
+        )?;
         assert!(matches!(first, Registration::Waiting));
-        let (_, second) = registry.register(
+        let (_, second) = register(
+            &registry,
             &topic,
             Role::Responder,
             responder,
@@ -220,9 +254,22 @@ mod tests {
         let (first, _) = peer(1);
         let (second, _) = peer(2);
         let topic = topic()?;
-        registry.register(&topic, Role::Proposer, first, &ready(&topic), usize::MAX)?;
-        let (_, registration) =
-            registry.register(&topic, Role::Proposer, second, &ready(&topic), usize::MAX)?;
+        register(
+            &registry,
+            &topic,
+            Role::Proposer,
+            first,
+            &ready(&topic),
+            usize::MAX,
+        )?;
+        let (_, registration) = register(
+            &registry,
+            &topic,
+            Role::Proposer,
+            second,
+            &ready(&topic),
+            usize::MAX,
+        )?;
         assert!(matches!(
             registration,
             Registration::RoleTaken(Role::Proposer)
@@ -236,8 +283,14 @@ mod tests {
         let topic = topic()?;
         let (proposer, _) = peer(1);
         let weak = proposer.tx.downgrade();
-        let (session, _) =
-            registry.register(&topic, Role::Proposer, proposer, &ready(&topic), usize::MAX)?;
+        let (session, _) = register(
+            &registry,
+            &topic,
+            Role::Proposer,
+            proposer,
+            &ready(&topic),
+            usize::MAX,
+        )?;
 
         assert!(registry.disconnect(&topic, Role::Proposer, &weak, Duration::from_secs(10))?);
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
@@ -246,7 +299,8 @@ mod tests {
         assert!(registry.expire(&topic, Role::Proposer)?.is_none());
 
         let (replacement, _) = peer(3);
-        let (again, _) = registry.register(
+        let (again, _) = register(
+            &registry,
             &topic,
             Role::Proposer,
             replacement,
@@ -263,7 +317,8 @@ mod tests {
         assert_eq!(registry.session_count()?, 0);
 
         let (proposer, _) = peer(1);
-        registry.register(
+        register(
+            &registry,
             &topic()?,
             Role::Proposer,
             proposer,
@@ -286,7 +341,8 @@ mod tests {
 
         let (proposer, _) = peer(1);
         assert!(matches!(
-            registry.register(
+            register(
+                &registry,
                 &topic()?,
                 Role::Proposer,
                 proposer,
@@ -304,9 +360,17 @@ mod tests {
         let (first, _) = peer(1);
         let (second, _) = peer(2);
 
-        registry.register(&topic()?, Role::Proposer, first, &ready(&topic()?), 1)?;
+        register(
+            &registry,
+            &topic()?,
+            Role::Proposer,
+            first,
+            &ready(&topic()?),
+            1,
+        )?;
         assert!(matches!(
-            registry.register(
+            register(
+                &registry,
                 &Topic::new([7u8; 32])?,
                 Role::Proposer,
                 second,

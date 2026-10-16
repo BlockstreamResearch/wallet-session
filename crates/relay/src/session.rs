@@ -1,3 +1,4 @@
+use crate::limits::ConnectionPermit;
 use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 
@@ -39,6 +40,9 @@ pub enum SessionError {
 
     #[error("counterpart not connected")]
     NoCounterpart,
+
+    #[error("identity connection limit reached")]
+    IdentityLimit,
 }
 
 /// The two peer slots bound to one topic, shared by both peers' connections.
@@ -51,6 +55,12 @@ pub struct Session {
 enum Slot {
     Connected {
         peer: PeerHandle,
+
+        /// The connection's per-identity permit, released when the slot stops
+        /// being a live connection. A same-identity replacement inherits it,
+        /// so the per-identity cap cannot refuse a documented takeover (§3).
+        permit: Option<ConnectionPermit>,
+
         backlog: VecDeque<RelayFrame>,
     },
     Disconnected {
@@ -125,11 +135,18 @@ impl Session {
     /// connection, become the slot's backlog; hand them over with
     /// [`Session::drain_backlog`]. A reservation claimed by another identity
     /// keeps no frames.
+    ///
+    /// `permit` is the connection's per-identity permit. A registration that
+    /// replaces this identity's own live connection inherits that connection's
+    /// permit instead, so it is accepted with `None`: the per-identity cap must
+    /// not refuse the documented takeover (§3). Any other registration is
+    /// refused with [`SessionError::IdentityLimit`] when it brings no permit.
     pub(crate) fn register(
         &self,
         role: Role,
         peer: PeerHandle,
         ready: &RelayFrame,
+        permit: Option<ConnectionPermit>,
     ) -> Result<Registration, SessionError> {
         let mut slots = self.lock()?;
         let now = Instant::now();
@@ -146,24 +163,40 @@ impl Session {
             _ => {}
         }
 
-        let backlog: VecDeque<RelayFrame> = match slots.get_mut(role).take() {
+        let inherits = matches!(
+            slots.get(role),
+            Some(Slot::Connected { peer: current, permit: Some(_), .. })
+                if current.identity == peer.identity
+        );
+        if permit.is_none() && !inherits {
+            return Err(SessionError::IdentityLimit);
+        }
+
+        let (backlog, permit) = match slots.get_mut(role).take() {
             // A reservation reclaimed by the same identity keeps its frames,
             // whether or not the grace window has passed.
             Some(Slot::Disconnected {
                 identity, buffered, ..
-            }) if identity == peer.identity => buffered
-                .into_iter()
-                .filter(|entry| entry.expires_at > now)
-                .map(|entry| entry.frame)
-                .collect(),
+            }) if identity == peer.identity => (
+                buffered
+                    .into_iter()
+                    .filter(|entry| entry.expires_at > now)
+                    .map(|entry| entry.frame)
+                    .collect(),
+                permit,
+            ),
             // An expired reservation claimed by another identity must not leak
             // the previous owner's frames.
-            Some(Slot::Disconnected { .. }) => VecDeque::new(),
-            Some(Slot::Connected { backlog, .. }) => {
+            Some(Slot::Disconnected { .. }) => (VecDeque::new(), permit),
+            Some(Slot::Connected {
+                backlog,
+                permit: inherited,
+                ..
+            }) => {
                 log::debug!("replacing live connection of {}", peer.identity);
-                backlog
+                (backlog, inherited.or(permit))
             }
-            None => VecDeque::new(),
+            None => (VecDeque::new(), permit),
         };
         if !backlog.is_empty() {
             log::debug!(
@@ -184,7 +217,11 @@ impl Session {
                 log::warn!("could not enqueue session_ready for {}", other.identity);
             }
         }
-        *slots.get_mut(role) = Some(Slot::Connected { peer, backlog });
+        *slots.get_mut(role) = Some(Slot::Connected {
+            peer,
+            permit,
+            backlog,
+        });
 
         Ok(if both_ready {
             Registration::BothReady
@@ -206,7 +243,7 @@ impl Session {
             };
 
             let mut slots = self.lock()?;
-            let Some(Slot::Connected { peer, backlog }) = slots.get_mut(role) else {
+            let Some(Slot::Connected { peer, backlog, .. }) = slots.get_mut(role) else {
                 return Ok(drained);
             };
             if !peer.tx.same_channel(tx) {
@@ -286,7 +323,7 @@ impl Session {
         let mut slots = self.lock()?;
         let target = from.counterpart();
 
-        if let Some(Slot::Connected { peer, backlog }) = slots.get_mut(target) {
+        if let Some(Slot::Connected { peer, backlog, .. }) = slots.get_mut(target) {
             if !backlog.is_empty() {
                 while backlog.len() >= max_buffered.max(1) {
                     backlog.pop_front();
@@ -325,7 +362,10 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::connection::RELAY_FRAME_VERSION;
+    use crate::limits::{Limiter, RelayLimitsConfig};
     use wallet_session_core::frame::RelayFrameBody;
     use wallet_session_core::message::Topic;
 
@@ -414,7 +454,18 @@ mod tests {
         role: Role,
         peer: PeerHandle,
     ) -> Result<Registration, SessionError> {
-        session.register(role, peer, &ready(&topic().expect("topic")))
+        let permit = permit(&peer.identity);
+        session.register(role, peer, &ready(&topic().expect("topic")), permit)
+    }
+
+    /// A permit for `identity`, from a limiter that is never shared: these
+    /// tests do not exercise the per-identity cap.
+    fn permit(identity: &DidKey) -> Option<ConnectionPermit> {
+        Arc::new(Limiter::new(RelayLimitsConfig::default())).acquire_identity(identity)
+    }
+
+    fn key(seed: u8) -> DidKey {
+        DidKey::from_ed25519_bytes([seed; 32])
     }
 
     #[test]
@@ -958,6 +1009,67 @@ mod tests {
             "an empty backlog hands over nothing"
         );
         let _ = responder_rx.try_recv()?;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_inherits_the_identity_permit() -> TestResult {
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            max_connections_per_identity: 1,
+            ..RelayLimitsConfig::default()
+        }));
+        let session = Session::default();
+
+        let (first, _) = peer(1);
+        let permit = limiter.acquire_identity(&key(1)).expect("first permit");
+        session.register(Role::Proposer, first, &ready(&topic()?), Some(permit))?;
+        assert!(
+            limiter.acquire_identity(&key(1)).is_none(),
+            "the slot holds the only permit"
+        );
+
+        // The same identity replaces the live connection while at the cap: the
+        // replacement carries the incumbent's permit, so no new one is needed.
+        let (replacement, _) = peer(1);
+        assert!(matches!(
+            session.register(Role::Proposer, replacement, &ready(&topic()?), None)?,
+            Registration::Waiting
+        ));
+        assert!(
+            limiter.acquire_identity(&key(1)).is_none(),
+            "the replacement inherited the incumbent's permit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_without_a_permit_is_refused() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+
+        assert!(matches!(
+            session.register(Role::Proposer, proposer, &ready(&topic()?), None),
+            Err(SessionError::IdentityLimit)
+        ));
+
+        // A reserved slot claimed by its own identity also needs a permit, and
+        // a refused registration leaves the reservation in place.
+        let (proposer, _) = peer(1);
+        session.register(Role::Proposer, proposer, &ready(&topic()?), permit(&key(1)))?;
+        disconnect_current(&session, Role::Proposer, Duration::from_secs(10))?;
+
+        let (returning, _) = peer(1);
+        assert!(matches!(
+            session.register(Role::Proposer, returning, &ready(&topic()?), None),
+            Err(SessionError::IdentityLimit)
+        ));
+        assert!(
+            matches!(
+                session.lock()?.get(Role::Proposer),
+                Some(Slot::Disconnected { .. })
+            ),
+            "the failed registration must not consume the reservation"
+        );
         Ok(())
     }
 

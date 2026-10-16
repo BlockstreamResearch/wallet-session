@@ -46,7 +46,7 @@ Relay is a main connection point between dApp and wallet.
 
 Relay is a web socket server. A client connects to the Relay by providing the topic and its role in the connection URL. The proposer connects with the `Proposer` role specified; the responder connects with the `Responder` role specified.
 
-A connection that presents a different identity than the one holding the slot is rejected while that slot is live or reserved for reconnection. A connection that presents the same identity replaces the holder: the Relay closes the replaced connection and signals `session_ready` to both peers again, so a peer may observe `session_ready` more than once per session. This lets a peer whose socket is half-open reconnect immediately instead of waiting for the Relay to reap the dead connection.
+A connection that presents a different identity than the one holding the slot is rejected while that slot is live or reserved for reconnection. A connection that presents the same identity replaces the holder: the Relay closes the replaced connection and signals `session_ready` to both peers again, so a peer may observe `session_ready` more than once per session. This lets a peer whose socket is half-open reconnect immediately instead of waiting for the Relay to reap the dead connection. The per-identity connection cap does not refuse a replacement: it bounds connections, and a replacement takes over one the identity already has.
 
 The Relay protocol is JSON text frames only. A peer that sends a binary frame is disconnected.
 
@@ -54,7 +54,7 @@ Once both parties are connected, the Relay sends `session_ready` to both. Neithe
 
 Messages send by the `Proposer` is send to the `Responder`. Messages send by the `Responder` is send to the `Proposer`.
 
-While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL (defaults: 256 frames, 60 seconds, inside a 10 second grace window). On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue. Buffered frames belong to the identity that owned the slot: a reservation claimed by a different identity after the grace window starts empty.
+While a peer is observed disconnected (its slot is in the reconnection grace), the Relay buffers frames addressed to it in FIFO order, up to a maximum number of messages and a per-message TTL (defaults: 256 frames, 60 seconds, inside a 10 second grace window). On overflow the oldest frame is discarded; on reconnect the frames whose TTL has not passed are sent to the peer after `session_ready`, in order, and removed from the queue. A peer that reconnects before its counterpart receives nothing until both are connected, since `session_ready` is sent only then. Buffered frames belong to the identity that owned the slot: a reservation claimed by a different identity after the grace window starts empty.
 
 The Relay cannot observe end-to-end acknowledgements: `ack` is an application message encrypted between the peers. Relay buffering is therefore best-effort and scoped to the observed-disconnected window. Frames written to a connection that is silently dead may be lost before the Relay notices; recovery is the responsibility of the sender's ack retry.
 

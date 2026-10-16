@@ -165,13 +165,16 @@ mod tests {
         let (registry, limiter) = state();
         let topic = Topic::new([3u8; 32])?;
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let identity = DidKey::from_ed25519_bytes([1u8; 32]);
+        let permit = limiter.acquire_identity(&identity);
         registry.register(
             &topic,
             Role::Proposer,
             PeerHandle {
-                identity: DidKey::from_ed25519_bytes([1u8; 32]),
+                identity: identity.clone(),
                 tx,
             },
+            permit,
             &RelayFrame {
                 v: 1,
                 id: "ready".to_owned(),
