@@ -179,8 +179,18 @@ impl FromStr for Topic {
 }
 
 /// AEAD nonce.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Nonce(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl<'de> Deserialize<'de> for Nonce {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        encoded.parse::<Nonce>().map_err(serde::de::Error::custom)
+    }
+}
 
 impl Nonce {
     /// Number of bytes in a nonce.
@@ -274,6 +284,35 @@ mod tests {
     #[test]
     fn nonce_rejects_wrong_length() {
         assert!(Nonce::new([0u8; 12]).is_err());
+    }
+
+    #[test]
+    fn nonce_deserialization_enforces_the_24_byte_invariant() {
+        let nonce = Nonce::new([2u8; 24]).unwrap();
+        let json = serde_json::to_string(&nonce).unwrap();
+        assert_eq!(serde_json::from_str::<Nonce>(&json).unwrap(), nonce);
+
+        for bad in [
+            String::new(),
+            codec::encode(&[7u8; 12]),
+            codec::encode(&[7u8; 23]),
+            codec::encode(&[7u8; 25]),
+        ] {
+            let json = format!("\"{bad}\"");
+            assert!(
+                serde_json::from_str::<Nonce>(&json).is_err(),
+                "{json} must be rejected"
+            );
+        }
+
+        // The same applies when the nonce arrives inside a documented envelope.
+        let envelope = format!(
+            r#"{{"version":1,"kind":"ping","from":"{FROM}","ts":1700000000,"nonce":"","data":"CQgH"}}"#
+        );
+        assert!(
+            serde_json::from_str::<Message>(&envelope).is_err(),
+            "an empty nonce must not decode through the wire decoder"
+        );
     }
 
     #[test]
