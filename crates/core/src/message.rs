@@ -1,53 +1,41 @@
 use crate::codec::{self};
+use crate::did::DidKey;
 use crate::error::Error;
 use crate::payload::Payload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Encrypted message.
-#[derive(Serialize, Deserialize)]
+/// Encrypted envelope carried in the `payload` of a `message` relay frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     /// Protocol version.
-    #[serde(rename = "v")]
-    version: u8,
-
-    /// 16 random bytes, base64url.
-    id: String,
+    pub version: u8,
 
     /// Message type.
-    #[serde(rename = "type")]
-    type_: MessageType,
+    pub kind: MessageType,
 
-    /// Subscription topic.
-    topic: Topic,
+    /// Sender identity.
+    pub from: DidKey,
 
     /// Unix timestamp (seconds).
-    ts: u64,
+    pub ts: u64,
 
     /// AEAD nonce.
-    nonce: Nonce,
+    pub nonce: Nonce,
 
     /// Ciphertext (with tag), base64url.
-    data: Ciphertext,
+    pub data: Ciphertext,
 }
 
 impl Message {
     pub const VERSION: u8 = 1;
 
-    pub fn new(
-        id: impl Into<String>,
-        type_: MessageType,
-        topic: Topic,
-        ts: u64,
-        nonce: Nonce,
-        data: Ciphertext,
-    ) -> Self {
+    pub fn new(kind: MessageType, from: DidKey, ts: u64, nonce: Nonce, data: Ciphertext) -> Self {
         Self {
             version: Self::VERSION,
-            id: id.into(),
-            type_,
-            topic,
+            kind,
+            from,
             ts,
             nonce,
             data,
@@ -308,23 +296,70 @@ mod tests {
         assert_eq!(serde_json::from_str::<Topic>(&json).unwrap(), topic);
     }
 
+    const FROM: &str = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    fn message() -> Message {
+        Message::new(
+            MessageType::Ping,
+            DidKey::parse(FROM).expect("did:key"),
+            1_700_000_000,
+            Nonce::new([2u8; 24]).unwrap(),
+            Ciphertext::new(vec![9, 8, 7]),
+        )
+    }
+
+    #[test]
+    fn decodes_documented_envelope() {
+        let json = format!(
+            r#"{{
+                "version": 1,
+                "kind": "request",
+                "from": "{FROM}",
+                "ts": 1700000000,
+                "nonce": "AgICAgICAgICAgICAgICAgICAgICAgIC",
+                "data": "CQgH"
+            }}"#
+        );
+
+        let envelope: Message = serde_json::from_str(&json).expect("documented envelope");
+        assert_eq!(envelope.version, Message::VERSION);
+        assert_eq!(envelope.kind, MessageType::Request);
+        assert_eq!(envelope.from, DidKey::parse(FROM).expect("did:key"));
+        assert_eq!(envelope.ts, 1_700_000_000);
+        assert_eq!(envelope.nonce, Nonce::new([2u8; 24]).unwrap());
+        assert_eq!(envelope.data, Ciphertext::new(vec![9, 8, 7]));
+    }
+
+    /// The envelope this crate writes has exactly the documented fields.
+    #[test]
+    fn serializes_as_documented_envelope() {
+        let value = serde_json::to_value(message()).expect("json");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "version": 1,
+                "kind": "ping",
+                "from": FROM,
+                "ts": 1_700_000_000u64,
+                "nonce": "AgICAgICAgICAgICAgICAgICAgICAgIC",
+                "data": "CQgH",
+            })
+        );
+        // the frame owns these; the envelope must not repeat them.
+        for retired in ["v", "type", "id", "topic"] {
+            assert!(value.get(retired).is_none(), "{retired} must not appear");
+        }
+    }
+
     #[test]
     fn message_round_trips_through_json() {
-        let message = Message {
-            version: 1,
-            id: codec::encode(&[0u8; 16]),
-            type_: MessageType::Ping,
-            topic: Topic::new([1u8; 32]).unwrap(),
-            ts: 1_700_000_000,
-            nonce: Nonce::new([2u8; 24]).unwrap(),
-            data: Ciphertext::new(vec![9, 8, 7]),
-        };
+        let message = message();
         let json = serde_json::to_string(&message).unwrap();
-        assert!(json.contains("\"v\":1"));
-        assert!(json.contains("\"type\":\"ping\""));
+        assert!(json.contains("\"version\":1"));
+        assert!(json.contains("\"kind\":\"ping\""));
+
         let back: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.topic, message.topic);
-        assert_eq!(back.nonce, message.nonce);
-        assert_eq!(back.data, message.data);
+        assert_eq!(back, message);
     }
 }
