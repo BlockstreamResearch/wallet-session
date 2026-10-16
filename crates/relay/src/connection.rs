@@ -243,7 +243,7 @@ impl Connection {
             );
         }
 
-        let drained = self
+        let redelivered = self
             .session
             .drain_backlog(self.query.role, &self.self_tx)
             .await;
@@ -252,11 +252,14 @@ impl Connection {
         // reconnect replaces this connection, dropping that handle closes the
         // outbound queue, which stops the writer and ends this connection.
         drop(self.self_tx);
-        if let Err(error) = drained {
-            let _ = shutdown_tx.send(());
-            stop_writer(&mut writer).await;
-            return Err(error.into());
-        }
+        let redelivered = match redelivered {
+            Ok(redelivered) => redelivered,
+            Err(error) => {
+                let _ = shutdown_tx.send(());
+                stop_writer(&mut writer).await;
+                return Err(error.into());
+            }
+        };
 
         let context = ReadContext {
             query: &self.query,
@@ -270,6 +273,7 @@ impl Connection {
             &context,
             &ping_deadline,
             &mut ping_deadline_rx,
+            redelivered,
         )
         .await;
 
@@ -348,6 +352,19 @@ async fn write_loop(
     }
 }
 
+/// Spend one redelivery credit, if any is left.
+///
+/// Credits are the inbound budget for the acknowledgements of frames the relay
+/// redelivered; they are spent only once the steady-state bucket is empty, so
+/// live traffic keeps using the configured rate.
+fn spend_redelivery_credit(credit: &mut u32) -> bool {
+    let Some(left) = credit.checked_sub(1) else {
+        return false;
+    };
+    *credit = left;
+    true
+}
+
 /// Charge an inbound control frame to the connection's inbound budget.
 ///
 /// The frame is dropped when the budget is exhausted, and a peer that keeps
@@ -412,6 +429,7 @@ async fn read_loop(
     context: &ReadContext<'_>,
     ping_deadline: &watch::Sender<Option<tokio::time::Instant>>,
     ping_deadline_rx: &mut watch::Receiver<Option<tokio::time::Instant>>,
+    redelivered: usize,
 ) -> Result<(), ConnectionError> {
     let ReadContext {
         query,
@@ -425,6 +443,8 @@ async fn read_loop(
     let mut message_bucket = Bucket::full(limits.inbound_message_rate.burst, now);
     let mut byte_bucket = Bucket::full(limits.inbound_byte_rate.burst, now);
     let mut consecutive_drops = 0u32;
+
+    let mut redelivery_credit = u32::try_from(redelivered).unwrap_or(u32::MAX);
 
     loop {
         let message = tokio::select! {
@@ -458,13 +478,15 @@ async fn read_loop(
                 // Charged before parsing so a flood cannot force JSON work or
                 // grow the counterpart's queue and buffer faster than the limits.
                 let now = tokio::time::Instant::now();
-                let within_connection_limits =
+                let within_message_budget =
                     message_bucket.allow_n(1, limits.inbound_message_rate, now)
-                        && byte_bucket.allow_n(
-                            u32::try_from(text.len()).unwrap_or(u32::MAX),
-                            limits.inbound_byte_rate,
-                            now,
-                        );
+                        || spend_redelivery_credit(&mut redelivery_credit);
+                let within_connection_limits = within_message_budget
+                    && byte_bucket.allow_n(
+                        u32::try_from(text.len()).unwrap_or(u32::MAX),
+                        limits.inbound_byte_rate,
+                        now,
+                    );
                 if !within_connection_limits {
                     consecutive_drops += 1;
                     log::debug!(

@@ -198,23 +198,25 @@ impl Session {
         &self,
         role: Role,
         tx: &mpsc::Sender<RelayFrame>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<usize, SessionError> {
+        let mut drained = 0usize;
         loop {
             let Ok(permit) = tx.reserve().await else {
-                return Ok(());
+                return Ok(drained);
             };
 
             let mut slots = self.lock()?;
             let Some(Slot::Connected { peer, backlog }) = slots.get_mut(role) else {
-                return Ok(());
+                return Ok(drained);
             };
             if !peer.tx.same_channel(tx) {
-                return Ok(());
+                return Ok(drained);
             }
             let Some(frame) = backlog.pop_front() else {
-                return Ok(());
+                return Ok(drained);
             };
             permit.send(frame);
+            drained += 1;
         }
     }
 
@@ -924,6 +926,38 @@ mod tests {
             ["ready", "old", "new"],
             "frames not yet handed to the replaced connection must not be lost"
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_backlog_counts_the_frames_it_hands_over() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        for _ in 0..3 {
+            session.route(Role::Proposer, frame(&topic), MAX_BUFFERED, BUFFER_TTL)?;
+        }
+
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+
+        assert_eq!(
+            session.drain_backlog(Role::Responder, &tx).await?,
+            3,
+            "the count is what the caller owes the peer in inbound budget"
+        );
+        assert_eq!(
+            session.drain_backlog(Role::Responder, &tx).await?,
+            0,
+            "an empty backlog hands over nothing"
+        );
+        let _ = responder_rx.try_recv()?;
         Ok(())
     }
 

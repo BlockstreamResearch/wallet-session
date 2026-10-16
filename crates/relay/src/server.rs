@@ -679,6 +679,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_ack_burst_survives_the_inbound_rate_limit() -> TestResult {
+        const BACKLOG: usize = 45;
+        const BURST: usize = 8;
+
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(5)),
+            RelayLimitsConfig {
+                inbound_message_rate: RateLimit {
+                    burst: BURST as u32,
+                    interval: Duration::from_millis(200),
+                },
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        for i in 0..BACKLOG {
+            if i >= BURST {
+                sleep(Duration::from_millis(35)).await;
+            }
+            send(&mut proposer, &message(&topic, &format!("m{i}"), "queued")).await?;
+        }
+
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        for i in 0..BACKLOG {
+            let frame = timeout(Duration::from_millis(500), read_frame(&mut responder)).await??;
+            assert!(
+                matches!(frame.body, RelayFrameBody::Message { .. }),
+                "expected redelivered frame {i}, got {:?}",
+                frame.body
+            );
+        }
+
+        for i in 0..BACKLOG {
+            send(&mut responder, &message(&topic, &format!("ack{i}"), "ack")).await?;
+        }
+
+        let mut delivered = 0;
+        while delivered < BACKLOG {
+            match timeout(Duration::from_millis(500), read_frame(&mut proposer)).await {
+                Ok(Ok(frame)) => {
+                    if matches!(frame.body, RelayFrameBody::Message { .. }) {
+                        delivered += 1;
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            delivered, BACKLOG,
+            "the relay dropped acknowledgements from a reconnect burst"
+        );
+
+        assert!(
+            timeout(Duration::from_millis(500), expect_closed(&mut responder))
+                .await
+                .is_err(),
+            "the relay disconnected a peer for acknowledging its own redelivery"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn reconnect_within_grace_suppresses_peer_disconnected() -> TestResult {
         let addr = serve_with(
             NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
