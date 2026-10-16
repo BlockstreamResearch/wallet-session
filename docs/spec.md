@@ -217,7 +217,7 @@ Nonce scheme:
 nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
 ```
 
-The AEAD AAD must be constructed by concatenating the plaintext fields as UTF-8 bytes, without separators or length prefixes: `AAD = version || id || type || topic || from`. Here `version` is the envelope version as a decimal string, `id` and `topic` come from the enclosing relay frame, `type` is the envelope `kind` in snake_case, and `from` is the sender's `did:key`. The receiver must reconstruct this exact AAD byte string and pass it to the cipher during decryption. If the relay tampered with the frame's `id` or `topic`, or with the envelope's `from`, the decryption tag will fail to authenticate.
+The AEAD AAD must be constructed by concatenating the plaintext fields as UTF-8 bytes, without separators or length prefixes: `AAD = version || id || type || topic || from || ts`. Here `version` is the envelope version as a decimal string, `id` and `topic` come from the enclosing relay frame, `type` is the envelope `kind` in snake_case, `from` is the sender's `did:key`, and `ts` is the envelope timestamp as a decimal string of Unix seconds. The receiver must reconstruct this exact AAD byte string and pass it to the cipher during decryption.
 
 ## 12. Message types
 
