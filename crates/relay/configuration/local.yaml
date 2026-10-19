@@ -1,0 +1,9 @@
+# Local development: both listeners stay on loopback, and tokens use the
+# audience clients default to in this repository.
+
+application:
+  host: '127.0.0.1'
+  audience: 'wss://relay.example.com'
+
+health:
+  host: '127.0.0.1'
