@@ -115,6 +115,14 @@ impl Session {
         self.slots.lock().map_err(|_| SessionError::LockPoisoned)
     }
 
+    /// Whether neither slot is occupied.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self.lock() {
+            Ok(slots) => slots.proposer.is_none() && slots.responder.is_none(),
+            Err(_) => false,
+        }
+    }
+
     /// Bind a peer to its role slot.
     ///
     /// A same-identity reservation is reclaimed. A same-identity live

@@ -1332,6 +1332,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_fresh_topics_do_not_leak_sessions() -> TestResult {
+        const IDENTITY: u8 = 7;
+        const SESSION_CAP: usize = 8;
+
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(300)),
+            RelayLimitsConfig {
+                max_connections_per_identity: 1,
+                max_sessions: SESSION_CAP,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut counterpart = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        let mut holder =
+            connect_auth(addr, &token_with(IDENTITY), "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut holder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut counterpart).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        for i in 0..16u8 {
+            let fresh = Topic::new([200 + i; 32])?;
+            let mut refused =
+                connect_auth(addr, &token_with(IDENTITY), "proposer", &fresh, None).await?;
+            assert!(
+                expect_closed(&mut refused).await,
+                "an identity at its cap must be refused on a fresh topic"
+            );
+        }
+
+        for i in 0..(SESSION_CAP - 1) as u8 {
+            let fresh = Topic::new([100 + i; 32])?;
+            let mut other =
+                connect_auth(addr, &token_with(30 + i), "proposer", &fresh, None).await?;
+            assert!(
+                timeout(Duration::from_millis(300), expect_closed(&mut other))
+                    .await
+                    .is_err(),
+                "a fresh identity must be able to create a session"
+            );
+        }
+
+        assert!(
+            timeout(Duration::from_millis(300), expect_closed(&mut holder))
+                .await
+                .is_err(),
+            "the session that was live all along must survive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn per_identity_connection_limit_is_enforced() -> TestResult {
         let limits = RelayLimitsConfig {
             max_connections_per_identity: 1,
