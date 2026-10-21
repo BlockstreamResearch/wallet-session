@@ -1474,6 +1474,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_expiry_reconnect_within_grace_keeps_the_session() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let now = crate::auth::unix_now();
+        let short = crate::auth::test_utils::token(
+            &crate::auth::test_utils::signing_key(7),
+            AUDIENCE,
+            now,
+            now + 1,
+        );
+
+        let topic = topic()?;
+        let mut responder = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        let mut proposer = connect_auth(addr, &short, "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        assert!(
+            expect_closed(&mut proposer).await,
+            "the expired token must close the connection"
+        );
+
+        sleep(Duration::from_millis(100)).await;
+        send(&mut responder, &message(&topic, "buffered", "queued")).await?;
+
+        let mut proposer = connect_auth(addr, &token_with(7), "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        let redelivered = read_frame(&mut proposer).await?;
+        assert!(
+            matches!(redelivered.body, RelayFrameBody::Message { ref payload } if payload == "queued"),
+            "expected the buffered frame after session_ready, got {:?}",
+            redelivered.body
+        );
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        sleep(Duration::from_secs(2)).await;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut responder))
+                .await
+                .is_err(),
+            "the counterpart must not see a peer_disconnected after the within-grace reconnect"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn per_identity_connection_limit_is_enforced() -> TestResult {
         let limits = RelayLimitsConfig {
             max_connections_per_identity: 1,
