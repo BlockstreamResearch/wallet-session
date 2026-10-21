@@ -89,6 +89,12 @@ logs of every proxy in the path, including this one. Keep
 `MAX_TOKEN_LIFETIME_SECONDS` short, and keep proxy logs private or turn request
 logging off for this service.
 
+The per-source limits (`PER_IP_*`) are keyed on the client address. When a load
+balancer, CDN or another proxy sits in front, that address is the terminator's
+unless `TRUSTED_PROXY_CIDR` names its range: real_ip then resolves the client
+from `X-Forwarded-For`, and forwarded headers from any other peer are ignored,
+so the limits cannot be spoofed.
+
 ## Scaling
 
 Sessions and buffered frames live in the relay's process memory: the two peers
