@@ -35,6 +35,9 @@ limits:
   inbound_byte_rate:
     burst: 524288
     interval_seconds: 2
+  identity_inbound_byte_rate:
+    burst: 1048576
+    interval_seconds: 1
   global_inbound_byte_rate:
     burst: 16777216
     interval_seconds: 1

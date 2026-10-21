@@ -32,6 +32,12 @@ pub enum ConfigurationError {
 
     #[error("health and application must not share an address, both are {0}")]
     AddressCollision(SocketAddr),
+
+    #[error(
+        "limits.identity_inbound_byte_rate.burst ({share}) must be at least \
+         connection.max_incoming_frame_bytes ({frame})"
+    )]
+    ShareBelowFrameCap { share: u32, frame: usize },
 }
 
 /// Relay settings.
@@ -133,6 +139,9 @@ pub struct LimitsSettings {
 
     /// Inbound byte rate per connection.
     pub inbound_byte_rate: RateSettings,
+
+    /// Inbound byte rate one identity may consume from the relay-wide budget.
+    pub identity_inbound_byte_rate: RateSettings,
 
     /// Inbound byte rate across all connections.
     pub global_inbound_byte_rate: RateSettings,
@@ -241,6 +250,10 @@ impl Settings {
             ),
             ("limits.inbound_byte_rate", &self.limits.inbound_byte_rate),
             (
+                "limits.identity_inbound_byte_rate",
+                &self.limits.identity_inbound_byte_rate,
+            ),
+            (
                 "limits.global_inbound_byte_rate",
                 &self.limits.global_inbound_byte_rate,
             ),
@@ -248,6 +261,15 @@ impl Settings {
             if rate.burst == 0 || rate.interval_seconds == 0 {
                 return Err(ConfigurationError::Zero { setting });
             }
+        }
+
+        if u32::try_from(self.connection.max_incoming_frame_bytes)
+            .is_ok_and(|frame| self.limits.identity_inbound_byte_rate.burst < frame)
+        {
+            return Err(ConfigurationError::ShareBelowFrameCap {
+                share: self.limits.identity_inbound_byte_rate.burst,
+                frame: self.connection.max_incoming_frame_bytes,
+            });
         }
 
         Ok(())
@@ -307,6 +329,7 @@ impl From<&Settings> for RelayLimitsConfig {
             connect_rate: (&settings.limits.connect_rate).into(),
             inbound_message_rate: (&settings.limits.inbound_message_rate).into(),
             inbound_byte_rate: (&settings.limits.inbound_byte_rate).into(),
+            identity_inbound_byte_rate: (&settings.limits.identity_inbound_byte_rate).into(),
             global_inbound_byte_rate: (&settings.limits.global_inbound_byte_rate).into(),
         }
     }

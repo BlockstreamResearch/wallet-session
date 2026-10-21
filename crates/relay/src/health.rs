@@ -25,12 +25,14 @@ pub struct StatusResponse {
     status: &'static str,
 }
 
-/// `{"status": "...", "connections": n, "sessions": n}` body.
+/// `{"status": "...", "connections": n, "sessions": n, ...}` body.
 #[derive(Debug, Serialize)]
 pub struct ReadinessResponse {
     status: &'static str,
     connections: usize,
     sessions: usize,
+    dropped_share_bytes: u64,
+    dropped_global_bytes: u64,
 }
 
 /// Health routes, with their state attached.
@@ -74,6 +76,8 @@ async fn ready(State(state): State<HealthState>) -> impl IntoResponse {
                 status: "ok",
                 connections: state.limiter.active_connections(),
                 sessions,
+                dropped_share_bytes: state.limiter.dropped_share_bytes(),
+                dropped_global_bytes: state.limiter.dropped_global_bytes(),
             }),
         )
             .into_response(),
@@ -111,7 +115,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        limits::RelayLimitsConfig,
+        limits::{RateLimit, RelayLimitsConfig},
         session::{PeerHandle, Role},
     };
 
@@ -190,7 +194,66 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&body)?,
-            serde_json::json!({ "status": "ok", "connections": 1, "sessions": 1 })
+            serde_json::json!({
+                "status": "ok",
+                "connections": 1,
+                "sessions": 1,
+                "dropped_share_bytes": 0,
+                "dropped_global_bytes": 0,
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_drop_counters() -> TestResult {
+        let (registry, _) = state();
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: RateLimit {
+                burst: 10,
+                interval: Duration::from_secs(3600),
+            },
+            global_inbound_byte_rate: RateLimit {
+                burst: 100,
+                interval: Duration::from_secs(3600),
+            },
+            ..RelayLimitsConfig::default()
+        }));
+
+        let hog = DidKey::from_ed25519_bytes([1u8; 32]);
+        assert_eq!(
+            limiter.allow_inbound_bytes(&hog, 10),
+            crate::limits::InboundBytes::Allowed
+        );
+        assert_eq!(
+            limiter.allow_inbound_bytes(&hog, 1),
+            crate::limits::InboundBytes::ShareExhausted
+        );
+
+        for seed in 2..11 {
+            let identity = DidKey::from_ed25519_bytes([seed; 32]);
+            assert_eq!(
+                limiter.allow_inbound_bytes(&identity, 10),
+                crate::limits::InboundBytes::Allowed
+            );
+        }
+        let last = DidKey::from_ed25519_bytes([11u8; 32]);
+        assert_eq!(
+            limiter.allow_inbound_bytes(&last, 10),
+            crate::limits::InboundBytes::GlobalExhausted
+        );
+
+        let (status, body) = get(registry, limiter, READY_PATH).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)?,
+            serde_json::json!({
+                "status": "ok",
+                "connections": 0,
+                "sessions": 0,
+                "dropped_share_bytes": 1,
+                "dropped_global_bytes": 10,
+            })
         );
         Ok(())
     }
@@ -277,7 +340,9 @@ mod tests {
         assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"), "{ready}");
         assert!(ready.contains("content-type: application/json"), "{ready}");
         assert!(
-            ready.ends_with(r#"{"status":"ok","connections":0,"sessions":0}"#),
+            ready.ends_with(
+                r#"{"status":"ok","connections":0,"sessions":0,"dropped_share_bytes":0,"dropped_global_bytes":0}"#
+            ),
             "{ready}"
         );
 
