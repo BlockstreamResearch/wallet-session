@@ -24,10 +24,11 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, Limiter, RelayLimitsConfig},
+    limits::{Bucket, InboundBytes, Limiter, RelayLimitsConfig},
     session::{Registration, Role, Session, SessionError},
 };
 use wallet_session_core::{
+    did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
     message::Topic,
 };
@@ -261,6 +262,7 @@ impl Connection {
             session: &self.session,
             config,
             limiter: &self.limiter,
+            identity: &self.identity.did,
         };
         let result = read_loop(
             source,
@@ -423,6 +425,7 @@ struct ReadContext<'a> {
     session: &'a Session,
     config: &'a NativeRelayTransportConfig,
     limiter: &'a Limiter,
+    identity: &'a DidKey,
 }
 
 /// Everything a read loop needs to deliver a peer's backlog.
@@ -448,6 +451,7 @@ async fn read_loop(
         session,
         config,
         limiter,
+        identity,
     } = *context;
 
     let limits = limiter.limits();
@@ -524,16 +528,31 @@ async fn read_loop(
                     }
                     continue;
                 }
-                consecutive_drops = 0;
 
-                // Shared budget: a drop here is not this peer's fault, so it
-                // does not count toward disconnecting it.
-                if !limiter.allow_inbound_bytes(text.len()) {
-                    log::debug!(
-                        "dropping frame on topic {}: relay inbound byte budget exhausted",
-                        query.topic
-                    );
-                    continue;
+                match limiter.allow_inbound_bytes(identity, text.len()) {
+                    InboundBytes::Allowed => consecutive_drops = 0,
+                    InboundBytes::ShareExhausted => {
+                        consecutive_drops += 1;
+                        log::debug!(
+                            "dropping frame on topic {}: identity share of the relay budget exhausted",
+                            query.topic
+                        );
+                        if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+                            log::warn!(
+                                "peer on topic {} keeps exceeding its share of the relay budget; dropping",
+                                query.topic
+                            );
+                            return Err(ConnectionError::RateLimited);
+                        }
+                        continue;
+                    }
+                    InboundBytes::GlobalExhausted => {
+                        log::debug!(
+                            "dropping frame on topic {}: relay inbound byte budget exhausted",
+                            query.topic
+                        );
+                        continue;
+                    }
                 }
 
                 log::trace!("relay <- topic={} frame={text}", query.topic);

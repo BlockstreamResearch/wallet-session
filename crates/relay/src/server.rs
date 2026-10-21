@@ -1392,6 +1392,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_share_violations_disconnect_only_the_offender() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                inbound_message_rate: RateLimit {
+                    burst: 1000,
+                    interval: Duration::from_secs(3600),
+                },
+                inbound_byte_rate: RateLimit {
+                    burst: 1024 * 1024,
+                    interval: Duration::from_secs(3600),
+                },
+                identity_inbound_byte_rate: RateLimit {
+                    burst: 4096,
+                    interval: Duration::from_secs(3600),
+                },
+                global_inbound_byte_rate: RateLimit {
+                    burst: 16384,
+                    interval: Duration::from_secs(3600),
+                },
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let hog_topic = Topic::new([1u8; 32])?;
+        let mut hog_proposer = connect(addr, "proposer", &hog_topic, None).await?;
+        let mut hog_responder = connect(addr, "responder", &hog_topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut hog_proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut hog_responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        for i in 0..40 {
+            if send(
+                &mut hog_proposer,
+                &message(&hog_topic, &format!("m{i}"), &"a".repeat(2048)),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+        assert!(
+            expect_closed(&mut hog_proposer).await,
+            "an identity over its share must be disconnected"
+        );
+
+        let victim_topic = Topic::new([2u8; 32])?;
+        let mut victim_proposer =
+            connect_auth(addr, &token_with(8), "proposer", &victim_topic, None).await?;
+        let mut victim_responder =
+            connect_auth(addr, &token_with(9), "responder", &victim_topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut victim_proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut victim_responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        send(
+            &mut victim_proposer,
+            &message(&victim_topic, "v1", &"b".repeat(3072)),
+        )
+        .await?;
+        let delivered = read_frame(&mut victim_responder).await?;
+        assert!(
+            matches!(delivered.body, RelayFrameBody::Message { ref payload } if payload.len() > 3000),
+            "the victim keeps its share of the budget, got {:?}",
+            delivered.body
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn per_identity_connection_limit_is_enforced() -> TestResult {
         let limits = RelayLimitsConfig {
             max_connections_per_identity: 1,
