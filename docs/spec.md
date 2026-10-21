@@ -66,7 +66,7 @@ TLS is terminated in front of the Relay. The Relay itself speaks plain WebSocket
 
 Slot ownership is first-come, first-served per topic and role. A party that learns a topic before its counterpart connects can claim the role slot and block the intended peer; the relay does not know which identity is expected on a slot. Pairing topics and URIs are therefore bearer secrets and must be short-lived. The connection caps above bound but do not eliminate this risk.
 
-Slot takeover means a valid token for an identity is enough to evict that identity's live connection, not just to claim an empty slot. A leaked, logged or replayed token therefore displaces the legitimate peer until it reconnects. This is the reason the relay caps token lifetime; the cap, not the identity check, is what bounds the exposure.
+Slot takeover means a valid token for an identity is enough to evict that identity's live connection, not just to claim an empty slot. A leaked, logged or replayed token therefore displaces the legitimate peer until it reconnects. This is the reason the relay caps token lifetime and closes connections whose token has expired: the cap bounds both opening a connection and holding one, and it, not the identity check, is what bounds the exposure.
 
 Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting by identity raises the cost of abuse, and so would an operator-side ban list, but neither is a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
 
@@ -115,6 +115,8 @@ The relay validates the token before the WebSocket upgrade completes:
 - `aud` must equal the relay's configured audience;
 - `exp` must be in the future and `iat` may be at most 60 seconds in the future, allowing for clock skew;
 - the remaining lifetime must not exceed the relay's maximum accepted token lifetime, default 10 minutes, and the token must be at most 4096 bytes.
+
+The relay enforces `exp` for the connection's whole lifetime. When a connection's token expires, the relay closes it with close code `1008` and reason `token expired`. A client must treat that close as a re-authentication request: it should reconnects with a freshly signed token for the same identity and never reuses the expired one, whose handshake the relay rejects with `400`. The topic slot is held in the reconnection grace exactly as after any other disconnect. Clients may instead re-authenticate before `exp` (minting tokens with a TTL shorter than the relay's cap and reconnecting ahead of it) to avoid the close altogether.
 
 The relay does not use `sub`; it is available for the client's own session bookkeeping. A handshake whose query is malformed, longer than 8 KiB, or whose token fails validation is answered with `400 Bad Request` and no upgrade.
 
@@ -271,5 +273,7 @@ Liveness is handled with WebSocket ping and pong control frames, not with applic
 The client sends a WebSocket ping every 30 seconds and requires a WebSocket pong within 10 seconds. If the pong does not arrive, the connection is considered dead and the client reconnects, starting at 250 ms and backing off up to 5 seconds for at most 5 attempts.
 
 The relay pings every 30 seconds and requires traffic from the peer within 10 seconds, after which the peer is disconnected and its slot enters the reconnection grace. Any inbound frame counts as activity, including the peer's own pings and pongs. A peer with no inbound traffic at all for 45 seconds is dropped regardless.
+
+Token expiry is a disconnect cause: the relay closes with `1008` and reason `token expired` when `exp` passes. The client reconnects promptly with a new token, without applying the liveness backoff. Because the slot is in the reconnection grace, the reconnect follows the normal path: the counterpart may observe an additional `session_ready` and no `peer_disconnected`; only a reconnect that misses the grace produces `peer_disconnected`.
 
 
