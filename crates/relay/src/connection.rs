@@ -24,10 +24,11 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, Limiter, RelayLimitsConfig},
+    limits::{Bucket, InboundBytes, Limiter, RelayLimitsConfig},
     session::{Registration, Role, Session, SessionError},
 };
 use wallet_session_core::{
+    did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
     message::Topic,
 };
@@ -223,7 +224,7 @@ impl Connection {
         };
 
         let (sink, source) = websocket.split();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<Option<CloseFrame>>();
 
         let backlog = BacklogDelivery {
             ready: Arc::new(Notify::new()),
@@ -256,11 +257,15 @@ impl Connection {
         // this connection. The read loop upgrades it again to drain a backlog.
         drop(self.self_tx);
 
+        let expires_at = tokio::time::Instant::now()
+            + Duration::from_secs(self.identity.exp.saturating_sub(unix_now()));
         let context = ReadContext {
             query: &self.query,
             session: &self.session,
             config,
             limiter: &self.limiter,
+            identity: &self.identity.did,
+            expires_at,
         };
         let result = read_loop(
             source,
@@ -272,7 +277,14 @@ impl Connection {
         )
         .await;
 
-        let _ = shutdown_tx.send(());
+        let close_frame = match &result {
+            Err(ConnectionError::TokenExpired) => Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "token expired".into(),
+            }),
+            _ => None,
+        };
+        let _ = shutdown_tx.send(close_frame);
         stop_writer(&mut writer).await;
 
         result
@@ -295,7 +307,7 @@ async fn stop_writer(writer: &mut JoinHandle<()>) {
 async fn write_loop(
     mut sink: SplitSink<RelayStream, Message>,
     mut rx: mpsc::Receiver<RelayFrame>,
-    mut shutdown: oneshot::Receiver<()>,
+    mut shutdown: oneshot::Receiver<Option<CloseFrame>>,
     config: NativeRelayTransportConfig,
     ping_deadline: watch::Sender<Option<tokio::time::Instant>>,
     backlog_ready: Arc<Notify>,
@@ -306,6 +318,7 @@ async fn write_loop(
     );
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut close_frame = None;
     loop {
         tokio::select! {
             received = rx.recv() => match received {
@@ -343,8 +356,14 @@ async fn write_loop(
                     }
                 });
             }
-            _ = &mut shutdown => break,
+            reason = &mut shutdown => {
+                close_frame = reason.ok().flatten();
+                break;
+            }
         }
+    }
+    if let Some(frame) = close_frame {
+        send_with_timeout(&mut sink, Message::Close(Some(frame)), config.write_timeout).await;
     }
     if tokio::time::timeout(WRITER_SHUTDOWN_GRACE, sink.close())
         .await
@@ -423,6 +442,8 @@ struct ReadContext<'a> {
     session: &'a Session,
     config: &'a NativeRelayTransportConfig,
     limiter: &'a Limiter,
+    identity: &'a DidKey,
+    expires_at: tokio::time::Instant,
 }
 
 /// Everything a read loop needs to deliver a peer's backlog.
@@ -448,6 +469,8 @@ async fn read_loop(
         session,
         config,
         limiter,
+        identity,
+        expires_at,
     } = *context;
 
     let limits = limiter.limits();
@@ -469,6 +492,13 @@ async fn read_loop(
             _ = wait_pong_deadline(ping_deadline_rx) => {
                 log::debug!("peer on topic {} missed a keepalive pong; dropping", query.topic);
                 return Err(ConnectionError::PongTimeout);
+            }
+            _ = tokio::time::sleep_until(expires_at) => {
+                log::debug!(
+                    "peer on topic {} has an expired token; closing",
+                    query.topic
+                );
+                return Err(ConnectionError::TokenExpired);
             }
             () = backlog.ready.notified() => {
                 if let Some(tx) = backlog.tx.upgrade() {
@@ -524,16 +554,31 @@ async fn read_loop(
                     }
                     continue;
                 }
-                consecutive_drops = 0;
 
-                // Shared budget: a drop here is not this peer's fault, so it
-                // does not count toward disconnecting it.
-                if !limiter.allow_inbound_bytes(text.len()) {
-                    log::debug!(
-                        "dropping frame on topic {}: relay inbound byte budget exhausted",
-                        query.topic
-                    );
-                    continue;
+                match limiter.allow_inbound_bytes(identity, text.len()) {
+                    InboundBytes::Allowed => consecutive_drops = 0,
+                    InboundBytes::ShareExhausted => {
+                        consecutive_drops += 1;
+                        log::debug!(
+                            "dropping frame on topic {}: identity share of the relay budget exhausted",
+                            query.topic
+                        );
+                        if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+                            log::warn!(
+                                "peer on topic {} keeps exceeding its share of the relay budget; dropping",
+                                query.topic
+                            );
+                            return Err(ConnectionError::RateLimited);
+                        }
+                        continue;
+                    }
+                    InboundBytes::GlobalExhausted => {
+                        log::debug!(
+                            "dropping frame on topic {}: relay inbound byte budget exhausted",
+                            query.topic
+                        );
+                        continue;
+                    }
                 }
 
                 log::trace!("relay <- topic={} frame={text}", query.topic);
@@ -693,6 +738,9 @@ pub enum ConnectionError {
 
     #[error("peer missed a keepalive pong")]
     PongTimeout,
+
+    #[error("connection token expired")]
+    TokenExpired,
 
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),

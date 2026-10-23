@@ -24,6 +24,9 @@ pub struct Identity {
 
     /// Session identifier.
     pub session: String,
+
+    /// Token expiry, enforced for the connection's whole lifetime.
+    pub exp: u64,
 }
 
 /// Failures decoding or verifying a connection token.
@@ -126,6 +129,7 @@ impl Identity {
         Ok(Self {
             did: token.iss,
             session: token.sub,
+            exp: token.exp,
         })
     }
 }
@@ -226,6 +230,7 @@ mod tests {
             Some(Identity {
                 did: test_utils::did_key(&key),
                 session: "session".to_owned(),
+                exp: NOW + 300,
             })
         );
     }

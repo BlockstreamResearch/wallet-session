@@ -25,6 +25,10 @@ services:
         condition: service_healthy
     environment:
       RELAY_PORT: ${RELAY_PORT}
+      PER_IP_CONNECTIONS: ${PER_IP_CONNECTIONS:-64}
+      PER_IP_RATE: ${PER_IP_RATE:-5}
+      PER_IP_BURST: ${PER_IP_BURST:-20}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-127.0.0.1/32}
     volumes:
       - ./configs/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
     ports:
