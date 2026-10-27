@@ -1332,6 +1332,209 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_fresh_topics_do_not_leak_sessions() -> TestResult {
+        const IDENTITY: u8 = 7;
+        const SESSION_CAP: usize = 8;
+
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_millis(300)),
+            RelayLimitsConfig {
+                max_connections_per_identity: 1,
+                max_sessions: SESSION_CAP,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut counterpart = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        let mut holder =
+            connect_auth(addr, &token_with(IDENTITY), "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut holder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut counterpart).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        for i in 0..16u8 {
+            let fresh = Topic::new([200 + i; 32])?;
+            let mut refused =
+                connect_auth(addr, &token_with(IDENTITY), "proposer", &fresh, None).await?;
+            assert!(
+                expect_closed(&mut refused).await,
+                "an identity at its cap must be refused on a fresh topic"
+            );
+        }
+
+        for i in 0..(SESSION_CAP - 1) as u8 {
+            let fresh = Topic::new([100 + i; 32])?;
+            let mut other =
+                connect_auth(addr, &token_with(30 + i), "proposer", &fresh, None).await?;
+            assert!(
+                timeout(Duration::from_millis(300), expect_closed(&mut other))
+                    .await
+                    .is_err(),
+                "a fresh identity must be able to create a session"
+            );
+        }
+
+        assert!(
+            timeout(Duration::from_millis(300), expect_closed(&mut holder))
+                .await
+                .is_err(),
+            "the session that was live all along must survive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_share_violations_disconnect_only_the_offender() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                inbound_message_rate: RateLimit {
+                    burst: 1000,
+                    interval: Duration::from_secs(3600),
+                },
+                inbound_byte_rate: RateLimit {
+                    burst: 1024 * 1024,
+                    interval: Duration::from_secs(3600),
+                },
+                identity_inbound_byte_rate: RateLimit {
+                    burst: 4096,
+                    interval: Duration::from_secs(3600),
+                },
+                global_inbound_byte_rate: RateLimit {
+                    burst: 16384,
+                    interval: Duration::from_secs(3600),
+                },
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let hog_topic = Topic::new([1u8; 32])?;
+        let mut hog_proposer = connect(addr, "proposer", &hog_topic, None).await?;
+        let mut hog_responder = connect(addr, "responder", &hog_topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut hog_proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut hog_responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        for i in 0..40 {
+            if send(
+                &mut hog_proposer,
+                &message(&hog_topic, &format!("m{i}"), &"a".repeat(2048)),
+            )
+            .await
+            .is_err()
+            {
+                break;
+            }
+        }
+        assert!(
+            expect_closed(&mut hog_proposer).await,
+            "an identity over its share must be disconnected"
+        );
+
+        let victim_topic = Topic::new([2u8; 32])?;
+        let mut victim_proposer =
+            connect_auth(addr, &token_with(8), "proposer", &victim_topic, None).await?;
+        let mut victim_responder =
+            connect_auth(addr, &token_with(9), "responder", &victim_topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut victim_proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut victim_responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        send(
+            &mut victim_proposer,
+            &message(&victim_topic, "v1", &"b".repeat(3072)),
+        )
+        .await?;
+        let delivered = read_frame(&mut victim_responder).await?;
+        assert!(
+            matches!(delivered.body, RelayFrameBody::Message { ref payload } if payload.len() > 3000),
+            "the victim keeps its share of the budget, got {:?}",
+            delivered.body
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_expiry_reconnect_within_grace_keeps_the_session() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let now = crate::auth::unix_now();
+        let short = crate::auth::test_utils::token(
+            &crate::auth::test_utils::signing_key(7),
+            AUDIENCE,
+            now,
+            now + 1,
+        );
+
+        let topic = topic()?;
+        let mut responder = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        let mut proposer = connect_auth(addr, &short, "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        assert!(
+            expect_closed(&mut proposer).await,
+            "the expired token must close the connection"
+        );
+
+        sleep(Duration::from_millis(100)).await;
+        send(&mut responder, &message(&topic, "buffered", "queued")).await?;
+
+        let mut proposer = connect_auth(addr, &token_with(7), "proposer", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        let redelivered = read_frame(&mut proposer).await?;
+        assert!(
+            matches!(redelivered.body, RelayFrameBody::Message { ref payload } if payload == "queued"),
+            "expected the buffered frame after session_ready, got {:?}",
+            redelivered.body
+        );
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        sleep(Duration::from_secs(2)).await;
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut responder))
+                .await
+                .is_err(),
+            "the counterpart must not see a peer_disconnected after the within-grace reconnect"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn per_identity_connection_limit_is_enforced() -> TestResult {
         let limits = RelayLimitsConfig {
             max_connections_per_identity: 1,

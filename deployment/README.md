@@ -27,7 +27,8 @@ From this directory:
 
 ```bash
 cp ./configs/compose.env.example ./configs/compose.env
-# edit APPLICATION_AUDIENCE, then:
+# edit APPLICATION_AUDIENCE and set TRUSTED_PROXY_CIDR (127.0.0.1/32 when
+# nothing sits in front, otherwise the terminator range), then:
 docker compose --env-file ./configs/compose.env up --build -d
 ```
 
@@ -50,6 +51,11 @@ Set these in `configs/compose.env`:
   container refuses to start without it, which is deliberate: a relay that
   accepts the wrong audience would either reject every client or, worse, accept
   tokens minted for another relay.
+- `TRUSTED_PROXY_CIDR`: the proxy range allowed to assert a client address
+  through `X-Forwarded-For`. Use `127.0.0.1/32` when nothing sits in front of
+  this stack, or the load balancer / CDN range when TLS terminates upstream.
+  The stack refuses to start without it, because a range that does not match
+  the terminator silently collapses the per-source limits into one bucket.
 - `RELAY_PUBLIC_PORT`: the host port nginx publishes.
 - `RELAY_PORT`, `HEALTH_PORT`: in-container ports.
 - `MAX_TOKEN_LIFETIME_SECONDS`: longest remaining token lifetime accepted.
@@ -85,9 +91,18 @@ the nginx service, add a `listen 443 ssl` server block to
 `configs/nginx/default.conf.template`, and publish `443`.
 
 Connection tokens travel in the URL query string, so they appear in the access
-logs of every proxy in the path, including this one. Keep
-`MAX_TOKEN_LIFETIME_SECONDS` short, and keep proxy logs private or turn request
-logging off for this service.
+logs of every proxy in the path. The template shipped here logs the path only
+(`$uri`, never the query) and keeps the nginx error log at `crit`, because
+upstream failures and rate-limit rejections embed the full request line. Any
+upstream terminator, load balancer or CDN must strip the query from its access
+logs too. Keep `MAX_TOKEN_LIFETIME_SECONDS` short regardless.
+
+The per-source limits (`PER_IP_*`) are keyed on the client address. When a load
+balancer, CDN or another proxy sits in front, that address is the terminator's
+unless `TRUSTED_PROXY_CIDR` names its range: real_ip then resolves the client
+from `X-Forwarded-For`, and forwarded headers from any other peer are ignored,
+so the limits cannot be spoofed. The stack requires the variable for exactly
+that reason; set it to `127.0.0.1/32` only when nothing sits in front of nginx.
 
 ## Scaling
 

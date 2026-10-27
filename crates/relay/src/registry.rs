@@ -54,14 +54,21 @@ impl Registry {
         if created && sessions.len() >= max_sessions {
             log::warn!("rejecting new session for topic {topic}: session limit reached");
             return Err(RegistryError::TooManySessions);
-        } else if created {
+        }
+        if created {
             log::debug!("created session for topic {topic}");
         }
 
         let session = sessions.entry(topic.clone()).or_default().clone();
         let identity = peer.identity.clone();
 
-        let registration = session.register(role, peer, ready, permit)?;
+        let registration = session
+            .register(role, peer, ready, permit)
+            .inspect_err(|_| {
+                if created {
+                    sessions.remove(topic);
+                }
+            })?;
 
         log::debug!("registered peer {identity} on topic {topic} as {role:?}");
 
@@ -316,6 +323,11 @@ mod tests {
             registry.expire(&topic, Role::Proposer, &notification(&topic))?,
             "the reservation expired"
         );
+        assert_eq!(
+            registry.session_count()?,
+            0,
+            "expiring the last reservation removes the session"
+        );
 
         let (replacement, _) = peer(3);
         let (again, _) = register(
@@ -405,6 +417,54 @@ mod tests {
             ["ready", "disconnected", "ready"],
             "the survivor must not be told it is gone after its peer came back"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refused_registrations_leave_the_registry_unchanged() -> TestResult {
+        let registry = Registry::new();
+
+        let (proposer, _) = peer(1);
+        register(
+            &registry,
+            &topic()?,
+            Role::Proposer,
+            proposer,
+            &ready(&topic()?),
+            usize::MAX,
+        )?;
+        assert_eq!(registry.session_count()?, 1);
+
+        for i in 0..10u8 {
+            let fresh = Topic::new([200 + i; 32])?;
+            let (refused, _) = peer(2);
+            assert!(
+                registry
+                    .register(
+                        &fresh,
+                        Role::Proposer,
+                        refused,
+                        None,
+                        &ready(&fresh),
+                        usize::MAX
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(registry.session_count()?, 1);
+
+        let fresh = Topic::new([1u8; 32])?;
+        let (accepted, _) = peer(2);
+        register(
+            &registry,
+            &fresh,
+            Role::Proposer,
+            accepted,
+            &ready(&fresh),
+            usize::MAX,
+        )?;
+        assert_eq!(registry.session_count()?, 2);
+
         Ok(())
     }
 

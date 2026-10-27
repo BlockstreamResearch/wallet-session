@@ -32,6 +32,21 @@ pub enum ConfigurationError {
 
     #[error("health and application must not share an address, both are {0}")]
     AddressCollision(SocketAddr),
+
+    #[error(
+        "connection.max_incoming_frame_bytes ({frame}) must not exceed the u32 byte accounting limit (4294967295)"
+    )]
+    FrameAboveByteCounter { frame: usize },
+
+    #[error(
+        "{setting}.burst ({burst}) must be at least \
+         connection.max_incoming_frame_bytes ({frame})"
+    )]
+    BurstBelowFrameCap {
+        setting: &'static str,
+        burst: u32,
+        frame: u32,
+    },
 }
 
 /// Relay settings.
@@ -133,6 +148,9 @@ pub struct LimitsSettings {
 
     /// Inbound byte rate per connection.
     pub inbound_byte_rate: RateSettings,
+
+    /// Inbound byte rate one identity may consume from the relay-wide budget.
+    pub identity_inbound_byte_rate: RateSettings,
 
     /// Inbound byte rate across all connections.
     pub global_inbound_byte_rate: RateSettings,
@@ -241,12 +259,42 @@ impl Settings {
             ),
             ("limits.inbound_byte_rate", &self.limits.inbound_byte_rate),
             (
+                "limits.identity_inbound_byte_rate",
+                &self.limits.identity_inbound_byte_rate,
+            ),
+            (
                 "limits.global_inbound_byte_rate",
                 &self.limits.global_inbound_byte_rate,
             ),
         ] {
             if rate.burst == 0 || rate.interval_seconds == 0 {
                 return Err(ConfigurationError::Zero { setting });
+            }
+        }
+
+        let frame = self.connection.max_incoming_frame_bytes;
+        let frame = u32::try_from(frame)
+            .map_err(|_| ConfigurationError::FrameAboveByteCounter { frame })?;
+        for (setting, burst) in [
+            (
+                "limits.identity_inbound_byte_rate",
+                self.limits.identity_inbound_byte_rate.burst,
+            ),
+            (
+                "limits.inbound_byte_rate",
+                self.limits.inbound_byte_rate.burst,
+            ),
+            (
+                "limits.global_inbound_byte_rate",
+                self.limits.global_inbound_byte_rate.burst,
+            ),
+        ] {
+            if burst < frame {
+                return Err(ConfigurationError::BurstBelowFrameCap {
+                    setting,
+                    burst,
+                    frame,
+                });
             }
         }
 
@@ -307,6 +355,7 @@ impl From<&Settings> for RelayLimitsConfig {
             connect_rate: (&settings.limits.connect_rate).into(),
             inbound_message_rate: (&settings.limits.inbound_message_rate).into(),
             inbound_byte_rate: (&settings.limits.inbound_byte_rate).into(),
+            identity_inbound_byte_rate: (&settings.limits.identity_inbound_byte_rate).into(),
             global_inbound_byte_rate: (&settings.limits.global_inbound_byte_rate).into(),
         }
     }

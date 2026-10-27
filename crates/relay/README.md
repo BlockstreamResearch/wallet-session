@@ -31,12 +31,14 @@ See `configuration/base.yaml` for every key. The ones that matter most:
 | `auth.max_token_lifetime_seconds` | longest remaining lifetime accepted in a token |
 | `session.grace_seconds` | how long a disconnected peer's slot is reserved |
 | `session.buffer_max_messages` / `session.buffer_ttl_seconds` | frames buffered for it |
-| `limits.*` | connection caps and per-identity/per-connection rates |
+| `limits.*` | connection caps, per-identity/per-connection rates, and each identity's share of the global inbound byte budget |
 | `connection.*` | frame size, queue capacity, and the handshake, write, ping, pong and idle timeouts |
 
 Values that would make the relay unusable are rejected at startup: zero limits,
-zero timeouts, a blank audience, or a health address equal to the application
-address.
+zero timeouts, a blank audience, a health address equal to the application
+address, a byte-rate burst below the maximum incoming frame (no frame could
+ever fit it), or a maximum incoming frame above `u32::MAX`. Every byte bucket must
+hold a whole frame.
 
 ## Running
 
@@ -48,6 +50,13 @@ cargo run -p wallet-session-relay                     # local, 127.0.0.1:8080
 APP_ENVIRONMENT=production APPLICATION__AUDIENCE=wss://relay.example.com \
   cargo run -p wallet-session-relay
 ```
+
+## Probes
+
+`GET /health` on the health port is liveness; `GET /ready` is readiness and
+reports `connections`, `sessions`, and the monotonic `dropped_share_bytes` /
+`dropped_global_bytes` counters. A rising drop counter means the relay is
+shedding inbound traffic, so alert on its rate of change.
 
 ## Deployment
 
