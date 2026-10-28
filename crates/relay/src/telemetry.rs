@@ -91,14 +91,15 @@ impl<T: fmt::Display> fmt::Display for Bounded<T> {
         };
         let written = write!(out, "{}", self.0);
         match written {
-            Err(_) if out.cut => out.out.write_str("..."),
+            _ if out.cut => out.out.write_str("..."),
             result => result,
         }
     }
 }
 
 /// Passes characters through until `left` bytes are used up, then fails,
-/// which also stops formatting the rest of the value.
+/// which also stops formatting the rest of the value. Nothing is passed
+/// through after a cut, even to a value that writes on regardless.
 struct Truncating<'a, 'b> {
     out: &'a mut fmt::Formatter<'b>,
     left: usize,
@@ -116,6 +117,7 @@ impl fmt::Write for Truncating<'_, '_> {
             };
             let Some(left) = self.left.checked_sub(c.len_utf8()) else {
                 self.cut = true;
+                self.left = 0;
                 return Err(fmt::Error);
             };
             self.left = left;
@@ -398,6 +400,26 @@ mod tests {
         let wide = bounded("€".repeat(MAX_LOGGED_DISPLAY_BYTES)).to_string();
         assert!(wide.len() <= MAX_LOGGED_DISPLAY_BYTES + "...".len());
         assert!(wide.trim_end_matches("...").chars().all(|c| c == '€'));
+    }
+
+    /// Writes on after a write has failed, and reports success.
+    struct Careless(String);
+
+    impl fmt::Display for Careless {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let _ = f.write_str(&self.0);
+            let _ = f.write_str("tail");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_ends_at_the_cut_whatever_the_value_does_next() {
+        // The cut falls inside the last of these, with bytes left over for
+        // the short writes that follow it.
+        let wide = "€".repeat(MAX_LOGGED_DISPLAY_BYTES / 3 + 1);
+        let kept = "€".repeat(MAX_LOGGED_DISPLAY_BYTES / 3);
+        assert_eq!(bounded(Careless(wide)).to_string(), format!("{kept}..."));
     }
 
     fn log(writer: &NonBlocking, record: &str) {

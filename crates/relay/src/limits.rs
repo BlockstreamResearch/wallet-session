@@ -16,6 +16,10 @@ use crate::source::Source;
 /// Maximum number of identities or sources tracked by one keyed rate limiter.
 const MAX_RATE_KEYS: usize = 65_536;
 
+/// Least time between two scans of a full keyed rate limiter for buckets
+/// that have refilled, which bounds the work a stream of new keys can cause.
+const MIN_PRUNE_SPACING: Duration = Duration::from_secs(1);
+
 /// Token-bucket parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimit {
@@ -211,6 +215,13 @@ impl Bucket {
         }
     }
 
+    /// Refill, and return whether the bucket holds its whole burst again, as
+    /// a new bucket would.
+    fn is_full(&mut self, rate: RateLimit, now: Instant) -> bool {
+        self.refill(rate, now);
+        self.tokens >= f64::from(rate.burst)
+    }
+
     /// Add what has accrued since the last update, up to the burst.
     fn refill(&mut self, rate: RateLimit, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last);
@@ -249,36 +260,43 @@ impl Bucket {
 #[derive(Debug)]
 struct BucketMap<K> {
     buckets: HashMap<K, Bucket>,
+
+    /// Shared by the keys that arrive while every tracked bucket is still
+    /// refilling, so they neither take a tracked key's place nor each get a
+    /// full bucket of their own.
+    overflow: Bucket,
     last_prune: Instant,
 }
 
 impl<K> BucketMap<K> {
-    fn new(now: Instant) -> Self {
+    fn new(rate: RateLimit, now: Instant) -> Self {
         Self {
             buckets: HashMap::new(),
+            overflow: Bucket::full(rate.burst, now),
             last_prune: now,
         }
     }
 }
 
+/// The bucket of `key`, tracking it if there is room.
+///
+/// A tracked key keeps its bucket for as long as the bucket is still
+/// refilling: forgetting it would hand the key a full bucket again. A full
+/// map makes room only by forgetting buckets that have refilled completely,
+/// and while none has, a new key is charged to the shared overflow bucket.
 fn bucket_for<'a, K: Eq + Hash + Clone>(
     state: &'a mut BucketMap<K>,
     key: &K,
     rate: RateLimit,
     now: Instant,
 ) -> &'a mut Bucket {
-    if state.buckets.len() >= MAX_RATE_KEYS {
-        if now.saturating_duration_since(state.last_prune) >= rate.interval {
-            state
-                .buckets
-                .retain(|_, bucket| now.saturating_duration_since(bucket.last) < rate.interval);
+    if state.buckets.len() >= MAX_RATE_KEYS && !state.buckets.contains_key(key) {
+        if now.saturating_duration_since(state.last_prune) >= MIN_PRUNE_SPACING {
+            state.buckets.retain(|_, bucket| !bucket.is_full(rate, now));
             state.last_prune = now;
         }
-        while state.buckets.len() >= MAX_RATE_KEYS {
-            let Some(evicted) = state.buckets.keys().next().cloned() else {
-                break;
-            };
-            state.buckets.remove(&evicted);
+        if state.buckets.len() >= MAX_RATE_KEYS {
+            return &mut state.overflow;
         }
     }
     state
@@ -310,9 +328,9 @@ impl Limiter {
             limits,
             total: Mutex::new(0),
             per_identity: Mutex::new(HashMap::new()),
-            connect_rate: Mutex::new(BucketMap::new(now)),
-            identity_bytes: Mutex::new(BucketMap::new(now)),
-            source_bytes: Mutex::new(BucketMap::new(now)),
+            connect_rate: Mutex::new(BucketMap::new(limits.connect_rate, now)),
+            identity_bytes: Mutex::new(BucketMap::new(limits.identity_inbound_byte_rate, now)),
+            source_bytes: Mutex::new(BucketMap::new(limits.source_inbound_byte_rate, now)),
             inbound_bytes: Mutex::new(Bucket::full(limits.global_inbound_byte_rate.burst, now)),
             dropped_share_bytes: AtomicU64::new(0),
             dropped_source_bytes: AtomicU64::new(0),
@@ -702,16 +720,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connect_rate_map_stays_bounded() {
-        let limiter = Limiter::new(RelayLimitsConfig::default());
+    async fn a_full_rate_map_forgets_no_bucket_that_is_still_refilling() {
+        let interval = Duration::from_secs(10);
+        let limiter = Limiter::new(RelayLimitsConfig {
+            connect_rate: RateLimit { burst: 1, interval },
+            ..RelayLimitsConfig::default()
+        });
 
-        for seed in 0..MAX_RATE_KEYS as u32 + 128 {
-            limiter.allow_connect(&key_from_u32(seed));
+        // Every tracked identity spends its only attempt.
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            assert!(limiter.allow_connect(&key_from_u32(seed)));
         }
 
-        assert!(limiter.tracked_identities() <= MAX_RATE_KEYS);
-        // A fresh identity can still attempt a connection.
+        // Past the bound, new identities share one bucket instead of taking
+        // the place of a tracked one, which would come back with a full one.
+        tokio::time::advance(MIN_PRUNE_SPACING).await;
         assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+        assert!(!limiter.allow_connect(&key_from_u32(u32::MAX - 1)));
+        assert_eq!(limiter.tracked_identities(), MAX_RATE_KEYS);
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            assert!(
+                !limiter.allow_connect(&key_from_u32(seed)),
+                "identity {seed} got its attempt back before its bucket refilled"
+            );
+        }
+
+        // Buckets that have refilled make room for new identities again.
+        tokio::time::advance(interval).await;
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX - 2)));
+        assert_eq!(limiter.tracked_identities(), 1);
     }
 
     #[tokio::test(start_paused = true)]
