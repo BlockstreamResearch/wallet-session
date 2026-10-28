@@ -30,6 +30,9 @@ services:
       PER_IP_BURST: ${PER_IP_BURST:-20}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:?set TRUSTED_PROXY_CIDR to the trusted proxy range}
     volumes:
+      # The main config sizes nginx's worker connection pool for the relay
+      # and keeps the stock access log, which records the query, off.
+      - ./configs/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./configs/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
     ports:
       - '${RELAY_PUBLIC_PORT}:80'
