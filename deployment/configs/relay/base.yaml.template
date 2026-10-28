@@ -23,6 +23,11 @@ connection:
   handshake_timeout_seconds: 10
   write_timeout_seconds: 10
   outbound_queue_capacity: 64
+  # Bytes held for one peer and not yet written: its queue and backlog, or
+  # its buffer while it reconnects. At least max_incoming_frame_bytes.
+  outbound_queue_max_bytes: 1048576
+  # A frame not written this long after it was queued drops its slow reader.
+  outbound_queue_timeout_seconds: 30
   ping_interval_seconds: 30
   pong_timeout_seconds: 10
   idle_timeout_seconds: 45

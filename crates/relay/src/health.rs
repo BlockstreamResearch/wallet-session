@@ -115,7 +115,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        limits::{RateLimit, RelayLimitsConfig},
+        limits::{OutboundBudget, RateLimit, RelayLimitsConfig},
         session::{PeerHandle, Role},
     };
 
@@ -177,6 +177,7 @@ mod tests {
             PeerHandle {
                 identity: identity.clone(),
                 tx,
+                budget: Arc::new(OutboundBudget::new(1024)),
             },
             permit,
             &RelayFrame {

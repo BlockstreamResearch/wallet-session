@@ -1,9 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use futures_util::{
-    SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
-};
+use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
@@ -25,7 +22,7 @@ use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
     limits::{Bucket, InboundBytes, Limiter, RelayLimitsConfig},
-    session::{Registration, Role, Session, SessionError},
+    session::{Outbound, Registration, Role, Session, SessionError},
 };
 use wallet_session_core::{
     did::DidKey,
@@ -113,8 +110,8 @@ pub struct Connection {
     query: ConnectionQuery,
     identity: Identity,
     session: Arc<Session>,
-    outbound: mpsc::Receiver<RelayFrame>,
-    self_tx: mpsc::Sender<RelayFrame>,
+    outbound: mpsc::Receiver<Outbound>,
+    self_tx: mpsc::Sender<Outbound>,
     config: NativeRelayTransportConfig,
     limiter: Arc<Limiter>,
 }
@@ -177,8 +174,8 @@ impl Connection {
         query: ConnectionQuery,
         identity: Identity,
         session: Arc<Session>,
-        outbound: mpsc::Receiver<RelayFrame>,
-        self_tx: mpsc::Sender<RelayFrame>,
+        outbound: mpsc::Receiver<Outbound>,
+        self_tx: mpsc::Sender<Outbound>,
         config: NativeRelayTransportConfig,
         limiter: Arc<Limiter>,
     ) -> Self {
@@ -304,14 +301,25 @@ async fn stop_writer(writer: &mut JoinHandle<()>) {
     }
 }
 
-async fn write_loop(
-    mut sink: SplitSink<RelayStream, Message>,
-    mut rx: mpsc::Receiver<RelayFrame>,
+/// Write queued frames and keepalive pings until the queue closes, the
+/// connection shuts down, or a write misses its deadline.
+///
+/// Besides the per-write timeout, a frame must be written within the queue
+/// timeout of entering the queue, so a reader that takes each write just in
+/// time but never catches up is dropped as well. The frames behind the one
+/// being written are checked when the writer reaches them, so a keepalive
+/// ping written in between can delay that by up to one write timeout. A frame
+/// holds its bytes in the peer's budget until it has been written.
+async fn write_loop<S>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<Outbound>,
     mut shutdown: oneshot::Receiver<Option<CloseFrame>>,
     config: NativeRelayTransportConfig,
     ping_deadline: watch::Sender<Option<tokio::time::Instant>>,
     backlog_ready: Arc<Notify>,
-) {
+) where
+    S: Sink<Message> + Unpin,
+{
     let mut ping = tokio::time::interval_at(
         tokio::time::Instant::now() + config.ping_interval,
         config.ping_interval,
@@ -323,15 +331,19 @@ async fn write_loop(
     loop {
         tokio::select! {
             received = rx.recv() => match received {
-                Some(frame) => {
+                Some(queued) => {
+                    let frame = &queued.frame;
                     let session_ready = matches!(&frame.body, RelayFrameBody::SessionReady);
-                    let Ok(text) = serde_json::to_string(&frame) else {
+                    let Ok(text) = serde_json::to_string(frame) else {
                         break;
                     };
                     log::trace!("relay -> topic={} frame={text}", frame.topic);
-                    if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
+                    let message = Message::text(text);
+                    if !send_queued(&mut sink, message, queued.queued_at, &config).await {
                         break;
                     }
+                    // Written: its bytes go back to the peer's budget.
+                    drop(queued);
                     // Once the peer has been told it is ready, the backlog
                     // held for it may follow, and every later write makes room
                     // in the queue for more of it.
@@ -424,16 +436,51 @@ fn charge_control_frame(
 }
 
 /// Send one message, returning whether the socket is still usable.
-async fn send_with_timeout(
-    sink: &mut SplitSink<RelayStream, Message>,
-    message: Message,
-    write_timeout: Duration,
-) -> bool {
+async fn send_with_timeout<S>(sink: &mut S, message: Message, write_timeout: Duration) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
     match tokio::time::timeout(write_timeout, sink.send(message)).await {
         Ok(Ok(())) => true,
         Ok(Err(_)) => false,
         Err(_) => {
             log::warn!("outbound websocket write timed out; closing connection");
+            false
+        }
+    }
+}
+
+/// Send a frame that entered the queue at `queued_at`, returning whether the
+/// socket is still usable.
+///
+/// The write gets the write timeout, cut short so that the frame is written
+/// within the queue timeout of entering the queue or not at all. A frame
+/// already past it is not attempted, even if the socket would take it now.
+async fn send_queued<S>(
+    sink: &mut S,
+    message: Message,
+    queued_at: tokio::time::Instant,
+    config: &NativeRelayTransportConfig,
+) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    let left = config
+        .outbound_queue_timeout
+        .saturating_sub(queued_at.elapsed());
+    if left >= config.write_timeout {
+        return send_with_timeout(sink, message, config.write_timeout).await;
+    }
+    let sent = if left.is_zero() {
+        None
+    } else {
+        tokio::time::timeout(left, sink.send(message)).await.ok()
+    };
+    match sent {
+        Some(Ok(())) => true,
+        Some(Err(_)) => false,
+        None => {
+            log::warn!("outbound queue is not draining; closing connection");
             false
         }
     }
@@ -457,7 +504,7 @@ struct BacklogDelivery {
 
     /// The slot's channel. It is weak because the slot's handle must stay the
     /// only strong sender, so a replaced connection closes its queue
-    tx: mpsc::WeakSender<RelayFrame>,
+    tx: mpsc::WeakSender<Outbound>,
 }
 
 async fn read_loop(
@@ -768,6 +815,8 @@ mod tests {
     use super::*;
 
     use crate::auth::test_utils::{self, signing_key};
+    use crate::limits::OutboundBudget;
+    use tokio::time::timeout;
     use wallet_session_core::message::Topic;
 
     const AUDIENCE: &str = "wss://relay.example.com";
@@ -956,5 +1005,135 @@ mod tests {
         let mut writer = tokio::spawn(std::future::pending::<()>());
         stop_writer(&mut writer).await;
         assert!(writer.await.is_err_and(|error| error.is_cancelled()));
+    }
+
+    /// Ids of the frames a test reader accepted.
+    type Accepted = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A reader that takes `per_message` to accept each message, and the ids
+    /// of the frames it accepted.
+    fn slow_reader(per_message: Duration) -> (Accepted, impl Sink<Message> + Unpin) {
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = futures_util::sink::unfold(
+            Arc::clone(&accepted),
+            move |accepted, message: Message| async move {
+                tokio::time::sleep(per_message).await;
+                if let Message::Text(text) = &message
+                    && let Ok(frame) = serde_json::from_str::<RelayFrame>(text)
+                {
+                    accepted.lock().expect("accepted ids").push(frame.id);
+                }
+                Ok::<_, std::convert::Infallible>(accepted)
+            },
+        );
+        (accepted, Box::pin(sink))
+    }
+
+    /// Run a writer over `sink` as a connection does. It runs until the
+    /// returned sender shuts it down or is dropped.
+    fn spawn_writer<S>(
+        sink: S,
+        rx: mpsc::Receiver<Outbound>,
+        config: NativeRelayTransportConfig,
+    ) -> (oneshot::Sender<Option<CloseFrame>>, JoinHandle<()>)
+    where
+        S: Sink<Message> + Unpin + Send + 'static,
+    {
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let (ping_deadline, _) = watch::channel(None);
+        let writer = tokio::spawn(write_loop(
+            sink,
+            rx,
+            shutdown_rx,
+            config,
+            ping_deadline,
+            Arc::new(Notify::new()),
+        ));
+        (shutdown, writer)
+    }
+
+    /// Writer settings for these tests, with no keepalive ping in the way.
+    fn writer_config() -> NativeRelayTransportConfig {
+        NativeRelayTransportConfig::new(AUDIENCE)
+            .with_ping_interval(Duration::from_secs(3600))
+            .with_write_timeout(Duration::from_secs(10))
+            .with_outbound_queue_timeout(Duration::from_secs(15))
+    }
+
+    /// A message frame entering the queue now, holding 100 bytes of `budget`.
+    fn queued(
+        budget: &Arc<OutboundBudget>,
+        id: &str,
+    ) -> Result<Outbound, Box<dyn std::error::Error>> {
+        let frame = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: id.to_owned(),
+            topic: topic()?,
+            body: RelayFrameBody::Message {
+                payload: "ciphertext".to_owned(),
+            },
+        };
+        Ok(Outbound::new(frame, budget.try_charge(100)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_drops_a_reader_that_never_catches_up_with_its_queue() -> TestResult {
+        let budget = Arc::new(OutboundBudget::new(1024));
+        let (tx, rx) = mpsc::channel(8);
+        for i in 0..6 {
+            tx.try_send(queued(&budget, &format!("m{i}"))?)?;
+        }
+
+        // Every write takes 4s, well inside the 10s write timeout, but the
+        // six frames take 24s to get through and none may wait over 15s. The
+        // fourth is still being written at 15s: that write is cut short.
+        let (accepted, sink) = slow_reader(Duration::from_secs(4));
+        let start = tokio::time::Instant::now();
+        let (_shutdown, writer) = spawn_writer(sink, rx, writer_config());
+        timeout(Duration::from_secs(60), writer).await??;
+
+        let queue_timeout = Duration::from_secs(15);
+        let window = queue_timeout..=queue_timeout + WRITER_SHUTDOWN_GRACE;
+        let elapsed = start.elapsed();
+        assert!(
+            window.contains(&elapsed),
+            "the writer must stop once a frame has waited the queue timeout, not {elapsed:?}"
+        );
+        assert_eq!(*accepted.lock().expect("accepted ids"), ["m0", "m1", "m2"]);
+
+        drop(tx);
+        assert_eq!(budget.held(), 0, "frames left behind give their bytes back");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_keeps_a_slow_reader_that_keeps_up() -> TestResult {
+        let budget = Arc::new(OutboundBudget::new(1024));
+        let (tx, rx) = mpsc::channel(8);
+        let (accepted, sink) = slow_reader(Duration::from_secs(4));
+        let (shutdown, writer) = spawn_writer(sink, rx, writer_config());
+
+        // The last of these waits 8s and is written by 12s.
+        for i in 0..3 {
+            tx.try_send(queued(&budget, &format!("m{i}"))?)?;
+        }
+        // A frame queued long after the queue emptied waits only from then.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tx.try_send(queued(&budget, "m3")?)?;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        assert!(
+            !writer.is_finished(),
+            "a reader that keeps up must not be dropped"
+        );
+        assert_eq!(
+            *accepted.lock().expect("accepted ids"),
+            ["m0", "m1", "m2", "m3"]
+        );
+        assert_eq!(budget.held(), 0, "written frames give their bytes back");
+
+        let _ = shutdown.send(None);
+        timeout(Duration::from_secs(1), writer).await??;
+        Ok(())
     }
 }

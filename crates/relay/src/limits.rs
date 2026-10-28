@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -345,6 +345,72 @@ impl Drop for ConnectionPermit {
     }
 }
 
+/// Bytes of frames held for one peer and not yet written to it.
+///
+/// A connection's budget covers its outbound queue, the frame its writer is
+/// writing, and the backlog waiting to enter the queue; a reserved slot has
+/// one of its own for the frames buffered while its peer reconnects. Bytes
+/// are the frame's JSON text, which is what the writer sends.
+#[derive(Debug)]
+pub struct OutboundBudget {
+    capacity: usize,
+    held: AtomicUsize,
+}
+
+impl OutboundBudget {
+    /// An empty budget of `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            held: AtomicUsize::new(0),
+        }
+    }
+
+    /// Bytes this budget may hold at once.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently charged to this budget.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// Charge `bytes`, if they fit beside what is already held.
+    pub(crate) fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<OutboundCharge> {
+        self.held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes)
+                    .filter(|total| *total <= self.capacity)
+            })
+            .ok()?;
+        Some(OutboundCharge {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+/// Bytes charged to an [`OutboundBudget`]; given back when dropped.
+#[derive(Debug)]
+pub(crate) struct OutboundCharge {
+    budget: Arc<OutboundBudget>,
+    bytes: usize,
+}
+
+impl OutboundCharge {
+    /// Bytes this charge holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for OutboundCharge {
+    fn drop(&mut self) {
+        self.budget.held.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +674,40 @@ mod tests {
             InboundBytes::Allowed,
             "the rejected oversized frame must not have spent the share"
         );
+    }
+
+    #[test]
+    fn outbound_budget_refuses_what_does_not_fit_and_takes_back_on_drop() {
+        let budget = Arc::new(OutboundBudget::new(100));
+
+        let first = budget.try_charge(60);
+        assert!(first.is_some());
+        assert!(
+            budget.try_charge(41).is_none(),
+            "a charge must fit beside what is held"
+        );
+        let second = budget.try_charge(40);
+        assert!(second.is_some(), "a charge may fill the budget exactly");
+        assert_eq!(budget.held(), 100);
+
+        drop(first);
+        assert_eq!(budget.held(), 40, "a dropped charge gives its bytes back");
+        assert!(budget.try_charge(60).is_some());
+        assert_eq!(budget.held(), 40, "an unbound charge is given back at once");
+    }
+
+    #[test]
+    fn outbound_budget_refuses_a_charge_larger_than_itself() {
+        let budget = Arc::new(OutboundBudget::new(100));
+        assert!(budget.try_charge(101).is_none());
+        assert!(budget.try_charge(usize::MAX).is_none());
+
+        let _held = budget.try_charge(1);
+        assert!(
+            budget.try_charge(usize::MAX).is_none(),
+            "an overflowing total must be refused, not wrapped"
+        );
+        assert_eq!(budget.held(), 1);
     }
 
     #[tokio::test(start_paused = true)]

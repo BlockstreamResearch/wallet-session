@@ -34,6 +34,13 @@ pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default number of frames queued for a connected peer.
 pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 
+/// Default bytes held for one peer and not yet written: four maximal frames.
+pub const DEFAULT_OUTBOUND_QUEUE_MAX_BYTES: usize = 4 * DEFAULT_MAX_INCOMING_FRAME_BYTES;
+
+/// Default longest time a frame may wait in a peer's outbound queue before
+/// the peer is dropped as too slow to read.
+pub const DEFAULT_OUTBOUND_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Runtime limits for the relay connection handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeRelayTransportConfig {
@@ -70,6 +77,15 @@ pub struct NativeRelayTransportConfig {
     /// Maximum frames queued for a connected peer that is not reading.
     pub outbound_queue_capacity: usize,
 
+    /// Maximum bytes of frames held for one peer and not yet written: its
+    /// outbound queue and the backlog waiting to enter it, or its buffer
+    /// while it reconnects. A frame that does not fit is dropped.
+    pub outbound_queue_max_bytes: usize,
+
+    /// Longest time a frame may wait in a peer's outbound queue, write
+    /// included, before the peer is dropped as too slow to read.
+    pub outbound_queue_timeout: Duration,
+
     /// Maximum accepted lifetime of an auth token.
     pub max_token_lifetime: Duration,
 }
@@ -89,6 +105,8 @@ impl NativeRelayTransportConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            outbound_queue_max_bytes: DEFAULT_OUTBOUND_QUEUE_MAX_BYTES,
+            outbound_queue_timeout: DEFAULT_OUTBOUND_QUEUE_TIMEOUT,
             max_token_lifetime: DEFAULT_MAX_TOKEN_LIFETIME,
         }
     }
@@ -159,6 +177,21 @@ impl NativeRelayTransportConfig {
             "outbound queue capacity must be greater than zero"
         );
         self.outbound_queue_capacity = capacity;
+        self
+    }
+
+    /// Set the bytes that may be held for one peer and not yet written.
+    ///
+    /// Below the encoded size of a frame, that frame is always dropped; the
+    /// configuration file rejects a value below the incoming frame cap.
+    pub fn with_outbound_queue_max_bytes(mut self, bytes: usize) -> Self {
+        self.outbound_queue_max_bytes = bytes;
+        self
+    }
+
+    /// Set the longest time a frame may wait in a peer's outbound queue.
+    pub fn with_outbound_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.outbound_queue_timeout = timeout;
         self
     }
 
