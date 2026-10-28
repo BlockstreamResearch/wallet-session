@@ -9,6 +9,12 @@ const DID_KEY_PREFIX: &str = "did:key:z";
 /// Multicodec prefix for an Ed25519 public key (`ed25519-pub`).
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 
+/// Base58btc length of `ED25519_MULTICODEC || key` for every 32-byte key.
+///
+/// The encoded value lies in `[0xed01 << 256, 0xed02 << 256)`, which is
+/// strictly between `58^46` and `58^47`, so it always has 47 digits.
+const ED25519_ENCODED_LEN: usize = 47;
+
 /// An Ed25519 `did:key` identifier.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -19,6 +25,9 @@ pub struct DidKey([u8; 32]);
 pub enum DidError {
     #[error("not a did:key multibase identifier: {0}")]
     Prefix(String),
+
+    #[error("invalid did:key encoded length: {0}")]
+    EncodedLength(usize),
 
     #[error("invalid base58btc did:key: {0}")]
     Base58(String),
@@ -43,6 +52,10 @@ impl DidKey {
         let encoded = input
             .strip_prefix(DID_KEY_PREFIX)
             .ok_or_else(|| DidError::Prefix(input.to_owned()))?;
+        // Checked before decoding, as base58 decoding is quadratic in the input length.
+        if encoded.len() != ED25519_ENCODED_LEN {
+            return Err(DidError::EncodedLength(encoded.len()));
+        }
         let bytes = bs58::decode(encoded)
             .into_vec()
             .map_err(|error| DidError::Base58(error.to_string()))?;
@@ -131,8 +144,21 @@ mod tests {
     }
 
     #[test]
+    fn extreme_keys_have_canonical_length() {
+        // Base58 length is monotonic in the encoded value, so the smallest and
+        // largest keys bound the encoded length of every other key.
+        for bytes in [[0x00; 32], [0xff; 32]] {
+            let key = DidKey::from_ed25519_bytes(bytes);
+            let did = key.to_string();
+            assert_eq!(did.len(), DID_KEY_PREFIX.len() + ED25519_ENCODED_LEN);
+            assert_eq!(DidKey::parse(&did).expect("parse"), key);
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_multicodec() {
-        let mut bytes = vec![0x00, 0x01];
+        // `x25519-pub` keys have the same encoded length as Ed25519 keys.
+        let mut bytes = vec![0xec, 0x01];
         bytes.extend_from_slice(&[0u8; 32]);
         let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
         assert!(matches!(DidKey::parse(&did), Err(DidError::KeyType)));
@@ -143,7 +169,45 @@ mod tests {
         let mut bytes = ED25519_MULTICODEC.to_vec();
         bytes.extend_from_slice(&[0u8; 31]);
         let did = format!("did:key:z{}", bs58::encode(bytes).into_string());
-        assert!(matches!(DidKey::parse(&did), Err(DidError::Length(31))));
+        assert!(matches!(
+            DidKey::parse(&did),
+            Err(DidError::EncodedLength(46))
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_encoded_length() {
+        let encoded = &EXAMPLE[DID_KEY_PREFIX.len()..];
+        for did in [
+            DID_KEY_PREFIX.to_owned(),
+            EXAMPLE[..EXAMPLE.len() - 1].to_owned(),
+            format!("{EXAMPLE}1"),
+            // A leading `1` encodes a leading zero byte.
+            format!("{DID_KEY_PREFIX}1{encoded}"),
+        ] {
+            let len = did.len() - DID_KEY_PREFIX.len();
+            assert!(matches!(
+                DidKey::parse(&did),
+                Err(DidError::EncodedLength(n)) if n == len
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_overlong_input_before_decoding() {
+        // `0` is not in the base58btc alphabet, so decoding would fail with
+        // `Base58` had it run before the length check.
+        let did = format!("{DID_KEY_PREFIX}{}", "0".repeat(ED25519_ENCODED_LEN + 1));
+        assert!(matches!(
+            DidKey::parse(&did),
+            Err(DidError::EncodedLength(48))
+        ));
+
+        let did = format!("{DID_KEY_PREFIX}{}", "z".repeat(4096));
+        assert!(matches!(
+            DidKey::parse(&did),
+            Err(DidError::EncodedLength(4096))
+        ));
     }
 
     #[test]
