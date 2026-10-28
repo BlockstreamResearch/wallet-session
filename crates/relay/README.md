@@ -75,6 +75,12 @@ container memory limit): the relay enforces no aggregate bound.
 
 ## Running
 
+Relay logs use a short topic tag instead of the bearer topic. Invalid-frame
+records report the error class and location without echoing client content.
+Stdout is written by a separate thread with an 8 MiB queue; when the sink
+falls behind, whole records are dropped and a count is reported after it
+recovers. Configure retention and collection for the deployment separately.
+
 From this directory, since the configuration is read from the working
 directory:
 

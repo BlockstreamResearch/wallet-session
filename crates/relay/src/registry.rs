@@ -49,14 +49,15 @@ impl Registry {
         max_sessions: usize,
     ) -> Result<(Arc<Session>, Registration), RegistryError> {
         let mut sessions = self.lock()?;
+        let tag = topic.log_tag();
 
         let created = !sessions.contains_key(topic);
         if created && sessions.len() >= max_sessions {
-            log::warn!("rejecting new session for topic {topic}: session limit reached");
+            log::warn!("rejecting new session for topic {tag}: session limit reached");
             return Err(RegistryError::TooManySessions);
         }
         if created {
-            log::debug!("created session for topic {topic}");
+            log::debug!("created session for topic {tag}");
         }
 
         let session = sessions.entry(topic.clone()).or_default().clone();
@@ -70,7 +71,7 @@ impl Registry {
                 }
             })?;
 
-        log::debug!("registered peer {identity} on topic {topic} as {role:?}");
+        log::debug!("registered peer {identity} on topic {tag} as {role:?}");
 
         Ok((session, registration))
     }
@@ -115,7 +116,10 @@ impl Registry {
 
         let reserved = session.disconnect(role, tx, grace)?;
         if reserved {
-            log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
+            log::debug!(
+                "reserved {role:?} slot on topic {} for {grace:?}",
+                topic.log_tag()
+            );
         }
 
         Ok(reserved)
@@ -139,11 +143,12 @@ impl Registry {
 
         match session.expire(role, notification)? {
             Some(expiry) => {
+                let tag = topic.log_tag();
                 if expiry.empty {
                     sessions.remove(topic);
-                    log::debug!("removed empty session for topic {topic}");
+                    log::debug!("removed empty session for topic {tag}");
                 }
-                log::debug!("expired {role:?} reservation on topic {topic}");
+                log::debug!("expired {role:?} reservation on topic {tag}");
                 Ok(true)
             }
             None => Ok(false),

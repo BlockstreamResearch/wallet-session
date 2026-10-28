@@ -3,7 +3,8 @@
 //! Configuration comes from `configuration/*.yaml`: `base.yaml` plus the
 //! overlay named by `APP_ENVIRONMENT`, with environment variables overriding
 //! both. The relay speaks plain WebSocket and expects TLS to be terminated in
-//! front of it. Logs are bunyan JSON on stdout.
+//! front of it. Logs are bunyan JSON on stdout, written by a thread of their
+//! own: when stdout falls behind, records are dropped rather than waited for.
 
 use std::sync::Arc;
 
@@ -16,12 +17,14 @@ use wallet_session_relay::{
     limits::Limiter,
     registry::Registry,
     server::serve,
-    telemetry::{SERVICE_NAME, get_subscriber, init_subscriber},
+    telemetry::{SERVICE_NAME, get_subscriber, init_subscriber, non_blocking},
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let subscriber = get_subscriber(SERVICE_NAME.to_owned(), "info".to_owned(), std::io::stdout);
+    let (log_writer, _log_guard) =
+        non_blocking(std::io::stdout()).context("failed to start the log writer")?;
+    let subscriber = get_subscriber(SERVICE_NAME.to_owned(), "info".to_owned(), log_writer);
     init_subscriber(subscriber);
 
     let settings =
