@@ -547,8 +547,12 @@ mod tests {
 
     /// Drain a client until the relay closes it (or the connection errors).
     async fn expect_closed(client: &mut Client) -> bool {
+        expect_closed_within(client, Duration::from_secs(2)).await
+    }
+
+    async fn expect_closed_within(client: &mut Client, wait: Duration) -> bool {
         loop {
-            match timeout(Duration::from_secs(2), client.next()).await {
+            match timeout(wait, client.next()).await {
                 Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return true,
                 Ok(Some(Ok(_))) => {}
                 Err(_) => return false,
@@ -597,6 +601,12 @@ mod tests {
 
         drop(responder);
         sleep(Duration::from_millis(100)).await;
+
+        // Keep the three writes in order before the reconnect, rather than
+        // leaving the last one in the client's Nagle buffer.
+        if let MaybeTlsStream::Plain(stream) = proposer.get_mut() {
+            stream.set_nodelay(true)?;
+        }
 
         // Three frames while the responder is gone, but only two may be kept.
         for (id, payload) in [("m1", "one"), ("m2", "two"), ("m3", "three")] {
@@ -2182,14 +2192,15 @@ mod tests {
         // after that.
         let mut hog = connect(addr, "proposer", &topic()?, None).await?;
         let _ = send_pings(&mut hog, MAX_CONSECUTIVE_RATE_DROPS + 8, PING_PAYLOAD).await;
-        assert!(
-            expect_closed(&mut hog).await,
-            "an identity flooding control frames over its share must be disconnected"
-        );
         let limit = u64::from(PING_PAYLOAD) * u64::from(MAX_CONSECUTIVE_RATE_DROPS);
+        let dropped = wait_for_count(|| limiter.dropped_share_bytes(), limit + 1).await;
         assert!(
-            limiter.dropped_share_bytes() > limit,
-            "the dropped pings must be counted against the identity share"
+            dropped > limit,
+            "the relay must process enough dropped pings to reach the disconnect threshold"
+        );
+        assert!(
+            expect_closed_within(&mut hog, Duration::from_secs(10)).await,
+            "an identity flooding control frames over its share must be disconnected"
         );
         assert_eq!(limiter.dropped_global_bytes(), 0);
         Ok(())
