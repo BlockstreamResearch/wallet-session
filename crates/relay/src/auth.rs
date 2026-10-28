@@ -213,6 +213,7 @@ pub(crate) mod test_utils {
 mod tests {
     use super::test_utils::{self, signing_key};
     use super::*;
+    use wallet_session_core::did::DidError;
 
     const AUDIENCE: &str = "wss://relay.example.com";
     const NOW: u64 = 1_700_000_000;
@@ -312,6 +313,24 @@ mod tests {
         assert!(matches!(
             Identity::verify_token(&token, AUDIENCE, NOW),
             Err(IdentityError::Token(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_overlong_did_key_issuer() {
+        let token = test_utils::raw_token_with_iss(
+            &signing_key(1),
+            &format!("did:key:z{}", "z".repeat(2048)),
+            AUDIENCE,
+            NOW,
+            NOW + 300,
+        );
+        // Under the token cap, so the issuer reaches `did:key` parsing.
+        assert!(token.len() <= MAX_TOKEN_BYTES);
+        let expected = DidError::EncodedLength(2048).to_string();
+        assert!(matches!(
+            Identity::verify_token(&token, AUDIENCE, NOW),
+            Err(IdentityError::Token(error)) if error.to_string().starts_with(&expected)
         ));
     }
 
