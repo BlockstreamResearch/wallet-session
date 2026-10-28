@@ -45,6 +45,12 @@ limits:
   inbound_byte_rate:
     burst: 524288
     interval_seconds: 2
+  # Every byte read from one connection's socket: framing, control frames and
+  # fragments included. Over it the socket is read more slowly, nothing is
+  # dropped. Keep it above inbound_byte_rate, which counts message payloads.
+  inbound_wire_byte_rate:
+    burst: 1048576
+    interval_seconds: 2
   identity_inbound_byte_rate:
     burst: 1048576
     interval_seconds: 1
