@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use wallet_session_core::{frame::RelayFrame, message::Topic};
 
 use crate::limits::ConnectionPermit;
-use crate::session::{PeerHandle, Registration, Role, Session, SessionError};
+use crate::session::{Outbound, PeerHandle, Registration, Role, Session, SessionError};
 
 /// Directory of live sessions, keyed by topic.
 ///
@@ -49,14 +49,15 @@ impl Registry {
         max_sessions: usize,
     ) -> Result<(Arc<Session>, Registration), RegistryError> {
         let mut sessions = self.lock()?;
+        let tag = topic.log_tag();
 
         let created = !sessions.contains_key(topic);
         if created && sessions.len() >= max_sessions {
-            log::warn!("rejecting new session for topic {topic}: session limit reached");
+            log::warn!("rejecting new session for topic {tag}: session limit reached");
             return Err(RegistryError::TooManySessions);
         }
         if created {
-            log::debug!("created session for topic {topic}");
+            log::debug!("created session for topic {tag}");
         }
 
         let session = sessions.entry(topic.clone()).or_default().clone();
@@ -70,7 +71,7 @@ impl Registry {
                 }
             })?;
 
-        log::debug!("registered peer {identity} on topic {topic} as {role:?}");
+        log::debug!("registered peer {identity} on topic {tag} as {role:?}");
 
         Ok((session, registration))
     }
@@ -104,7 +105,7 @@ impl Registry {
         &self,
         topic: &Topic,
         role: Role,
-        tx: &mpsc::WeakSender<RelayFrame>,
+        tx: &mpsc::WeakSender<Outbound>,
         grace: Duration,
     ) -> Result<bool, RegistryError> {
         let sessions = self.lock()?;
@@ -115,7 +116,10 @@ impl Registry {
 
         let reserved = session.disconnect(role, tx, grace)?;
         if reserved {
-            log::debug!("reserved {role:?} slot on topic {topic} for {grace:?}");
+            log::debug!(
+                "reserved {role:?} slot on topic {} for {grace:?}",
+                topic.log_tag()
+            );
         }
 
         Ok(reserved)
@@ -139,11 +143,12 @@ impl Registry {
 
         match session.expire(role, notification)? {
             Some(expiry) => {
+                let tag = topic.log_tag();
                 if expiry.empty {
                     sessions.remove(topic);
-                    log::debug!("removed empty session for topic {topic}");
+                    log::debug!("removed empty session for topic {tag}");
                 }
-                log::debug!("expired {role:?} reservation on topic {topic}");
+                log::debug!("expired {role:?} reservation on topic {tag}");
                 Ok(true)
             }
             None => Ok(false),
@@ -169,7 +174,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    use crate::limits::{Limiter, RelayLimitsConfig};
+    use crate::limits::{Limiter, OutboundBudget, RelayLimitsConfig};
 
     /// A permit for `identity`, from a limiter that is never shared: these
     /// tests do not exercise the per-identity cap.
@@ -197,12 +202,13 @@ mod tests {
     /// Outbound queue capacity used by peer handles in these tests.
     const PEER_QUEUE: usize = 8;
 
-    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<RelayFrame>) {
+    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<Outbound>) {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
         (
             PeerHandle {
                 identity: wallet_session_core::did::DidKey::from_ed25519_bytes([seed; 32]),
                 tx,
+                budget: Arc::new(OutboundBudget::new(1024 * 1024)),
             },
             rx,
         )
@@ -405,8 +411,8 @@ mod tests {
         )?;
 
         let mut kinds = Vec::new();
-        while let Ok(frame) = proposer_rx.try_recv() {
-            kinds.push(match &frame.body {
+        while let Ok(queued) = proposer_rx.try_recv() {
+            kinds.push(match &queued.frame.body {
                 RelayFrameBody::SessionReady => "ready",
                 RelayFrameBody::PeerDisconnected => "disconnected",
                 RelayFrameBody::Message { .. } => "message",

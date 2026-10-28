@@ -1,9 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
-use futures_util::{
-    SinkExt, StreamExt,
-    stream::{SplitSink, SplitStream},
-};
+use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
+use serde_json::error::Category;
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
@@ -24,17 +22,19 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, InboundBytes, Limiter, RelayLimitsConfig},
-    session::{Registration, Role, Session, SessionError},
+    limits::{Bucket, InboundBytes, Limiter, RateLimit, Traffic},
+    meter::MeteredStream,
+    session::{Counterpart, Outbound, Registration, Role, Session, SessionError},
+    source::Source,
 };
 use wallet_session_core::{
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
-    message::Topic,
 };
 
-/// Server-side relay WebSocket stream.
-pub(crate) type RelayStream = WebSocketStream<TcpStream>;
+/// Server-side relay WebSocket stream, read through the connection's wire
+/// budget.
+pub(crate) type RelayStream = WebSocketStream<MeteredStream<TcpStream>>;
 
 /// Relay frame protocol version accepted from clients.
 pub(crate) const RELAY_FRAME_VERSION: u8 = 1;
@@ -44,7 +44,7 @@ const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Consecutive frames a connection may have rejected by its own inbound rate
 /// limits before it is disconnected.
-const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
+pub(crate) const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
 
 /// Maximum accepted query-string length before parsing.
 pub const MAX_QUERY_BYTES: usize = 8 * 1024;
@@ -105,6 +105,16 @@ pub(crate) fn random_id() -> Result<String, ConnectionError> {
     Ok(codec::encode(&bytes))
 }
 
+/// The client behind an accepted handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    /// Identity proven by the connection token.
+    pub identity: Identity,
+
+    /// Address the connection's inbound bytes are accounted to.
+    pub source: Source,
+}
+
 /// A single peer connection bound to one topic slot.
 ///
 /// A connection only depends on its [`Session`]; peer registration and
@@ -112,30 +122,47 @@ pub(crate) fn random_id() -> Result<String, ConnectionError> {
 pub struct Connection {
     query: ConnectionQuery,
     identity: Identity,
+    source: Source,
     session: Arc<Session>,
-    outbound: mpsc::Receiver<RelayFrame>,
-    self_tx: mpsc::Sender<RelayFrame>,
+    outbound: mpsc::Receiver<Outbound>,
+    self_tx: mpsc::Sender<Outbound>,
     config: NativeRelayTransportConfig,
     limiter: Arc<Limiter>,
 }
 
 impl Connection {
     /// Perform the WebSocket handshake and parse the connection parameters.
+    ///
+    /// The client's source is the TCP peer, or the address a peer listed in
+    /// the trusted proxies names in `X-Real-IP` (see [`Source::resolve`]).
+    ///
+    /// Every byte read from `stream` from here on, the upgrade request
+    /// included, is admitted at `wire_rate` before tungstenite parses it (see
+    /// [`crate::meter`]).
     #[allow(clippy::result_large_err)]
     pub async fn handshake(
         stream: TcpStream,
         config: NativeRelayTransportConfig,
-    ) -> Result<(ConnectionQuery, Identity, RelayStream), ConnectionError> {
+        wire_rate: RateLimit,
+    ) -> Result<(ConnectionQuery, Client, RelayStream), ConnectionError> {
+        let peer = stream
+            .peer_addr()
+            .map_err(ConnectionError::PeerAddress)?
+            .ip();
+        let stream = MeteredStream::new(stream, wire_rate);
         let audience = config.audience.as_str();
         let now = unix_now();
-        let mut parsed: Option<Result<(ConnectionQuery, Identity), ConnectionError>> = None;
+        let mut parsed: Option<Result<(ConnectionQuery, Client), ConnectionError>> = None;
         let request = accept_hdr_async_with_config(
             stream,
             |request: &Request, response: Response| {
                 let params =
                     parse_connection(request.uri(), audience, now, config.max_token_lifetime);
                 let accepted = params.is_ok();
-                parsed = Some(params);
+                parsed = Some(params.map(|(query, identity)| {
+                    let source = Source::resolve(peer, request.headers(), &config.trusted_proxies);
+                    (query, Client { identity, source })
+                }));
                 if accepted {
                     Ok(response)
                 } else {
@@ -152,7 +179,7 @@ impl Connection {
             }
         };
 
-        let (query, identity) = match parsed {
+        let (query, client) = match parsed {
             Some(Ok(parsed)) => parsed,
             Some(Err(error)) => return Err(error),
             None => match handshake.err() {
@@ -164,27 +191,28 @@ impl Connection {
         let websocket = handshake.map_err(ConnectionError::from)?;
         log::debug!(
             "handshake accepted for topic {} as {:?} ({})",
-            query.topic,
+            query.topic.log_tag(),
             query.role,
-            identity.did
+            client.identity.did
         );
 
-        Ok((query, identity, websocket))
+        Ok((query, client, websocket))
     }
 
     /// Build a connection for a peer that has been registered on `session`.
     pub fn new(
         query: ConnectionQuery,
-        identity: Identity,
+        client: Client,
         session: Arc<Session>,
-        outbound: mpsc::Receiver<RelayFrame>,
-        self_tx: mpsc::Sender<RelayFrame>,
+        outbound: mpsc::Receiver<Outbound>,
+        self_tx: mpsc::Sender<Outbound>,
         config: NativeRelayTransportConfig,
         limiter: Arc<Limiter>,
     ) -> Self {
         Self {
             query,
-            identity,
+            identity: client.identity,
+            source: client.source,
             session,
             outbound,
             self_tx,
@@ -200,20 +228,17 @@ impl Connection {
         registration: Registration,
     ) -> Result<(), ConnectionError> {
         let mut websocket = websocket;
+        let topic = self.query.topic.log_tag();
         log::debug!(
-            "serving peer {} on topic {} as {:?}",
+            "serving peer {} on topic {topic} as {:?}",
             self.identity.did,
-            self.query.topic,
             self.query.role
         );
         let both_ready = match registration {
             Registration::BothReady => true,
             Registration::Waiting => false,
             Registration::RoleTaken(role) => {
-                log::warn!(
-                    "rejecting connection for topic {}: {role:?} role already taken",
-                    self.query.topic
-                );
+                log::warn!("rejecting connection for topic {topic}: {role:?} role already taken");
                 let frame = CloseFrame {
                     code: CloseCode::Policy,
                     reason: "role already taken".into(),
@@ -245,8 +270,7 @@ impl Connection {
         let config = &self.config;
         if both_ready {
             log::info!(
-                "session ready for topic {}, role {:?}",
-                self.query.topic,
+                "session ready for topic {topic}, role {:?}",
                 self.query.role
             );
         }
@@ -265,6 +289,7 @@ impl Connection {
             config,
             limiter: &self.limiter,
             identity: &self.identity.did,
+            source: self.source,
             expires_at,
         };
         let result = read_loop(
@@ -304,14 +329,25 @@ async fn stop_writer(writer: &mut JoinHandle<()>) {
     }
 }
 
-async fn write_loop(
-    mut sink: SplitSink<RelayStream, Message>,
-    mut rx: mpsc::Receiver<RelayFrame>,
+/// Write queued frames and keepalive pings until the queue closes, the
+/// connection shuts down, or a write misses its deadline.
+///
+/// Besides the per-write timeout, a frame must be written within the queue
+/// timeout of entering the queue, so a reader that takes each write just in
+/// time but never catches up is dropped as well. The frames behind the one
+/// being written are checked when the writer reaches them, so a keepalive
+/// ping written in between can delay that by up to one write timeout. A frame
+/// holds its bytes in the peer's budget until it has been written.
+async fn write_loop<S>(
+    mut sink: S,
+    mut rx: mpsc::Receiver<Outbound>,
     mut shutdown: oneshot::Receiver<Option<CloseFrame>>,
     config: NativeRelayTransportConfig,
     ping_deadline: watch::Sender<Option<tokio::time::Instant>>,
     backlog_ready: Arc<Notify>,
-) {
+) where
+    S: Sink<Message> + Unpin,
+{
     let mut ping = tokio::time::interval_at(
         tokio::time::Instant::now() + config.ping_interval,
         config.ping_interval,
@@ -319,21 +355,33 @@ async fn write_loop(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut close_frame = None;
+    let mut session_ready_sent = false;
     loop {
         tokio::select! {
             received = rx.recv() => match received {
-                Some(frame) => {
+                Some(queued) => {
+                    let frame = &queued.frame;
                     let session_ready = matches!(&frame.body, RelayFrameBody::SessionReady);
-                    let Ok(text) = serde_json::to_string(&frame) else {
+                    let Ok(text) = serde_json::to_string(frame) else {
                         break;
                     };
-                    log::trace!("relay -> topic={} frame={text}", frame.topic);
-                    if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
+                    log::trace!(
+                        "relay -> topic={} type={} ({} bytes)",
+                        frame.topic.log_tag(),
+                        frame.body.relay_only_body().unwrap_or("message"),
+                        text.len()
+                    );
+                    let message = Message::text(text);
+                    if !send_queued(&mut sink, message, queued.queued_at, &config).await {
                         break;
                     }
-                    if session_ready {
-                        // The peer has been told it is ready, so the backlog
-                        // held for it may follow.
+                    // Written: its bytes go back to the peer's budget.
+                    drop(queued);
+                    // Once the peer has been told it is ready, the backlog
+                    // held for it may follow, and every later write makes room
+                    // in the queue for more of it.
+                    session_ready_sent |= session_ready;
+                    if session_ready_sent {
                         backlog_ready.notify_one();
                     }
                 }
@@ -386,51 +434,155 @@ fn spend_redelivery_credit(credit: &mut u32) -> bool {
     true
 }
 
-/// Charge an inbound control frame to the connection's inbound budget.
+/// Charge an inbound control frame like a text frame: to the connection's
+/// inbound budget, then to the shared budgets (see [`charge_shared`]).
 ///
-/// The frame is dropped when the budget is exhausted, and a peer that keeps
-/// exceeding it is disconnected like any other flooder. Returns `Err` only to
-/// disconnect the peer.
+/// Control frames are for the relay, not the counterpart, so they are charged
+/// whether or not one is connected. Without a connected counterpart they are
+/// [`Traffic::Unpaired`] and cannot spend the share reserved for paired
+/// traffic. The frame is dropped when a budget is exhausted, and a peer that
+/// keeps exceeding its own budget is disconnected like any other flooder.
+/// Returns `Err` only to disconnect the peer.
 fn charge_control_frame(
     bytes: usize,
     message_bucket: &mut Bucket,
     byte_bucket: &mut Bucket,
-    limits: &RelayLimitsConfig,
+    context: &ReadContext<'_>,
     consecutive_drops: &mut u32,
-    topic: &Topic,
+    topic: &impl fmt::Display,
 ) -> Result<(), ConnectionError> {
+    let limits = context.limiter.limits();
     let now = tokio::time::Instant::now();
-    let within_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
+    let within_connection_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
         && byte_bucket.allow_n(
             u32::try_from(bytes).unwrap_or(u32::MAX),
             limits.inbound_byte_rate,
             now,
         );
-    if within_limits {
-        *consecutive_drops = 0;
+    if !within_connection_limits {
+        *consecutive_drops += 1;
+        log::debug!("dropping control frame on topic {topic}: inbound rate limit exceeded");
+        if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+            log::warn!("peer on topic {topic} keeps exceeding its inbound rate limit; dropping");
+            return Err(ConnectionError::RateLimited);
+        }
         return Ok(());
     }
 
-    *consecutive_drops += 1;
-    log::debug!("dropping control frame on topic {topic}: inbound rate limit exceeded");
-    if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
-        log::warn!("peer on topic {topic} keeps exceeding its inbound rate limit; dropping");
-        return Err(ConnectionError::RateLimited);
-    }
+    let traffic = match context.session.counterpart(context.query.role)? {
+        Counterpart::Connected => Traffic::Paired,
+        Counterpart::Reserved | Counterpart::Absent => Traffic::Unpaired,
+    };
+    charge_shared(
+        context,
+        bytes,
+        traffic,
+        consecutive_drops,
+        "control frame",
+        topic,
+    )?;
     Ok(())
 }
 
+/// Charge `bytes` the connection's own budget has accepted to the shared
+/// budgets: the identity's and the source's shares of the relay-wide budget,
+/// and the budget itself. Returns whether the frame may go on, or `Err` to
+/// disconnect the peer.
+///
+/// A peer that keeps exceeding its identity's share is disconnected like one
+/// that keeps exceeding its own budget. An exhausted source share or
+/// relay-wide budget only drops the frame, without counting towards that:
+/// other identities, behind the same address or anywhere else, could
+/// otherwise get this peer disconnected.
+fn charge_shared(
+    context: &ReadContext<'_>,
+    bytes: usize,
+    traffic: Traffic,
+    consecutive_drops: &mut u32,
+    kind: &str,
+    topic: &impl fmt::Display,
+) -> Result<bool, ConnectionError> {
+    let ReadContext {
+        limiter,
+        identity,
+        source,
+        ..
+    } = *context;
+    match limiter.allow_inbound_bytes(identity, &source, bytes, traffic) {
+        InboundBytes::Allowed => {
+            *consecutive_drops = 0;
+            return Ok(true);
+        }
+        InboundBytes::ShareExhausted => {
+            *consecutive_drops += 1;
+            log::debug!(
+                "dropping {kind} on topic {topic}: identity share of the relay budget exhausted"
+            );
+            if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+                log::warn!(
+                    "peer on topic {topic} keeps exceeding its share of the relay budget; dropping"
+                );
+                return Err(ConnectionError::RateLimited);
+            }
+        }
+        InboundBytes::SourceExhausted => {
+            log::debug!(
+                "dropping {kind} on topic {topic}: source share of the relay budget exhausted"
+            );
+        }
+        InboundBytes::GlobalExhausted => {
+            log::debug!("dropping {kind} on topic {topic}: relay inbound byte budget exhausted");
+        }
+    }
+    Ok(false)
+}
+
 /// Send one message, returning whether the socket is still usable.
-async fn send_with_timeout(
-    sink: &mut SplitSink<RelayStream, Message>,
-    message: Message,
-    write_timeout: Duration,
-) -> bool {
+async fn send_with_timeout<S>(sink: &mut S, message: Message, write_timeout: Duration) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
     match tokio::time::timeout(write_timeout, sink.send(message)).await {
         Ok(Ok(())) => true,
         Ok(Err(_)) => false,
         Err(_) => {
             log::warn!("outbound websocket write timed out; closing connection");
+            false
+        }
+    }
+}
+
+/// Send a frame that entered the queue at `queued_at`, returning whether the
+/// socket is still usable.
+///
+/// The write gets the write timeout, cut short so that the frame is written
+/// within the queue timeout of entering the queue or not at all. A frame
+/// already past it is not attempted, even if the socket would take it now.
+async fn send_queued<S>(
+    sink: &mut S,
+    message: Message,
+    queued_at: tokio::time::Instant,
+    config: &NativeRelayTransportConfig,
+) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    let left = config
+        .outbound_queue_timeout
+        .saturating_sub(queued_at.elapsed());
+    if left >= config.write_timeout {
+        return send_with_timeout(sink, message, config.write_timeout).await;
+    }
+    let sent = if left.is_zero() {
+        None
+    } else {
+        tokio::time::timeout(left, sink.send(message)).await.ok()
+    };
+    match sent {
+        Some(Ok(())) => true,
+        Some(Err(_)) => false,
+        None => {
+            log::warn!("outbound queue is not draining; closing connection");
             false
         }
     }
@@ -443,17 +595,19 @@ struct ReadContext<'a> {
     config: &'a NativeRelayTransportConfig,
     limiter: &'a Limiter,
     identity: &'a DidKey,
+    source: Source,
     expires_at: tokio::time::Instant,
 }
 
 /// Everything a read loop needs to deliver a peer's backlog.
 struct BacklogDelivery {
-    /// Armed by the writer after `session_ready` has been written.
+    /// Armed by the writer after `session_ready` has been written, and after
+    /// every write from then on.
     ready: Arc<Notify>,
 
     /// The slot's channel. It is weak because the slot's handle must stay the
     /// only strong sender, so a replaced connection closes its queue
-    tx: mpsc::WeakSender<RelayFrame>,
+    tx: mpsc::WeakSender<Outbound>,
 }
 
 async fn read_loop(
@@ -469,9 +623,13 @@ async fn read_loop(
         session,
         config,
         limiter,
-        identity,
         expires_at,
+        ..
     } = *context;
+    let topic = query.topic.log_tag();
+    // A frame for a reconnecting counterpart is buffered only when buffering
+    // is on; otherwise nothing will receive it, as with no counterpart at all.
+    let buffering = config.session_buffer_max_messages > 0 && !config.session_buffer_ttl.is_zero();
 
     let limits = limiter.limits();
     let now = tokio::time::Instant::now();
@@ -480,49 +638,63 @@ async fn read_loop(
     let mut consecutive_drops = 0u32;
 
     let mut redelivery_credit = 0u32;
+    let mut backlog_pending = true;
+    let mut idle_deadline = now + config.idle_timeout;
 
+    // Every deadline is absolute and polled on each iteration, and no arm
+    // awaits anything, so neither a slow writer nor a backlog its counterpart
+    // keeps refilling can hold the connection past them.
     loop {
         let message = tokio::select! {
             biased;
 
             _ = &mut *writer => {
-                log::debug!("connection writer stopped for topic {}; closing", query.topic);
+                log::debug!("connection writer stopped for topic {topic}; closing");
                 break;
             }
             _ = wait_pong_deadline(ping_deadline_rx) => {
-                log::debug!("peer on topic {} missed a keepalive pong; dropping", query.topic);
+                log::debug!("peer on topic {topic} missed a keepalive pong; dropping");
                 return Err(ConnectionError::PongTimeout);
             }
             _ = tokio::time::sleep_until(expires_at) => {
-                log::debug!(
-                    "peer on topic {} has an expired token; closing",
-                    query.topic
-                );
+                log::debug!("peer on topic {topic} has an expired token; closing");
                 return Err(ConnectionError::TokenExpired);
             }
-            () = backlog.ready.notified() => {
-                if let Some(tx) = backlog.tx.upgrade() {
-                    let drained = session.drain_backlog(query.role, &tx).await?;
-                    redelivery_credit = redelivery_credit
-                        .saturating_add(u32::try_from(drained).unwrap_or(u32::MAX));
-                }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                log::debug!(
+                    "peer on topic {topic} idle for {:?}; dropping",
+                    config.idle_timeout
+                );
+                return Err(ConnectionError::IdleTimeout);
+            }
+            () = backlog.ready.notified(), if backlog_pending => {
+                // One step: what fits in the queue now. The writer wakes this
+                // arm again once it has made room.
+                backlog_pending = match backlog.tx.upgrade() {
+                    Some(tx) => {
+                        let drain = session.drain_backlog(query.role, &tx)?;
+                        // A continuously refilled backlog must not bank an
+                        // unbounded exemption for later inbound messages.
+                        let credit_cap = u32::try_from(config.session_buffer_max_messages)
+                            .unwrap_or(u32::MAX);
+                        redelivery_credit = redelivery_credit
+                            .saturating_add(u32::try_from(drain.delivered).unwrap_or(u32::MAX))
+                            .min(credit_cap);
+                        !drain.finished
+                    }
+                    // The slot let go of the queue: this connection was replaced.
+                    None => false,
+                };
                 continue;
             }
-            incoming = tokio::time::timeout(config.idle_timeout, source.next()) => match incoming {
-                Ok(Some(Ok(message))) => message,
-                Ok(Some(Err(error))) => return Err(error.into()),
-                Ok(None) => break,
-                Err(_) => {
-                    log::debug!(
-                        "peer on topic {} idle for {:?}; dropping",
-                        query.topic,
-                        config.idle_timeout
-                    );
-                    return Err(ConnectionError::IdleTimeout);
-                }
+            incoming = source.next() => match incoming {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
             },
         };
 
+        idle_deadline = tokio::time::Instant::now() + config.idle_timeout;
         let _ = ping_deadline.send(None);
 
         let frame = match message {
@@ -541,71 +713,70 @@ async fn read_loop(
                     );
                 if !within_connection_limits {
                     consecutive_drops += 1;
-                    log::debug!(
-                        "dropping frame on topic {}: inbound rate limit exceeded",
-                        query.topic
-                    );
+                    log::debug!("dropping frame on topic {topic}: inbound rate limit exceeded");
                     if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
                         log::warn!(
-                            "peer on topic {} keeps exceeding its inbound rate limit; dropping",
-                            query.topic
+                            "peer on topic {topic} keeps exceeding its inbound rate limit; dropping"
                         );
                         return Err(ConnectionError::RateLimited);
                     }
                     continue;
                 }
 
-                match limiter.allow_inbound_bytes(identity, text.len()) {
-                    InboundBytes::Allowed => consecutive_drops = 0,
-                    InboundBytes::ShareExhausted => {
-                        consecutive_drops += 1;
-                        log::debug!(
-                            "dropping frame on topic {}: identity share of the relay budget exhausted",
-                            query.topic
-                        );
-                        if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
-                            log::warn!(
-                                "peer on topic {} keeps exceeding its share of the relay budget; dropping",
-                                query.topic
-                            );
-                            return Err(ConnectionError::RateLimited);
-                        }
+                // Only a frame something can receive, its counterpart or the
+                // buffer kept for it while it reconnects, spends the shared
+                // budgets and is parsed. Any other frame is dropped here, at
+                // the cost of this connection's own budget alone. That budget
+                // accepted it, so it ends a run of rate-limit drops.
+                let traffic = match session.counterpart(query.role)? {
+                    Counterpart::Connected => Traffic::Paired,
+                    Counterpart::Reserved if buffering => Traffic::Unpaired,
+                    Counterpart::Reserved | Counterpart::Absent => {
+                        consecutive_drops = 0;
+                        log::trace!("dropping frame on topic {topic}: counterpart not connected");
                         continue;
                     }
-                    InboundBytes::GlobalExhausted => {
-                        log::debug!(
-                            "dropping frame on topic {}: relay inbound byte budget exhausted",
-                            query.topic
-                        );
-                        continue;
-                    }
+                };
+                let charged = charge_shared(
+                    context,
+                    text.len(),
+                    traffic,
+                    &mut consecutive_drops,
+                    "frame",
+                    &topic,
+                )?;
+                if !charged {
+                    continue;
                 }
 
-                log::trace!("relay <- topic={} frame={text}", query.topic);
-                serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
-                    log::warn!("invalid relay frame on topic {}: {error}", query.topic);
+                // Neither record carries the frame itself: it holds the topic,
+                // and the client picks its content.
+                log::trace!("relay <- topic={topic} ({} bytes)", text.len());
+                serde_json::from_str::<RelayFrame>(&text).map_err(|error| {
+                    let rejection = FrameRejection::new(&error, text.len());
+                    log::warn!("invalid relay frame on topic {topic}: {rejection}");
+                    ConnectionError::Frame(rejection)
                 })?
             }
             Message::Close(_) => break,
             // The relay protocol is JSON text only.
             Message::Binary(_) => {
-                log::warn!(
-                    "binary frame on topic {} is not part of the relay protocol",
-                    query.topic
-                );
+                log::warn!("binary frame on topic {topic} is not part of the relay protocol");
                 return Err(ConnectionError::UnexpectedBinary);
             }
             // Keepalive pongs and other control frames count as activity, but
-            // they are charged to the same budget as data frames so a peer
-            // cannot hold the connection open with unmetered traffic.
+            // they are charged to the same budgets as data frames, the shared
+            // ones included, so a peer cannot hold the connection open with
+            // unmetered traffic and identities cannot exceed the relay-wide
+            // budget with it.
             Message::Ping(payload) | Message::Pong(payload) => {
                 charge_control_frame(
                     payload.len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    &limits,
+                    context,
                     &mut consecutive_drops,
-                    &query.topic,
+                    &topic,
                 )?;
                 continue;
             }
@@ -614,9 +785,9 @@ async fn read_loop(
                     frame.payload().len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    &limits,
+                    context,
                     &mut consecutive_drops,
-                    &query.topic,
+                    &topic,
                 )?;
                 continue;
             }
@@ -624,25 +795,20 @@ async fn read_loop(
 
         if frame.v != RELAY_FRAME_VERSION {
             log::warn!(
-                "unsupported relay frame version {} on topic {}",
-                frame.v,
-                query.topic
+                "unsupported relay frame version {} on topic {topic}",
+                frame.v
             );
             return Err(ConnectionError::InvalidVersion(frame.v));
         }
         if frame.topic != query.topic {
             log::warn!(
-                "frame topic {} does not match subscription {}",
-                frame.topic,
-                query.topic
+                "frame topic {} does not match subscription {topic}",
+                frame.topic.log_tag()
             );
             return Err(ConnectionError::TopicMismatch);
         }
         if let Some(kind) = frame.body.relay_only_body() {
-            log::warn!(
-                "client sent relay-only {kind} frame on topic {}",
-                query.topic
-            );
+            log::warn!("client sent relay-only {kind} frame on topic {topic}");
             return Err(ConnectionError::ClientControlFrame(kind));
         }
 
@@ -654,10 +820,7 @@ async fn read_loop(
         ) {
             Ok(()) => {}
             Err(SessionError::NoCounterpart) => {
-                log::trace!(
-                    "dropping frame on topic {}: counterpart not connected",
-                    query.topic
-                );
+                log::trace!("dropping frame on topic {topic}: counterpart not connected");
             }
             Err(error) => return Err(error.into()),
         }
@@ -701,7 +864,7 @@ pub enum ConnectionError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 
     #[error("malformed relay frame: {0}")]
-    Frame(#[from] serde_json::Error),
+    Frame(FrameRejection),
 
     #[error(transparent)]
     Session(#[from] SessionError),
@@ -723,6 +886,9 @@ pub enum ConnectionError {
 
     #[error("websocket handshake timed out")]
     HandshakeTimeout,
+
+    #[error("peer address unavailable: {0}")]
+    PeerAddress(std::io::Error),
 
     #[error("handshake query is too large")]
     QueryTooLarge,
@@ -746,11 +912,56 @@ pub enum ConnectionError {
     Random(#[from] getrandom::Error),
 }
 
+/// What may be logged about a text frame that failed to parse: the kind of
+/// error, where it occurred and the frame's size, never the frame's content.
+///
+/// The rendered `serde_json` error quotes the offending value, escaped, so
+/// logging it would let a client write its frame into the log several times
+/// over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRejection {
+    category: Category,
+    line: usize,
+    column: usize,
+    bytes: usize,
+}
+
+impl FrameRejection {
+    fn new(error: &serde_json::Error, bytes: usize) -> Self {
+        Self {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+            bytes,
+        }
+    }
+}
+
+impl fmt::Display for FrameRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self.category {
+            Category::Io => "i/o",
+            Category::Syntax => "syntax",
+            Category::Data => "data",
+            Category::Eof => "end of input",
+        };
+        write!(
+            f,
+            "{category} error at line {} column {} ({} bytes)",
+            self.line, self.column, self.bytes
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::auth::test_utils::{self, signing_key};
+    use crate::limits::{OutboundBudget, RelayLimitsConfig};
+    use crate::session::PeerHandle;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::connect_async;
     use wallet_session_core::message::Topic;
 
     const AUDIENCE: &str = "wss://relay.example.com";
@@ -793,6 +1004,28 @@ mod tests {
             format!("{:?}", described_registration_id("a\nb")),
             r#""a\nb""#
         );
+    }
+
+    #[test]
+    fn frame_rejection_is_short_and_independent_of_the_frame() {
+        let text = format!(r#"{{"v":"{}"}}"#, "\u{7f}".repeat(200_000));
+        let Err(error) = serde_json::from_str::<RelayFrame>(&text) else {
+            panic!("a string version must be rejected");
+        };
+        // serde_json's own rendering quotes the value: this is what it replaces.
+        assert!(error.to_string().len() > 1_000_000);
+
+        let rejection = FrameRejection::new(&error, text.len());
+        let rendered = ConnectionError::Frame(rejection).to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "malformed relay frame: data error at line 1 column {} ({} bytes)",
+                error.column(),
+                text.len()
+            )
+        );
+        assert!(rendered.len() < 100);
     }
 
     #[test]
@@ -920,7 +1153,8 @@ mod tests {
 
         let config = NativeRelayTransportConfig::new(AUDIENCE)
             .with_handshake_timeout(Duration::from_millis(100));
-        let outcome = Connection::handshake(server, config).await;
+        let wire_rate = crate::limits::RelayLimitsConfig::default().inbound_wire_byte_rate;
+        let outcome = Connection::handshake(server, config, wire_rate).await;
         assert!(matches!(outcome, Err(ConnectionError::HandshakeTimeout)));
         Ok(())
     }
@@ -939,5 +1173,230 @@ mod tests {
         let mut writer = tokio::spawn(std::future::pending::<()>());
         stop_writer(&mut writer).await;
         assert!(writer.await.is_err_and(|error| error.is_cancelled()));
+    }
+
+    /// Ids of the frames a test reader accepted.
+    type Accepted = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A reader that takes `per_message` to accept each message, and the ids
+    /// of the frames it accepted.
+    fn slow_reader(per_message: Duration) -> (Accepted, impl Sink<Message> + Unpin) {
+        let accepted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = futures_util::sink::unfold(
+            Arc::clone(&accepted),
+            move |accepted, message: Message| async move {
+                tokio::time::sleep(per_message).await;
+                if let Message::Text(text) = &message
+                    && let Ok(frame) = serde_json::from_str::<RelayFrame>(text)
+                {
+                    accepted.lock().expect("accepted ids").push(frame.id);
+                }
+                Ok::<_, std::convert::Infallible>(accepted)
+            },
+        );
+        (accepted, Box::pin(sink))
+    }
+
+    /// Run a writer over `sink` as a connection does. It runs until the
+    /// returned sender shuts it down or is dropped.
+    fn spawn_writer<S>(
+        sink: S,
+        rx: mpsc::Receiver<Outbound>,
+        config: NativeRelayTransportConfig,
+    ) -> (oneshot::Sender<Option<CloseFrame>>, JoinHandle<()>)
+    where
+        S: Sink<Message> + Unpin + Send + 'static,
+    {
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let (ping_deadline, _) = watch::channel(None);
+        let writer = tokio::spawn(write_loop(
+            sink,
+            rx,
+            shutdown_rx,
+            config,
+            ping_deadline,
+            Arc::new(Notify::new()),
+        ));
+        (shutdown, writer)
+    }
+
+    /// Writer settings for these tests, with no keepalive ping in the way.
+    fn writer_config() -> NativeRelayTransportConfig {
+        NativeRelayTransportConfig::new(AUDIENCE)
+            .with_ping_interval(Duration::from_secs(3600))
+            .with_write_timeout(Duration::from_secs(10))
+            .with_outbound_queue_timeout(Duration::from_secs(15))
+    }
+
+    /// A message frame entering the queue now, holding 100 bytes of `budget`.
+    fn queued(
+        budget: &Arc<OutboundBudget>,
+        id: &str,
+    ) -> Result<Outbound, Box<dyn std::error::Error>> {
+        let frame = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: id.to_owned(),
+            topic: topic()?,
+            body: RelayFrameBody::Message {
+                payload: "ciphertext".to_owned(),
+            },
+        };
+        Ok(Outbound::new(frame, budget.try_charge(100)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_drops_a_reader_that_never_catches_up_with_its_queue() -> TestResult {
+        let budget = Arc::new(OutboundBudget::new(1024));
+        let (tx, rx) = mpsc::channel(8);
+        for i in 0..6 {
+            tx.try_send(queued(&budget, &format!("m{i}"))?)?;
+        }
+
+        // Every write takes 4s, well inside the 10s write timeout, but the
+        // six frames take 24s to get through and none may wait over 15s. The
+        // fourth is still being written at 15s: that write is cut short.
+        let (accepted, sink) = slow_reader(Duration::from_secs(4));
+        let start = tokio::time::Instant::now();
+        let (_shutdown, writer) = spawn_writer(sink, rx, writer_config());
+        timeout(Duration::from_secs(60), writer).await??;
+
+        let queue_timeout = Duration::from_secs(15);
+        let window = queue_timeout..=queue_timeout + WRITER_SHUTDOWN_GRACE;
+        let elapsed = start.elapsed();
+        assert!(
+            window.contains(&elapsed),
+            "the writer must stop once a frame has waited the queue timeout, not {elapsed:?}"
+        );
+        assert_eq!(*accepted.lock().expect("accepted ids"), ["m0", "m1", "m2"]);
+
+        drop(tx);
+        assert_eq!(budget.held(), 0, "frames left behind give their bytes back");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_keeps_a_slow_reader_that_keeps_up() -> TestResult {
+        let budget = Arc::new(OutboundBudget::new(1024));
+        let (tx, rx) = mpsc::channel(8);
+        let (accepted, sink) = slow_reader(Duration::from_secs(4));
+        let (shutdown, writer) = spawn_writer(sink, rx, writer_config());
+
+        // The last of these waits 8s and is written by 12s.
+        for i in 0..3 {
+            tx.try_send(queued(&budget, &format!("m{i}"))?)?;
+        }
+        // A frame queued long after the queue emptied waits only from then.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        tx.try_send(queued(&budget, "m3")?)?;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        assert!(
+            !writer.is_finished(),
+            "a reader that keeps up must not be dropped"
+        );
+        assert_eq!(
+            *accepted.lock().expect("accepted ids"),
+            ["m0", "m1", "m2", "m3"]
+        );
+        assert_eq!(budget.held(), 0, "written frames give their bytes back");
+
+        let _ = shutdown.send(None);
+        timeout(Duration::from_secs(1), writer).await??;
+        Ok(())
+    }
+
+    /// Limits under which only the connection's own byte budget can drop a
+    /// text frame. It holds `burst` bytes and does not refill within a test.
+    fn own_byte_budget(burst: u32) -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            inbound_message_rate: RateLimit {
+                burst: 1000,
+                interval: Duration::from_secs(3600),
+            },
+            inbound_byte_rate: RateLimit {
+                burst,
+                interval: Duration::from_secs(86_400),
+            },
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    /// Serve one proposer that has no counterpart under `limits`, have it send
+    /// `messages` and then close, and return how its connection ended.
+    async fn serve_alone(
+        limits: RelayLimitsConfig,
+        messages: Vec<Message>,
+    ) -> Result<Result<(), ConnectionError>, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let now = unix_now();
+        let auth = test_utils::token(&signing_key(1), AUDIENCE, now, now + 300);
+        let url = format!("ws://{addr}/?auth={auth}&role=proposer&topic={}", topic()?);
+        let client = tokio::spawn(connect_async(url));
+
+        let (stream, _) = listener.accept().await?;
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let wire_rate = limits.inbound_wire_byte_rate;
+        let (query, peer, websocket) =
+            Connection::handshake(stream, config.clone(), wire_rate).await?;
+        let (mut client, _) = client.await??;
+
+        let limiter = Arc::new(Limiter::new(limits));
+        let session = Arc::new(Session::default());
+        let (tx, rx) = mpsc::channel(config.outbound_queue_capacity);
+        let handle = PeerHandle {
+            identity: peer.identity.did.clone(),
+            tx: tx.clone(),
+            budget: Arc::new(OutboundBudget::new(config.outbound_queue_max_bytes)),
+        };
+        let ready = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: "ready".to_owned(),
+            topic: topic()?,
+            body: RelayFrameBody::SessionReady,
+        };
+        let permit = limiter.acquire_identity(&peer.identity.did);
+        let registration = session.register(Role::Proposer, handle, &ready, permit)?;
+        let connection = Connection::new(query, peer, session, rx, tx, config, limiter);
+        let served = tokio::spawn(connection.run(websocket, registration));
+
+        // Once the relay has dropped the peer, sending fails.
+        for message in messages {
+            let _ = client.send(message).await;
+        }
+        let _ = client.close(None).await;
+        Ok(timeout(Duration::from_secs(5), served).await??)
+    }
+
+    /// A frame nothing can receive is dropped unparsed, but one within the
+    /// connection's own budget still ends a run of rate-limit drops: only
+    /// drops in a row disconnect a peer, with or without a counterpart.
+    #[tokio::test]
+    async fn accepted_frames_without_a_counterpart_end_a_run_of_drops() -> TestResult {
+        const BURST: u32 = 1000;
+        let fits = Message::text("s");
+        // Once a byte is spent, a frame of the whole burst never fits again.
+        let over = Message::text("o".repeat(usize::try_from(BURST)?));
+        let tolerated = usize::try_from(MAX_CONSECUTIVE_RATE_DROPS)?;
+
+        let mut interleaved = vec![fits.clone()];
+        for _ in 0..2 {
+            interleaved.extend(vec![over.clone(); tolerated]);
+            interleaved.push(fits.clone());
+        }
+        let outcome = serve_alone(own_byte_budget(BURST), interleaved).await?;
+        assert!(
+            outcome.is_ok(),
+            "drops broken up by accepted frames must not disconnect: {outcome:?}"
+        );
+
+        let mut in_a_row = vec![fits];
+        in_a_row.extend(vec![over; tolerated + 1]);
+        let outcome = serve_alone(own_byte_budget(BURST), in_a_row).await?;
+        assert!(
+            matches!(outcome, Err(ConnectionError::RateLimited)),
+            "drops in a row must still disconnect: {outcome:?}"
+        );
+        Ok(())
     }
 }

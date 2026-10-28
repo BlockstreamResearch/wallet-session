@@ -11,9 +11,10 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseC
 use crate::{
     config::NativeRelayTransportConfig,
     connection::{Connection, ConnectionError, RELAY_FRAME_VERSION, RelayStream, random_id},
-    limits::Limiter,
+    limits::{Limiter, OutboundBudget},
     registry::{Registry, RegistryError},
     session::{PeerHandle, Registration, SessionError},
+    telemetry::bounded,
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
@@ -40,7 +41,8 @@ pub async fn serve(
 
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, registry, limiter, config).await {
-                        log::debug!("relay connection ended with error: {error}");
+                        // Errors can quote what the client sent.
+                        log::debug!("relay connection ended with error: {}", bounded(&error));
                     }
                 });
             }
@@ -65,7 +67,10 @@ pub async fn handle(
     };
 
     let grace = config.session_grace;
-    let (query, identity, mut websocket) = Connection::handshake(stream, config.clone()).await?;
+    let wire_rate = limiter.limits().inbound_wire_byte_rate;
+    let (query, client, mut websocket) =
+        Connection::handshake(stream, config.clone(), wire_rate).await?;
+    let identity = &client.identity;
 
     if !limiter.allow_connect(&identity.did) {
         log::warn!("connect rate limit exceeded for {}", identity.did);
@@ -94,6 +99,7 @@ pub async fn handle(
     let peer = PeerHandle {
         identity: identity.did.clone(),
         tx: tx.clone(),
+        budget: Arc::new(OutboundBudget::new(config.outbound_queue_max_bytes)),
     };
 
     let ready = RelayFrame {
@@ -118,17 +124,9 @@ pub async fn handle(
         };
 
     let holds_slot = !matches!(registration, Registration::RoleTaken(_));
-    let result = Connection::new(
-        query,
-        identity,
-        session,
-        rx,
-        tx,
-        config,
-        Arc::clone(&limiter),
-    )
-    .run(websocket, registration)
-    .await;
+    let result = Connection::new(query, client, session, rx, tx, config, Arc::clone(&limiter))
+        .run(websocket, registration)
+        .await;
 
     if holds_slot
         && registry
@@ -148,7 +146,10 @@ pub async fn handle(
         tokio::spawn(async move {
             sleep(grace).await;
             if let Err(error) = registry.expire(&notify_topic, role, &notification) {
-                log::warn!("could not expire the reservation on topic {notify_topic}: {error}");
+                log::warn!(
+                    "could not expire the reservation on topic {}: {error}",
+                    notify_topic.log_tag()
+                );
             }
         });
     }
@@ -184,13 +185,24 @@ pub enum ServerError {
 mod tests {
     use super::*;
     use crate::auth::test_utils::{self, signing_key};
+    use crate::connection::MAX_CONSECUTIVE_RATE_DROPS;
     use crate::limits::{Limiter, RateLimit, RelayLimitsConfig};
+    use crate::source::{IpPrefix, REAL_IP_HEADER};
+    use crate::telemetry::test_utils::{CapturedLogs, capture};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
     use tokio_tungstenite::{
         MaybeTlsStream, WebSocketStream, connect_async,
-        tungstenite::{Bytes, Message},
+        tungstenite::{
+            Bytes, Message,
+            client::IntoClientRequest,
+            http::HeaderValue,
+            protocol::frame::{
+                Frame, FrameHeader,
+                coding::{Data, OpCode},
+            },
+        },
     };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
     use wallet_session_core::message::Topic;
@@ -384,14 +396,16 @@ mod tests {
         config: NativeRelayTransportConfig,
         limits: RelayLimitsConfig,
     ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+        serve_with_limiter(config, Arc::new(Limiter::new(limits))).await
+    }
+
+    async fn serve_with_limiter(
+        config: NativeRelayTransportConfig,
+        limiter: Arc<Limiter>,
+    ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(serve(
-            listener,
-            Arc::new(Registry::new()),
-            Arc::new(Limiter::new(limits)),
-            config,
-        ));
+        tokio::spawn(serve(listener, Arc::new(Registry::new()), limiter, config));
         Ok(addr)
     }
 
@@ -533,8 +547,12 @@ mod tests {
 
     /// Drain a client until the relay closes it (or the connection errors).
     async fn expect_closed(client: &mut Client) -> bool {
+        expect_closed_within(client, Duration::from_secs(2)).await
+    }
+
+    async fn expect_closed_within(client: &mut Client, wait: Duration) -> bool {
         loop {
-            match timeout(Duration::from_secs(2), client.next()).await {
+            match timeout(wait, client.next()).await {
                 Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => return true,
                 Ok(Some(Ok(_))) => {}
                 Err(_) => return false,
@@ -584,6 +602,12 @@ mod tests {
         drop(responder);
         sleep(Duration::from_millis(100)).await;
 
+        // Keep the three writes in order before the reconnect, rather than
+        // leaving the last one in the client's Nagle buffer.
+        if let MaybeTlsStream::Plain(stream) = proposer.get_mut() {
+            stream.set_nodelay(true)?;
+        }
+
         // Three frames while the responder is gone, but only two may be kept.
         for (id, payload) in [("m1", "one"), ("m2", "two"), ("m3", "three")] {
             send(&mut proposer, &message(&topic, id, payload)).await?;
@@ -608,6 +632,47 @@ mod tests {
             }
         }
         assert_eq!(delivered, vec!["two".to_owned(), "three".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_buffer_keeps_the_newest_frames_its_byte_budget_holds() -> TestResult {
+        let topic = topic()?;
+        let payload = "a".repeat(1000);
+        // Each frame is re-encoded as the client sent it: room for two, not three.
+        let encoded = serde_json::to_string(&message(&topic, "m1", &payload))?;
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_secs(2))
+                .with_outbound_queue_max_bytes(2 * encoded.len()),
+        )
+        .await?;
+
+        let (mut proposer, responder) = ready_pair(addr, &topic).await?;
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        for id in ["m1", "m2", "m3"] {
+            send(&mut proposer, &message(&topic, id, &payload)).await?;
+        }
+        // Let the relay buffer them before the responder returns.
+        sleep(Duration::from_millis(200)).await;
+
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        let mut redelivered = Vec::new();
+        while let Ok(Ok(frame)) =
+            timeout(Duration::from_millis(300), read_frame(&mut responder)).await
+        {
+            redelivered.push(frame.id);
+        }
+        assert_eq!(
+            redelivered,
+            ["m2", "m3"],
+            "the oldest buffered frame makes room for the newest"
+        );
         Ok(())
     }
 
@@ -1711,6 +1776,7 @@ mod tests {
             RelayLimitsConfig {
                 inbound_message_rate: unlimited,
                 inbound_byte_rate: unlimited,
+                inbound_wire_byte_rate: unlimited,
                 global_inbound_byte_rate: unlimited,
                 ..RelayLimitsConfig::default()
             },
@@ -1749,6 +1815,91 @@ mod tests {
         }
         drop(responder);
         assert!(released, "stalled responder kept its slot");
+        Ok(())
+    }
+
+    /// A reader too slow to take its backlog must not hold its connection past
+    /// the token's expiry: the deadline is observed while the backlog is still
+    /// being handed over, not once the reader has caught up.
+    #[tokio::test]
+    async fn token_expiry_closes_a_connection_stuck_on_its_backlog() -> TestResult {
+        // Far more than the loopback socket buffers hold.
+        const BACKLOG: usize = 160;
+
+        let unlimited = RateLimit {
+            burst: u32::MAX,
+            interval: Duration::from_secs(1),
+        };
+        // The write deadline is far beyond the test, so only the token can end
+        // the stuck connection in time. The byte budget holds the whole
+        // backlog, so it outlasts the socket buffers.
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_outbound_queue_capacity(2)
+                .with_outbound_queue_max_bytes(32 * 1024 * 1024)
+                .with_write_timeout(Duration::from_secs(60)),
+            RelayLimitsConfig {
+                inbound_message_rate: unlimited,
+                inbound_byte_rate: unlimited,
+                inbound_wire_byte_rate: unlimited,
+                identity_inbound_byte_rate: unlimited,
+                source_inbound_byte_rate: unlimited,
+                global_inbound_byte_rate: unlimited,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+        let mut responder = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        let payload = "a".repeat(100 * 1024);
+        for i in 0..BACKLOG {
+            send(&mut proposer, &message(&topic, &format!("m{i}"), &payload)).await?;
+        }
+        // Let the relay buffer all of it before the responder returns.
+        sleep(Duration::from_millis(500)).await;
+
+        // It comes back with a token that expires within two seconds, and does
+        // not read until well after that.
+        let now = crate::auth::unix_now();
+        let short = test_utils::token(&signing_key(8), AUDIENCE, now, now + 2);
+        let mut stuck = connect_auth(addr, &short, "responder", &topic, None).await?;
+        assert!(
+            matches!(
+                read_frame(&mut proposer).await?.body,
+                RelayFrameBody::SessionReady
+            ),
+            "the responder must reclaim its slot and backlog within the grace window"
+        );
+        sleep(Duration::from_secs(3)).await;
+
+        let mut delivered = 0usize;
+        let closed = loop {
+            match timeout(Duration::from_secs(5), stuck.next()).await {
+                Err(_) => break false,
+                Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => break true,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let frame: RelayFrame = serde_json::from_str(&text)?;
+                    if matches!(frame.body, RelayFrameBody::Message { .. }) {
+                        delivered += 1;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+            }
+        };
+        assert!(closed, "the relay kept the expired connection open");
+        // What the socket buffers held at expiry arrives, but the relay must
+        // not have gone on handing the backlog to an expired connection.
+        assert!(
+            (1..BACKLOG).contains(&delivered),
+            "expected the relay to stop part-way through the backlog, got {delivered}/{BACKLOG}"
+        );
         Ok(())
     }
 
@@ -1914,6 +2065,497 @@ mod tests {
         Ok(())
     }
 
+    /// Wait until `counter` reaches `expected`, for at most two seconds, and
+    /// return what it reads then.
+    async fn wait_for_count(counter: impl Fn() -> u64, expected: u64) -> u64 {
+        for _ in 0..100 {
+            if counter() >= expected {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        counter()
+    }
+
+    /// Send `count` pings carrying `payload` bytes each.
+    async fn send_pings(client: &mut Client, count: u32, payload: u32) -> TestResult {
+        let payload = Bytes::from(vec![b'p'; usize::try_from(payload)?]);
+        for _ in 0..count {
+            client.send(Message::Ping(payload.clone())).await?;
+        }
+        Ok(())
+    }
+
+    /// Bytes of the pings these tests send.
+    const PING_PAYLOAD: u32 = 100;
+
+    /// Limits under which only a budget a test tightens can refuse a frame.
+    fn roomy_limits() -> RelayLimitsConfig {
+        let roomy = RateLimit {
+            burst: 16 * 1024 * 1024,
+            interval: Duration::from_secs(3600),
+        };
+        RelayLimitsConfig {
+            inbound_message_rate: RateLimit {
+                burst: 1000,
+                interval: Duration::from_secs(3600),
+            },
+            inbound_byte_rate: roomy,
+            inbound_wire_byte_rate: roomy,
+            identity_inbound_byte_rate: roomy,
+            source_inbound_byte_rate: roomy,
+            global_inbound_byte_rate: roomy,
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    /// Limits under which only the shared byte budgets can refuse a ping.
+    /// The pinging connections have no counterpart, so their pings may not
+    /// spend a paired reserve: there is none, and the whole budget is theirs.
+    fn ping_limits() -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            global_paired_reserve_percent: 0,
+            ..roomy_limits()
+        }
+    }
+
+    /// Pings spend the relay-wide inbound budget like text frames, and its
+    /// exhaustion drops them without disconnecting an identity that is within
+    /// its own limits.
+    #[tokio::test]
+    async fn control_frames_spend_the_global_budget_and_spare_others() -> TestResult {
+        // Room for ten pings, refilling far slower than the test runs.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 10 * PING_PAYLOAD,
+                interval: Duration::from_secs(3600),
+            },
+            ..ping_limits()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // One identity spends the whole relay-wide budget on pings: the
+        // eleventh no longer fits it.
+        let mut hog = connect_auth(addr, &token_with(7), "proposer", &topic()?, None).await?;
+        send_pings(&mut hog, 11, PING_PAYLOAD).await?;
+        let payload = u64::from(PING_PAYLOAD);
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), payload).await;
+        assert_eq!(
+            dropped, payload,
+            "ten pings must fit the relay-wide budget and the eleventh must not"
+        );
+
+        // An unrelated identity within its own limits has its pings dropped
+        // for the exhausted relay budget, more often than the consecutive-drop
+        // limit allows, and is not disconnected for it.
+        let other = Topic::new([2u8; 32])?;
+        let mut victim = connect_auth(addr, &token_with(8), "proposer", &other, None).await?;
+        let flood = MAX_CONSECUTIVE_RATE_DROPS + 8;
+        send_pings(&mut victim, flood, PING_PAYLOAD).await?;
+        let expected = payload * (1 + u64::from(flood));
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), expected).await;
+        assert_eq!(
+            dropped, expected,
+            "pings past the exhausted relay budget must be dropped and counted"
+        );
+        assert_eq!(limiter.dropped_share_bytes(), 0);
+
+        for client in [&mut victim, &mut hog] {
+            assert!(
+                timeout(Duration::from_millis(500), expect_closed(client))
+                    .await
+                    .is_err(),
+                "an exhausted relay-wide budget alone must not disconnect anyone"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pings spend the sender's identity share, and an identity that keeps
+    /// exceeding it with them is disconnected like a text flooder.
+    #[tokio::test]
+    async fn control_frames_over_the_identity_share_disconnect_the_sender() -> TestResult {
+        // Room for one ping, refilling far slower than the test runs.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: RateLimit {
+                burst: PING_PAYLOAD,
+                interval: Duration::from_secs(3600),
+            },
+            ..ping_limits()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Every ping after the first is dropped, and once the drops pass the
+        // consecutive-drop limit the sender is disconnected. Sends may fail
+        // after that.
+        let mut hog = connect(addr, "proposer", &topic()?, None).await?;
+        let _ = send_pings(&mut hog, MAX_CONSECUTIVE_RATE_DROPS + 8, PING_PAYLOAD).await;
+        let limit = u64::from(PING_PAYLOAD) * u64::from(MAX_CONSECUTIVE_RATE_DROPS);
+        let dropped = wait_for_count(|| limiter.dropped_share_bytes(), limit + 1).await;
+        assert!(
+            dropped > limit,
+            "the relay must process enough dropped pings to reach the disconnect threshold"
+        );
+        assert!(
+            expect_closed_within(&mut hog, Duration::from_secs(10)).await,
+            "an identity flooding control frames over its share must be disconnected"
+        );
+        assert_eq!(limiter.dropped_global_bytes(), 0);
+        Ok(())
+    }
+
+    /// Connect as `auth`, sending `X-Real-IP: real_ip` if one is given.
+    async fn connect_claiming(
+        addr: SocketAddr,
+        auth: &str,
+        role: &str,
+        topic: &Topic,
+        real_ip: Option<&str>,
+    ) -> Result<Client, Box<dyn std::error::Error>> {
+        let mut request =
+            format!("ws://{addr}/?auth={auth}&role={role}&topic={topic}").into_client_request()?;
+        if let Some(real_ip) = real_ip {
+            request
+                .headers_mut()
+                .insert(REAL_IP_HEADER, HeaderValue::from_str(real_ip)?);
+        }
+        let (client, _response) = connect_async(request).await?;
+        Ok(client)
+    }
+
+    /// Ready session `n` of a test, on a topic and between two identities of
+    /// its own. Its proposer, which the tests send from, claims `real_ip` if
+    /// one is given.
+    async fn session_claiming(
+        addr: SocketAddr,
+        n: u8,
+        real_ip: Option<&str>,
+    ) -> Result<(Topic, (Client, Client)), Box<dyn std::error::Error>> {
+        let topic = Topic::new([100 + n; 32])?;
+        let proposer = token_with(2 * n + 1);
+        let responder = token_with(2 * n + 2);
+        let mut proposer = connect_claiming(addr, &proposer, "proposer", &topic, real_ip).await?;
+        let mut responder = connect_claiming(addr, &responder, "responder", &topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+        Ok((topic, (proposer, responder)))
+    }
+
+    /// Send `frame` from the first client of `pair` and report whether the
+    /// second receives it.
+    async fn reaches(
+        pair: &mut (Client, Client),
+        frame: &RelayFrame,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        send(&mut pair.0, frame).await?;
+        let received = timeout(Duration::from_millis(300), read_frame(&mut pair.1)).await;
+        Ok(matches!(received, Ok(Ok(RelayFrame { ref id, .. })) if *id == frame.id))
+    }
+
+    /// Bytes the relay charges for `frame`, the text the client sends.
+    fn charged_bytes(frame: &RelayFrame) -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(u32::try_from(serde_json::to_string(frame)?.len())?)
+    }
+
+    /// A frame nothing can receive is dropped before it is parsed, and costs
+    /// its connection's own budget only: none of the shared budgets.
+    #[tokio::test]
+    async fn frames_nothing_can_receive_spend_no_shared_budget() -> TestResult {
+        let tight = RateLimit {
+            burst: 4096,
+            interval: Duration::from_secs(3600),
+        };
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: tight,
+            source_inbound_byte_rate: tight,
+            global_inbound_byte_rate: tight,
+            ..RelayLimitsConfig::default()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Five times what any shared budget holds, then a frame that would
+        // close the connection if it were parsed.
+        let topic = topic()?;
+        let payload = "a".repeat(1000);
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+        for i in 0..20 {
+            send(
+                &mut proposer,
+                &message(&topic, &format!("x{i:02}"), &payload),
+            )
+            .await?;
+        }
+        proposer.send(Message::text("not a relay frame")).await?;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            (
+                limiter.dropped_share_bytes(),
+                limiter.dropped_source_bytes(),
+                limiter.dropped_global_bytes()
+            ),
+            (0, 0, 0),
+            "a frame without a receiver must not be charged to a shared budget"
+        );
+
+        // The connection survived, and every shared budget is still whole.
+        let responder = connect(addr, "responder", &topic, None).await?;
+        let mut pair = (proposer, responder);
+        read_frame(&mut pair.0).await?;
+        read_frame(&mut pair.1).await?;
+        for i in 0..3 {
+            let frame = message(&topic, &format!("m{i}"), &payload);
+            assert!(
+                reaches(&mut pair, &frame).await?,
+                "paired frame {i} was refused"
+            );
+        }
+        Ok(())
+    }
+
+    /// The connection's own budget still meters frames nothing can receive,
+    /// and a peer flooding past it is disconnected.
+    #[tokio::test]
+    async fn frames_nothing_can_receive_still_spend_the_connection_budget() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            tight_inbound_limits(),
+        )
+        .await?;
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+
+        for i in 0..64 {
+            if send(&mut proposer, &message(&topic, &format!("m{i}"), "x"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        assert!(
+            expect_closed(&mut proposer).await,
+            "a one-sided flood over the connection's own limit must be disconnected"
+        );
+        Ok(())
+    }
+
+    /// Traffic that does not travel between two connected peers, here frames
+    /// buffered for a peer that is away, cannot spend the paired reserve; and
+    /// paired frames refused for an exhausted relay budget disconnect no one.
+    #[tokio::test]
+    async fn paired_traffic_keeps_its_reserve_under_one_sided_load() -> TestResult {
+        let payload = "a".repeat(900);
+        let frame = charged_bytes(&message(&topic()?, "b0", &payload))?;
+
+        // Three frames beside the reserve, and the reserve holds one more.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 4 * frame,
+                interval: Duration::from_secs(3600),
+            },
+            global_paired_reserve_percent: 25,
+            ..roomy_limits()
+        }));
+        assert_eq!(limiter.limits().paired_reserve_bytes(), frame);
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        let (away, (mut sender, gone)) = session_claiming(addr, 0, None).await?;
+        drop(gone);
+        sleep(Duration::from_millis(100)).await;
+        for id in ["b0", "b1", "b2", "b3"] {
+            send(&mut sender, &message(&away, id, &payload)).await?;
+        }
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), u64::from(frame)).await;
+        assert_eq!(
+            dropped,
+            u64::from(frame),
+            "three buffered frames fit beside the reserve, and the fourth does not"
+        );
+
+        let (talking, mut pair) = session_claiming(addr, 1, None).await?;
+        assert!(
+            reaches(&mut pair, &message(&talking, "v0", &payload)).await?,
+            "a paired frame must find the reserve untouched"
+        );
+        assert!(
+            !reaches(&mut pair, &message(&talking, "v1", &payload)).await?,
+            "the reserve is a share of the budget, not more of it"
+        );
+        assert_eq!(limiter.dropped_global_bytes(), 2 * u64::from(frame));
+
+        for client in [&mut sender, &mut pair.0] {
+            assert!(
+                timeout(Duration::from_millis(500), expect_closed(client))
+                    .await
+                    .is_err(),
+                "an exhausted relay-wide budget alone must not disconnect anyone"
+            );
+        }
+        Ok(())
+    }
+
+    /// Limits under which a source's share holds two of the frames these tests
+    /// send, and nothing else can refuse one.
+    fn source_limits(frame: u32) -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            source_inbound_byte_rate: RateLimit {
+                burst: 2 * frame,
+                interval: Duration::from_secs(3600),
+            },
+            ..roomy_limits()
+        }
+    }
+
+    /// Without trusted proxies, the source is the TCP peer: identities
+    /// connecting from one address share its share, and a client cannot buy
+    /// a fresh one by naming another address in `X-Real-IP`.
+    #[tokio::test]
+    async fn a_direct_peer_cannot_name_its_own_source() -> TestResult {
+        let payload = "a".repeat(1000);
+        let frame = charged_bytes(&message(&topic()?, "m0", &payload))?;
+        let limiter = Arc::new(Limiter::new(source_limits(frame)));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        let (topic, mut spender) = session_claiming(addr, 0, None).await?;
+        for id in ["m0", "m1"] {
+            assert!(reaches(&mut spender, &message(&topic, id, &payload)).await?);
+        }
+
+        let (topic, mut same_address) = session_claiming(addr, 1, None).await?;
+        assert!(
+            !reaches(&mut same_address, &message(&topic, "s0", &payload)).await?,
+            "another identity from the same address shares the spent share"
+        );
+        let (topic, mut spoofer) = session_claiming(addr, 2, Some("203.0.113.7")).await?;
+        assert!(
+            !reaches(&mut spoofer, &message(&topic, "s1", &payload)).await?,
+            "X-Real-IP from a peer that is not a trusted proxy must be ignored"
+        );
+        assert_eq!(limiter.dropped_source_bytes(), 2 * u64::from(frame));
+        assert_eq!(limiter.dropped_share_bytes(), 0);
+
+        assert!(
+            timeout(Duration::from_millis(500), expect_closed(&mut spoofer.0))
+                .await
+                .is_err(),
+            "an exhausted source share alone must not disconnect anyone"
+        );
+        Ok(())
+    }
+
+    /// Behind a trusted proxy, the source is the client address the proxy
+    /// names: one per IPv4 address, one per IPv6 /64.
+    #[tokio::test]
+    async fn a_trusted_proxy_names_each_client_source() -> TestResult {
+        let payload = "a".repeat(1000);
+        let frame = charged_bytes(&message(&topic()?, "m0", &payload))?;
+        let limiter = Arc::new(Limiter::new(source_limits(frame)));
+        let config = NativeRelayTransportConfig::new(AUDIENCE)
+            .with_trusted_proxies(vec!["127.0.0.1".parse::<IpPrefix>()?]);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Each client spends its source's share, which another identity
+        // behind the same source then finds spent, and a neighbour does not.
+        let clients = [
+            ("198.51.100.1", "198.51.100.1", "198.51.100.2"),
+            ("2001:db8:1:1::1", "2001:db8:1:1::2", "2001:db8:1:2::1"),
+        ];
+        for (n, (spender, same_source, neighbour)) in (0u8..).step_by(3).zip(clients) {
+            let (topic, mut pair) = session_claiming(addr, n, Some(spender)).await?;
+            for id in ["m0", "m1"] {
+                assert!(
+                    reaches(&mut pair, &message(&topic, id, &payload)).await?,
+                    "{spender} has a share of its own"
+                );
+            }
+
+            let (topic, mut pair) = session_claiming(addr, n + 1, Some(same_source)).await?;
+            assert!(
+                !reaches(&mut pair, &message(&topic, "s0", &payload)).await?,
+                "{same_source} is the same source as {spender}"
+            );
+
+            let (topic, mut pair) = session_claiming(addr, n + 2, Some(neighbour)).await?;
+            assert!(
+                reaches(&mut pair, &message(&topic, "n0", &payload)).await?,
+                "{neighbour} is a source of its own"
+            );
+        }
+        assert_eq!(limiter.dropped_source_bytes(), 2 * u64::from(frame));
+        Ok(())
+    }
+
+    /// A data frame as a client hands it to its WebSocket, which masks it on
+    /// the way out.
+    fn raw_frame(opcode: Data, is_final: bool, payload: &[u8]) -> Message {
+        Message::Frame(Frame::from_payload(
+            FrameHeader {
+                is_final,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: OpCode::Data(opcode),
+                mask: None,
+            },
+            Bytes::copy_from_slice(payload),
+        ))
+    }
+
+    /// The fragment bypass the Cloud audit reproduced, at a bounded scale. A
+    /// FIN=0 text frame and 100,000 empty continuations, six bytes each, were
+    /// parsed in milliseconds with nothing charged, because none of them is a
+    /// message. Every byte now passes the connection's wire budget before it
+    /// is parsed, so the flood is read at that rate, and the sender is slowed
+    /// down, not disconnected.
+    #[tokio::test]
+    async fn empty_continuation_flood_is_read_at_the_wire_rate() -> TestResult {
+        const CONTINUATIONS: usize = 10_000;
+        // The flood is about 60 KB, nearly four bursts.
+        let wire_rate = RateLimit {
+            burst: 16 * 1024,
+            interval: Duration::from_secs(1),
+        };
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                inbound_wire_byte_rate: wire_rate,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+
+        let started = tokio::time::Instant::now();
+        proposer.feed(raw_frame(Data::Text, false, b"")).await?;
+        for _ in 0..CONTINUATIONS {
+            proposer.feed(raw_frame(Data::Continue, false, b"")).await?;
+        }
+        let last = serde_json::to_string(&message(&topic, "f0", "after-fragments"))?;
+        proposer
+            .send(raw_frame(Data::Continue, true, last.as_bytes()))
+            .await?;
+
+        // The message is whole, so every fragment was read, in order.
+        assert_eq!(read_frame(&mut responder).await?.id, "f0");
+        // What the burst did not cover takes about 2.7 seconds.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "empty continuations must be read at the wire rate, took {elapsed:?}"
+        );
+
+        // The sender is still connected, and its next frame goes through.
+        send(&mut proposer, &message(&topic, "f1", "still-connected")).await?;
+        assert_eq!(read_frame(&mut responder).await?.id, "f1");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn frame_over_incoming_size_cap_closes_connection() -> TestResult {
         let addr = serve_with(
@@ -1926,5 +2568,119 @@ mod tests {
         let _ = send(&mut proposer, &message(&topic, "big", &"a".repeat(4096))).await;
         assert!(expect_closed(&mut proposer).await);
         Ok(())
+    }
+
+    /// Wait for a captured record that contains `needle`.
+    async fn logged(logs: &CapturedLogs, needle: &str) -> bool {
+        for _ in 0..200 {
+            if logs.records().iter().any(|record| record.contains(needle)) {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn logs_tag_topics_instead_of_writing_them() -> TestResult {
+        // At trace, so that every record the relay can write is checked.
+        let (logs, _capture) = capture("trace");
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+        send(&mut proposer, &message(&topic, "m1", "hello")).await?;
+        read_frame(&mut responder).await?;
+
+        // Warnings that name topics: a role already taken, and a frame
+        // stamped with another topic.
+        let mut second = connect_auth(addr, &token_with(8), "proposer", &topic, None).await?;
+        assert!(expect_closed(&mut second).await);
+        let other = Topic::new([8u8; 32])?;
+        send(&mut proposer, &message(&other, "rogue", "cross-topic")).await?;
+        assert!(expect_closed(&mut proposer).await);
+
+        let tag = topic.log_tag();
+        for needle in [
+            format!("session ready for topic {tag}"),
+            format!("rejecting connection for topic {tag}"),
+            format!(
+                "frame topic {} does not match subscription {tag}",
+                other.log_tag()
+            ),
+        ] {
+            assert!(logged(&logs, &needle).await, "nothing logged {needle:?}");
+        }
+
+        let records = logs.records();
+        for raw in [
+            topic.to_string(),
+            format!("{topic:?}"),
+            other.to_string(),
+            format!("{other:?}"),
+        ] {
+            assert!(
+                records.iter().all(|record| !record.contains(&raw)),
+                "a record carries the raw topic {raw}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a frame that serde_json would quote, escaped, into its error and
+    /// check the records the relay writes about it at `filter`.
+    async fn invalid_frame_records_are_short_and_content_free(filter: &str) -> TestResult {
+        let (logs, _capture) = capture(filter);
+        let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
+        let topic = topic()?;
+        let (mut proposer, _responder) = ready_pair(addr, &topic).await?;
+
+        let frame = format!(r#"{{"v":"{}"}}"#, "\u{7f}".repeat(200_000));
+        proposer.send(Message::text(frame)).await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "an invalid frame closes the connection"
+        );
+
+        assert!(logged(&logs, "invalid relay frame on topic").await);
+        if filter != "info" {
+            assert!(
+                logged(
+                    &logs,
+                    "relay connection ended with error: malformed relay frame"
+                )
+                .await
+            );
+        }
+        for record in logs.records() {
+            assert!(
+                record.len() < 1024,
+                "a {}-byte record at {filter}",
+                record.len()
+            );
+            assert!(
+                !record.contains('\u{7f}') && !record.contains("\\u{7f}"),
+                "a record at {filter} carries the frame"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_info() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("info").await
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_debug() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("debug").await
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_trace() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("trace").await
     }
 }
