@@ -1,6 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use futures_util::{Sink, SinkExt, StreamExt, stream::SplitStream};
+use serde_json::error::Category;
 use thiserror::Error;
 use tokio::{
     net::TcpStream,
@@ -161,7 +162,7 @@ impl Connection {
         let websocket = handshake.map_err(ConnectionError::from)?;
         log::debug!(
             "handshake accepted for topic {} as {:?} ({})",
-            query.topic,
+            query.topic.log_tag(),
             query.role,
             identity.did
         );
@@ -197,20 +198,17 @@ impl Connection {
         registration: Registration,
     ) -> Result<(), ConnectionError> {
         let mut websocket = websocket;
+        let topic = self.query.topic.log_tag();
         log::debug!(
-            "serving peer {} on topic {} as {:?}",
+            "serving peer {} on topic {topic} as {:?}",
             self.identity.did,
-            self.query.topic,
             self.query.role
         );
         let both_ready = match registration {
             Registration::BothReady => true,
             Registration::Waiting => false,
             Registration::RoleTaken(role) => {
-                log::warn!(
-                    "rejecting connection for topic {}: {role:?} role already taken",
-                    self.query.topic
-                );
+                log::warn!("rejecting connection for topic {topic}: {role:?} role already taken");
                 let frame = CloseFrame {
                     code: CloseCode::Policy,
                     reason: "role already taken".into(),
@@ -242,8 +240,7 @@ impl Connection {
         let config = &self.config;
         if both_ready {
             log::info!(
-                "session ready for topic {}, role {:?}",
-                self.query.topic,
+                "session ready for topic {topic}, role {:?}",
                 self.query.role
             );
         }
@@ -337,7 +334,12 @@ async fn write_loop<S>(
                     let Ok(text) = serde_json::to_string(frame) else {
                         break;
                     };
-                    log::trace!("relay -> topic={} frame={text}", frame.topic);
+                    log::trace!(
+                        "relay -> topic={} type={} ({} bytes)",
+                        frame.topic.log_tag(),
+                        frame.body.relay_only_body().unwrap_or("message"),
+                        text.len()
+                    );
                     let message = Message::text(text);
                     if !send_queued(&mut sink, message, queued.queued_at, &config).await {
                         break;
@@ -419,6 +421,7 @@ fn charge_control_frame(
     consecutive_drops: &mut u32,
     topic: &Topic,
 ) -> Result<(), ConnectionError> {
+    let topic = topic.log_tag();
     let limits = limiter.limits();
     let now = tokio::time::Instant::now();
     let within_connection_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
@@ -548,6 +551,7 @@ async fn read_loop(
         identity,
         expires_at,
     } = *context;
+    let topic = query.topic.log_tag();
 
     let limits = limiter.limits();
     let now = tokio::time::Instant::now();
@@ -567,24 +571,20 @@ async fn read_loop(
             biased;
 
             _ = &mut *writer => {
-                log::debug!("connection writer stopped for topic {}; closing", query.topic);
+                log::debug!("connection writer stopped for topic {topic}; closing");
                 break;
             }
             _ = wait_pong_deadline(ping_deadline_rx) => {
-                log::debug!("peer on topic {} missed a keepalive pong; dropping", query.topic);
+                log::debug!("peer on topic {topic} missed a keepalive pong; dropping");
                 return Err(ConnectionError::PongTimeout);
             }
             _ = tokio::time::sleep_until(expires_at) => {
-                log::debug!(
-                    "peer on topic {} has an expired token; closing",
-                    query.topic
-                );
+                log::debug!("peer on topic {topic} has an expired token; closing");
                 return Err(ConnectionError::TokenExpired);
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 log::debug!(
-                    "peer on topic {} idle for {:?}; dropping",
-                    query.topic,
+                    "peer on topic {topic} idle for {:?}; dropping",
                     config.idle_timeout
                 );
                 return Err(ConnectionError::IdleTimeout);
@@ -630,14 +630,10 @@ async fn read_loop(
                     );
                 if !within_connection_limits {
                     consecutive_drops += 1;
-                    log::debug!(
-                        "dropping frame on topic {}: inbound rate limit exceeded",
-                        query.topic
-                    );
+                    log::debug!("dropping frame on topic {topic}: inbound rate limit exceeded");
                     if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
                         log::warn!(
-                            "peer on topic {} keeps exceeding its inbound rate limit; dropping",
-                            query.topic
+                            "peer on topic {topic} keeps exceeding its inbound rate limit; dropping"
                         );
                         return Err(ConnectionError::RateLimited);
                     }
@@ -649,13 +645,11 @@ async fn read_loop(
                     InboundBytes::ShareExhausted => {
                         consecutive_drops += 1;
                         log::debug!(
-                            "dropping frame on topic {}: identity share of the relay budget exhausted",
-                            query.topic
+                            "dropping frame on topic {topic}: identity share of the relay budget exhausted"
                         );
                         if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
                             log::warn!(
-                                "peer on topic {} keeps exceeding its share of the relay budget; dropping",
-                                query.topic
+                                "peer on topic {topic} keeps exceeding its share of the relay budget; dropping"
                             );
                             return Err(ConnectionError::RateLimited);
                         }
@@ -663,25 +657,25 @@ async fn read_loop(
                     }
                     InboundBytes::GlobalExhausted => {
                         log::debug!(
-                            "dropping frame on topic {}: relay inbound byte budget exhausted",
-                            query.topic
+                            "dropping frame on topic {topic}: relay inbound byte budget exhausted"
                         );
                         continue;
                     }
                 }
 
-                log::trace!("relay <- topic={} frame={text}", query.topic);
-                serde_json::from_str::<RelayFrame>(&text).inspect_err(|error| {
-                    log::warn!("invalid relay frame on topic {}: {error}", query.topic);
+                // Neither record carries the frame itself: it holds the topic,
+                // and the client picks its content.
+                log::trace!("relay <- topic={topic} ({} bytes)", text.len());
+                serde_json::from_str::<RelayFrame>(&text).map_err(|error| {
+                    let rejection = FrameRejection::new(&error, text.len());
+                    log::warn!("invalid relay frame on topic {topic}: {rejection}");
+                    ConnectionError::Frame(rejection)
                 })?
             }
             Message::Close(_) => break,
             // The relay protocol is JSON text only.
             Message::Binary(_) => {
-                log::warn!(
-                    "binary frame on topic {} is not part of the relay protocol",
-                    query.topic
-                );
+                log::warn!("binary frame on topic {topic} is not part of the relay protocol");
                 return Err(ConnectionError::UnexpectedBinary);
             }
             // Keepalive pongs and other control frames count as activity, but
@@ -717,25 +711,20 @@ async fn read_loop(
 
         if frame.v != RELAY_FRAME_VERSION {
             log::warn!(
-                "unsupported relay frame version {} on topic {}",
-                frame.v,
-                query.topic
+                "unsupported relay frame version {} on topic {topic}",
+                frame.v
             );
             return Err(ConnectionError::InvalidVersion(frame.v));
         }
         if frame.topic != query.topic {
             log::warn!(
-                "frame topic {} does not match subscription {}",
-                frame.topic,
-                query.topic
+                "frame topic {} does not match subscription {topic}",
+                frame.topic.log_tag()
             );
             return Err(ConnectionError::TopicMismatch);
         }
         if let Some(kind) = frame.body.relay_only_body() {
-            log::warn!(
-                "client sent relay-only {kind} frame on topic {}",
-                query.topic
-            );
+            log::warn!("client sent relay-only {kind} frame on topic {topic}");
             return Err(ConnectionError::ClientControlFrame(kind));
         }
 
@@ -747,10 +736,7 @@ async fn read_loop(
         ) {
             Ok(()) => {}
             Err(SessionError::NoCounterpart) => {
-                log::trace!(
-                    "dropping frame on topic {}: counterpart not connected",
-                    query.topic
-                );
+                log::trace!("dropping frame on topic {topic}: counterpart not connected");
             }
             Err(error) => return Err(error.into()),
         }
@@ -794,7 +780,7 @@ pub enum ConnectionError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
 
     #[error("malformed relay frame: {0}")]
-    Frame(#[from] serde_json::Error),
+    Frame(FrameRejection),
 
     #[error(transparent)]
     Session(#[from] SessionError),
@@ -837,6 +823,47 @@ pub enum ConnectionError {
 
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),
+}
+
+/// What may be logged about a text frame that failed to parse: the kind of
+/// error, where it occurred and the frame's size, never the frame's content.
+///
+/// The rendered `serde_json` error quotes the offending value, escaped, so
+/// logging it would let a client write its frame into the log several times
+/// over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRejection {
+    category: Category,
+    line: usize,
+    column: usize,
+    bytes: usize,
+}
+
+impl FrameRejection {
+    fn new(error: &serde_json::Error, bytes: usize) -> Self {
+        Self {
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+            bytes,
+        }
+    }
+}
+
+impl fmt::Display for FrameRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let category = match self.category {
+            Category::Io => "i/o",
+            Category::Syntax => "syntax",
+            Category::Data => "data",
+            Category::Eof => "end of input",
+        };
+        write!(
+            f,
+            "{category} error at line {} column {} ({} bytes)",
+            self.line, self.column, self.bytes
+        )
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +915,28 @@ mod tests {
             format!("{:?}", described_registration_id("a\nb")),
             r#""a\nb""#
         );
+    }
+
+    #[test]
+    fn frame_rejection_is_short_and_independent_of_the_frame() {
+        let text = format!(r#"{{"v":"{}"}}"#, "\u{7f}".repeat(200_000));
+        let Err(error) = serde_json::from_str::<RelayFrame>(&text) else {
+            panic!("a string version must be rejected");
+        };
+        // serde_json's own rendering quotes the value: this is what it replaces.
+        assert!(error.to_string().len() > 1_000_000);
+
+        let rejection = FrameRejection::new(&error, text.len());
+        let rendered = ConnectionError::Frame(rejection).to_string();
+        assert_eq!(
+            rendered,
+            format!(
+                "malformed relay frame: data error at line 1 column {} ({} bytes)",
+                error.column(),
+                text.len()
+            )
+        );
+        assert!(rendered.len() < 100);
     }
 
     #[test]

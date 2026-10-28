@@ -3,6 +3,7 @@ use crate::did::DidKey;
 use crate::error::Error;
 use crate::payload::Payload;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
@@ -162,11 +163,53 @@ impl Topic {
         }
         Ok(Self(bytes))
     }
+
+    /// A short tag that tells topics apart in logs without disclosing them.
+    ///
+    /// A topic is a bearer secret, so logs carry this tag instead: the first
+    /// four bytes of SHA-256 over a fixed domain separator and the topic, in
+    /// hex. It is the same in every process, and nothing short of searching
+    /// the topic space recovers a topic from it. The digest is only computed
+    /// when the tag is formatted.
+    pub fn log_tag(&self) -> TopicLogTag<'_> {
+        TopicLogTag(self)
+    }
 }
 
 impl fmt::Display for Topic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&codec::encode(&self.0))
+    }
+}
+
+/// Log-safe stand-in for a [`Topic`]; see [`Topic::log_tag`].
+#[derive(Clone, Copy)]
+pub struct TopicLogTag<'a>(&'a Topic);
+
+impl TopicLogTag<'_> {
+    /// Domain separator, so the tag is not a plain hash of the topic.
+    const DOMAIN: &'static [u8] = b"wallet-session/topic-log-tag/v1";
+
+    /// Digest bytes kept.
+    const LEN: usize = 4;
+}
+
+impl fmt::Display for TopicLogTag<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digest = Sha256::new()
+            .chain_update(Self::DOMAIN)
+            .chain_update(&self.0.0)
+            .finalize();
+        digest[..Self::LEN]
+            .iter()
+            .try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// Same as [`fmt::Display`]: a derived `Debug` would print the topic.
+impl fmt::Debug for TopicLogTag<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -319,6 +362,24 @@ mod tests {
     fn topic_base64url_round_trip() {
         let topic = Topic::new([7u8; 32]).unwrap();
         assert_eq!(topic.to_string().parse::<Topic>().unwrap(), topic);
+    }
+
+    #[test]
+    fn topic_log_tag_is_short_stable_and_hides_the_topic() {
+        let topic = Topic::new([7u8; 32]).unwrap();
+        let tag = topic.log_tag().to_string();
+
+        assert_eq!(tag.len(), 8);
+        assert!(
+            tag.bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert_eq!(topic.clone().log_tag().to_string(), tag);
+        assert_eq!(format!("{:?}", topic.log_tag()), tag);
+        assert_ne!(Topic::new([8u8; 32]).unwrap().log_tag().to_string(), tag);
+
+        // The topic's own encoding is untouched.
+        assert_eq!(topic.to_string(), codec::encode(&[7u8; 32]));
     }
 
     #[test]

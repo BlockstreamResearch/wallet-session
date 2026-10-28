@@ -14,6 +14,7 @@ use crate::{
     limits::{Limiter, OutboundBudget},
     registry::{Registry, RegistryError},
     session::{PeerHandle, Registration, SessionError},
+    telemetry::bounded,
 };
 use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
 
@@ -40,7 +41,8 @@ pub async fn serve(
 
                 tokio::spawn(async move {
                     if let Err(error) = handle(stream, registry, limiter, config).await {
-                        log::debug!("relay connection ended with error: {error}");
+                        // Errors can quote what the client sent.
+                        log::debug!("relay connection ended with error: {}", bounded(&error));
                     }
                 });
             }
@@ -149,7 +151,10 @@ pub async fn handle(
         tokio::spawn(async move {
             sleep(grace).await;
             if let Err(error) = registry.expire(&notify_topic, role, &notification) {
-                log::warn!("could not expire the reservation on topic {notify_topic}: {error}");
+                log::warn!(
+                    "could not expire the reservation on topic {}: {error}",
+                    notify_topic.log_tag()
+                );
             }
         });
     }
@@ -187,6 +192,7 @@ mod tests {
     use crate::auth::test_utils::{self, signing_key};
     use crate::connection::MAX_CONSECUTIVE_RATE_DROPS;
     use crate::limits::{Limiter, RateLimit, RelayLimitsConfig};
+    use crate::telemetry::test_utils::{CapturedLogs, capture};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
@@ -2182,5 +2188,119 @@ mod tests {
         let _ = send(&mut proposer, &message(&topic, "big", &"a".repeat(4096))).await;
         assert!(expect_closed(&mut proposer).await);
         Ok(())
+    }
+
+    /// Wait for a captured record that contains `needle`.
+    async fn logged(logs: &CapturedLogs, needle: &str) -> bool {
+        for _ in 0..200 {
+            if logs.records().iter().any(|record| record.contains(needle)) {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn logs_tag_topics_instead_of_writing_them() -> TestResult {
+        // At trace, so that every record the relay can write is checked.
+        let (logs, _capture) = capture("trace");
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+        send(&mut proposer, &message(&topic, "m1", "hello")).await?;
+        read_frame(&mut responder).await?;
+
+        // Warnings that name topics: a role already taken, and a frame
+        // stamped with another topic.
+        let mut second = connect_auth(addr, &token_with(8), "proposer", &topic, None).await?;
+        assert!(expect_closed(&mut second).await);
+        let other = Topic::new([8u8; 32])?;
+        send(&mut proposer, &message(&other, "rogue", "cross-topic")).await?;
+        assert!(expect_closed(&mut proposer).await);
+
+        let tag = topic.log_tag();
+        for needle in [
+            format!("session ready for topic {tag}"),
+            format!("rejecting connection for topic {tag}"),
+            format!(
+                "frame topic {} does not match subscription {tag}",
+                other.log_tag()
+            ),
+        ] {
+            assert!(logged(&logs, &needle).await, "nothing logged {needle:?}");
+        }
+
+        let records = logs.records();
+        for raw in [
+            topic.to_string(),
+            format!("{topic:?}"),
+            other.to_string(),
+            format!("{other:?}"),
+        ] {
+            assert!(
+                records.iter().all(|record| !record.contains(&raw)),
+                "a record carries the raw topic {raw}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a frame that serde_json would quote, escaped, into its error and
+    /// check the records the relay writes about it at `filter`.
+    async fn invalid_frame_records_are_short_and_content_free(filter: &str) -> TestResult {
+        let (logs, _capture) = capture(filter);
+        let addr = serve_with(NativeRelayTransportConfig::new(AUDIENCE)).await?;
+        let topic = topic()?;
+        let (mut proposer, _responder) = ready_pair(addr, &topic).await?;
+
+        let frame = format!(r#"{{"v":"{}"}}"#, "\u{7f}".repeat(200_000));
+        proposer.send(Message::text(frame)).await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "an invalid frame closes the connection"
+        );
+
+        assert!(logged(&logs, "invalid relay frame on topic").await);
+        if filter != "info" {
+            assert!(
+                logged(
+                    &logs,
+                    "relay connection ended with error: malformed relay frame"
+                )
+                .await
+            );
+        }
+        for record in logs.records() {
+            assert!(
+                record.len() < 1024,
+                "a {}-byte record at {filter}",
+                record.len()
+            );
+            assert!(
+                !record.contains('\u{7f}') && !record.contains("\\u{7f}"),
+                "a record at {filter} carries the frame"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_info() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("info").await
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_debug() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("debug").await
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_records_are_short_at_trace() -> TestResult {
+        invalid_frame_records_are_short_and_content_free("trace").await
     }
 }
