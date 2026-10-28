@@ -75,6 +75,67 @@ impl IpPrefix {
         let address = address.to_canonical();
         address.is_ipv4() == self.network.is_ipv4() && mask(address, self.length) == self.network
     }
+
+    /// The first and last address of the range, as integers.
+    fn span(&self) -> (u128, u128) {
+        let (first, host_bits) = match self.network {
+            IpAddr::V4(v4) => (
+                u128::from(u32::from(v4)),
+                32u32.saturating_sub(u32::from(self.length)),
+            ),
+            IpAddr::V6(v6) => (
+                u128::from(v6),
+                128u32.saturating_sub(u32::from(self.length)),
+            ),
+        };
+        let hosts = u128::MAX.checked_shr(128 - host_bits).unwrap_or(0);
+        (first, first | hosts)
+    }
+}
+
+/// The whole of an address family, as a range, if `ranges` together hold
+/// every address a peer of that family can connect from. Trusting them would
+/// let every such peer name its own source, as trusting `0.0.0.0/0` would.
+///
+/// Peers are compared in canonical form, so an IPv6 list need not hold the
+/// IPv4-mapped block to take in every IPv6 peer.
+pub fn covered_family(ranges: &[IpPrefix]) -> Option<IpPrefix> {
+    let v4 = ranges
+        .iter()
+        .filter(|range| range.network.is_ipv4())
+        .map(IpPrefix::span);
+    if covers_all(v4, u128::from(u32::MAX)) {
+        return IpPrefix::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+    }
+
+    let mapped = u128::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0));
+    let v6 = ranges
+        .iter()
+        .filter(|range| range.network.is_ipv6())
+        .map(IpPrefix::span)
+        .chain([(mapped, mapped | u128::from(u32::MAX))]);
+    if covers_all(v6, u128::MAX) {
+        return IpPrefix::new(Ipv6Addr::UNSPECIFIED.into(), 0);
+    }
+    None
+}
+
+/// Whether `spans`, inclusive, together hold every integer up to `last`.
+fn covers_all(spans: impl Iterator<Item = (u128, u128)>, last: u128) -> bool {
+    let mut spans: Vec<_> = spans.collect();
+    spans.sort_unstable();
+    // The lowest integer none of the spans seen so far holds.
+    let mut next = 0u128;
+    for (first, end) in spans {
+        if first > next {
+            return false;
+        }
+        match end.checked_add(1) {
+            Some(after) if after <= last => next = next.max(after),
+            _ => return true,
+        }
+    }
+    false
 }
 
 impl FromStr for IpPrefix {
@@ -245,6 +306,50 @@ mod tests {
                 invalid.parse::<IpPrefix>().is_err(),
                 "{invalid:?} must be rejected"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ranges_that_together_hold_every_peer_are_found() -> TestResult {
+        let every_v4: IpPrefix = "0.0.0.0/0".parse()?;
+        let every_v6: IpPrefix = "::/0".parse()?;
+        assert_eq!(covered_family(&proxies(&["0.0.0.0/0"])), Some(every_v4));
+        assert_eq!(
+            covered_family(&proxies(&["128.0.0.0/1", "fd00::/8", "0.0.0.0/1"])),
+            Some(every_v4),
+            "two halves trust every IPv4 peer as /0 does"
+        );
+        assert_eq!(
+            covered_family(&proxies(&["::ffff:0.0.0.0/97", "128.0.0.0/1"])),
+            Some(every_v4),
+            "an IPv4-mapped range is its IPv4 range"
+        );
+        assert_eq!(
+            covered_family(&proxies(&["8000::/1", "::/1"])),
+            Some(every_v6)
+        );
+
+        // Every range beside the IPv4-mapped block: no IPv6 peer is left out.
+        let mapped = u128::from(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0));
+        let around = (0..96u8)
+            .map(|bit| {
+                let differs = Ipv6Addr::from(mapped ^ (1u128 << (127 - bit)));
+                IpPrefix::new(IpAddr::V6(differs), bit + 1)
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("ranges around the mapped block")?;
+        assert_eq!(covered_family(&around), Some(every_v6));
+        assert_eq!(covered_family(&around[1..]), None);
+
+        let partial: [&[&str]; 4] = [
+            &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"],
+            &["0.0.0.0/1", "128.0.0.0/2", "192.0.0.0/3", "::/1"],
+            &["127.0.0.1", "::1"],
+            &[],
+        ];
+        for ranges in partial {
+            assert_eq!(covered_family(&proxies(ranges)), None, "{ranges:?}");
         }
         Ok(())
     }

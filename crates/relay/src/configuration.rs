@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::{
     config::NativeRelayTransportConfig,
     limits::{RateLimit, RelayLimitsConfig},
-    source::IpPrefix,
+    source::{IpPrefix, covered_family},
 };
 
 pub const CONFIGURATION_DIRECTORY: &str = "configuration";
@@ -69,7 +69,19 @@ pub enum ConfigurationError {
     UnreservedBelowFrameCap { unreserved: u32, frame: u32 },
 
     #[error(
-        "application.trusted_proxies must not contain {0}: it would let every peer \
+        "limits.inbound_wire_byte_rate ({wire_burst} bytes per {wire_seconds} s) must be at \
+         least limits.inbound_byte_rate ({payload_burst} bytes per {payload_seconds} s), in \
+         burst and in rate"
+    )]
+    WireRateBelowPayloadRate {
+        wire_burst: u32,
+        wire_seconds: u64,
+        payload_burst: u32,
+        payload_seconds: u64,
+    },
+
+    #[error(
+        "application.trusted_proxies must not cover {0}: it would let every peer \
          name its own source"
     )]
     TrustsEveryPeer(IpPrefix),
@@ -273,13 +285,8 @@ impl Settings {
                 self.application_address(),
             ));
         }
-        if let Some(range) = self
-            .application
-            .trusted_proxies
-            .iter()
-            .find(|range| range.length() == 0)
-        {
-            return Err(ConfigurationError::TrustsEveryPeer(*range));
+        if let Some(family) = covered_family(&self.application.trusted_proxies) {
+            return Err(ConfigurationError::TrustsEveryPeer(family));
         }
 
         for (setting, value) in [
@@ -429,6 +436,22 @@ impl Settings {
                     frame,
                 });
             }
+        }
+        // Every payload byte crosses the wire too, framing on top: a wire
+        // budget below the payload budget would throttle the reads, pongs
+        // included, of a peer within its limits. Rates are compared over the
+        // product of the two intervals.
+        let wire = &self.limits.inbound_wire_byte_rate;
+        let payload = &self.limits.inbound_byte_rate;
+        let wire_bytes = u128::from(wire.burst) * u128::from(payload.interval_seconds);
+        let payload_bytes = u128::from(payload.burst) * u128::from(wire.interval_seconds);
+        if wire.burst < payload.burst || wire_bytes < payload_bytes {
+            return Err(ConfigurationError::WireRateBelowPayloadRate {
+                wire_burst: wire.burst,
+                wire_seconds: wire.interval_seconds,
+                payload_burst: payload.burst,
+                payload_seconds: payload.interval_seconds,
+            });
         }
         // Frames buffered for a reconnecting peer cannot spend the reserve,
         // so what is left of the burst must still hold a whole frame.
@@ -681,13 +704,25 @@ mod tests {
 
     #[test]
     fn fairness_settings_that_break_the_boundary_are_rejected() -> TestResult {
-        for everyone in ["0.0.0.0/0", "::/0"] {
+        let everyone: [&[&str]; 4] = [
+            &["0.0.0.0/0"],
+            &["::/0"],
+            &["10.0.0.0/8", "0.0.0.0/1", "128.0.0.0/1"],
+            &["::/1", "8000::/1"],
+        ];
+        for ranges in everyone {
             let mut settings = shipped()?;
-            settings.application.trusted_proxies = vec![everyone.parse()?];
-            assert!(matches!(
-                settings.validate(),
-                Err(ConfigurationError::TrustsEveryPeer(_))
-            ));
+            settings.application.trusted_proxies = ranges
+                .iter()
+                .map(|range| range.parse())
+                .collect::<Result<_, _>>()?;
+            assert!(
+                matches!(
+                    settings.validate(),
+                    Err(ConfigurationError::TrustsEveryPeer(_))
+                ),
+                "{ranges:?} trusts every peer of a family"
+            );
         }
 
         let mut settings = shipped()?;
@@ -759,6 +794,30 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn wire_rate_below_the_payload_rate_is_rejected() -> TestResult {
+        let below = |burst: u32, interval_seconds: u64| -> Result<bool, ConfigurationError> {
+            let mut settings = shipped()?;
+            settings.limits.inbound_wire_byte_rate = RateSettings {
+                burst,
+                interval_seconds,
+            };
+            Ok(matches!(
+                settings.validate(),
+                Err(ConfigurationError::WireRateBelowPayloadRate { .. })
+            ))
+        };
+        // The shipped payload rate: 512 KiB per 2 seconds.
+        let payload = shipped()?.limits.inbound_byte_rate;
+        assert_eq!((payload.burst, payload.interval_seconds), (512 * 1024, 2));
+
+        assert!(below(512 * 1024 - 1, 2)?, "a smaller burst");
+        assert!(below(1024 * 1024, 5)?, "a larger burst refilling slower");
+        assert!(!below(512 * 1024, 2)?, "the payload rate itself");
+        assert!(!below(1024 * 1024, 4)?, "a larger burst at the same rate");
         Ok(())
     }
 

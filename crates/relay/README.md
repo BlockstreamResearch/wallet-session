@@ -45,9 +45,12 @@ address, a byte-rate burst below the maximum incoming frame (no frame could
 ever fit it), an outbound byte budget below the maximum incoming frame, or a
 maximum incoming frame above `u32::MAX`. Every byte bucket and outbound budget
 must hold a whole frame, and so must the part of the global burst outside the
-paired reserve, which must be below 100 percent. A trusted proxy range of
-length 0 (`0.0.0.0/0`, `::/0`) is refused: it would let every peer choose its
-own source.
+paired reserve, which must be below 100 percent. The wire budget may not be
+below `inbound_byte_rate`, in burst or in rate. Trusted proxy ranges that
+together hold every IPv4 or every IPv6 address (`0.0.0.0/0`, `::/0`, or
+`0.0.0.0/1` with `128.0.0.0/1`) are refused: they would let every peer choose
+its own source. Narrower ranges are taken as given, so a range that holds
+client addresses lets those clients choose theirs.
 
 ### Inbound fairness
 
@@ -123,8 +126,9 @@ Topology limits:
   addresses, or with routed IPv6 space (a /48 holds 65,536 /64s), gets one
   share for each; the global budget and the paired reserve remain the bound
   on what such a client can take. As for identities, at most 65,536 sources
-  are tracked at once; past that, idle ones are pruned first and then
-  arbitrary ones are forgotten, starting again with a full share.
+  are tracked at once. Past that, a share is forgotten only once it has
+  refilled completely (checked at most once a second); until one has, new
+  sources spend one share between them instead of displacing a tracked one.
 - Trusting a proxy is only safe when the proxy overwrites `X-Real-IP` and
   nothing else reachable from a trusted address can connect to the relay. The
   compose deployment trusts the private ranges Docker assigns its networks
@@ -169,7 +173,8 @@ fragmented message, and the payloads of complete messages.
   payload is counted once in each, never twice in one. The default leaves room
   for the framing of a peer that stays within `inbound_byte_rate`, so only
   overhead-heavy traffic, like a fragment flood, is slowed. Keep it above
-  `inbound_byte_rate`.
+  `inbound_byte_rate`: the relay refuses to start with a wire burst or rate
+  below it.
 - `limits.inbound_wire_byte_rate` is required, like the other limits; a
   configuration file written for an earlier version must add it.
 

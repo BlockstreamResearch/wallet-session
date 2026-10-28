@@ -726,11 +726,13 @@ async fn read_loop(
                 // Only a frame something can receive, its counterpart or the
                 // buffer kept for it while it reconnects, spends the shared
                 // budgets and is parsed. Any other frame is dropped here, at
-                // the cost of this connection's own budget alone.
+                // the cost of this connection's own budget alone. That budget
+                // accepted it, so it ends a run of rate-limit drops.
                 let traffic = match session.counterpart(query.role)? {
                     Counterpart::Connected => Traffic::Paired,
                     Counterpart::Reserved if buffering => Traffic::Unpaired,
                     Counterpart::Reserved | Counterpart::Absent => {
+                        consecutive_drops = 0;
                         log::trace!("dropping frame on topic {topic}: counterpart not connected");
                         continue;
                     }
@@ -956,8 +958,10 @@ mod tests {
     use super::*;
 
     use crate::auth::test_utils::{self, signing_key};
-    use crate::limits::OutboundBudget;
-    use tokio::time::timeout;
+    use crate::limits::{OutboundBudget, RelayLimitsConfig};
+    use crate::session::PeerHandle;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::connect_async;
     use wallet_session_core::message::Topic;
 
     const AUDIENCE: &str = "wss://relay.example.com";
@@ -1298,6 +1302,101 @@ mod tests {
 
         let _ = shutdown.send(None);
         timeout(Duration::from_secs(1), writer).await??;
+        Ok(())
+    }
+
+    /// Limits under which only the connection's own byte budget can drop a
+    /// text frame. It holds `burst` bytes and does not refill within a test.
+    fn own_byte_budget(burst: u32) -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            inbound_message_rate: RateLimit {
+                burst: 1000,
+                interval: Duration::from_secs(3600),
+            },
+            inbound_byte_rate: RateLimit {
+                burst,
+                interval: Duration::from_secs(86_400),
+            },
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    /// Serve one proposer that has no counterpart under `limits`, have it send
+    /// `messages` and then close, and return how its connection ended.
+    async fn serve_alone(
+        limits: RelayLimitsConfig,
+        messages: Vec<Message>,
+    ) -> Result<Result<(), ConnectionError>, Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let now = unix_now();
+        let auth = test_utils::token(&signing_key(1), AUDIENCE, now, now + 300);
+        let url = format!("ws://{addr}/?auth={auth}&role=proposer&topic={}", topic()?);
+        let client = tokio::spawn(connect_async(url));
+
+        let (stream, _) = listener.accept().await?;
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let wire_rate = limits.inbound_wire_byte_rate;
+        let (query, peer, websocket) =
+            Connection::handshake(stream, config.clone(), wire_rate).await?;
+        let (mut client, _) = client.await??;
+
+        let limiter = Arc::new(Limiter::new(limits));
+        let session = Arc::new(Session::default());
+        let (tx, rx) = mpsc::channel(config.outbound_queue_capacity);
+        let handle = PeerHandle {
+            identity: peer.identity.did.clone(),
+            tx: tx.clone(),
+            budget: Arc::new(OutboundBudget::new(config.outbound_queue_max_bytes)),
+        };
+        let ready = RelayFrame {
+            v: RELAY_FRAME_VERSION,
+            id: "ready".to_owned(),
+            topic: topic()?,
+            body: RelayFrameBody::SessionReady,
+        };
+        let permit = limiter.acquire_identity(&peer.identity.did);
+        let registration = session.register(Role::Proposer, handle, &ready, permit)?;
+        let connection = Connection::new(query, peer, session, rx, tx, config, limiter);
+        let served = tokio::spawn(connection.run(websocket, registration));
+
+        // Once the relay has dropped the peer, sending fails.
+        for message in messages {
+            let _ = client.send(message).await;
+        }
+        let _ = client.close(None).await;
+        Ok(timeout(Duration::from_secs(5), served).await??)
+    }
+
+    /// A frame nothing can receive is dropped unparsed, but one within the
+    /// connection's own budget still ends a run of rate-limit drops: only
+    /// drops in a row disconnect a peer, with or without a counterpart.
+    #[tokio::test]
+    async fn accepted_frames_without_a_counterpart_end_a_run_of_drops() -> TestResult {
+        const BURST: u32 = 1000;
+        let fits = Message::text("s");
+        // Once a byte is spent, a frame of the whole burst never fits again.
+        let over = Message::text("o".repeat(usize::try_from(BURST)?));
+        let tolerated = usize::try_from(MAX_CONSECUTIVE_RATE_DROPS)?;
+
+        let mut interleaved = vec![fits.clone()];
+        for _ in 0..2 {
+            interleaved.extend(vec![over.clone(); tolerated]);
+            interleaved.push(fits.clone());
+        }
+        let outcome = serve_alone(own_byte_budget(BURST), interleaved).await?;
+        assert!(
+            outcome.is_ok(),
+            "drops broken up by accepted frames must not disconnect: {outcome:?}"
+        );
+
+        let mut in_a_row = vec![fits];
+        in_a_row.extend(vec![over; tolerated + 1]);
+        let outcome = serve_alone(own_byte_budget(BURST), in_a_row).await?;
+        assert!(
+            matches!(outcome, Err(ConnectionError::RateLimited)),
+            "drops in a row must still disconnect: {outcome:?}"
+        );
         Ok(())
     }
 }
