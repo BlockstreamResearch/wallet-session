@@ -27,11 +27,13 @@ See `configuration/base.yaml` for every key. The ones that matter most:
 | --- | --- |
 | `application.host` / `application.port` | WebSocket listener |
 | `application.audience` | `aud` required in connection tokens (no default in production) |
+| `application.trusted_proxies` | peers allowed to name the client in `X-Real-IP` (see [Inbound fairness](#inbound-fairness)) |
 | `health.host` / `health.port` | probe listener, separate from the WebSocket port |
 | `auth.max_token_lifetime_seconds` | longest remaining lifetime accepted in a token |
 | `session.grace_seconds` | how long a disconnected peer's slot is reserved |
 | `session.buffer_max_messages` / `session.buffer_ttl_seconds` | frames buffered for it |
-| `limits.*` | connection caps, per-identity/per-connection rates, and each identity's share of the global inbound byte budget |
+| `limits.*` | connection caps, per-identity/per-connection rates, and each identity's and source's share of the global inbound byte budget |
+| `limits.global_paired_reserve_percent` | part of the global budget only paired sessions may spend |
 | `connection.*` | frame size, queue capacity, and the handshake, write, ping, pong and idle timeouts |
 | `connection.outbound_queue_max_bytes` | bytes held for one peer and not yet written (see [Outbound memory](#outbound-memory)) |
 | `connection.outbound_queue_timeout_seconds` | longest a frame may wait in a peer's outbound queue before that peer is dropped |
@@ -41,7 +43,103 @@ zero timeouts, a blank audience, a health address equal to the application
 address, a byte-rate burst below the maximum incoming frame (no frame could
 ever fit it), an outbound byte budget below the maximum incoming frame, or a
 maximum incoming frame above `u32::MAX`. Every byte bucket and outbound budget
-must hold a whole frame.
+must hold a whole frame, and so must the part of the global burst outside the
+paired reserve, which must be below 100 percent. A trusted proxy range of
+length 0 (`0.0.0.0/0`, `::/0`) is refused: it would let every peer choose its
+own source.
+
+### Inbound fairness
+
+Every inbound text, ping and pong frame is charged, before it is parsed, to its
+connection's own message and byte buckets (`inbound_message_rate`,
+`inbound_byte_rate`). A
+connection that keeps exceeding them is disconnected. What happens next
+depends on whether anything can receive the frame:
+
+- **Paired**: the counterpart is connected. The frame is charged to its
+  identity's share (`identity_inbound_byte_rate`), its source's share
+  (`source_inbound_byte_rate`) and the relay-wide budget
+  (`global_inbound_byte_rate`), then parsed and forwarded.
+- **Buffered**: the counterpart is within its reconnect grace window and
+  buffering is enabled. The frame will be delivered when it returns, so it is
+  charged like a paired one, except that it cannot spend the paired reserve.
+- **No receiver**: there is no counterpart, or it is reconnecting while
+  buffering is disabled. The frame is dropped without being parsed and without
+  spending any shared budget: identities cannot drain the relay-wide budget
+  through sessions that have nobody on the other side.
+
+WebSocket pings and pongs are for the relay, not the counterpart. They are
+charged to the same budgets whether or not a counterpart is connected, but
+without one they cannot spend the paired reserve either. Refusing one still
+counts as activity for the idle and pong deadlines.
+
+The shares and what exceeding them does:
+
+- The **identity share** (default 1 MiB/s) caps one `did:key`. A connection
+  that keeps exceeding it is disconnected.
+- The **source share** (default 1 MiB/s, no larger than the identity share)
+  caps every identity connecting from one source together, since identities
+  cost nothing to mint. Exhausting it only drops the frame: other clients
+  behind the same address must not be able to get a peer disconnected.
+- The **global budget** (default 16 MiB/s) caps the relay. Exhausting it only
+  drops the frame, so other identities cannot get a peer disconnected.
+  `global_paired_reserve_percent` (default 25) of its burst can be spent only
+  by paired frames: buffered frames and control frames without a counterpart
+  are refused once the budget is down to the reserve, so they cannot starve
+  sessions whose peers are talking to each other.
+
+A source is the TCP peer's IPv4 address, or the /64 holding its IPv6 address
+(IPv4-mapped peers count as IPv4). When the peer is in
+`application.trusted_proxies`, the source is instead the address it writes in
+`X-Real-IP`. The header must appear once and hold exactly one address,
+otherwise the proxy itself is the source. From any other peer the header is
+ignored, so a client that reaches the relay directly cannot pick its source;
+the first time that happens the relay logs a warning, since it also means a
+proxy in front is missing from the list. `X-Forwarded-For` is never read.
+`trusted_proxies` takes a YAML list or one comma-separated string, so
+`APPLICATION__TRUSTED_PROXIES=172.20.0.5/32` sets it from the environment.
+
+Compatibility and defaults:
+
+- `application.trusted_proxies` is optional and empty by default: every
+  connection is accounted to its TCP peer. `limits.source_inbound_byte_rate`
+  and `limits.global_paired_reserve_percent` are required, like the other
+  limits; a configuration file written for an earlier version must add them.
+- A relay behind a proxy that is not listed accounts every client to the
+  proxy's address, so all of them share one source share (1 MiB/s by
+  default). List the proxy, or raise the source share.
+- Clients behind one NAT address, or one IPv6 /64, share a source share.
+- A frame sent before the counterpart connects, or while it is reconnecting
+  with buffering disabled, is no longer parsed: an invalid or relay-only frame
+  sent then is dropped silently instead of closing the connection. It is
+  checked as before once a counterpart is present. Clients should wait for
+  `session_ready` before sending, as the protocol already requires.
+- `/ready` reports `dropped_source_bytes` beside the other drop counters.
+
+Topology limits:
+
+- The source share is only as scarce as addresses are. A client with many IPv4
+  addresses, or with routed IPv6 space (a /48 holds 65,536 /64s), gets one
+  share for each; the global budget and the paired reserve remain the bound
+  on what such a client can take. As for identities, at most 65,536 sources
+  are tracked at once; past that, idle ones are pruned first and then
+  arbitrary ones are forgotten, starting again with a full share.
+- Trusting a proxy is only safe when the proxy overwrites `X-Real-IP` and
+  nothing else reachable from a trusted address can connect to the relay. The
+  compose deployment trusts the private ranges Docker assigns its networks
+  from, because the relay port is not published and nginx is its only peer
+  there (see `deployment/configs/relay/base.yaml.template`). Publishing the
+  relay port, attaching other containers to its network, or running a
+  relay-port listener on the Docker host breaks that assumption: narrow the
+  list to nginx's address.
+- nginx resolves the client address it forwards from `X-Forwarded-For` only
+  for its own `TRUSTED_PROXY_CIDR`, so the source behind a load balancer or
+  CDN is only as accurate as that setting. nginx's own per-address limits are
+  keyed on the full address, not the /64.
+- A relay without a proxy listens directly (`configuration/production.yaml`),
+  and its sources are the TCP peers. Nothing in the relay can tell apart
+  clients that share an address.
+- Budgets are per process. Each relay instance has its own.
 
 ### Outbound memory
 
@@ -94,8 +192,9 @@ APP_ENVIRONMENT=production APPLICATION__AUDIENCE=wss://relay.example.com \
 
 `GET /health` on the health port is liveness; `GET /ready` is readiness and
 reports `connections`, `sessions`, and the monotonic `dropped_share_bytes` /
-`dropped_global_bytes` counters. A rising drop counter means the relay is
-shedding inbound traffic, so alert on its rate of change.
+`dropped_source_bytes` / `dropped_global_bytes` counters. A rising drop counter
+means the relay is shedding inbound traffic, so alert on its rate of change.
+Frames dropped because nothing could receive them are not counted.
 
 ## Deployment
 

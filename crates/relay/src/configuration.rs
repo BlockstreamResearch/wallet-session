@@ -1,15 +1,20 @@
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
     path::Path,
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, SeqAccess, Visitor},
+};
 use thiserror::Error;
 
 use crate::{
     config::NativeRelayTransportConfig,
     limits::{RateLimit, RelayLimitsConfig},
+    source::IpPrefix,
 };
 
 pub const CONFIGURATION_DIRECTORY: &str = "configuration";
@@ -53,6 +58,21 @@ pub enum ConfigurationError {
          connection.max_incoming_frame_bytes ({frame})"
     )]
     OutboundBytesBelowFrameCap { bytes: usize, frame: usize },
+
+    #[error("limits.global_paired_reserve_percent ({0}) must be below 100")]
+    ReserveTooLarge(u8),
+
+    #[error(
+        "limits.global_inbound_byte_rate.burst outside the paired reserve ({unreserved}) \
+         must be at least connection.max_incoming_frame_bytes ({frame})"
+    )]
+    UnreservedBelowFrameCap { unreserved: u32, frame: u32 },
+
+    #[error(
+        "application.trusted_proxies must not contain {0}: it would let every peer \
+         name its own source"
+    )]
+    TrustsEveryPeer(IpPrefix),
 }
 
 /// Relay settings.
@@ -77,6 +97,44 @@ pub struct ApplicationSettings {
 
     /// Audience expected in connection tokens (`aud`).
     pub audience: String,
+
+    /// Peers allowed to name the client they forward in `X-Real-IP`, as
+    /// addresses or `address/length` ranges. A list, or one comma-separated
+    /// string so that an environment variable can set it. Empty when absent:
+    /// the header is then ignored from every peer.
+    #[serde(default, deserialize_with = "address_ranges")]
+    pub trusted_proxies: Vec<IpPrefix>,
+}
+
+/// Read a list of address ranges, or one string of comma-separated ranges.
+fn address_ranges<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<IpPrefix>, D::Error> {
+    struct Ranges;
+
+    impl<'de> Visitor<'de> for Ranges {
+        type Value = Vec<IpPrefix>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of address ranges, or a string of comma-separated ranges")
+        }
+
+        fn visit_str<E: de::Error>(self, joined: &str) -> Result<Self::Value, E> {
+            joined
+                .split(',')
+                .filter(|range| !range.trim().is_empty())
+                .map(|range| range.parse().map_err(E::custom))
+                .collect()
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut ranges: A) -> Result<Self::Value, A::Error> {
+            let mut parsed = Vec::new();
+            while let Some(range) = ranges.next_element()? {
+                parsed.push(range);
+            }
+            Ok(parsed)
+        }
+    }
+
+    deserializer.deserialize_any(Ranges)
 }
 
 /// HTTP listener used by probes.
@@ -166,8 +224,16 @@ pub struct LimitsSettings {
     /// Inbound byte rate one identity may consume from the relay-wide budget.
     pub identity_inbound_byte_rate: RateSettings,
 
+    /// Inbound byte rate the identities connecting from one address (an IPv6
+    /// /64) may consume together from the relay-wide budget.
+    pub source_inbound_byte_rate: RateSettings,
+
     /// Inbound byte rate across all connections.
     pub global_inbound_byte_rate: RateSettings,
+
+    /// Percentage of the global burst only frames between two connected peers
+    /// may spend.
+    pub global_paired_reserve_percent: u8,
 }
 
 /// Token bucket parameters.
@@ -202,6 +268,14 @@ impl Settings {
             return Err(ConfigurationError::AddressCollision(
                 self.application_address(),
             ));
+        }
+        if let Some(range) = self
+            .application
+            .trusted_proxies
+            .iter()
+            .find(|range| range.length() == 0)
+        {
+            return Err(ConfigurationError::TrustsEveryPeer(*range));
         }
 
         for (setting, value) in [
@@ -285,6 +359,10 @@ impl Settings {
                 &self.limits.identity_inbound_byte_rate,
             ),
             (
+                "limits.source_inbound_byte_rate",
+                &self.limits.source_inbound_byte_rate,
+            ),
+            (
                 "limits.global_inbound_byte_rate",
                 &self.limits.global_inbound_byte_rate,
             ),
@@ -292,6 +370,11 @@ impl Settings {
             if rate.burst == 0 || rate.interval_seconds == 0 {
                 return Err(ConfigurationError::Zero { setting });
             }
+        }
+        if self.limits.global_paired_reserve_percent >= 100 {
+            return Err(ConfigurationError::ReserveTooLarge(
+                self.limits.global_paired_reserve_percent,
+            ));
         }
 
         // The relay re-encodes a frame no longer than the text it arrived as,
@@ -313,6 +396,10 @@ impl Settings {
                 self.limits.identity_inbound_byte_rate.burst,
             ),
             (
+                "limits.source_inbound_byte_rate",
+                self.limits.source_inbound_byte_rate.burst,
+            ),
+            (
                 "limits.inbound_byte_rate",
                 self.limits.inbound_byte_rate.burst,
             ),
@@ -328,6 +415,16 @@ impl Settings {
                     frame,
                 });
             }
+        }
+        // Frames buffered for a reconnecting peer cannot spend the reserve,
+        // so what is left of the burst must still hold a whole frame.
+        let limits = RelayLimitsConfig::from(self);
+        let unreserved = limits
+            .global_inbound_byte_rate
+            .burst
+            .saturating_sub(limits.paired_reserve_bytes());
+        if unreserved < frame {
+            return Err(ConfigurationError::UnreservedBelowFrameCap { unreserved, frame });
         }
 
         Ok(())
@@ -378,6 +475,7 @@ impl From<&Settings> for NativeRelayTransportConfig {
                 settings.connection.outbound_queue_timeout_seconds,
             ),
             max_token_lifetime: Duration::from_secs(settings.auth.max_token_lifetime_seconds),
+            trusted_proxies: settings.application.trusted_proxies.clone().into(),
         }
     }
 }
@@ -392,7 +490,9 @@ impl From<&Settings> for RelayLimitsConfig {
             inbound_message_rate: (&settings.limits.inbound_message_rate).into(),
             inbound_byte_rate: (&settings.limits.inbound_byte_rate).into(),
             identity_inbound_byte_rate: (&settings.limits.identity_inbound_byte_rate).into(),
+            source_inbound_byte_rate: (&settings.limits.source_inbound_byte_rate).into(),
             global_inbound_byte_rate: (&settings.limits.global_inbound_byte_rate).into(),
+            global_paired_reserve_percent: settings.limits.global_paired_reserve_percent,
         }
     }
 }
@@ -460,6 +560,154 @@ mod tests {
 
         settings.connection.outbound_queue_max_bytes = frame;
         settings.validate()?;
+        Ok(())
+    }
+
+    /// The deployment templates, with the placeholders the container
+    /// entrypoint substitutes filled in.
+    fn deployed() -> Result<Settings, ConfigurationError> {
+        let render = |template: &str| {
+            template
+                .replace("${RELAY_PORT}", "8080")
+                .replace("${HEALTH_PORT}", "8081")
+                .replace("${APPLICATION_AUDIENCE}", "wss://relay.example.com")
+                .replace("${MAX_TOKEN_LIFETIME_SECONDS}", "600")
+        };
+        let base = include_str!("../../../deployment/configs/relay/base.yaml.template");
+        let production = include_str!("../../../deployment/configs/relay/production.yaml.template");
+        let settings = config::Config::builder()
+            .add_source(config::File::from_str(
+                &render(base),
+                config::FileFormat::Yaml,
+            ))
+            .add_source(config::File::from_str(
+                &render(production),
+                config::FileFormat::Yaml,
+            ))
+            .build()?
+            .try_deserialize::<Settings>()?;
+        Ok(settings)
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("test address")
+    }
+
+    #[test]
+    fn shipped_fairness_defaults_match_the_limiter_and_trust_no_proxy() -> TestResult {
+        let settings = shipped()?;
+        settings.validate()?;
+
+        let limits = RelayLimitsConfig::from(&settings);
+        assert_eq!(limits, RelayLimitsConfig::default());
+        assert!(
+            limits.source_inbound_byte_rate.burst <= limits.identity_inbound_byte_rate.burst,
+            "a source's share must default to no more than an identity's"
+        );
+        assert!(settings.application.trusted_proxies.is_empty());
+        assert!(
+            NativeRelayTransportConfig::from(&settings)
+                .trusted_proxies
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_deployment_trusts_only_the_compose_network() -> TestResult {
+        let deployed = deployed()?;
+        deployed.validate()?;
+
+        let shipped = shipped()?;
+        assert_eq!(deployed.limits, shipped.limits);
+        assert_eq!(deployed.connection, shipped.connection);
+        assert_eq!(deployed.session, shipped.session);
+
+        let trusted = &deployed.application.trusted_proxies;
+        let trusts = |peer: &str| trusted.iter().any(|range| range.contains(ip(peer)));
+        for nginx in ["172.18.0.3", "192.168.16.2", "10.10.0.5"] {
+            assert!(trusts(nginx), "a compose network address {nginx} is nginx");
+        }
+        for client in ["203.0.113.9", "2001:db8::1", "127.0.0.1"] {
+            assert!(!trusts(client), "{client} must not name its own source");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_proxies_read_from_a_list_or_one_joined_string() -> TestResult {
+        let with = |value: &str| -> Result<Settings, ConfigurationError> {
+            Ok(config::Config::builder()
+                .add_source(config::File::from_str(
+                    include_str!("../configuration/base.yaml"),
+                    config::FileFormat::Yaml,
+                ))
+                .add_source(config::File::from_str(
+                    include_str!("../configuration/local.yaml"),
+                    config::FileFormat::Yaml,
+                ))
+                .set_override("application.trusted_proxies", value)?
+                .build()?
+                .try_deserialize::<Settings>()?)
+        };
+
+        let settings = with("10.0.0.5, fd00::/8")?;
+        assert_eq!(
+            settings.application.trusted_proxies,
+            ["10.0.0.5/32".parse::<IpPrefix>()?, "fd00::/8".parse()?]
+        );
+        assert!(with("")?.application.trusted_proxies.is_empty());
+        assert!(
+            with("10.0.0.0/33").is_err(),
+            "an invalid range must fail the configuration, not be skipped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fairness_settings_that_break_the_boundary_are_rejected() -> TestResult {
+        for everyone in ["0.0.0.0/0", "::/0"] {
+            let mut settings = shipped()?;
+            settings.application.trusted_proxies = vec![everyone.parse()?];
+            assert!(matches!(
+                settings.validate(),
+                Err(ConfigurationError::TrustsEveryPeer(_))
+            ));
+        }
+
+        let mut settings = shipped()?;
+        settings.limits.global_paired_reserve_percent = 100;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::ReserveTooLarge(100))
+        ));
+
+        // 1% of the shipped 16 MiB burst is less than one maximal frame.
+        settings.limits.global_paired_reserve_percent = 99;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::UnreservedBelowFrameCap { .. })
+        ));
+
+        let mut settings = shipped()?;
+        settings.limits.source_inbound_byte_rate.burst =
+            u32::try_from(settings.connection.max_incoming_frame_bytes)? - 1;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::BurstBelowFrameCap {
+                setting: "limits.source_inbound_byte_rate",
+                ..
+            })
+        ));
+
+        let mut settings = shipped()?;
+        settings.limits.source_inbound_byte_rate.interval_seconds = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::Zero {
+                setting: "limits.source_inbound_byte_rate"
+            })
+        ));
         Ok(())
     }
 

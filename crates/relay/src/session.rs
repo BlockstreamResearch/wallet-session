@@ -259,6 +259,20 @@ impl Slots {
     }
 }
 
+/// Where a frame from one peer would go if it were routed now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Counterpart {
+    /// The counterpart is connected: the frame goes to its queue.
+    Connected,
+
+    /// The counterpart's slot is reserved while it reconnects: the frame is
+    /// buffered for it, if buffering is enabled.
+    Reserved,
+
+    /// There is no counterpart: the frame is dropped.
+    Absent,
+}
+
 /// Result of expiring a reservation.
 pub(crate) struct Expiry {
     /// Whether the session now has no peers left.
@@ -282,6 +296,18 @@ impl Session {
     /// Acquire the slot lock
     fn lock(&self) -> Result<MutexGuard<'_, Slots>, SessionError> {
         self.slots.lock().map_err(|_| SessionError::LockPoisoned)
+    }
+
+    /// What a frame from `from` would reach if [`Session::route`]d now.
+    ///
+    /// The answer can be stale by the time a frame is routed; it is meant for
+    /// deciding what a frame costs before it is parsed, not where it goes.
+    pub(crate) fn counterpart(&self, from: Role) -> Result<Counterpart, SessionError> {
+        Ok(match self.lock()?.get(from.counterpart()) {
+            Some(Slot::Connected { .. }) => Counterpart::Connected,
+            Some(Slot::Disconnected { .. }) => Counterpart::Reserved,
+            None => Counterpart::Absent,
+        })
     }
 
     /// Bind a peer to its role slot.
@@ -838,6 +864,31 @@ mod tests {
             session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL),
             Err(SessionError::NoCounterpart)
         ));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counterpart_follows_the_other_slot() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        register(&session, Role::Proposer, proposer)?;
+        assert_eq!(session.counterpart(Role::Proposer)?, Counterpart::Absent);
+
+        let (responder, _) = peer(2);
+        register(&session, Role::Responder, responder)?;
+        assert_eq!(session.counterpart(Role::Proposer)?, Counterpart::Connected);
+        assert_eq!(
+            session.counterpart(Role::Responder)?,
+            Counterpart::Connected
+        );
+
+        let grace = Duration::from_secs(10);
+        disconnect_current(&session, Role::Responder, grace)?;
+        assert_eq!(session.counterpart(Role::Proposer)?, Counterpart::Reserved);
+
+        tokio::time::advance(grace).await;
+        session.expire(Role::Responder, &notification())?;
+        assert_eq!(session.counterpart(Role::Proposer)?, Counterpart::Absent);
         Ok(())
     }
 

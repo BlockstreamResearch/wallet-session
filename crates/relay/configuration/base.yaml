@@ -1,5 +1,10 @@
 application:
   port: 8080
+  # Peers allowed to name the client they forward in X-Real-IP, as addresses
+  # or address/length ranges. Empty: the header is ignored and every
+  # connection is accounted to its TCP peer. List a proxy only if it sets
+  # X-Real-IP itself and nothing else can reach this port.
+  trusted_proxies: []
 
 health:
   port: 8081
@@ -43,6 +48,13 @@ limits:
   identity_inbound_byte_rate:
     burst: 1048576
     interval_seconds: 1
+  # Shared by every identity connecting from one address (an IPv6 /64).
+  source_inbound_byte_rate:
+    burst: 1048576
+    interval_seconds: 1
   global_inbound_byte_rate:
     burst: 16777216
     interval_seconds: 1
+  # Share of the global burst, in percent, that only frames between two
+  # connected peers may spend.
+  global_paired_reserve_percent: 25
