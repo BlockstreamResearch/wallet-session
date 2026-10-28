@@ -21,7 +21,7 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, InboundBytes, Limiter, RelayLimitsConfig},
+    limits::{Bucket, InboundBytes, Limiter},
     session::{Outbound, Registration, Role, Session, SessionError},
 };
 use wallet_session_core::{
@@ -41,7 +41,7 @@ const WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Consecutive frames a connection may have rejected by its own inbound rate
 /// limits before it is disconnected.
-const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
+pub(crate) const MAX_CONSECUTIVE_RATE_DROPS: u32 = 32;
 
 /// Maximum accepted query-string length before parsing.
 pub const MAX_QUERY_BYTES: usize = 8 * 1024;
@@ -401,36 +401,61 @@ fn spend_redelivery_credit(credit: &mut u32) -> bool {
     true
 }
 
-/// Charge an inbound control frame to the connection's inbound budget.
+/// Charge an inbound control frame like a text frame: to the connection's
+/// inbound budget, then to the identity's share of the relay-wide budget and
+/// to the budget itself.
 ///
-/// The frame is dropped when the budget is exhausted, and a peer that keeps
-/// exceeding it is disconnected like any other flooder. Returns `Err` only to
-/// disconnect the peer.
+/// The frame is dropped when a budget is exhausted, and a peer that keeps
+/// exceeding its own or its identity's budget is disconnected like any other
+/// flooder. An exhausted relay-wide budget alone drops the frame without
+/// counting towards that, so other identities cannot get this peer
+/// disconnected. Returns `Err` only to disconnect the peer.
 fn charge_control_frame(
     bytes: usize,
     message_bucket: &mut Bucket,
     byte_bucket: &mut Bucket,
-    limits: &RelayLimitsConfig,
+    limiter: &Limiter,
+    identity: &DidKey,
     consecutive_drops: &mut u32,
     topic: &Topic,
 ) -> Result<(), ConnectionError> {
+    let limits = limiter.limits();
     let now = tokio::time::Instant::now();
-    let within_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
+    let within_connection_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
         && byte_bucket.allow_n(
             u32::try_from(bytes).unwrap_or(u32::MAX),
             limits.inbound_byte_rate,
             now,
         );
-    if within_limits {
-        *consecutive_drops = 0;
+    if !within_connection_limits {
+        *consecutive_drops += 1;
+        log::debug!("dropping control frame on topic {topic}: inbound rate limit exceeded");
+        if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+            log::warn!("peer on topic {topic} keeps exceeding its inbound rate limit; dropping");
+            return Err(ConnectionError::RateLimited);
+        }
         return Ok(());
     }
 
-    *consecutive_drops += 1;
-    log::debug!("dropping control frame on topic {topic}: inbound rate limit exceeded");
-    if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
-        log::warn!("peer on topic {topic} keeps exceeding its inbound rate limit; dropping");
-        return Err(ConnectionError::RateLimited);
+    match limiter.allow_inbound_bytes(identity, bytes) {
+        InboundBytes::Allowed => *consecutive_drops = 0,
+        InboundBytes::ShareExhausted => {
+            *consecutive_drops += 1;
+            log::debug!(
+                "dropping control frame on topic {topic}: identity share of the relay budget exhausted"
+            );
+            if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
+                log::warn!(
+                    "peer on topic {topic} keeps exceeding its share of the relay budget; dropping"
+                );
+                return Err(ConnectionError::RateLimited);
+            }
+        }
+        InboundBytes::GlobalExhausted => {
+            log::debug!(
+                "dropping control frame on topic {topic}: relay inbound byte budget exhausted"
+            );
+        }
     }
     Ok(())
 }
@@ -660,14 +685,17 @@ async fn read_loop(
                 return Err(ConnectionError::UnexpectedBinary);
             }
             // Keepalive pongs and other control frames count as activity, but
-            // they are charged to the same budget as data frames so a peer
-            // cannot hold the connection open with unmetered traffic.
+            // they are charged to the same budgets as data frames, the shared
+            // ones included, so a peer cannot hold the connection open with
+            // unmetered traffic and identities cannot exceed the relay-wide
+            // budget with it.
             Message::Ping(payload) | Message::Pong(payload) => {
                 charge_control_frame(
                     payload.len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    &limits,
+                    limiter,
+                    identity,
                     &mut consecutive_drops,
                     &query.topic,
                 )?;
@@ -678,7 +706,8 @@ async fn read_loop(
                     frame.payload().len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    &limits,
+                    limiter,
+                    identity,
                     &mut consecutive_drops,
                     &query.topic,
                 )?;
