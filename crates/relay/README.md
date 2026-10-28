@@ -33,12 +33,45 @@ See `configuration/base.yaml` for every key. The ones that matter most:
 | `session.buffer_max_messages` / `session.buffer_ttl_seconds` | frames buffered for it |
 | `limits.*` | connection caps, per-identity/per-connection rates, and each identity's share of the global inbound byte budget |
 | `connection.*` | frame size, queue capacity, and the handshake, write, ping, pong and idle timeouts |
+| `connection.outbound_queue_max_bytes` | bytes held for one peer and not yet written (see [Outbound memory](#outbound-memory)) |
+| `connection.outbound_queue_timeout_seconds` | longest a frame may wait in a peer's outbound queue before that peer is dropped |
 
 Values that would make the relay unusable are rejected at startup: zero limits,
 zero timeouts, a blank audience, a health address equal to the application
 address, a byte-rate burst below the maximum incoming frame (no frame could
-ever fit it), or a maximum incoming frame above `u32::MAX`. Every byte bucket must
-hold a whole frame.
+ever fit it), an outbound byte budget below the maximum incoming frame, or a
+maximum incoming frame above `u32::MAX`. Every byte bucket and outbound budget
+must hold a whole frame.
+
+### Outbound memory
+
+Frames waiting for a peer are bounded per peer, in frames and in bytes, and
+in time:
+
+- `connection.outbound_queue_max_bytes` (default 1 MiB, four maximal frames)
+  caps the bytes held for one connection: its outbound queue, the frame being
+  written, and the backlog of buffered frames waiting to enter the queue. A
+  reserved slot gets a budget of the same size for what is buffered while its
+  peer reconnects, and the connection that reclaims it takes those frames over.
+  Bytes are the frame's JSON text, what the relay writes. A full buffer or
+  backlog drops its oldest frames; a frame that cannot fit beside the queue is
+  dropped, like one that finds `outbound_queue_capacity` full. Clients
+  retransmit what is not acknowledged. `session_ready` and `peer_disconnected`
+  are not charged, so a full budget never drops them.
+- `connection.outbound_queue_timeout_seconds` (default 30) drops a peer whose
+  queue holds a frame that was not written within that time of being queued,
+  even if every single write met `write_timeout`. A reader too slow to drain
+  its queue cannot keep its budget filled indefinitely.
+
+These are per-peer limits only. The relay has no relay-wide cap on outbound
+memory: the worst case is about `limits.max_connections ×
+outbound_queue_max_bytes` for connected peers (10,000 × 1 MiB, roughly 10 GiB,
+with the defaults), plus one budget per slot reserved during its grace window,
+plus the copy of the frame each writer is encoding. The inbound byte budgets
+limit how fast that memory can fill, not how much of it can be held. Size
+`limits.max_connections` and `outbound_queue_max_bytes` together against the
+memory available to the relay, and cap the process itself (for example with a
+container memory limit): the relay enforces no aggregate bound.
 
 ## Running
 

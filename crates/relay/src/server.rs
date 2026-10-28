@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseC
 use crate::{
     config::NativeRelayTransportConfig,
     connection::{Connection, ConnectionError, RELAY_FRAME_VERSION, RelayStream, random_id},
-    limits::Limiter,
+    limits::{Limiter, OutboundBudget},
     registry::{Registry, RegistryError},
     session::{PeerHandle, Registration, SessionError},
 };
@@ -94,6 +94,7 @@ pub async fn handle(
     let peer = PeerHandle {
         identity: identity.did.clone(),
         tx: tx.clone(),
+        budget: Arc::new(OutboundBudget::new(config.outbound_queue_max_bytes)),
     };
 
     let ready = RelayFrame {
@@ -608,6 +609,47 @@ mod tests {
             }
         }
         assert_eq!(delivered, vec!["two".to_owned(), "three".to_owned()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_buffer_keeps_the_newest_frames_its_byte_budget_holds() -> TestResult {
+        let topic = topic()?;
+        let payload = "a".repeat(1000);
+        // Each frame is re-encoded as the client sent it: room for two, not three.
+        let encoded = serde_json::to_string(&message(&topic, "m1", &payload))?;
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_session_grace(Duration::from_secs(2))
+                .with_outbound_queue_max_bytes(2 * encoded.len()),
+        )
+        .await?;
+
+        let (mut proposer, responder) = ready_pair(addr, &topic).await?;
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        for id in ["m1", "m2", "m3"] {
+            send(&mut proposer, &message(&topic, id, &payload)).await?;
+        }
+        // Let the relay buffer them before the responder returns.
+        sleep(Duration::from_millis(200)).await;
+
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        let mut redelivered = Vec::new();
+        while let Ok(Ok(frame)) =
+            timeout(Duration::from_millis(300), read_frame(&mut responder)).await
+        {
+            redelivered.push(frame.id);
+        }
+        assert_eq!(
+            redelivered,
+            ["m2", "m3"],
+            "the oldest buffered frame makes room for the newest"
+        );
         Ok(())
     }
 
@@ -1765,10 +1807,12 @@ mod tests {
             interval: Duration::from_secs(1),
         };
         // The write deadline is far beyond the test, so only the token can end
-        // the stuck connection in time.
+        // the stuck connection in time. The byte budget holds the whole
+        // backlog, so it outlasts the socket buffers.
         let addr = serve_with_limits(
             NativeRelayTransportConfig::new(AUDIENCE)
                 .with_outbound_queue_capacity(2)
+                .with_outbound_queue_max_bytes(32 * 1024 * 1024)
                 .with_write_timeout(Duration::from_secs(60)),
             RelayLimitsConfig {
                 inbound_message_rate: unlimited,

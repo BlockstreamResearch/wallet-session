@@ -47,6 +47,12 @@ pub enum ConfigurationError {
         burst: u32,
         frame: u32,
     },
+
+    #[error(
+        "connection.outbound_queue_max_bytes ({bytes}) must be at least \
+         connection.max_incoming_frame_bytes ({frame})"
+    )]
+    OutboundBytesBelowFrameCap { bytes: usize, frame: usize },
 }
 
 /// Relay settings.
@@ -117,6 +123,14 @@ pub struct ConnectionSettings {
 
     /// Frames queued for a connected peer that is not reading.
     pub outbound_queue_capacity: usize,
+
+    /// Bytes of frames held for one peer and not yet written: its queue and
+    /// backlog, or its buffer while it reconnects.
+    pub outbound_queue_max_bytes: usize,
+
+    /// Time a frame may wait in the outbound queue before its slow reader
+    /// is dropped.
+    pub outbound_queue_timeout_seconds: u64,
 
     /// Interval between relay keepalive pings.
     pub ping_interval_seconds: u64,
@@ -209,6 +223,10 @@ impl Settings {
                 self.connection.write_timeout_seconds,
             ),
             (
+                "connection.outbound_queue_timeout_seconds",
+                self.connection.outbound_queue_timeout_seconds,
+            ),
+            (
                 "connection.ping_interval_seconds",
                 self.connection.ping_interval_seconds,
             ),
@@ -238,6 +256,10 @@ impl Settings {
             (
                 "connection.outbound_queue_capacity",
                 self.connection.outbound_queue_capacity,
+            ),
+            (
+                "connection.outbound_queue_max_bytes",
+                self.connection.outbound_queue_max_bytes,
             ),
             ("limits.max_connections", self.limits.max_connections),
             (
@@ -270,6 +292,16 @@ impl Settings {
             if rate.burst == 0 || rate.interval_seconds == 0 {
                 return Err(ConfigurationError::Zero { setting });
             }
+        }
+
+        // The relay re-encodes a frame no longer than the text it arrived as,
+        // so a budget that holds the largest incoming frame can queue any
+        // frame the relay accepts.
+        if self.connection.outbound_queue_max_bytes < self.connection.max_incoming_frame_bytes {
+            return Err(ConfigurationError::OutboundBytesBelowFrameCap {
+                bytes: self.connection.outbound_queue_max_bytes,
+                frame: self.connection.max_incoming_frame_bytes,
+            });
         }
 
         let frame = self.connection.max_incoming_frame_bytes;
@@ -341,6 +373,10 @@ impl From<&Settings> for NativeRelayTransportConfig {
             handshake_timeout: Duration::from_secs(settings.connection.handshake_timeout_seconds),
             write_timeout: Duration::from_secs(settings.connection.write_timeout_seconds),
             outbound_queue_capacity: settings.connection.outbound_queue_capacity,
+            outbound_queue_max_bytes: settings.connection.outbound_queue_max_bytes,
+            outbound_queue_timeout: Duration::from_secs(
+                settings.connection.outbound_queue_timeout_seconds,
+            ),
             max_token_lifetime: Duration::from_secs(settings.auth.max_token_lifetime_seconds),
         }
     }
@@ -367,5 +403,85 @@ impl From<&RateSettings> for RateLimit {
             burst: settings.burst,
             interval: Duration::from_secs(settings.interval_seconds),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DEFAULT_OUTBOUND_QUEUE_MAX_BYTES, DEFAULT_OUTBOUND_QUEUE_TIMEOUT};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// The shipped `base.yaml` with the local overlay, without environment
+    /// overrides.
+    fn shipped() -> Result<Settings, ConfigurationError> {
+        let settings = config::Config::builder()
+            .add_source(config::File::from_str(
+                include_str!("../configuration/base.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .add_source(config::File::from_str(
+                include_str!("../configuration/local.yaml"),
+                config::FileFormat::Yaml,
+            ))
+            .build()?
+            .try_deserialize::<Settings>()?;
+        Ok(settings)
+    }
+
+    #[test]
+    fn shipped_outbound_defaults_are_valid_and_match_the_transport() -> TestResult {
+        let settings = shipped()?;
+        settings.validate()?;
+
+        let transport = NativeRelayTransportConfig::from(&settings);
+        assert_eq!(
+            transport.outbound_queue_max_bytes,
+            DEFAULT_OUTBOUND_QUEUE_MAX_BYTES
+        );
+        assert_eq!(
+            transport.outbound_queue_timeout,
+            DEFAULT_OUTBOUND_QUEUE_TIMEOUT
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_budget_below_the_frame_cap_is_rejected() -> TestResult {
+        let mut settings = shipped()?;
+        let frame = settings.connection.max_incoming_frame_bytes;
+
+        settings.connection.outbound_queue_max_bytes = frame - 1;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::OutboundBytesBelowFrameCap { .. })
+        ));
+
+        settings.connection.outbound_queue_max_bytes = frame;
+        settings.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn zero_outbound_budget_or_timeout_is_rejected() -> TestResult {
+        let mut settings = shipped()?;
+        settings.connection.outbound_queue_max_bytes = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::Zero {
+                setting: "connection.outbound_queue_max_bytes"
+            })
+        ));
+
+        let mut settings = shipped()?;
+        settings.connection.outbound_queue_timeout_seconds = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::Zero {
+                setting: "connection.outbound_queue_timeout_seconds"
+            })
+        ));
+        Ok(())
     }
 }

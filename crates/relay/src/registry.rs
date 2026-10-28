@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use wallet_session_core::{frame::RelayFrame, message::Topic};
 
 use crate::limits::ConnectionPermit;
-use crate::session::{PeerHandle, Registration, Role, Session, SessionError};
+use crate::session::{Outbound, PeerHandle, Registration, Role, Session, SessionError};
 
 /// Directory of live sessions, keyed by topic.
 ///
@@ -104,7 +104,7 @@ impl Registry {
         &self,
         topic: &Topic,
         role: Role,
-        tx: &mpsc::WeakSender<RelayFrame>,
+        tx: &mpsc::WeakSender<Outbound>,
         grace: Duration,
     ) -> Result<bool, RegistryError> {
         let sessions = self.lock()?;
@@ -169,7 +169,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    use crate::limits::{Limiter, RelayLimitsConfig};
+    use crate::limits::{Limiter, OutboundBudget, RelayLimitsConfig};
 
     /// A permit for `identity`, from a limiter that is never shared: these
     /// tests do not exercise the per-identity cap.
@@ -197,12 +197,13 @@ mod tests {
     /// Outbound queue capacity used by peer handles in these tests.
     const PEER_QUEUE: usize = 8;
 
-    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<RelayFrame>) {
+    fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<Outbound>) {
         let (tx, rx) = mpsc::channel(PEER_QUEUE);
         (
             PeerHandle {
                 identity: wallet_session_core::did::DidKey::from_ed25519_bytes([seed; 32]),
                 tx,
+                budget: Arc::new(OutboundBudget::new(1024 * 1024)),
             },
             rx,
         )
@@ -405,8 +406,8 @@ mod tests {
         )?;
 
         let mut kinds = Vec::new();
-        while let Ok(frame) = proposer_rx.try_recv() {
-            kinds.push(match &frame.body {
+        while let Ok(queued) = proposer_rx.try_recv() {
+            kinds.push(match &queued.frame.body {
                 RelayFrameBody::SessionReady => "ready",
                 RelayFrameBody::PeerDisconnected => "disconnected",
                 RelayFrameBody::Message { .. } => "message",
