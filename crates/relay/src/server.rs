@@ -1752,6 +1752,87 @@ mod tests {
         Ok(())
     }
 
+    /// A reader too slow to take its backlog must not hold its connection past
+    /// the token's expiry: the deadline is observed while the backlog is still
+    /// being handed over, not once the reader has caught up.
+    #[tokio::test]
+    async fn token_expiry_closes_a_connection_stuck_on_its_backlog() -> TestResult {
+        // Far more than the loopback socket buffers hold.
+        const BACKLOG: usize = 160;
+
+        let unlimited = RateLimit {
+            burst: u32::MAX,
+            interval: Duration::from_secs(1),
+        };
+        // The write deadline is far beyond the test, so only the token can end
+        // the stuck connection in time.
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE)
+                .with_outbound_queue_capacity(2)
+                .with_write_timeout(Duration::from_secs(60)),
+            RelayLimitsConfig {
+                inbound_message_rate: unlimited,
+                inbound_byte_rate: unlimited,
+                identity_inbound_byte_rate: unlimited,
+                global_inbound_byte_rate: unlimited,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+        let mut responder = connect_auth(addr, &token_with(8), "responder", &topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+
+        drop(responder);
+        sleep(Duration::from_millis(100)).await;
+        let payload = "a".repeat(100 * 1024);
+        for i in 0..BACKLOG {
+            send(&mut proposer, &message(&topic, &format!("m{i}"), &payload)).await?;
+        }
+        // Let the relay buffer all of it before the responder returns.
+        sleep(Duration::from_millis(500)).await;
+
+        // It comes back with a token that expires within two seconds, and does
+        // not read until well after that.
+        let now = crate::auth::unix_now();
+        let short = test_utils::token(&signing_key(8), AUDIENCE, now, now + 2);
+        let mut stuck = connect_auth(addr, &short, "responder", &topic, None).await?;
+        assert!(
+            matches!(
+                read_frame(&mut proposer).await?.body,
+                RelayFrameBody::SessionReady
+            ),
+            "the responder must reclaim its slot and backlog within the grace window"
+        );
+        sleep(Duration::from_secs(3)).await;
+
+        let mut delivered = 0usize;
+        let closed = loop {
+            match timeout(Duration::from_secs(5), stuck.next()).await {
+                Err(_) => break false,
+                Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => break true,
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let frame: RelayFrame = serde_json::from_str(&text)?;
+                    if matches!(frame.body, RelayFrameBody::Message { .. }) {
+                        delivered += 1;
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+            }
+        };
+        assert!(closed, "the relay kept the expired connection open");
+        // What the socket buffers held at expiry arrives, but the relay must
+        // not have gone on handing the backlog to an expired connection.
+        assert!(
+            (1..BACKLOG).contains(&delivered),
+            "expected the relay to stop part-way through the backlog, got {delivered}/{BACKLOG}"
+        );
+        Ok(())
+    }
+
     fn tight_inbound_limits() -> RelayLimitsConfig {
         RelayLimitsConfig {
             inbound_message_rate: RateLimit {

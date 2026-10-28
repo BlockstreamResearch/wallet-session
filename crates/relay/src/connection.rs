@@ -319,6 +319,7 @@ async fn write_loop(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut close_frame = None;
+    let mut session_ready_sent = false;
     loop {
         tokio::select! {
             received = rx.recv() => match received {
@@ -331,9 +332,11 @@ async fn write_loop(
                     if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
                         break;
                     }
-                    if session_ready {
-                        // The peer has been told it is ready, so the backlog
-                        // held for it may follow.
+                    // Once the peer has been told it is ready, the backlog
+                    // held for it may follow, and every later write makes room
+                    // in the queue for more of it.
+                    session_ready_sent |= session_ready;
+                    if session_ready_sent {
                         backlog_ready.notify_one();
                     }
                 }
@@ -448,7 +451,8 @@ struct ReadContext<'a> {
 
 /// Everything a read loop needs to deliver a peer's backlog.
 struct BacklogDelivery {
-    /// Armed by the writer after `session_ready` has been written.
+    /// Armed by the writer after `session_ready` has been written, and after
+    /// every write from then on.
     ready: Arc<Notify>,
 
     /// The slot's channel. It is weak because the slot's handle must stay the
@@ -480,7 +484,12 @@ async fn read_loop(
     let mut consecutive_drops = 0u32;
 
     let mut redelivery_credit = 0u32;
+    let mut backlog_pending = true;
+    let mut idle_deadline = now + config.idle_timeout;
 
+    // Every deadline is absolute and polled on each iteration, and no arm
+    // awaits anything, so neither a slow writer nor a backlog its counterpart
+    // keeps refilling can hold the connection past them.
     loop {
         let message = tokio::select! {
             biased;
@@ -500,29 +509,37 @@ async fn read_loop(
                 );
                 return Err(ConnectionError::TokenExpired);
             }
-            () = backlog.ready.notified() => {
-                if let Some(tx) = backlog.tx.upgrade() {
-                    let drained = session.drain_backlog(query.role, &tx).await?;
-                    redelivery_credit = redelivery_credit
-                        .saturating_add(u32::try_from(drained).unwrap_or(u32::MAX));
-                }
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                log::debug!(
+                    "peer on topic {} idle for {:?}; dropping",
+                    query.topic,
+                    config.idle_timeout
+                );
+                return Err(ConnectionError::IdleTimeout);
+            }
+            () = backlog.ready.notified(), if backlog_pending => {
+                // One step: what fits in the queue now. The writer wakes this
+                // arm again once it has made room.
+                backlog_pending = match backlog.tx.upgrade() {
+                    Some(tx) => {
+                        let drain = session.drain_backlog(query.role, &tx)?;
+                        redelivery_credit = redelivery_credit
+                            .saturating_add(u32::try_from(drain.delivered).unwrap_or(u32::MAX));
+                        !drain.finished
+                    }
+                    // The slot let go of the queue: this connection was replaced.
+                    None => false,
+                };
                 continue;
             }
-            incoming = tokio::time::timeout(config.idle_timeout, source.next()) => match incoming {
-                Ok(Some(Ok(message))) => message,
-                Ok(Some(Err(error))) => return Err(error.into()),
-                Ok(None) => break,
-                Err(_) => {
-                    log::debug!(
-                        "peer on topic {} idle for {:?}; dropping",
-                        query.topic,
-                        config.idle_timeout
-                    );
-                    return Err(ConnectionError::IdleTimeout);
-                }
+            incoming = source.next() => match incoming {
+                Some(Ok(message)) => message,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
             },
         };
 
+        idle_deadline = tokio::time::Instant::now() + config.idle_timeout;
         let _ = ping_deadline.send(None);
 
         let frame = match message {
