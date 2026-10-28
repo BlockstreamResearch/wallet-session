@@ -185,6 +185,7 @@ pub enum ServerError {
 mod tests {
     use super::*;
     use crate::auth::test_utils::{self, signing_key};
+    use crate::connection::MAX_CONSECUTIVE_RATE_DROPS;
     use crate::limits::{Limiter, RateLimit, RelayLimitsConfig};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
@@ -385,14 +386,16 @@ mod tests {
         config: NativeRelayTransportConfig,
         limits: RelayLimitsConfig,
     ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+        serve_with_limiter(config, Arc::new(Limiter::new(limits))).await
+    }
+
+    async fn serve_with_limiter(
+        config: NativeRelayTransportConfig,
+        limiter: Arc<Limiter>,
+    ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(serve(
-            listener,
-            Arc::new(Registry::new()),
-            Arc::new(Limiter::new(limits)),
-            config,
-        ));
+        tokio::spawn(serve(listener, Arc::new(Registry::new()), limiter, config));
         Ok(addr)
     }
 
@@ -2036,6 +2039,134 @@ mod tests {
             "expected PeerDisconnected after a control-frame flood, got {:?}",
             notified.body
         );
+        Ok(())
+    }
+
+    /// Wait until `counter` reaches `expected`, for at most two seconds, and
+    /// return what it reads then.
+    async fn wait_for_count(counter: impl Fn() -> u64, expected: u64) -> u64 {
+        for _ in 0..100 {
+            if counter() >= expected {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        counter()
+    }
+
+    /// Send `count` pings carrying `payload` bytes each.
+    async fn send_pings(client: &mut Client, count: u32, payload: u32) -> TestResult {
+        let payload = Bytes::from(vec![b'p'; usize::try_from(payload)?]);
+        for _ in 0..count {
+            client.send(Message::Ping(payload.clone())).await?;
+        }
+        Ok(())
+    }
+
+    /// Bytes of the pings these tests send.
+    const PING_PAYLOAD: u32 = 100;
+
+    /// Limits under which only the shared byte budgets can refuse a ping.
+    fn ping_limits() -> RelayLimitsConfig {
+        let roomy = RateLimit {
+            burst: 1024 * 1024,
+            interval: Duration::from_secs(3600),
+        };
+        RelayLimitsConfig {
+            inbound_message_rate: RateLimit {
+                burst: 1000,
+                interval: Duration::from_secs(3600),
+            },
+            inbound_byte_rate: roomy,
+            identity_inbound_byte_rate: roomy,
+            global_inbound_byte_rate: roomy,
+            ..RelayLimitsConfig::default()
+        }
+    }
+
+    /// Pings spend the relay-wide inbound budget like text frames, and its
+    /// exhaustion drops them without disconnecting an identity that is within
+    /// its own limits.
+    #[tokio::test]
+    async fn control_frames_spend_the_global_budget_and_spare_others() -> TestResult {
+        // Room for ten pings, refilling far slower than the test runs.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 10 * PING_PAYLOAD,
+                interval: Duration::from_secs(3600),
+            },
+            ..ping_limits()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // One identity spends the whole relay-wide budget on pings: the
+        // eleventh no longer fits it.
+        let mut hog = connect_auth(addr, &token_with(7), "proposer", &topic()?, None).await?;
+        send_pings(&mut hog, 11, PING_PAYLOAD).await?;
+        let payload = u64::from(PING_PAYLOAD);
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), payload).await;
+        assert_eq!(
+            dropped, payload,
+            "ten pings must fit the relay-wide budget and the eleventh must not"
+        );
+
+        // An unrelated identity within its own limits has its pings dropped
+        // for the exhausted relay budget, more often than the consecutive-drop
+        // limit allows, and is not disconnected for it.
+        let other = Topic::new([2u8; 32])?;
+        let mut victim = connect_auth(addr, &token_with(8), "proposer", &other, None).await?;
+        let flood = MAX_CONSECUTIVE_RATE_DROPS + 8;
+        send_pings(&mut victim, flood, PING_PAYLOAD).await?;
+        let expected = payload * (1 + u64::from(flood));
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), expected).await;
+        assert_eq!(
+            dropped, expected,
+            "pings past the exhausted relay budget must be dropped and counted"
+        );
+        assert_eq!(limiter.dropped_share_bytes(), 0);
+
+        for client in [&mut victim, &mut hog] {
+            assert!(
+                timeout(Duration::from_millis(500), expect_closed(client))
+                    .await
+                    .is_err(),
+                "an exhausted relay-wide budget alone must not disconnect anyone"
+            );
+        }
+        Ok(())
+    }
+
+    /// Pings spend the sender's identity share, and an identity that keeps
+    /// exceeding it with them is disconnected like a text flooder.
+    #[tokio::test]
+    async fn control_frames_over_the_identity_share_disconnect_the_sender() -> TestResult {
+        // Room for one ping, refilling far slower than the test runs.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: RateLimit {
+                burst: PING_PAYLOAD,
+                interval: Duration::from_secs(3600),
+            },
+            ..ping_limits()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Every ping after the first is dropped, and once the drops pass the
+        // consecutive-drop limit the sender is disconnected. Sends may fail
+        // after that.
+        let mut hog = connect(addr, "proposer", &topic()?, None).await?;
+        let _ = send_pings(&mut hog, MAX_CONSECUTIVE_RATE_DROPS + 8, PING_PAYLOAD).await;
+        assert!(
+            expect_closed(&mut hog).await,
+            "an identity flooding control frames over its share must be disconnected"
+        );
+        let limit = u64::from(PING_PAYLOAD) * u64::from(MAX_CONSECUTIVE_RATE_DROPS);
+        assert!(
+            limiter.dropped_share_bytes() > limit,
+            "the dropped pings must be counted against the identity share"
+        );
+        assert_eq!(limiter.dropped_global_bytes(), 0);
         Ok(())
     }
 
