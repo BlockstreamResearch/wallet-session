@@ -61,7 +61,9 @@ enum Slot {
         /// so the per-identity cap cannot refuse a documented takeover (§3).
         permit: Option<ConnectionPermit>,
 
-        backlog: VecDeque<RelayFrame>,
+        /// Frames not yet handed to the outbound queue. They keep the expiry
+        /// they were buffered with.
+        backlog: VecDeque<BufferedFrame>,
     },
     Disconnected {
         identity: DidKey,
@@ -70,10 +72,26 @@ enum Slot {
     },
 }
 
-/// A frame buffered for a disconnected peer, with its expiry time.
+impl Slot {
+    /// Frames held for this slot's peer: its backlog while connected, its
+    /// buffer while disconnected.
+    fn held_frames(&mut self) -> &mut VecDeque<BufferedFrame> {
+        match self {
+            Slot::Connected { backlog, .. } => backlog,
+            Slot::Disconnected { buffered, .. } => buffered,
+        }
+    }
+}
+
+/// A frame held for a peer, with its expiry time.
 struct BufferedFrame {
     frame: RelayFrame,
     expires_at: Instant,
+}
+
+/// Drop the frames whose TTL has passed.
+fn prune_expired(frames: &mut VecDeque<BufferedFrame>, now: Instant) {
+    frames.retain(|entry| entry.expires_at > now);
 }
 
 /// The two role slots for one topic.
@@ -101,12 +119,40 @@ impl Slots {
     fn is_connected(&self, role: Role) -> bool {
         matches!(self.get(role), Some(Slot::Connected { .. }))
     }
+
+    /// Drop the frames held for `role`'s peer: they were sent by a
+    /// counterpart whose reservation has expired.
+    fn discard_held_frames(&mut self, role: Role) {
+        if let Some(slot) = self.get_mut(role) {
+            let held = slot.held_frames();
+            if !held.is_empty() {
+                log::debug!(
+                    "discarding {} frame(s) from an expired counterpart",
+                    held.len()
+                );
+                held.clear();
+            }
+        }
+    }
 }
 
 /// Result of expiring a reservation.
 pub(crate) struct Expiry {
     /// Whether the session now has no peers left.
     pub empty: bool,
+}
+
+/// Result of one [`Session::drain_backlog`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drain {
+    /// Frames handed to the outbound queue.
+    pub delivered: usize,
+
+    /// Whether this connection has nothing left to drain: the backlog is
+    /// empty, or the slot or its queue no longer belongs to the connection.
+    /// A connection's backlog never grows back once empty, since frames are
+    /// only queued behind a non-empty one.
+    pub finished: bool,
 }
 
 impl Session {
@@ -129,9 +175,10 @@ impl Session {
     /// peers while the slot lock is held, so it precedes anything
     /// [`Session::route`] can send afterwards. Frames buffered for this
     /// identity while it was disconnected, or not yet handed to a replaced
-    /// connection, become the slot's backlog; hand them over with
-    /// [`Session::drain_backlog`]. A reservation claimed by another identity
-    /// keeps no frames.
+    /// connection, become the slot's backlog with their original expiry; hand
+    /// them over with [`Session::drain_backlog`]. An expired reservation
+    /// claimed by another identity keeps no frames, and the frames its previous
+    /// owner sent to the counterpart are discarded.
     ///
     /// `permit` is the connection's per-identity permit. A registration that
     /// replaces this identity's own live connection inherits that connection's
@@ -169,22 +216,20 @@ impl Session {
             return Err(SessionError::IdentityLimit);
         }
 
-        let (backlog, permit) = match slots.get_mut(role).take() {
+        let previous = slots.get_mut(role).take();
+        let (mut backlog, permit) = match previous {
             // A reservation reclaimed by the same identity keeps its frames,
             // whether or not the grace window has passed.
             Some(Slot::Disconnected {
                 identity, buffered, ..
-            }) if identity == peer.identity => (
-                buffered
-                    .into_iter()
-                    .filter(|entry| entry.expires_at > now)
-                    .map(|entry| entry.frame)
-                    .collect(),
-                permit,
-            ),
+            }) if identity == peer.identity => (buffered, permit),
             // An expired reservation claimed by another identity must not leak
-            // the previous owner's frames.
-            Some(Slot::Disconnected { .. }) => (VecDeque::new(), permit),
+            // the previous owner's frames, nor deliver what the previous owner
+            // sent to the counterpart as if it came from the new one.
+            Some(Slot::Disconnected { .. }) => {
+                slots.discard_held_frames(role.counterpart());
+                (VecDeque::new(), permit)
+            }
             Some(Slot::Connected {
                 backlog,
                 permit: inherited,
@@ -195,6 +240,7 @@ impl Session {
             }
             None => (VecDeque::new(), permit),
         };
+        prune_expired(&mut backlog, now);
         if !backlog.is_empty() {
             log::debug!(
                 "redelivering {} buffered frame(s) to {}",
@@ -227,31 +273,54 @@ impl Session {
         })
     }
 
-    /// Hand the slot's backlog to the peer's outbound queue.
-    pub(crate) async fn drain_backlog(
+    /// Hand as much of the slot's backlog to the peer's outbound queue as it
+    /// has room for, without waiting.
+    ///
+    /// Expired frames are dropped, never handed over. What does not fit stays
+    /// in the backlog, in order, for a later call once the writer has made
+    /// room. Only the connection owning `tx` may drain the slot, so a replaced
+    /// connection cannot consume its successor's backlog.
+    pub(crate) fn drain_backlog(
         &self,
         role: Role,
         tx: &mpsc::Sender<RelayFrame>,
-    ) -> Result<usize, SessionError> {
-        let mut drained = 0usize;
-        loop {
-            let Ok(permit) = tx.reserve().await else {
-                return Ok(drained);
-            };
-
-            let mut slots = self.lock()?;
-            let Some(Slot::Connected { peer, backlog, .. }) = slots.get_mut(role) else {
-                return Ok(drained);
-            };
-            if !peer.tx.same_channel(tx) {
-                return Ok(drained);
-            }
-            let Some(frame) = backlog.pop_front() else {
-                return Ok(drained);
-            };
-            permit.send(frame);
-            drained += 1;
+    ) -> Result<Drain, SessionError> {
+        let mut slots = self.lock()?;
+        let Some(Slot::Connected { peer, backlog, .. }) = slots.get_mut(role) else {
+            return Ok(Drain {
+                delivered: 0,
+                finished: true,
+            });
+        };
+        if !peer.tx.same_channel(tx) {
+            return Ok(Drain {
+                delivered: 0,
+                finished: true,
+            });
         }
+
+        prune_expired(backlog, Instant::now());
+        let mut delivered = 0usize;
+        let finished = loop {
+            if backlog.is_empty() {
+                break true;
+            }
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    if let Some(entry) = backlog.pop_front() {
+                        permit.send(entry.frame);
+                        delivered += 1;
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(())) => break false,
+                Err(mpsc::error::TrySendError::Closed(())) => break true,
+            }
+        };
+
+        Ok(Drain {
+            delivered,
+            finished,
+        })
     }
 
     /// Reserve a peer's slot for `grace`, buffering frames addressed to it.
@@ -302,6 +371,11 @@ impl Session {
         }
         *slots.get_mut(role) = None;
 
+        // Frames still held for the survivor came from the peer that just
+        // expired: they must not follow `peer_disconnected`, nor a later
+        // `session_ready` with another counterpart.
+        slots.discard_held_frames(role.counterpart());
+
         if let Some(Slot::Connected { peer, .. }) = slots.get(role.counterpart())
             && peer.tx.try_send(notification.clone()).is_err()
         {
@@ -318,6 +392,7 @@ impl Session {
     /// Forward a frame to the counterpart, buffering while it is disconnected.
     ///
     /// Buffered frames expire after `buffer_ttl`; a zero TTL drops them immediately.
+    /// A frame queued behind a connected peer's backlog expires the same way.
     pub(crate) fn route(
         &self,
         from: Role,
@@ -327,13 +402,18 @@ impl Session {
     ) -> Result<(), SessionError> {
         let mut slots = self.lock()?;
         let target = from.counterpart();
+        let now = Instant::now();
 
         if let Some(Slot::Connected { peer, backlog, .. }) = slots.get_mut(target) {
+            prune_expired(backlog, now);
             if !backlog.is_empty() {
                 while backlog.len() >= max_buffered.max(1) {
                     backlog.pop_front();
                 }
-                backlog.push_back(frame);
+                backlog.push_back(BufferedFrame {
+                    frame,
+                    expires_at: now + buffer_ttl,
+                });
                 return Ok(());
             }
             return match peer.tx.try_send(frame) {
@@ -349,12 +429,13 @@ impl Session {
         match slots.get_mut(target) {
             Some(Slot::Disconnected { buffered, .. }) => {
                 if max_buffered > 0 && !buffer_ttl.is_zero() {
+                    prune_expired(buffered, now);
                     if buffered.len() >= max_buffered {
                         buffered.pop_front();
                     }
                     buffered.push_back(BufferedFrame {
                         frame,
-                        expires_at: Instant::now() + buffer_ttl,
+                        expires_at: now + buffer_ttl,
                     });
                 }
                 Ok(())
@@ -450,18 +531,25 @@ mod tests {
     }
 
     /// Ids a freshly registered peer receives: queued frames, then the backlog.
+    ///
+    /// Drains in steps like a connection does, emptying the queue in between
+    /// as its writer would, so a backlog larger than the queue gets through.
     async fn received_ids(
         session: &Session,
         role: Role,
         tx: &mpsc::Sender<RelayFrame>,
         rx: &mut mpsc::Receiver<RelayFrame>,
     ) -> Result<Vec<String>, SessionError> {
-        session.drain_backlog(role, tx).await?;
         let mut ids = Vec::new();
-        while let Ok(frame) = rx.try_recv() {
-            ids.push(frame.id);
+        loop {
+            let drain = session.drain_backlog(role, tx)?;
+            while let Ok(frame) = rx.try_recv() {
+                ids.push(frame.id);
+            }
+            if drain.finished {
+                return Ok(ids);
+            }
         }
-        Ok(ids)
     }
 
     fn register(
@@ -827,19 +915,22 @@ mod tests {
         let tx = responder.tx.clone();
         register(&session, Role::Responder, responder)?;
 
-        let drain = session.drain_backlog(Role::Responder, &tx);
-        let collect = async {
-            let mut ids = Vec::new();
-            while ids.len() < total + 1 {
-                match responder_rx.recv().await {
-                    Some(frame) => ids.push(frame.id),
-                    None => break,
-                }
-            }
-            ids
-        };
-        let (drained, ids) = tokio::join!(drain, collect);
-        drained?;
+        // One step fills the queue and leaves the rest for later.
+        let first = session.drain_backlog(Role::Responder, &tx)?;
+        assert_eq!(
+            first,
+            Drain {
+                delivered: PEER_QUEUE - 1,
+                finished: false,
+            },
+            "session_ready holds one slot of the queue"
+        );
+
+        let mut ids = Vec::new();
+        while let Ok(frame) = responder_rx.try_recv() {
+            ids.push(frame.id);
+        }
+        ids.extend(received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?);
 
         let mut expected = vec!["ready".to_owned()];
         expected.extend((0..total).map(|i| format!("m{i:02}")));
@@ -1039,12 +1130,12 @@ mod tests {
         register(&session, Role::Responder, responder)?;
 
         assert_eq!(
-            session.drain_backlog(Role::Responder, &tx).await?,
+            session.drain_backlog(Role::Responder, &tx)?.delivered,
             3,
             "the count is what the caller owes the peer in inbound budget"
         );
         assert_eq!(
-            session.drain_backlog(Role::Responder, &tx).await?,
+            session.drain_backlog(Role::Responder, &tx)?.delivered,
             0,
             "an empty backlog hands over nothing"
         );
@@ -1162,6 +1253,236 @@ mod tests {
             received_ids(&session, Role::Responder, &tx, &mut reconnect_rx).await?,
             ["ready", "frame-id"],
             "the owner gets its frames back after the reservation expired"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaimed_frames_expire_while_waiting_for_the_counterpart() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let ttl = Duration::from_secs(5);
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
+        disconnect_current(&session, Role::Proposer, Duration::from_secs(60))?;
+
+        // The responder takes its frame back well inside the TTL, but nothing
+        // may reach it until its counterpart returns.
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        assert!(matches!(
+            register(&session, Role::Responder, responder)?,
+            Registration::Waiting
+        ));
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let (proposer, _proposer_rx) = peer(1);
+        assert!(matches!(
+            register(&session, Role::Proposer, proposer)?,
+            Registration::BothReady
+        ));
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["ready"],
+            "a frame reclaimed before its TTL must not be delivered after it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frames_queued_behind_a_backlog_expire_on_their_own_ttl() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        let ttl = Duration::from_secs(5);
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "reclaimed"),
+            MAX_BUFFERED,
+            ttl,
+        )?;
+
+        // The responder returns, but its writer is too slow to take anything.
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+
+        // t=3: queued behind the backlog, expires at t=8.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "early"),
+            MAX_BUFFERED,
+            ttl,
+        )?;
+
+        // t=6: "reclaimed" has expired; "late" expires at t=11.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        session.route(
+            Role::Proposer,
+            frame_with_id(&topic, "late"),
+            MAX_BUFFERED,
+            ttl,
+        )?;
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["ready", "late"],
+            "at t=9 only the frame queued at t=6 is still deliverable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_keeps_the_expiry_of_inherited_frames() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let ttl = Duration::from_secs(5);
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, ttl)?;
+
+        // The first reconnect takes the frame back but never drains it.
+        let (first, _first_rx) = peer(2);
+        register(&session, Role::Responder, first)?;
+
+        // Its replacement arrives after the TTL has passed.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let (second, mut second_rx) = peer(2);
+        let second_tx = second.tx.clone();
+        register(&session, Role::Responder, second)?;
+
+        assert_eq!(
+            received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
+            ["ready"],
+            "an inherited frame must not outlive its TTL"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_expiring_mid_drain_is_not_handed_over() -> TestResult {
+        let session = Session::default();
+        let (proposer, _proposer_rx) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+
+        let topic = topic()?;
+        let ttl = Duration::from_secs(5);
+        let total = PEER_QUEUE * 2;
+        for i in 0..total {
+            session.route(
+                Role::Proposer,
+                frame_with_id(&topic, &format!("m{i:02}")),
+                total,
+                ttl,
+            )?;
+        }
+
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+
+        // A slow reader: one step fills the queue, then the writer stalls past
+        // the TTL before it makes room for more.
+        assert!(!session.drain_backlog(Role::Responder, &tx)?.finished);
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let mut queued = 0;
+        while responder_rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, PEER_QUEUE, "session_ready and the first frames");
+        assert_eq!(
+            session.drain_backlog(Role::Responder, &tx)?,
+            Drain {
+                delivered: 0,
+                finished: true,
+            },
+            "the rest of the backlog expired while the writer was stalled"
+        );
+        assert!(responder_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn counterpart_expiry_discards_the_frames_it_sent() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+        disconnect_current(&session, Role::Proposer, Duration::from_secs(1))?;
+
+        // The responder takes its frame back while the proposer is away, and
+        // the proposer never returns.
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        register(&session, Role::Responder, responder)?;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(session.expire(Role::Proposer, &notification())?.is_some());
+
+        let (other, _other_rx) = peer(3);
+        assert!(matches!(
+            register(&session, Role::Proposer, other)?,
+            Registration::BothReady
+        ));
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["gone", "ready"],
+            "frames from an expired counterpart must not follow peer_disconnected"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn claiming_a_lapsed_reservation_discards_what_its_owner_sent() -> TestResult {
+        let session = Session::default();
+        let (proposer, _) = peer(1);
+        let (responder, _) = peer(2);
+        register(&session, Role::Proposer, proposer)?;
+        register(&session, Role::Responder, responder)?;
+        disconnect_current(&session, Role::Responder, Duration::from_secs(10))?;
+        session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
+        disconnect_current(&session, Role::Proposer, Duration::from_secs(1))?;
+
+        // The proposer's grace lapses and another identity takes the role
+        // before the expiry is processed.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (other, _other_rx) = peer(3);
+        assert!(matches!(
+            register(&session, Role::Proposer, other)?,
+            Registration::Waiting
+        ));
+
+        let (responder, mut responder_rx) = peer(2);
+        let tx = responder.tx.clone();
+        assert!(matches!(
+            register(&session, Role::Responder, responder)?,
+            Registration::BothReady
+        ));
+        assert_eq!(
+            received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
+            ["ready"],
+            "frames the previous proposer sent must not reach the responder as the new one's"
         );
         Ok(())
     }
