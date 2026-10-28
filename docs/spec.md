@@ -70,6 +70,8 @@ Slot takeover means a valid token for an identity is enough to evict that identi
 
 Likewise, identity keys are self-issued: anyone can mint a fresh `did:key` and a valid connection token. Rate limiting by identity raises the cost of abuse, and so would an operator-side ban list, but neither is a substitute for an issuer allowlist or proof of work; the transport-layer threat model accepts this.
 
+Clients do not rely on the Relay for the origin, direction or freshness of a message. The receiver rules of §10 and §11 reject a frame the Relay returns to its sender or forwards from an identity other than the established counterpart, and they deliver each envelope at most once, however often it is replayed. A Relay that does not hold the key can therefore drop or delay messages, but it cannot duplicate a delivery or forge an acknowledgement.
+
 ## 4. Network identity
 
 Each client derives a long-term identity as a Ed25519 key.
@@ -205,25 +207,43 @@ The envelope `id` and `topic` are those of the enclosing relay frame and are not
 
 `session_ready` and `peer_disconnected` are relay-generated control frames: they carry no payload and are never forwarded to peers. Clients must not send them; the relay closes the connection of a peer that does.
 
-Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key. Receiver must reject an envelope with an unsupported version, a topic it is not subscribed to, an invalid AEAD tag, or a nonce reused with different content.
+Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key.
 
-Receiver must reject any envelope where the `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock.
+A receiver processes each `message` frame in the following order. An envelope rejected at any step is neither delivered to the application nor acknowledged.
 
-Clients must maintain a list of the frame `id`s whose envelopes they have authenticated in the last 5 minutes. An envelope whose `id` was seen before, and whose authenticated fields and ciphertext are identical, is a retransmission: it is not delivered to the application again, but it is acknowledged again if its type requires an acknowledgement. An envelope that reuses a known `id` with different authenticated content is a protocol violation; the receiver must reject it and may end the session.
+1. Reject an unsupported `version`, a `topic` it is not subscribed to, a `from` equal to its own identity and, once the counterpart is established, a `from` other than the counterpart's.
+2. Authenticate: decrypt `data` with the topic's key, the envelope `nonce` and the AAD of §11 built with the counterpart's role. Reject an invalid tag.
+3. Reject an envelope whose `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Also reject one whose `ts` is not greater than the largest `ts` the receiver has discarded from the replay memory of the key.
+4. Look up the frame `id` and the `nonce` in the replay memory of the key. An envelope that matches a record by either one, and whose frame `id`, `kind`, `from`, `ts`, `nonce` and `data` are all identical to that record's, is a retransmission: it is acknowledged again if its kind requires an acknowledgement (§13), and it is not delivered again. An envelope that matches a record with any other content is a protocol violation; the receiver must reject it and may end the session.
+5. Otherwise, record the envelope in the replay memory, deliver it to the application, and acknowledge it if its kind requires an acknowledgement.
 
-The receiver must authenticate an envelope before comparing it with that list, and must not treat an envelope it has not authenticated as a retransmission.
+Steps 1 to 3 may run in any order, but only an envelope that has passed all three reaches step 4: an envelope that has not been authenticated is never treated as a retransmission.
+
+The counterpart is the `from` of the first envelope that passes steps 1 to 3 on the pairing topic. It remains the counterpart for that pairing and for the session derived from it, across reconnects. Step 1 rejects the receiver's own identity, so the two peers of a session must have different identities. The AEAD authenticates `from` only as the identity that a holder of the key declares; the identity key does not sign envelopes (§4).
+
+The replay memory holds, for each key, every envelope the receiver has accepted at step 5. Each record is kept at least until the local clock passes the envelope's `ts` plus 300 seconds. From then on, step 3 rejects every copy of the envelope, so no envelope is delivered twice. Step 3 admits a `ts` at most 300 seconds ahead of the local clock, so no record has to be kept longer than 10 minutes after it was made. While the local clock runs forward, the second check of step 3 rejects nothing the first does not. If the clock steps backward, it keeps discarded envelopes rejected. A receiver may discard the replay memory of a key once it stops accepting envelopes under that key.
 
 ## 11. AEAD AAD and nonce generation
 
 
-Each sender generates a fresh random sender prefix per key. The counter increments by one per message. A sender must not reuse a (prefix, counter) pair with the same key. Receivers reject reused nonces for the current key, except when the ciphertext is identical to the one already received with that nonce: that is a retransmission of the same message. A nonce reused with any other content must be rejected, because encrypting two different plaintexts under the same key and nonce destroys the AEAD's confidentiality.
+Each sender generates a fresh random sender prefix per key. The counter increments by one for each new envelope, `ack`s included. A retransmission is the original envelope, unchanged, so it keeps its nonce. A sender must not reuse a (prefix, counter) pair with the same key. A sender that cannot be sure of its counter, for example after a restart, must generate a new prefix. A receiver detects a reused nonce through its replay memory (§10, step 4): an identical envelope is a retransmission, and a nonce reused with any other content is rejected, because encrypting two different plaintexts under the same key and nonce destroys the AEAD's confidentiality. That check sees only the nonces still held in the replay memory. The sender's obligation has no time limit.
 
 Nonce scheme:
 ```
 nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
 ```
 
-The AEAD AAD must be constructed by concatenating the plaintext fields as UTF-8 bytes, without separators or length prefixes: `AAD = version || id || type || topic || from || ts`. Here `version` is the envelope version as a decimal string, `id` and `topic` come from the enclosing relay frame, `type` is the envelope `kind` in snake_case, `from` is the sender's `did:key`, and `ts` is the envelope timestamp as a decimal string of Unix seconds. The receiver must reconstruct this exact AAD byte string and pass it to the cipher during decryption.
+The AEAD AAD concatenates the following fields, each prefixed with its length:
+```
+LP(x) = length of x in bytes, as a 4-byte big-endian unsigned integer || x
+AAD   = LP(version) || LP(id) || LP(kind) || LP(topic) || LP(from) || LP(ts) || LP(role)
+```
+
+Each field is a UTF-8 string. `version` is the envelope version as a decimal string. `id` and `topic` are the base64url strings of the enclosing relay frame. `kind` is the envelope `kind` in snake_case. `from` is the sender's `did:key`. `ts` is the envelope timestamp as a decimal string of Unix seconds. `role` is the sender's role on the topic, `proposer` or `responder`.
+
+`role` is not sent. The sender uses its own role, and the receiver rebuilds the AAD with its counterpart's role, the opposite of its own, then passes it to the cipher during decryption. An envelope returned to its sender therefore fails authentication. The length prefixes make every field boundary unambiguous.
+
+Compatibility: this AAD replaces the one in earlier drafts, `version || id || type || topic || from || ts`, which was concatenated without length prefixes and had no `role`. An envelope sealed under one does not authenticate under the other. The relay frame and the envelope JSON are unchanged, and the envelope version stays `1`. No client implementing the earlier AAD has shipped, so version `1` means this AAD only.
 
 ## 12. Message types
 
@@ -261,10 +281,11 @@ Payload shapes:
 
 ## 13. Reliability
 
-Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the `id` of the frame that carried the message. The `ack` message is not itself acknowledged. The receiver sends the `ack` after successfully decrypting and validating the message. An `ack` is sent for every authenticated envelope whose type requires one, including a retransmission of an envelope already received: a receiver that has authenticated an envelope and then receives the identical envelope again must send the `ack` again, and must not deliver the message to the application a second time. Retransmissions must be identical: the same frame `id`, and the same authenticated envelope header and ciphertext (`kind`, `from`, `ts`, `nonce`, `data`).
+Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the `id` of the frame that carried the message. The `ack` message is not itself acknowledged. The receiver sends the `ack` on the topic the message arrived on, only after the message passes the receiver checks of §10, and never for a rejected envelope. An `ack` is sent for every accepted envelope whose type requires one, including a retransmission found in the replay memory (§10, step 4): such a retransmission is acknowledged again and is not delivered to the application a second time. Each `ack` is a new envelope with its own frame `id`, `nonce` and `ts`. Retransmissions must be identical: the same frame `id`, and the same authenticated envelope header and ciphertext (`kind`, `from`, `ts`, `nonce`, `data`).
 
+A sender accepts an `ack` only if the envelope carrying it passes the receiver checks of §10, which means it comes from the established counterpart. Its `ackId` must also name a message the sender sent on that topic and still has outstanding. Such an `ack` completes the send. The sender ignores any other `ack` without error. That includes an `ack` for an id it never sent on that topic, or for a message already completed or given up on, so a late `ack` plus a re-`ack` for the same id cannot fail a send.
 
-If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. When the last attempt fails the sender gives up and reports the failure to the application. The retry window must stay inside the receiver's duplicate window, so a retransmission is recognized as one; with the values here, the last attempt is about a minute after the first send. A sender must treat an `ack` for an `id` it no longer tracks as a no-op, so that a late `ack` plus a re-`ack` for the same id cannot fail a send. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection. A post-reconnect flush is paced traffic like any other: a sender with many pending messages must spread them within the relay's inbound budget instead of sending them in one burst.
+If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection, and each such retransmission counts as an attempt. A post-reconnect flush is paced traffic like any other: a sender with many pending messages must spread them within the relay's inbound budget instead of sending them in one burst. The sender gives up when the last attempt fails, or earlier once its own clock passes the envelope's `ts` plus 300 seconds, because receivers reject every copy after that (§10, step 3). It then reports the failure to the application. With the values here, the last attempt is about a minute after the first send. The schedule does not affect recognition: a receiver keeps an envelope in its replay memory for as long as it would accept a copy, so every retransmission it accepts is recognized as one.
 
 ## 14. Connection lifecycle
 
@@ -275,5 +296,7 @@ The client sends a WebSocket ping every 30 seconds and requires a WebSocket pong
 The relay pings every 30 seconds and requires traffic from the peer within 10 seconds, after which the peer is disconnected and its slot enters the reconnection grace. Any inbound frame counts as activity, including the peer's own pings and pongs. A peer with no inbound traffic at all for 45 seconds is dropped regardless.
 
 Token expiry is a disconnect cause: the relay closes with `1008` and reason `token expired` when `exp` passes. The client reconnects promptly with a new token, without applying the liveness backoff. Because the slot is in the reconnection grace, the reconnect follows the normal path: the counterpart may observe an additional `session_ready` and no `peer_disconnected`; only a reconnect that misses the grace produces `peer_disconnected`.
+
+A reconnect does not reset the client state of §10 and §13. The established counterpart, the replay memory and the outstanding messages belong to the pairing or session and its keys, not to the connection. A repeated `session_ready` does not start a new session. A peer that reconnects under a different identity is rejected by its counterpart (§10, step 1), even if the Relay admitted that identity to the slot after the grace window.
 
 
