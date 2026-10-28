@@ -79,6 +79,16 @@ pub struct RelayLimitsConfig {
     /// Inbound byte rate per connection.
     pub inbound_byte_rate: RateLimit,
 
+    /// Rate at which one connection's socket is read, counting every byte
+    /// that crosses the wire before the WebSocket layer parses it: the
+    /// upgrade request, frame headers and masks, control frames and the
+    /// continuation frames of fragmented messages. A connection over it is
+    /// read more slowly, not disconnected. Keep it above
+    /// [`RelayLimitsConfig::inbound_byte_rate`], which counts only the
+    /// payloads of complete messages, so that framing never slows a peer
+    /// that stays within that.
+    pub inbound_wire_byte_rate: RateLimit,
+
     /// Inbound byte rate one identity may consume from the relay-wide budget.
     /// Sized so that several identities together can exhaust
     /// [`RelayLimitsConfig::global_inbound_byte_rate`], but one cannot.
@@ -116,6 +126,10 @@ impl Default for RelayLimitsConfig {
             },
             inbound_byte_rate: RateLimit {
                 burst: 512 * 1024,
+                interval: Duration::from_secs(2),
+            },
+            inbound_wire_byte_rate: RateLimit {
+                burst: 1024 * 1024,
                 interval: Duration::from_secs(2),
             },
             identity_inbound_byte_rate: RateLimit {
@@ -187,11 +201,7 @@ impl Bucket {
     /// returning whether the attempt is allowed.
     fn allow_n_above(&mut self, cost: u32, floor: u32, rate: RateLimit, now: Instant) -> bool {
         let cost = f64::from(cost.clamp(1, rate.burst.max(1)));
-        let elapsed = now.saturating_duration_since(self.last);
-        let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
-        let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
-        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
-        self.last = now;
+        self.refill(rate, now);
 
         if self.tokens - cost >= f64::from(floor) {
             self.tokens -= cost;
@@ -199,6 +209,39 @@ impl Bucket {
         } else {
             false
         }
+    }
+
+    /// Add what has accrued since the last update, up to the burst.
+    fn refill(&mut self, rate: RateLimit, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last);
+        let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
+        let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
+        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
+        self.last = now;
+    }
+
+    /// Refill, and return the whole tokens available now.
+    pub(crate) fn available(&mut self, rate: RateLimit, now: Instant) -> u32 {
+        self.refill(rate, now);
+        // Truncates, and saturates at both ends.
+        self.tokens as u32
+    }
+
+    /// Spend `cost` of the tokens [`Bucket::available`] reported.
+    pub(crate) fn spend(&mut self, cost: u32) {
+        self.tokens -= f64::from(cost);
+    }
+
+    /// Time from the last refill until the bucket holds `tokens`, or its whole
+    /// burst if that is smaller.
+    pub(crate) fn time_until(&self, tokens: u32, rate: RateLimit) -> Duration {
+        let burst = rate.burst.max(1);
+        let missing = f64::from(tokens.clamp(1, burst)) - self.tokens;
+        if missing <= 0.0 {
+            return Duration::ZERO;
+        }
+        let seconds = missing * rate.interval.as_secs_f64() / f64::from(burst);
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
     }
 }
 
@@ -608,6 +651,26 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         assert!(!bucket.allow_n(31, rate, Instant::now()));
         assert!(bucket.allow_n(30, rate, Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_reports_what_it_holds_and_when_it_will_hold_more() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert_eq!(bucket.available(rate, Instant::now()), 100);
+        assert_eq!(bucket.time_until(50, rate), Duration::ZERO);
+        bucket.spend(100);
+        assert_eq!(bucket.available(rate, Instant::now()), 0);
+        // 10 tokens per second, and never more than the burst to wait for.
+        assert_eq!(bucket.time_until(50, rate), Duration::from_secs(5));
+        assert_eq!(bucket.time_until(1_000, rate), Duration::from_secs(10));
+
+        tokio::time::advance(Duration::from_millis(2_500)).await;
+        assert_eq!(bucket.available(rate, Instant::now()), 25);
     }
 
     #[tokio::test(start_paused = true)]

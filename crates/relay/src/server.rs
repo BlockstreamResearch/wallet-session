@@ -67,7 +67,9 @@ pub async fn handle(
     };
 
     let grace = config.session_grace;
-    let (query, client, mut websocket) = Connection::handshake(stream, config.clone()).await?;
+    let wire_rate = limiter.limits().inbound_wire_byte_rate;
+    let (query, client, mut websocket) =
+        Connection::handshake(stream, config.clone(), wire_rate).await?;
     let identity = &client.identity;
 
     if !limiter.allow_connect(&identity.did) {
@@ -192,7 +194,15 @@ mod tests {
     use tokio::time::timeout;
     use tokio_tungstenite::{
         MaybeTlsStream, WebSocketStream, connect_async,
-        tungstenite::{Bytes, Message, client::IntoClientRequest, http::HeaderValue},
+        tungstenite::{
+            Bytes, Message,
+            client::IntoClientRequest,
+            http::HeaderValue,
+            protocol::frame::{
+                Frame, FrameHeader,
+                coding::{Data, OpCode},
+            },
+        },
     };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
     use wallet_session_core::message::Topic;
@@ -1756,6 +1766,7 @@ mod tests {
             RelayLimitsConfig {
                 inbound_message_rate: unlimited,
                 inbound_byte_rate: unlimited,
+                inbound_wire_byte_rate: unlimited,
                 global_inbound_byte_rate: unlimited,
                 ..RelayLimitsConfig::default()
             },
@@ -1820,6 +1831,7 @@ mod tests {
             RelayLimitsConfig {
                 inbound_message_rate: unlimited,
                 inbound_byte_rate: unlimited,
+                inbound_wire_byte_rate: unlimited,
                 identity_inbound_byte_rate: unlimited,
                 source_inbound_byte_rate: unlimited,
                 global_inbound_byte_rate: unlimited,
@@ -2079,6 +2091,7 @@ mod tests {
                 interval: Duration::from_secs(3600),
             },
             inbound_byte_rate: roomy,
+            inbound_wire_byte_rate: roomy,
             identity_inbound_byte_rate: roomy,
             source_inbound_byte_rate: roomy,
             global_inbound_byte_rate: roomy,
@@ -2463,6 +2476,72 @@ mod tests {
             );
         }
         assert_eq!(limiter.dropped_source_bytes(), 2 * u64::from(frame));
+        Ok(())
+    }
+
+    /// A data frame as a client hands it to its WebSocket, which masks it on
+    /// the way out.
+    fn raw_frame(opcode: Data, is_final: bool, payload: &[u8]) -> Message {
+        Message::Frame(Frame::from_payload(
+            FrameHeader {
+                is_final,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: OpCode::Data(opcode),
+                mask: None,
+            },
+            Bytes::copy_from_slice(payload),
+        ))
+    }
+
+    /// The fragment bypass the Cloud audit reproduced, at a bounded scale. A
+    /// FIN=0 text frame and 100,000 empty continuations, six bytes each, were
+    /// parsed in milliseconds with nothing charged, because none of them is a
+    /// message. Every byte now passes the connection's wire budget before it
+    /// is parsed, so the flood is read at that rate, and the sender is slowed
+    /// down, not disconnected.
+    #[tokio::test]
+    async fn empty_continuation_flood_is_read_at_the_wire_rate() -> TestResult {
+        const CONTINUATIONS: usize = 10_000;
+        // The flood is about 60 KB, nearly four bursts.
+        let wire_rate = RateLimit {
+            burst: 16 * 1024,
+            interval: Duration::from_secs(1),
+        };
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            RelayLimitsConfig {
+                inbound_wire_byte_rate: wire_rate,
+                ..RelayLimitsConfig::default()
+            },
+        )
+        .await?;
+        let topic = topic()?;
+        let (mut proposer, mut responder) = ready_pair(addr, &topic).await?;
+
+        let started = tokio::time::Instant::now();
+        proposer.feed(raw_frame(Data::Text, false, b"")).await?;
+        for _ in 0..CONTINUATIONS {
+            proposer.feed(raw_frame(Data::Continue, false, b"")).await?;
+        }
+        let last = serde_json::to_string(&message(&topic, "f0", "after-fragments"))?;
+        proposer
+            .send(raw_frame(Data::Continue, true, last.as_bytes()))
+            .await?;
+
+        // The message is whole, so every fragment was read, in order.
+        assert_eq!(read_frame(&mut responder).await?.id, "f0");
+        // What the burst did not cover takes about 2.7 seconds.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "empty continuations must be read at the wire rate, took {elapsed:?}"
+        );
+
+        // The sender is still connected, and its next frame goes through.
+        send(&mut proposer, &message(&topic, "f1", "still-connected")).await?;
+        assert_eq!(read_frame(&mut responder).await?.id, "f1");
         Ok(())
     }
 

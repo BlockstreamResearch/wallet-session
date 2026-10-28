@@ -34,6 +34,7 @@ See `configuration/base.yaml` for every key. The ones that matter most:
 | `session.buffer_max_messages` / `session.buffer_ttl_seconds` | frames buffered for it |
 | `limits.*` | connection caps, per-identity/per-connection rates, and each identity's and source's share of the global inbound byte budget |
 | `limits.global_paired_reserve_percent` | part of the global budget only paired sessions may spend |
+| `limits.inbound_wire_byte_rate` | rate at which one connection's socket is read, framing and fragments included (see [Wire bytes](#wire-bytes)) |
 | `connection.*` | frame size, queue capacity, and the handshake, write, ping, pong and idle timeouts |
 | `connection.outbound_queue_max_bytes` | bytes held for one peer and not yet written (see [Outbound memory](#outbound-memory)) |
 | `connection.outbound_queue_timeout_seconds` | longest a frame may wait in a peer's outbound queue before that peer is dropped |
@@ -140,6 +141,56 @@ Topology limits:
   and its sources are the TCP peers. Nothing in the relay can tell apart
   clients that share an address.
 - Budgets are per process. Each relay instance has its own.
+
+### Wire bytes
+
+The budgets above count what reaches the read loop: complete text messages
+and control frames. The WebSocket layer below it does work on every frame,
+and a message may arrive in any number of fragments, so a client could send a
+text frame without FIN followed by empty continuation frames, six bytes each,
+that never form a message and were never charged.
+
+Every connection's socket is therefore read through its own wire budget,
+`limits.inbound_wire_byte_rate` (default 1 MiB per 2 seconds), before the
+WebSocket layer parses anything. Every byte read counts once: the upgrade
+request, frame headers and masks, control frames, the continuations of a
+fragmented message, and the payloads of complete messages.
+
+- A read takes no more than the budget holds. While the budget is empty the
+  relay leaves the socket alone and tries again when it has refilled, after at
+  most a second, so the sender is slowed down by TCP flow control. Nothing is
+  dropped, and exceeding the wire budget never disconnects anyone.
+- The token, pong and idle deadlines keep running meanwhile. A throttled read
+  only holds up this connection's own frames.
+- The wire budget is separate from `inbound_byte_rate`: a complete message's
+  payload is counted once in each, never twice in one. The default leaves room
+  for the framing of a peer that stays within `inbound_byte_rate`, so only
+  overhead-heavy traffic, like a fragment flood, is slowed. Keep it above
+  `inbound_byte_rate`.
+- `limits.inbound_wire_byte_rate` is required, like the other limits; a
+  configuration file written for an earlier version must add it.
+
+Residual limits:
+
+- The wire budget is per connection only. Wire bytes spend no identity, source
+  or global budget, because frames that reach nobody must not (see above), and
+  a relay-wide wire budget would let one-sided floods slow paired sessions'
+  reads. A client's wire throughput therefore scales with its connections, up
+  to `limits.max_connections` across identities, and only per-connection
+  limits in front of the relay (nginx `limit_conn`) bound how many one source
+  holds.
+- The budget counts bytes, not frames. An empty continuation costs the relay
+  several times more work per byte than a large frame, so at the default rate
+  one connection streaming nothing but empty fragments is read at about
+  87,000 frames a second. There is no limit on the number of fragments per
+  message: tokio-tungstenite has no frame-level read to enforce one.
+- Fragments are not messages, so they do not reset the idle deadline; a
+  connection that streams them and answers the relay's pings lasts until its
+  token expires, read at its wire rate.
+- A peer that sends faster than its wire budget queues its own pongs and
+  messages behind the bytes waiting for it. If nothing complete gets through
+  within `connection.pong_timeout_seconds` of a keepalive ping, the pong
+  deadline drops it.
 
 ### Outbound memory
 

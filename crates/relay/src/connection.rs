@@ -22,7 +22,8 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, InboundBytes, Limiter, Traffic},
+    limits::{Bucket, InboundBytes, Limiter, RateLimit, Traffic},
+    meter::MeteredStream,
     session::{Counterpart, Outbound, Registration, Role, Session, SessionError},
     source::Source,
 };
@@ -31,8 +32,9 @@ use wallet_session_core::{
     frame::{RelayFrame, RelayFrameBody},
 };
 
-/// Server-side relay WebSocket stream.
-pub(crate) type RelayStream = WebSocketStream<TcpStream>;
+/// Server-side relay WebSocket stream, read through the connection's wire
+/// budget.
+pub(crate) type RelayStream = WebSocketStream<MeteredStream<TcpStream>>;
 
 /// Relay frame protocol version accepted from clients.
 pub(crate) const RELAY_FRAME_VERSION: u8 = 1;
@@ -133,15 +135,21 @@ impl Connection {
     ///
     /// The client's source is the TCP peer, or the address a peer listed in
     /// the trusted proxies names in `X-Real-IP` (see [`Source::resolve`]).
+    ///
+    /// Every byte read from `stream` from here on, the upgrade request
+    /// included, is admitted at `wire_rate` before tungstenite parses it (see
+    /// [`crate::meter`]).
     #[allow(clippy::result_large_err)]
     pub async fn handshake(
         stream: TcpStream,
         config: NativeRelayTransportConfig,
+        wire_rate: RateLimit,
     ) -> Result<(ConnectionQuery, Client, RelayStream), ConnectionError> {
         let peer = stream
             .peer_addr()
             .map_err(ConnectionError::PeerAddress)?
             .ip();
+        let stream = MeteredStream::new(stream, wire_rate);
         let audience = config.audience.as_str();
         let now = unix_now();
         let mut parsed: Option<Result<(ConnectionQuery, Client), ConnectionError>> = None;
@@ -1136,7 +1144,8 @@ mod tests {
 
         let config = NativeRelayTransportConfig::new(AUDIENCE)
             .with_handshake_timeout(Duration::from_millis(100));
-        let outcome = Connection::handshake(server, config).await;
+        let wire_rate = crate::limits::RelayLimitsConfig::default().inbound_wire_byte_rate;
+        let outcome = Connection::handshake(server, config, wire_rate).await;
         assert!(matches!(outcome, Err(ConnectionError::HandshakeTimeout)));
         Ok(())
     }

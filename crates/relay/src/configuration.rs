@@ -221,6 +221,10 @@ pub struct LimitsSettings {
     /// Inbound byte rate per connection.
     pub inbound_byte_rate: RateSettings,
 
+    /// Rate at which one connection's socket is read, framing, control
+    /// frames and fragments included.
+    pub inbound_wire_byte_rate: RateSettings,
+
     /// Inbound byte rate one identity may consume from the relay-wide budget.
     pub identity_inbound_byte_rate: RateSettings,
 
@@ -355,6 +359,10 @@ impl Settings {
             ),
             ("limits.inbound_byte_rate", &self.limits.inbound_byte_rate),
             (
+                "limits.inbound_wire_byte_rate",
+                &self.limits.inbound_wire_byte_rate,
+            ),
+            (
                 "limits.identity_inbound_byte_rate",
                 &self.limits.identity_inbound_byte_rate,
             ),
@@ -402,6 +410,12 @@ impl Settings {
             (
                 "limits.inbound_byte_rate",
                 self.limits.inbound_byte_rate.burst,
+            ),
+            // A frame larger than this burst would still be read, only
+            // throttled part-way through.
+            (
+                "limits.inbound_wire_byte_rate",
+                self.limits.inbound_wire_byte_rate.burst,
             ),
             (
                 "limits.global_inbound_byte_rate",
@@ -489,6 +503,7 @@ impl From<&Settings> for RelayLimitsConfig {
             connect_rate: (&settings.limits.connect_rate).into(),
             inbound_message_rate: (&settings.limits.inbound_message_rate).into(),
             inbound_byte_rate: (&settings.limits.inbound_byte_rate).into(),
+            inbound_wire_byte_rate: (&settings.limits.inbound_wire_byte_rate).into(),
             identity_inbound_byte_rate: (&settings.limits.identity_inbound_byte_rate).into(),
             source_inbound_byte_rate: (&settings.limits.source_inbound_byte_rate).into(),
             global_inbound_byte_rate: (&settings.limits.global_inbound_byte_rate).into(),
@@ -706,6 +721,42 @@ mod tests {
             settings.validate(),
             Err(ConfigurationError::Zero {
                 setting: "limits.source_inbound_byte_rate"
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wire_rate_is_shipped_above_the_payload_rate_and_validated() -> TestResult {
+        let settings = shipped()?;
+        let limits = RelayLimitsConfig::from(&settings);
+        assert!(
+            limits.inbound_wire_byte_rate.burst > limits.inbound_byte_rate.burst
+                && limits.inbound_wire_byte_rate.interval == limits.inbound_byte_rate.interval,
+            "the wire rate must leave room for the framing of payloads within their rate"
+        );
+        assert_eq!(
+            RelayLimitsConfig::from(&deployed()?).inbound_wire_byte_rate,
+            limits.inbound_wire_byte_rate
+        );
+
+        let mut settings = shipped()?;
+        settings.limits.inbound_wire_byte_rate.interval_seconds = 0;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::Zero {
+                setting: "limits.inbound_wire_byte_rate"
+            })
+        ));
+
+        let mut settings = shipped()?;
+        settings.limits.inbound_wire_byte_rate.burst =
+            u32::try_from(settings.connection.max_incoming_frame_bytes)? - 1;
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigurationError::BurstBelowFrameCap {
+                setting: "limits.inbound_wire_byte_rate",
+                ..
             })
         ));
         Ok(())
