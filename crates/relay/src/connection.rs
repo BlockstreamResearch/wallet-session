@@ -673,8 +673,13 @@ async fn read_loop(
                 backlog_pending = match backlog.tx.upgrade() {
                     Some(tx) => {
                         let drain = session.drain_backlog(query.role, &tx)?;
+                        // A continuously refilled backlog must not bank an
+                        // unbounded exemption for later inbound messages.
+                        let credit_cap = u32::try_from(config.session_buffer_max_messages)
+                            .unwrap_or(u32::MAX);
                         redelivery_credit = redelivery_credit
-                            .saturating_add(u32::try_from(drain.delivered).unwrap_or(u32::MAX));
+                            .saturating_add(u32::try_from(drain.delivered).unwrap_or(u32::MAX))
+                            .min(credit_cap);
                         !drain.finished
                     }
                     // The slot let go of the queue: this connection was replaced.
