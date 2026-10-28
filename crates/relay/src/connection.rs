@@ -22,13 +22,13 @@ use wallet_session_core::{codec, connection::ConnectionQuery};
 use crate::{
     auth::{Identity, IdentityError, unix_now},
     config::NativeRelayTransportConfig,
-    limits::{Bucket, InboundBytes, Limiter},
-    session::{Outbound, Registration, Role, Session, SessionError},
+    limits::{Bucket, InboundBytes, Limiter, Traffic},
+    session::{Counterpart, Outbound, Registration, Role, Session, SessionError},
+    source::Source,
 };
 use wallet_session_core::{
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
-    message::Topic,
 };
 
 /// Server-side relay WebSocket stream.
@@ -103,6 +103,16 @@ pub(crate) fn random_id() -> Result<String, ConnectionError> {
     Ok(codec::encode(&bytes))
 }
 
+/// The client behind an accepted handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    /// Identity proven by the connection token.
+    pub identity: Identity,
+
+    /// Address the connection's inbound bytes are accounted to.
+    pub source: Source,
+}
+
 /// A single peer connection bound to one topic slot.
 ///
 /// A connection only depends on its [`Session`]; peer registration and
@@ -110,6 +120,7 @@ pub(crate) fn random_id() -> Result<String, ConnectionError> {
 pub struct Connection {
     query: ConnectionQuery,
     identity: Identity,
+    source: Source,
     session: Arc<Session>,
     outbound: mpsc::Receiver<Outbound>,
     self_tx: mpsc::Sender<Outbound>,
@@ -119,21 +130,31 @@ pub struct Connection {
 
 impl Connection {
     /// Perform the WebSocket handshake and parse the connection parameters.
+    ///
+    /// The client's source is the TCP peer, or the address a peer listed in
+    /// the trusted proxies names in `X-Real-IP` (see [`Source::resolve`]).
     #[allow(clippy::result_large_err)]
     pub async fn handshake(
         stream: TcpStream,
         config: NativeRelayTransportConfig,
-    ) -> Result<(ConnectionQuery, Identity, RelayStream), ConnectionError> {
+    ) -> Result<(ConnectionQuery, Client, RelayStream), ConnectionError> {
+        let peer = stream
+            .peer_addr()
+            .map_err(ConnectionError::PeerAddress)?
+            .ip();
         let audience = config.audience.as_str();
         let now = unix_now();
-        let mut parsed: Option<Result<(ConnectionQuery, Identity), ConnectionError>> = None;
+        let mut parsed: Option<Result<(ConnectionQuery, Client), ConnectionError>> = None;
         let request = accept_hdr_async_with_config(
             stream,
             |request: &Request, response: Response| {
                 let params =
                     parse_connection(request.uri(), audience, now, config.max_token_lifetime);
                 let accepted = params.is_ok();
-                parsed = Some(params);
+                parsed = Some(params.map(|(query, identity)| {
+                    let source = Source::resolve(peer, request.headers(), &config.trusted_proxies);
+                    (query, Client { identity, source })
+                }));
                 if accepted {
                     Ok(response)
                 } else {
@@ -150,7 +171,7 @@ impl Connection {
             }
         };
 
-        let (query, identity) = match parsed {
+        let (query, client) = match parsed {
             Some(Ok(parsed)) => parsed,
             Some(Err(error)) => return Err(error),
             None => match handshake.err() {
@@ -164,16 +185,16 @@ impl Connection {
             "handshake accepted for topic {} as {:?} ({})",
             query.topic.log_tag(),
             query.role,
-            identity.did
+            client.identity.did
         );
 
-        Ok((query, identity, websocket))
+        Ok((query, client, websocket))
     }
 
     /// Build a connection for a peer that has been registered on `session`.
     pub fn new(
         query: ConnectionQuery,
-        identity: Identity,
+        client: Client,
         session: Arc<Session>,
         outbound: mpsc::Receiver<Outbound>,
         self_tx: mpsc::Sender<Outbound>,
@@ -182,7 +203,8 @@ impl Connection {
     ) -> Self {
         Self {
             query,
-            identity,
+            identity: client.identity,
+            source: client.source,
             session,
             outbound,
             self_tx,
@@ -259,6 +281,7 @@ impl Connection {
             config,
             limiter: &self.limiter,
             identity: &self.identity.did,
+            source: self.source,
             expires_at,
         };
         let result = read_loop(
@@ -404,25 +427,23 @@ fn spend_redelivery_credit(credit: &mut u32) -> bool {
 }
 
 /// Charge an inbound control frame like a text frame: to the connection's
-/// inbound budget, then to the identity's share of the relay-wide budget and
-/// to the budget itself.
+/// inbound budget, then to the shared budgets (see [`charge_shared`]).
 ///
-/// The frame is dropped when a budget is exhausted, and a peer that keeps
-/// exceeding its own or its identity's budget is disconnected like any other
-/// flooder. An exhausted relay-wide budget alone drops the frame without
-/// counting towards that, so other identities cannot get this peer
-/// disconnected. Returns `Err` only to disconnect the peer.
+/// Control frames are for the relay, not the counterpart, so they are charged
+/// whether or not one is connected. Without a connected counterpart they are
+/// [`Traffic::Unpaired`] and cannot spend the share reserved for paired
+/// traffic. The frame is dropped when a budget is exhausted, and a peer that
+/// keeps exceeding its own budget is disconnected like any other flooder.
+/// Returns `Err` only to disconnect the peer.
 fn charge_control_frame(
     bytes: usize,
     message_bucket: &mut Bucket,
     byte_bucket: &mut Bucket,
-    limiter: &Limiter,
-    identity: &DidKey,
+    context: &ReadContext<'_>,
     consecutive_drops: &mut u32,
-    topic: &Topic,
+    topic: &impl fmt::Display,
 ) -> Result<(), ConnectionError> {
-    let topic = topic.log_tag();
-    let limits = limiter.limits();
+    let limits = context.limiter.limits();
     let now = tokio::time::Instant::now();
     let within_connection_limits = message_bucket.allow_n(1, limits.inbound_message_rate, now)
         && byte_bucket.allow_n(
@@ -440,12 +461,54 @@ fn charge_control_frame(
         return Ok(());
     }
 
-    match limiter.allow_inbound_bytes(identity, bytes) {
-        InboundBytes::Allowed => *consecutive_drops = 0,
+    let traffic = match context.session.counterpart(context.query.role)? {
+        Counterpart::Connected => Traffic::Paired,
+        Counterpart::Reserved | Counterpart::Absent => Traffic::Unpaired,
+    };
+    charge_shared(
+        context,
+        bytes,
+        traffic,
+        consecutive_drops,
+        "control frame",
+        topic,
+    )?;
+    Ok(())
+}
+
+/// Charge `bytes` the connection's own budget has accepted to the shared
+/// budgets: the identity's and the source's shares of the relay-wide budget,
+/// and the budget itself. Returns whether the frame may go on, or `Err` to
+/// disconnect the peer.
+///
+/// A peer that keeps exceeding its identity's share is disconnected like one
+/// that keeps exceeding its own budget. An exhausted source share or
+/// relay-wide budget only drops the frame, without counting towards that:
+/// other identities, behind the same address or anywhere else, could
+/// otherwise get this peer disconnected.
+fn charge_shared(
+    context: &ReadContext<'_>,
+    bytes: usize,
+    traffic: Traffic,
+    consecutive_drops: &mut u32,
+    kind: &str,
+    topic: &impl fmt::Display,
+) -> Result<bool, ConnectionError> {
+    let ReadContext {
+        limiter,
+        identity,
+        source,
+        ..
+    } = *context;
+    match limiter.allow_inbound_bytes(identity, &source, bytes, traffic) {
+        InboundBytes::Allowed => {
+            *consecutive_drops = 0;
+            return Ok(true);
+        }
         InboundBytes::ShareExhausted => {
             *consecutive_drops += 1;
             log::debug!(
-                "dropping control frame on topic {topic}: identity share of the relay budget exhausted"
+                "dropping {kind} on topic {topic}: identity share of the relay budget exhausted"
             );
             if *consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
                 log::warn!(
@@ -454,13 +517,16 @@ fn charge_control_frame(
                 return Err(ConnectionError::RateLimited);
             }
         }
-        InboundBytes::GlobalExhausted => {
+        InboundBytes::SourceExhausted => {
             log::debug!(
-                "dropping control frame on topic {topic}: relay inbound byte budget exhausted"
+                "dropping {kind} on topic {topic}: source share of the relay budget exhausted"
             );
         }
+        InboundBytes::GlobalExhausted => {
+            log::debug!("dropping {kind} on topic {topic}: relay inbound byte budget exhausted");
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Send one message, returning whether the socket is still usable.
@@ -521,6 +587,7 @@ struct ReadContext<'a> {
     config: &'a NativeRelayTransportConfig,
     limiter: &'a Limiter,
     identity: &'a DidKey,
+    source: Source,
     expires_at: tokio::time::Instant,
 }
 
@@ -548,10 +615,13 @@ async fn read_loop(
         session,
         config,
         limiter,
-        identity,
         expires_at,
+        ..
     } = *context;
     let topic = query.topic.log_tag();
+    // A frame for a reconnecting counterpart is buffered only when buffering
+    // is on; otherwise nothing will receive it, as with no counterpart at all.
+    let buffering = config.session_buffer_max_messages > 0 && !config.session_buffer_ttl.is_zero();
 
     let limits = limiter.limits();
     let now = tokio::time::Instant::now();
@@ -640,27 +710,28 @@ async fn read_loop(
                     continue;
                 }
 
-                match limiter.allow_inbound_bytes(identity, text.len()) {
-                    InboundBytes::Allowed => consecutive_drops = 0,
-                    InboundBytes::ShareExhausted => {
-                        consecutive_drops += 1;
-                        log::debug!(
-                            "dropping frame on topic {topic}: identity share of the relay budget exhausted"
-                        );
-                        if consecutive_drops > MAX_CONSECUTIVE_RATE_DROPS {
-                            log::warn!(
-                                "peer on topic {topic} keeps exceeding its share of the relay budget; dropping"
-                            );
-                            return Err(ConnectionError::RateLimited);
-                        }
+                // Only a frame something can receive, its counterpart or the
+                // buffer kept for it while it reconnects, spends the shared
+                // budgets and is parsed. Any other frame is dropped here, at
+                // the cost of this connection's own budget alone.
+                let traffic = match session.counterpart(query.role)? {
+                    Counterpart::Connected => Traffic::Paired,
+                    Counterpart::Reserved if buffering => Traffic::Unpaired,
+                    Counterpart::Reserved | Counterpart::Absent => {
+                        log::trace!("dropping frame on topic {topic}: counterpart not connected");
                         continue;
                     }
-                    InboundBytes::GlobalExhausted => {
-                        log::debug!(
-                            "dropping frame on topic {topic}: relay inbound byte budget exhausted"
-                        );
-                        continue;
-                    }
+                };
+                let charged = charge_shared(
+                    context,
+                    text.len(),
+                    traffic,
+                    &mut consecutive_drops,
+                    "frame",
+                    &topic,
+                )?;
+                if !charged {
+                    continue;
                 }
 
                 // Neither record carries the frame itself: it holds the topic,
@@ -688,10 +759,9 @@ async fn read_loop(
                     payload.len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    limiter,
-                    identity,
+                    context,
                     &mut consecutive_drops,
-                    &query.topic,
+                    &topic,
                 )?;
                 continue;
             }
@@ -700,10 +770,9 @@ async fn read_loop(
                     frame.payload().len(),
                     &mut message_bucket,
                     &mut byte_bucket,
-                    limiter,
-                    identity,
+                    context,
                     &mut consecutive_drops,
-                    &query.topic,
+                    &topic,
                 )?;
                 continue;
             }
@@ -802,6 +871,9 @@ pub enum ConnectionError {
 
     #[error("websocket handshake timed out")]
     HandshakeTimeout,
+
+    #[error("peer address unavailable: {0}")]
+    PeerAddress(std::io::Error),
 
     #[error("handshake query is too large")]
     QueryTooLarge,

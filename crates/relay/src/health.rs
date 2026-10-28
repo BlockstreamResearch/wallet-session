@@ -32,6 +32,7 @@ pub struct ReadinessResponse {
     connections: usize,
     sessions: usize,
     dropped_share_bytes: u64,
+    dropped_source_bytes: u64,
     dropped_global_bytes: u64,
 }
 
@@ -77,6 +78,7 @@ async fn ready(State(state): State<HealthState>) -> impl IntoResponse {
                 connections: state.limiter.active_connections(),
                 sessions,
                 dropped_share_bytes: state.limiter.dropped_share_bytes(),
+                dropped_source_bytes: state.limiter.dropped_source_bytes(),
                 dropped_global_bytes: state.limiter.dropped_global_bytes(),
             }),
         )
@@ -96,7 +98,7 @@ async fn ready(State(state): State<HealthState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{net::IpAddr, time::Duration};
 
     use axum::{
         body::{Body, to_bytes},
@@ -115,8 +117,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        limits::{OutboundBudget, RateLimit, RelayLimitsConfig},
+        limits::{InboundBytes, OutboundBudget, RateLimit, RelayLimitsConfig, Traffic},
         session::{PeerHandle, Role},
+        source::Source,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -200,6 +203,7 @@ mod tests {
                 "connections": 1,
                 "sessions": 1,
                 "dropped_share_bytes": 0,
+                "dropped_source_bytes": 0,
                 "dropped_global_bytes": 0,
             })
         );
@@ -214,6 +218,10 @@ mod tests {
                 burst: 10,
                 interval: Duration::from_secs(3600),
             },
+            source_inbound_byte_rate: RateLimit {
+                burst: 20,
+                interval: Duration::from_secs(3600),
+            },
             global_inbound_byte_rate: RateLimit {
                 burst: 100,
                 interval: Duration::from_secs(3600),
@@ -221,28 +229,21 @@ mod tests {
             ..RelayLimitsConfig::default()
         }));
 
-        let hog = DidKey::from_ed25519_bytes([1u8; 32]);
-        assert_eq!(
-            limiter.allow_inbound_bytes(&hog, 10),
-            crate::limits::InboundBytes::Allowed
-        );
-        assert_eq!(
-            limiter.allow_inbound_bytes(&hog, 1),
-            crate::limits::InboundBytes::ShareExhausted
-        );
-
-        for seed in 2..11 {
+        let shared = Source::of(IpAddr::from([192, 0, 2, 1]));
+        let own = |seed: u8| Source::of(IpAddr::from([198, 51, 100, seed]));
+        let charge = |seed: u8, source: Source, bytes: usize| {
             let identity = DidKey::from_ed25519_bytes([seed; 32]);
-            assert_eq!(
-                limiter.allow_inbound_bytes(&identity, 10),
-                crate::limits::InboundBytes::Allowed
-            );
+            limiter.allow_inbound_bytes(&identity, &source, bytes, Traffic::Paired)
+        };
+
+        assert_eq!(charge(1, shared, 10), InboundBytes::Allowed);
+        assert_eq!(charge(1, shared, 1), InboundBytes::ShareExhausted);
+        assert_eq!(charge(2, shared, 10), InboundBytes::Allowed);
+        assert_eq!(charge(3, shared, 10), InboundBytes::SourceExhausted);
+        for seed in 4..12 {
+            assert_eq!(charge(seed, own(seed), 10), InboundBytes::Allowed);
         }
-        let last = DidKey::from_ed25519_bytes([11u8; 32]);
-        assert_eq!(
-            limiter.allow_inbound_bytes(&last, 10),
-            crate::limits::InboundBytes::GlobalExhausted
-        );
+        assert_eq!(charge(12, own(12), 10), InboundBytes::GlobalExhausted);
 
         let (status, body) = get(registry, limiter, READY_PATH).await;
         assert_eq!(status, StatusCode::OK);
@@ -253,6 +254,7 @@ mod tests {
                 "connections": 0,
                 "sessions": 0,
                 "dropped_share_bytes": 1,
+                "dropped_source_bytes": 10,
                 "dropped_global_bytes": 10,
             })
         );
@@ -342,7 +344,7 @@ mod tests {
         assert!(ready.contains("content-type: application/json"), "{ready}");
         assert!(
             ready.ends_with(
-                r#"{"status":"ok","connections":0,"sessions":0,"dropped_share_bytes":0,"dropped_global_bytes":0}"#
+                r#"{"status":"ok","connections":0,"sessions":0,"dropped_share_bytes":0,"dropped_source_bytes":0,"dropped_global_bytes":0}"#
             ),
             "{ready}"
         );

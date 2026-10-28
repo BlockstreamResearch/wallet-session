@@ -67,7 +67,8 @@ pub async fn handle(
     };
 
     let grace = config.session_grace;
-    let (query, identity, mut websocket) = Connection::handshake(stream, config.clone()).await?;
+    let (query, client, mut websocket) = Connection::handshake(stream, config.clone()).await?;
+    let identity = &client.identity;
 
     if !limiter.allow_connect(&identity.did) {
         log::warn!("connect rate limit exceeded for {}", identity.did);
@@ -121,17 +122,9 @@ pub async fn handle(
         };
 
     let holds_slot = !matches!(registration, Registration::RoleTaken(_));
-    let result = Connection::new(
-        query,
-        identity,
-        session,
-        rx,
-        tx,
-        config,
-        Arc::clone(&limiter),
-    )
-    .run(websocket, registration)
-    .await;
+    let result = Connection::new(query, client, session, rx, tx, config, Arc::clone(&limiter))
+        .run(websocket, registration)
+        .await;
 
     if holds_slot
         && registry
@@ -192,13 +185,14 @@ mod tests {
     use crate::auth::test_utils::{self, signing_key};
     use crate::connection::MAX_CONSECUTIVE_RATE_DROPS;
     use crate::limits::{Limiter, RateLimit, RelayLimitsConfig};
+    use crate::source::{IpPrefix, REAL_IP_HEADER};
     use crate::telemetry::test_utils::{CapturedLogs, capture};
     use futures_util::{SinkExt, StreamExt};
     use std::net::SocketAddr;
     use tokio::time::timeout;
     use tokio_tungstenite::{
         MaybeTlsStream, WebSocketStream, connect_async,
-        tungstenite::{Bytes, Message},
+        tungstenite::{Bytes, Message, client::IntoClientRequest, http::HeaderValue},
     };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
     use wallet_session_core::message::Topic;
@@ -1827,6 +1821,7 @@ mod tests {
                 inbound_message_rate: unlimited,
                 inbound_byte_rate: unlimited,
                 identity_inbound_byte_rate: unlimited,
+                source_inbound_byte_rate: unlimited,
                 global_inbound_byte_rate: unlimited,
                 ..RelayLimitsConfig::default()
             },
@@ -2072,10 +2067,10 @@ mod tests {
     /// Bytes of the pings these tests send.
     const PING_PAYLOAD: u32 = 100;
 
-    /// Limits under which only the shared byte budgets can refuse a ping.
-    fn ping_limits() -> RelayLimitsConfig {
+    /// Limits under which only a budget a test tightens can refuse a frame.
+    fn roomy_limits() -> RelayLimitsConfig {
         let roomy = RateLimit {
-            burst: 1024 * 1024,
+            burst: 16 * 1024 * 1024,
             interval: Duration::from_secs(3600),
         };
         RelayLimitsConfig {
@@ -2085,8 +2080,19 @@ mod tests {
             },
             inbound_byte_rate: roomy,
             identity_inbound_byte_rate: roomy,
+            source_inbound_byte_rate: roomy,
             global_inbound_byte_rate: roomy,
             ..RelayLimitsConfig::default()
+        }
+    }
+
+    /// Limits under which only the shared byte budgets can refuse a ping.
+    /// The pinging connections have no counterpart, so their pings may not
+    /// spend a paired reserve: there is none, and the whole budget is theirs.
+    fn ping_limits() -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            global_paired_reserve_percent: 0,
+            ..roomy_limits()
         }
     }
 
@@ -2173,6 +2179,290 @@ mod tests {
             "the dropped pings must be counted against the identity share"
         );
         assert_eq!(limiter.dropped_global_bytes(), 0);
+        Ok(())
+    }
+
+    /// Connect as `auth`, sending `X-Real-IP: real_ip` if one is given.
+    async fn connect_claiming(
+        addr: SocketAddr,
+        auth: &str,
+        role: &str,
+        topic: &Topic,
+        real_ip: Option<&str>,
+    ) -> Result<Client, Box<dyn std::error::Error>> {
+        let mut request =
+            format!("ws://{addr}/?auth={auth}&role={role}&topic={topic}").into_client_request()?;
+        if let Some(real_ip) = real_ip {
+            request
+                .headers_mut()
+                .insert(REAL_IP_HEADER, HeaderValue::from_str(real_ip)?);
+        }
+        let (client, _response) = connect_async(request).await?;
+        Ok(client)
+    }
+
+    /// Ready session `n` of a test, on a topic and between two identities of
+    /// its own. Its proposer, which the tests send from, claims `real_ip` if
+    /// one is given.
+    async fn session_claiming(
+        addr: SocketAddr,
+        n: u8,
+        real_ip: Option<&str>,
+    ) -> Result<(Topic, (Client, Client)), Box<dyn std::error::Error>> {
+        let topic = Topic::new([100 + n; 32])?;
+        let proposer = token_with(2 * n + 1);
+        let responder = token_with(2 * n + 2);
+        let mut proposer = connect_claiming(addr, &proposer, "proposer", &topic, real_ip).await?;
+        let mut responder = connect_claiming(addr, &responder, "responder", &topic, None).await?;
+        read_frame(&mut proposer).await?;
+        read_frame(&mut responder).await?;
+        Ok((topic, (proposer, responder)))
+    }
+
+    /// Send `frame` from the first client of `pair` and report whether the
+    /// second receives it.
+    async fn reaches(
+        pair: &mut (Client, Client),
+        frame: &RelayFrame,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        send(&mut pair.0, frame).await?;
+        let received = timeout(Duration::from_millis(300), read_frame(&mut pair.1)).await;
+        Ok(matches!(received, Ok(Ok(RelayFrame { ref id, .. })) if *id == frame.id))
+    }
+
+    /// Bytes the relay charges for `frame`, the text the client sends.
+    fn charged_bytes(frame: &RelayFrame) -> Result<u32, Box<dyn std::error::Error>> {
+        Ok(u32::try_from(serde_json::to_string(frame)?.len())?)
+    }
+
+    /// A frame nothing can receive is dropped before it is parsed, and costs
+    /// its connection's own budget only: none of the shared budgets.
+    #[tokio::test]
+    async fn frames_nothing_can_receive_spend_no_shared_budget() -> TestResult {
+        let tight = RateLimit {
+            burst: 4096,
+            interval: Duration::from_secs(3600),
+        };
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: tight,
+            source_inbound_byte_rate: tight,
+            global_inbound_byte_rate: tight,
+            ..RelayLimitsConfig::default()
+        }));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Five times what any shared budget holds, then a frame that would
+        // close the connection if it were parsed.
+        let topic = topic()?;
+        let payload = "a".repeat(1000);
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+        for i in 0..20 {
+            send(
+                &mut proposer,
+                &message(&topic, &format!("x{i:02}"), &payload),
+            )
+            .await?;
+        }
+        proposer.send(Message::text("not a relay frame")).await?;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            (
+                limiter.dropped_share_bytes(),
+                limiter.dropped_source_bytes(),
+                limiter.dropped_global_bytes()
+            ),
+            (0, 0, 0),
+            "a frame without a receiver must not be charged to a shared budget"
+        );
+
+        // The connection survived, and every shared budget is still whole.
+        let responder = connect(addr, "responder", &topic, None).await?;
+        let mut pair = (proposer, responder);
+        read_frame(&mut pair.0).await?;
+        read_frame(&mut pair.1).await?;
+        for i in 0..3 {
+            let frame = message(&topic, &format!("m{i}"), &payload);
+            assert!(
+                reaches(&mut pair, &frame).await?,
+                "paired frame {i} was refused"
+            );
+        }
+        Ok(())
+    }
+
+    /// The connection's own budget still meters frames nothing can receive,
+    /// and a peer flooding past it is disconnected.
+    #[tokio::test]
+    async fn frames_nothing_can_receive_still_spend_the_connection_budget() -> TestResult {
+        let addr = serve_with_limits(
+            NativeRelayTransportConfig::new(AUDIENCE),
+            tight_inbound_limits(),
+        )
+        .await?;
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, None).await?;
+
+        for i in 0..64 {
+            if send(&mut proposer, &message(&topic, &format!("m{i}"), "x"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        assert!(
+            expect_closed(&mut proposer).await,
+            "a one-sided flood over the connection's own limit must be disconnected"
+        );
+        Ok(())
+    }
+
+    /// Traffic that does not travel between two connected peers, here frames
+    /// buffered for a peer that is away, cannot spend the paired reserve; and
+    /// paired frames refused for an exhausted relay budget disconnect no one.
+    #[tokio::test]
+    async fn paired_traffic_keeps_its_reserve_under_one_sided_load() -> TestResult {
+        let payload = "a".repeat(900);
+        let frame = charged_bytes(&message(&topic()?, "b0", &payload))?;
+
+        // Three frames beside the reserve, and the reserve holds one more.
+        let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+            global_inbound_byte_rate: RateLimit {
+                burst: 4 * frame,
+                interval: Duration::from_secs(3600),
+            },
+            global_paired_reserve_percent: 25,
+            ..roomy_limits()
+        }));
+        assert_eq!(limiter.limits().paired_reserve_bytes(), frame);
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        let (away, (mut sender, gone)) = session_claiming(addr, 0, None).await?;
+        drop(gone);
+        sleep(Duration::from_millis(100)).await;
+        for id in ["b0", "b1", "b2", "b3"] {
+            send(&mut sender, &message(&away, id, &payload)).await?;
+        }
+        let dropped = wait_for_count(|| limiter.dropped_global_bytes(), u64::from(frame)).await;
+        assert_eq!(
+            dropped,
+            u64::from(frame),
+            "three buffered frames fit beside the reserve, and the fourth does not"
+        );
+
+        let (talking, mut pair) = session_claiming(addr, 1, None).await?;
+        assert!(
+            reaches(&mut pair, &message(&talking, "v0", &payload)).await?,
+            "a paired frame must find the reserve untouched"
+        );
+        assert!(
+            !reaches(&mut pair, &message(&talking, "v1", &payload)).await?,
+            "the reserve is a share of the budget, not more of it"
+        );
+        assert_eq!(limiter.dropped_global_bytes(), 2 * u64::from(frame));
+
+        for client in [&mut sender, &mut pair.0] {
+            assert!(
+                timeout(Duration::from_millis(500), expect_closed(client))
+                    .await
+                    .is_err(),
+                "an exhausted relay-wide budget alone must not disconnect anyone"
+            );
+        }
+        Ok(())
+    }
+
+    /// Limits under which a source's share holds two of the frames these tests
+    /// send, and nothing else can refuse one.
+    fn source_limits(frame: u32) -> RelayLimitsConfig {
+        RelayLimitsConfig {
+            source_inbound_byte_rate: RateLimit {
+                burst: 2 * frame,
+                interval: Duration::from_secs(3600),
+            },
+            ..roomy_limits()
+        }
+    }
+
+    /// Without trusted proxies, the source is the TCP peer: identities
+    /// connecting from one address share its share, and a client cannot buy
+    /// a fresh one by naming another address in `X-Real-IP`.
+    #[tokio::test]
+    async fn a_direct_peer_cannot_name_its_own_source() -> TestResult {
+        let payload = "a".repeat(1000);
+        let frame = charged_bytes(&message(&topic()?, "m0", &payload))?;
+        let limiter = Arc::new(Limiter::new(source_limits(frame)));
+        let config = NativeRelayTransportConfig::new(AUDIENCE);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        let (topic, mut spender) = session_claiming(addr, 0, None).await?;
+        for id in ["m0", "m1"] {
+            assert!(reaches(&mut spender, &message(&topic, id, &payload)).await?);
+        }
+
+        let (topic, mut same_address) = session_claiming(addr, 1, None).await?;
+        assert!(
+            !reaches(&mut same_address, &message(&topic, "s0", &payload)).await?,
+            "another identity from the same address shares the spent share"
+        );
+        let (topic, mut spoofer) = session_claiming(addr, 2, Some("203.0.113.7")).await?;
+        assert!(
+            !reaches(&mut spoofer, &message(&topic, "s1", &payload)).await?,
+            "X-Real-IP from a peer that is not a trusted proxy must be ignored"
+        );
+        assert_eq!(limiter.dropped_source_bytes(), 2 * u64::from(frame));
+        assert_eq!(limiter.dropped_share_bytes(), 0);
+
+        assert!(
+            timeout(Duration::from_millis(500), expect_closed(&mut spoofer.0))
+                .await
+                .is_err(),
+            "an exhausted source share alone must not disconnect anyone"
+        );
+        Ok(())
+    }
+
+    /// Behind a trusted proxy, the source is the client address the proxy
+    /// names: one per IPv4 address, one per IPv6 /64.
+    #[tokio::test]
+    async fn a_trusted_proxy_names_each_client_source() -> TestResult {
+        let payload = "a".repeat(1000);
+        let frame = charged_bytes(&message(&topic()?, "m0", &payload))?;
+        let limiter = Arc::new(Limiter::new(source_limits(frame)));
+        let config = NativeRelayTransportConfig::new(AUDIENCE)
+            .with_trusted_proxies(vec!["127.0.0.1".parse::<IpPrefix>()?]);
+        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+
+        // Each client spends its source's share, which another identity
+        // behind the same source then finds spent, and a neighbour does not.
+        let clients = [
+            ("198.51.100.1", "198.51.100.1", "198.51.100.2"),
+            ("2001:db8:1:1::1", "2001:db8:1:1::2", "2001:db8:1:2::1"),
+        ];
+        for (n, (spender, same_source, neighbour)) in (0u8..).step_by(3).zip(clients) {
+            let (topic, mut pair) = session_claiming(addr, n, Some(spender)).await?;
+            for id in ["m0", "m1"] {
+                assert!(
+                    reaches(&mut pair, &message(&topic, id, &payload)).await?,
+                    "{spender} has a share of its own"
+                );
+            }
+
+            let (topic, mut pair) = session_claiming(addr, n + 1, Some(same_source)).await?;
+            assert!(
+                !reaches(&mut pair, &message(&topic, "s0", &payload)).await?,
+                "{same_source} is the same source as {spender}"
+            );
+
+            let (topic, mut pair) = session_claiming(addr, n + 2, Some(neighbour)).await?;
+            assert!(
+                reaches(&mut pair, &message(&topic, "n0", &payload)).await?,
+                "{neighbour} is a source of its own"
+            );
+        }
+        assert_eq!(limiter.dropped_source_bytes(), 2 * u64::from(frame));
         Ok(())
     }
 

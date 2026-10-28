@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
-use crate::auth::DEFAULT_MAX_TOKEN_LIFETIME;
+use crate::{auth::DEFAULT_MAX_TOKEN_LIFETIME, source::IpPrefix};
 
 /// Default maximum WebSocket text or binary frame size accepted from a client.
 pub const DEFAULT_MAX_INCOMING_FRAME_BYTES: usize = 256 * 1024;
@@ -88,6 +88,11 @@ pub struct NativeRelayTransportConfig {
 
     /// Maximum accepted lifetime of an auth token.
     pub max_token_lifetime: Duration,
+
+    /// Peers allowed to name the client they forward in `X-Real-IP`. The
+    /// header is ignored from every other peer, which is then the source its
+    /// connection is accounted to. Empty by default: no peer is trusted.
+    pub trusted_proxies: Arc<[IpPrefix]>,
 }
 
 impl NativeRelayTransportConfig {
@@ -108,6 +113,7 @@ impl NativeRelayTransportConfig {
             outbound_queue_max_bytes: DEFAULT_OUTBOUND_QUEUE_MAX_BYTES,
             outbound_queue_timeout: DEFAULT_OUTBOUND_QUEUE_TIMEOUT,
             max_token_lifetime: DEFAULT_MAX_TOKEN_LIFETIME,
+            trusted_proxies: Arc::from([]),
         }
     }
 
@@ -198,6 +204,12 @@ impl NativeRelayTransportConfig {
     /// Set the maximum accepted auth-token lifetime.
     pub fn with_max_token_lifetime(mut self, lifetime: Duration) -> Self {
         self.max_token_lifetime = lifetime;
+        self
+    }
+
+    /// Set the peers allowed to name the client they forward in `X-Real-IP`.
+    pub fn with_trusted_proxies(mut self, proxies: impl Into<Arc<[IpPrefix]>>) -> Self {
+        self.trusted_proxies = proxies.into();
         self
     }
 

@@ -6,6 +6,12 @@
 application:
   port: ${RELAY_PORT}
   audience: '${APPLICATION_AUDIENCE}'
+  # nginx writes the client address into X-Real-IP; the relay believes it only
+  # from these peers. docker-compose.yml publishes no relay port, so the only
+  # peer on the compose network is nginx, whose address Docker assigns from
+  # one of these private ranges. If the relay port is ever published, or
+  # anything else joins its network, narrow this to nginx's address.
+  trusted_proxies: ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
 
 health:
   port: ${HEALTH_PORT}
@@ -48,6 +54,13 @@ limits:
   identity_inbound_byte_rate:
     burst: 1048576
     interval_seconds: 1
+  # Shared by every identity connecting from one address (an IPv6 /64).
+  source_inbound_byte_rate:
+    burst: 1048576
+    interval_seconds: 1
   global_inbound_byte_rate:
     burst: 16777216
     interval_seconds: 1
+  # Share of the global burst, in percent, that only frames between two
+  # connected peers may spend.
+  global_paired_reserve_percent: 25
