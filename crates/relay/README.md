@@ -135,11 +135,14 @@ Topology limits:
   list to nginx's address.
 - nginx resolves the client address it forwards from `X-Forwarded-For` only
   for its own `TRUSTED_PROXY_CIDR`, so the source behind a load balancer or
-  CDN is only as accurate as that setting. nginx's own per-address limits are
-  keyed on the full address, not the /64.
+  CDN is only as accurate as that setting. In the shipped deployment, nginx
+  keys its IPv6 per-source limits on the /64, like the relay.
 - A relay without a proxy listens directly (`configuration/production.yaml`),
   and its sources are the TCP peers. Nothing in the relay can tell apart
-  clients that share an address.
+  clients that share an address. Its wire-byte throttle is per connection;
+  put a per-source connection cap in front of a directly exposed relay so
+  free identities cannot multiply fragment-processing work up to the global
+  connection limit.
 - Budgets are per process. Each relay instance has its own.
 
 ### Wire bytes
