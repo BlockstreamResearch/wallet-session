@@ -395,6 +395,61 @@ mod tests {
         Ok(addr)
     }
 
+    /// Bound on each wait for the relay to reach a synchronization point.
+    const SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Server tasks handling accepted connections, in accept order.
+    type Handlers = mpsc::UnboundedReceiver<tokio::task::JoinHandle<Result<(), ServerError>>>;
+
+    /// Serve like [`serve`], but hand each connection's task to the test so it
+    /// can wait for the relay to finish tearing that connection down.
+    async fn serve_tracked(
+        config: NativeRelayTransportConfig,
+    ) -> Result<(SocketAddr, Handlers), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let registry = Arc::new(Registry::new());
+        let limiter = limiter();
+        let (handlers_tx, handlers) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let handler = tokio::spawn(handle(
+                    stream,
+                    Arc::clone(&registry),
+                    Arc::clone(&limiter),
+                    config.clone(),
+                ));
+                if handlers_tx.send(handler).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok((addr, handlers))
+    }
+
+    /// Wait until the relay has routed every frame `client` sent before this call.
+    ///
+    /// The relay reads a connection's frames one at a time and routes each
+    /// before reading the next, and its WebSocket answers a ping only once the
+    /// ping itself is read. The pong therefore follows the routing of every
+    /// earlier frame.
+    async fn routed(client: &mut Client) -> TestResult {
+        let probe = Bytes::from_static(b"routed");
+        let pong = async {
+            client.send(Message::Ping(probe.clone())).await?;
+            while let Some(message) = client.next().await {
+                match message? {
+                    Message::Pong(payload) if payload == probe => return Ok(()),
+                    Message::Ping(payload) => client.send(Message::Pong(payload)).await?,
+                    Message::Pong(_) => {}
+                    other => return Err(format!("unexpected {other:?} before the pong").into()),
+                }
+            }
+            Err::<(), Box<dyn std::error::Error>>("websocket closed".into())
+        };
+        timeout(SYNC_TIMEOUT, pong).await?
+    }
+
     #[tokio::test]
     async fn counterpart_is_notified_after_grace_expires() -> TestResult {
         let addr = serve_with(
@@ -562,9 +617,11 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_frames_are_capped_dropping_oldest() -> TestResult {
-        let addr = serve_with(
+        // The grace comfortably exceeds both bounded synchronization waits, so
+        // the reservation should still be held when the responder returns.
+        let (addr, mut handlers) = serve_tracked(
             NativeRelayTransportConfig::new(AUDIENCE)
-                .with_session_grace(Duration::from_secs(2))
+                .with_session_grace(Duration::from_secs(30))
                 .with_session_buffer_max_messages(2),
         )
         .await?;
@@ -572,6 +629,10 @@ mod tests {
         let topic = topic()?;
         let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
         let mut responder = connect(addr, "responder", &topic, None).await?;
+        // Each connect completes its handshake first, so handlers arrive in
+        // connect order.
+        let _proposer_handler = handlers.recv().await.ok_or("relay stopped accepting")?;
+        let responder_handler = handlers.recv().await.ok_or("relay stopped accepting")?;
         assert!(matches!(
             read_frame(&mut proposer).await?.body,
             RelayFrameBody::SessionReady
@@ -581,13 +642,19 @@ mod tests {
             RelayFrameBody::SessionReady
         ));
 
+        // The handler returns only after reserving the responder's slot, so the
+        // frames below are buffered rather than routed to the dead connection.
+        // How the connection ended does not matter, only that it was torn down.
         drop(responder);
-        sleep(Duration::from_millis(100)).await;
+        let _ = timeout(SYNC_TIMEOUT, responder_handler).await??;
 
         // Three frames while the responder is gone, but only two may be kept.
         for (id, payload) in [("m1", "one"), ("m2", "two"), ("m3", "three")] {
             send(&mut proposer, &message(&topic, id, payload)).await?;
         }
+        // Reconnecting earlier would let the responder reclaim the reservation
+        // before the later frames reach it.
+        routed(&mut proposer).await?;
 
         let mut responder = connect(addr, "responder", &topic, None).await?;
         assert!(matches!(
