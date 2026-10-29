@@ -1,0 +1,27 @@
+# Override for when nothing sits in front of this stack (clients reach the
+# published port directly). Adds an nginx stream{} front on the published port
+# that caps connections per client address at accept, before nginx reads any
+# HTTP byte:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.direct.yml \
+#     --env-file ./configs/compose.env up --build -d
+#
+# Do not use it behind a load balancer, CDN or other proxy: every client would
+# share the proxy's address. That front must buffer complete request headers
+# and enforce its own per-client connection limit instead (see README.md).
+services:
+  nginx:
+    # The shipped direct variant speaks plain HTTP. Expose it on loopback for
+    # local checks; a public bind requires TLS configured in this nginx first.
+    ports: !override
+      - '127.0.0.1:${RELAY_PUBLIC_PORT}:80'
+    # Each entry replaces the base file's mount with the same target.
+    volumes:
+      - ./configs/nginx/direct/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./configs/nginx/direct/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./configs/nginx/direct/edge.conf.stream-template:/etc/nginx/templates/edge.conf.stream-template:ro
+    # Holds the unix socket between the front and the http server. nginx does
+    # not remove a leftover socket file before binding, so a socket left by an
+    # unclean stop would make the next start fail; a tmpfs starts empty.
+    tmpfs:
+      - /run/nginx-edge
