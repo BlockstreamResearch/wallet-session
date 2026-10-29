@@ -4,7 +4,7 @@ This stack runs one relay instance behind an nginx reverse proxy:
 
 - `relay` renders its configuration from the templates in `configs/relay`,
   serves the WebSocket protocol on `RELAY_PORT`, and answers probes on
-  `HEALTH_PORT`.
+  `HEALTH_PORT`. nginx publishes only the liveness probe, at `/health`.
 - `nginx` is the only published service. It upgrades WebSocket connections to
   the relay and forwards everything else to it.
 
@@ -78,9 +78,11 @@ container, so it can be inspected with
 - `GET /ready` on `HEALTH_PORT` is readiness; `503` means the relay can no
   longer serve sessions.
 
-The compose healthcheck polls `/ready` inside the relay container. Keep
-`HEALTH_PORT` off the public interface: it needs no authentication and reports
-session counts.
+nginx proxies `GET /health` on the published port, so a load balancer or uptime
+check can poll `http://<host>:<RELAY_PUBLIC_PORT>/health`. It does not proxy
+`/ready`, which reports session and connection counts: that endpoint is for the
+orchestrator, so keep `HEALTH_PORT` off the public interface. The compose
+healthcheck polls `/ready` inside the relay container.
 
 ## TLS
 
