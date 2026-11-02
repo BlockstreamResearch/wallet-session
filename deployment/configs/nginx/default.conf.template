@@ -26,6 +26,14 @@ server {
     access_log /dev/stdout relay;
     error_log /dev/stderr crit;
 
+    location = /health {
+        proxy_pass http://relay:${HEALTH_PORT};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location / {
         limit_conn perip ${PER_IP_CONNECTIONS};
         limit_req  zone=perip_rate burst=${PER_IP_BURST} nodelay;
