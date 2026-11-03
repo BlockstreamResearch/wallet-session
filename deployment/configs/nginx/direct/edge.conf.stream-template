@@ -1,0 +1,35 @@
+# Rendered into /etc/nginx/stream-conf.d/edge.conf by the nginx image
+# entrypoint when docker-compose.direct.yml is in use. The entrypoint strips
+# only the ".stream-template" suffix, so keep ".conf" in this file name:
+# direct/nginx.conf includes stream-conf.d/*.conf, and a file rendered without
+# it is never loaded, which leaves the published port with no listener.
+#
+# Caps connections per client address at accept, before nginx reads any HTTP
+# byte. limit_conn in the http server counts a connection only once its request
+# header is complete, so a client that never finishes its header would
+# otherwise be counted nowhere. Do not use this behind a load balancer or CDN:
+# every client would share its address.
+
+# Same key as the http server: the whole IPv4 address, or the /64 prefix of an
+# IPv6 address; IPv4-mapped IPv6 addresses keep the whole address.
+map $binary_remote_addr $relay_limit_key {
+    "~(?s)^\x00{10}\xff\xff.{4}\z"            $binary_remote_addr;
+    "~(?s)^(?<relay_v6_prefix>.{8}).{8}\z"    $relay_v6_prefix;
+    default                                   $binary_remote_addr;
+}
+
+limit_conn_zone $relay_limit_key zone=tcp_perip:10m;
+# Refusals are logged with the client address only; the front never sees a
+# request line.
+limit_conn_log_level warn;
+
+server {
+    listen 80;
+    limit_conn tcp_perip ${PER_IP_CONNECTIONS};
+
+    proxy_pass unix:/run/nginx-edge/http.sock;
+    proxy_protocol on;
+    # Tunnels carry relay pings every 30 s; keep well above that, as the http
+    # server's proxy_read_timeout does.
+    proxy_timeout 3600s;
+}
