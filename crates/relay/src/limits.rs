@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    hash::Hash,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -10,8 +11,14 @@ use std::{
 use tokio::time::Instant;
 use wallet_session_core::did::DidKey;
 
-/// Maximum number of identities tracked by the connect rate limiter.
+use crate::source::Source;
+
+/// Maximum number of identities or sources tracked by one keyed rate limiter.
 const MAX_RATE_KEYS: usize = 65_536;
+
+/// Least time between two scans of a full keyed rate limiter for buckets
+/// that have refilled, which bounds the work a stream of new keys can cause.
+const MIN_PRUNE_SPACING: Duration = Duration::from_secs(1);
 
 /// Token-bucket parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,14 +33,33 @@ pub struct RateLimit {
 /// Outcome of charging the relay-wide inbound byte budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundBytes {
-    /// Accepted against both the identity share and the global budget.
+    /// Accepted against the identity and source shares and the global budget.
     Allowed,
 
     /// The identity already consumed its share of the budget.
     ShareExhausted,
 
-    /// The identity is within its share, but the global budget is dry.
+    /// The identity is within its share, but the identities connecting from
+    /// its source address have together consumed the source's share.
+    SourceExhausted,
+
+    /// Both shares have room, but the global budget is dry, or down to the
+    /// reserve for paired traffic.
     GlobalExhausted,
+}
+
+/// What the inbound bytes being charged are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Traffic {
+    /// Frames between two connected peers. They may spend the whole relay-wide
+    /// budget, the share reserved for them included.
+    Paired,
+
+    /// Anything else the relay spends work on: frames buffered for a peer
+    /// that is reconnecting, and control frames on a connection whose
+    /// counterpart is not connected. They are refused once the relay-wide
+    /// budget is down to the paired reserve.
+    Unpaired,
 }
 
 /// Static relay resource limits.
@@ -57,13 +83,35 @@ pub struct RelayLimitsConfig {
     /// Inbound byte rate per connection.
     pub inbound_byte_rate: RateLimit,
 
+    /// Rate at which one connection's socket is read, counting every byte
+    /// that crosses the wire before the WebSocket layer parses it: the
+    /// upgrade request, frame headers and masks, control frames and the
+    /// continuation frames of fragmented messages. A connection over it is
+    /// read more slowly, not disconnected. Keep it above
+    /// [`RelayLimitsConfig::inbound_byte_rate`], which counts only the
+    /// payloads of complete messages, so that framing never slows a peer
+    /// that stays within that.
+    pub inbound_wire_byte_rate: RateLimit,
+
     /// Inbound byte rate one identity may consume from the relay-wide budget.
     /// Sized so that several identities together can exhaust
     /// [`RelayLimitsConfig::global_inbound_byte_rate`], but one cannot.
     pub identity_inbound_byte_rate: RateLimit,
 
+    /// Inbound byte rate the identities connecting from one source address
+    /// may consume together from the relay-wide budget. Identities cost
+    /// nothing to mint and addresses do, so this is what bounds one client
+    /// spreading its traffic across many identities. No larger than the
+    /// identity share by default.
+    pub source_inbound_byte_rate: RateLimit,
+
     /// Inbound byte rate across all connections.
     pub global_inbound_byte_rate: RateLimit,
+
+    /// Percentage of the global burst that only [`Traffic::Paired`] bytes may
+    /// spend, so that one-sided sessions cannot take the last of the budget
+    /// from peers that are talking to each other.
+    pub global_paired_reserve_percent: u8,
 }
 
 impl Default for RelayLimitsConfig {
@@ -84,7 +132,15 @@ impl Default for RelayLimitsConfig {
                 burst: 512 * 1024,
                 interval: Duration::from_secs(2),
             },
+            inbound_wire_byte_rate: RateLimit {
+                burst: 1024 * 1024,
+                interval: Duration::from_secs(2),
+            },
             identity_inbound_byte_rate: RateLimit {
+                burst: 1024 * 1024,
+                interval: Duration::from_secs(1),
+            },
+            source_inbound_byte_rate: RateLimit {
                 burst: 1024 * 1024,
                 interval: Duration::from_secs(1),
             },
@@ -92,7 +148,17 @@ impl Default for RelayLimitsConfig {
                 burst: 16 * 1024 * 1024,
                 interval: Duration::from_secs(1),
             },
+            global_paired_reserve_percent: 25,
         }
+    }
+}
+
+impl RelayLimitsConfig {
+    /// Bytes of the global burst only [`Traffic::Paired`] bytes may spend.
+    pub fn paired_reserve_bytes(&self) -> u32 {
+        let percent = u64::from(self.global_paired_reserve_percent.min(100));
+        let reserve = u64::from(self.global_inbound_byte_rate.burst) * percent / 100;
+        u32::try_from(reserve).unwrap_or(u32::MAX)
     }
 }
 
@@ -132,52 +198,110 @@ impl Bucket {
 
     /// Refill and consume `cost` tokens, returning whether the attempt is allowed.
     pub(crate) fn allow_n(&mut self, cost: u32, rate: RateLimit, now: Instant) -> bool {
-        let cost = f64::from(cost.clamp(1, rate.burst.max(1)));
-        let elapsed = now.saturating_duration_since(self.last);
-        let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
-        let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
-        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
-        self.last = now;
+        self.allow_n_above(cost, 0, rate, now)
+    }
 
-        if self.tokens >= cost {
+    /// Refill and consume `cost` tokens if at least `floor` remain afterwards,
+    /// returning whether the attempt is allowed.
+    fn allow_n_above(&mut self, cost: u32, floor: u32, rate: RateLimit, now: Instant) -> bool {
+        let cost = f64::from(cost.clamp(1, rate.burst.max(1)));
+        self.refill(rate, now);
+
+        if self.tokens - cost >= f64::from(floor) {
             self.tokens -= cost;
             true
         } else {
             false
         }
     }
+
+    /// Refill, and return whether the bucket holds its whole burst again, as
+    /// a new bucket would.
+    fn is_full(&mut self, rate: RateLimit, now: Instant) -> bool {
+        self.refill(rate, now);
+        self.tokens >= f64::from(rate.burst)
+    }
+
+    /// Add what has accrued since the last update, up to the burst.
+    fn refill(&mut self, rate: RateLimit, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last);
+        let interval = rate.interval.as_secs_f64().max(f64::EPSILON);
+        let refill = elapsed.as_secs_f64() / interval * f64::from(rate.burst);
+        self.tokens = (self.tokens + refill).min(f64::from(rate.burst));
+        self.last = now;
+    }
+
+    /// Refill, and return the whole tokens available now.
+    pub(crate) fn available(&mut self, rate: RateLimit, now: Instant) -> u32 {
+        self.refill(rate, now);
+        // Truncates, and saturates at both ends.
+        self.tokens as u32
+    }
+
+    /// Spend `cost` of the tokens [`Bucket::available`] reported.
+    pub(crate) fn spend(&mut self, cost: u32) {
+        self.tokens -= f64::from(cost);
+    }
+
+    /// Time from the last refill until the bucket holds `tokens`, or its whole
+    /// burst if that is smaller.
+    pub(crate) fn time_until(&self, tokens: u32, rate: RateLimit) -> Duration {
+        let burst = rate.burst.max(1);
+        let missing = f64::from(tokens.clamp(1, burst)) - self.tokens;
+        if missing <= 0.0 {
+            return Duration::ZERO;
+        }
+        let seconds = missing * rate.interval.as_secs_f64() / f64::from(burst);
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+    }
 }
 
 /// Per-key token buckets, with the time of the last full prune.
 #[derive(Debug)]
-struct BucketMap {
-    buckets: HashMap<DidKey, Bucket>,
+struct BucketMap<K> {
+    buckets: HashMap<K, Bucket>,
+
+    /// Shared by the keys that arrive while every tracked bucket is still
+    /// refilling, so they neither take a tracked key's place nor each get a
+    /// full bucket of their own.
+    overflow: Bucket,
     last_prune: Instant,
 }
 
-fn bucket_for<'a>(
-    state: &'a mut BucketMap,
-    identity: &DidKey,
+impl<K> BucketMap<K> {
+    fn new(rate: RateLimit, now: Instant) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            overflow: Bucket::full(rate.burst, now),
+            last_prune: now,
+        }
+    }
+}
+
+/// The bucket of `key`, tracking it if there is room.
+///
+/// A tracked key keeps its bucket for as long as the bucket is still
+/// refilling: forgetting it would hand the key a full bucket again. A full
+/// map makes room only by forgetting buckets that have refilled completely,
+/// and while none has, a new key is charged to the shared overflow bucket.
+fn bucket_for<'a, K: Eq + Hash + Clone>(
+    state: &'a mut BucketMap<K>,
+    key: &K,
     rate: RateLimit,
     now: Instant,
 ) -> &'a mut Bucket {
-    if state.buckets.len() >= MAX_RATE_KEYS {
-        if now.saturating_duration_since(state.last_prune) >= rate.interval {
-            state
-                .buckets
-                .retain(|_, bucket| now.saturating_duration_since(bucket.last) < rate.interval);
+    if state.buckets.len() >= MAX_RATE_KEYS && !state.buckets.contains_key(key) {
+        if now.saturating_duration_since(state.last_prune) >= MIN_PRUNE_SPACING {
+            state.buckets.retain(|_, bucket| !bucket.is_full(rate, now));
             state.last_prune = now;
         }
-        while state.buckets.len() >= MAX_RATE_KEYS {
-            let Some(key) = state.buckets.keys().next().cloned() else {
-                break;
-            };
-            state.buckets.remove(&key);
+        if state.buckets.len() >= MAX_RATE_KEYS {
+            return &mut state.overflow;
         }
     }
     state
         .buckets
-        .entry(identity.clone())
+        .entry(key.clone())
         .or_insert_with(|| Bucket::full(rate.burst, now))
 }
 
@@ -187,10 +311,12 @@ pub struct Limiter {
     limits: RelayLimitsConfig,
     total: Mutex<usize>,
     per_identity: Mutex<HashMap<DidKey, usize>>,
-    connect_rate: Mutex<BucketMap>,
-    identity_bytes: Mutex<BucketMap>,
+    connect_rate: Mutex<BucketMap<DidKey>>,
+    identity_bytes: Mutex<BucketMap<DidKey>>,
+    source_bytes: Mutex<BucketMap<Source>>,
     inbound_bytes: Mutex<Bucket>,
     dropped_share_bytes: AtomicU64,
+    dropped_source_bytes: AtomicU64,
     dropped_global_bytes: AtomicU64,
 }
 
@@ -202,16 +328,12 @@ impl Limiter {
             limits,
             total: Mutex::new(0),
             per_identity: Mutex::new(HashMap::new()),
-            connect_rate: Mutex::new(BucketMap {
-                buckets: HashMap::new(),
-                last_prune: now,
-            }),
-            identity_bytes: Mutex::new(BucketMap {
-                buckets: HashMap::new(),
-                last_prune: now,
-            }),
+            connect_rate: Mutex::new(BucketMap::new(limits.connect_rate, now)),
+            identity_bytes: Mutex::new(BucketMap::new(limits.identity_inbound_byte_rate, now)),
+            source_bytes: Mutex::new(BucketMap::new(limits.source_inbound_byte_rate, now)),
             inbound_bytes: Mutex::new(Bucket::full(limits.global_inbound_byte_rate.burst, now)),
             dropped_share_bytes: AtomicU64::new(0),
+            dropped_source_bytes: AtomicU64::new(0),
             dropped_global_bytes: AtomicU64::new(0),
         }
     }
@@ -262,12 +384,26 @@ impl Limiter {
         })
     }
 
-    /// Consume `bytes` from the identity's share of the relay-wide budget and
-    /// from the budget itself.
-    pub fn allow_inbound_bytes(&self, identity: &DidKey, bytes: usize) -> InboundBytes {
+    /// Consume `bytes` sent by `identity` from `source` from the identity's
+    /// and the source's shares of the relay-wide budget, and from the budget
+    /// itself.
+    ///
+    /// The identity share is checked first, so a sender over its own share
+    /// hears so even when its source is exhausted as well. Nothing is spent
+    /// unless every budget has room: a refused charge is given back to the
+    /// shares that had already accepted it. [`Traffic::Unpaired`] bytes are
+    /// refused once the global budget is down to the paired reserve.
+    pub fn allow_inbound_bytes(
+        &self,
+        identity: &DidKey,
+        source: &Source,
+        bytes: usize,
+        traffic: Traffic,
+    ) -> InboundBytes {
         let cost = u32::try_from(bytes).unwrap_or(u32::MAX);
         let now = Instant::now();
         let share = self.limits.identity_inbound_byte_rate;
+        let source_share = self.limits.source_inbound_byte_rate;
 
         if cost > share.burst {
             self.dropped_share_bytes
@@ -275,18 +411,38 @@ impl Limiter {
             return InboundBytes::ShareExhausted;
         }
 
-        let mut state = lock(&self.identity_bytes);
-        let bucket = bucket_for(&mut state, identity, share, now);
-        if !bucket.allow_n(cost, share, now) {
+        // Locks are always taken in this order: identities, sources, global.
+        let mut identities = lock(&self.identity_bytes);
+        let identity_bucket = bucket_for(&mut identities, identity, share, now);
+        if !identity_bucket.allow_n(cost, share, now) {
             self.dropped_share_bytes
                 .fetch_add(u64::from(cost), Ordering::Relaxed);
             return InboundBytes::ShareExhausted;
         }
 
-        let within_global =
-            lock(&self.inbound_bytes).allow_n(cost, self.limits.global_inbound_byte_rate, now);
+        let mut sources = lock(&self.source_bytes);
+        let source_bucket = bucket_for(&mut sources, source, source_share, now);
+        // A cost above the burst would be charged as only the burst.
+        if cost > source_share.burst || !source_bucket.allow_n(cost, source_share, now) {
+            identity_bucket.refund(cost, share);
+            self.dropped_source_bytes
+                .fetch_add(u64::from(cost), Ordering::Relaxed);
+            return InboundBytes::SourceExhausted;
+        }
+
+        let floor = match traffic {
+            Traffic::Paired => 0,
+            Traffic::Unpaired => self.limits.paired_reserve_bytes(),
+        };
+        let within_global = lock(&self.inbound_bytes).allow_n_above(
+            cost,
+            floor,
+            self.limits.global_inbound_byte_rate,
+            now,
+        );
         if !within_global {
-            bucket.refund(cost, share);
+            identity_bucket.refund(cost, share);
+            source_bucket.refund(cost, source_share);
             self.dropped_global_bytes
                 .fetch_add(u64::from(cost), Ordering::Relaxed);
             return InboundBytes::GlobalExhausted;
@@ -297,6 +453,12 @@ impl Limiter {
     /// Bytes dropped because a sender exceeded its identity's share.
     pub fn dropped_share_bytes(&self) -> u64 {
         self.dropped_share_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes dropped because the identities behind one source address
+    /// exceeded the source's share.
+    pub fn dropped_source_bytes(&self) -> u64 {
+        self.dropped_source_bytes.load(Ordering::Relaxed)
     }
 
     /// Bytes dropped because the relay-wide budget was exhausted.
@@ -345,12 +507,91 @@ impl Drop for ConnectionPermit {
     }
 }
 
+/// Bytes of frames held for one peer and not yet written to it.
+///
+/// A connection's budget covers its outbound queue, the frame its writer is
+/// writing, and the backlog waiting to enter the queue; a reserved slot has
+/// one of its own for the frames buffered while its peer reconnects. Bytes
+/// are the frame's JSON text, which is what the writer sends.
+#[derive(Debug)]
+pub struct OutboundBudget {
+    capacity: usize,
+    held: AtomicUsize,
+}
+
+impl OutboundBudget {
+    /// An empty budget of `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            held: AtomicUsize::new(0),
+        }
+    }
+
+    /// Bytes this budget may hold at once.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently charged to this budget.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// Charge `bytes`, if they fit beside what is already held.
+    pub(crate) fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<OutboundCharge> {
+        self.held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(bytes)
+                    .filter(|total| *total <= self.capacity)
+            })
+            .ok()?;
+        Some(OutboundCharge {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+/// Bytes charged to an [`OutboundBudget`]; given back when dropped.
+#[derive(Debug)]
+pub(crate) struct OutboundCharge {
+    budget: Arc<OutboundBudget>,
+    bytes: usize,
+}
+
+impl OutboundCharge {
+    /// Bytes this charge holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for OutboundCharge {
+    fn drop(&mut self) {
+        self.budget.held.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::net::IpAddr;
+
     fn key(seed: u8) -> DidKey {
         DidKey::from_ed25519_bytes([seed; 32])
+    }
+
+    /// A source address of its own for each `seed`.
+    fn source(seed: u8) -> Source {
+        Source::of(IpAddr::from([192, 0, 2, seed]))
+    }
+
+    /// Charge paired bytes from the source the tests share unless they say
+    /// otherwise.
+    fn paired(limiter: &Limiter, identity: &DidKey, bytes: usize) -> InboundBytes {
+        limiter.allow_inbound_bytes(identity, &source(1), bytes, Traffic::Paired)
     }
 
     fn limits() -> RelayLimitsConfig {
@@ -431,6 +672,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn bucket_reports_what_it_holds_and_when_it_will_hold_more() {
+        let rate = RateLimit {
+            burst: 100,
+            interval: Duration::from_secs(10),
+        };
+        let mut bucket = Bucket::full(rate.burst, Instant::now());
+
+        assert_eq!(bucket.available(rate, Instant::now()), 100);
+        assert_eq!(bucket.time_until(50, rate), Duration::ZERO);
+        bucket.spend(100);
+        assert_eq!(bucket.available(rate, Instant::now()), 0);
+        // 10 tokens per second, and never more than the burst to wait for.
+        assert_eq!(bucket.time_until(50, rate), Duration::from_secs(5));
+        assert_eq!(bucket.time_until(1_000, rate), Duration::from_secs(10));
+
+        tokio::time::advance(Duration::from_millis(2_500)).await;
+        assert_eq!(bucket.available(rate, Instant::now()), 25);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn oversized_cost_is_clamped_to_burst() {
         let rate = RateLimit {
             burst: 100,
@@ -459,16 +720,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connect_rate_map_stays_bounded() {
-        let limiter = Limiter::new(RelayLimitsConfig::default());
+    async fn a_full_rate_map_forgets_no_bucket_that_is_still_refilling() {
+        let interval = Duration::from_secs(10);
+        let limiter = Limiter::new(RelayLimitsConfig {
+            connect_rate: RateLimit { burst: 1, interval },
+            ..RelayLimitsConfig::default()
+        });
 
-        for seed in 0..MAX_RATE_KEYS as u32 + 128 {
-            limiter.allow_connect(&key_from_u32(seed));
+        // Every tracked identity spends its only attempt.
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            assert!(limiter.allow_connect(&key_from_u32(seed)));
         }
 
-        assert!(limiter.tracked_identities() <= MAX_RATE_KEYS);
-        // A fresh identity can still attempt a connection.
+        // Past the bound, new identities share one bucket instead of taking
+        // the place of a tracked one, which would come back with a full one.
+        tokio::time::advance(MIN_PRUNE_SPACING).await;
         assert!(limiter.allow_connect(&key_from_u32(u32::MAX)));
+        assert!(!limiter.allow_connect(&key_from_u32(u32::MAX - 1)));
+        assert_eq!(limiter.tracked_identities(), MAX_RATE_KEYS);
+        for seed in 0..MAX_RATE_KEYS as u32 {
+            assert!(
+                !limiter.allow_connect(&key_from_u32(seed)),
+                "identity {seed} got its attempt back before its bucket refilled"
+            );
+        }
+
+        // Buckets that have refilled make room for new identities again.
+        tokio::time::advance(interval).await;
+        assert!(limiter.allow_connect(&key_from_u32(u32::MAX - 2)));
+        assert_eq!(limiter.tracked_identities(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -508,24 +788,15 @@ mod tests {
         });
         let identity = key(1);
 
+        assert_eq!(paired(&limiter, &identity, 600), InboundBytes::Allowed);
         assert_eq!(
-            limiter.allow_inbound_bytes(&identity, 600),
-            InboundBytes::Allowed
-        );
-        assert_eq!(
-            limiter.allow_inbound_bytes(&identity, 600),
+            paired(&limiter, &identity, 600),
             InboundBytes::GlobalExhausted
         );
-        assert_eq!(
-            limiter.allow_inbound_bytes(&identity, 400),
-            InboundBytes::Allowed
-        );
+        assert_eq!(paired(&limiter, &identity, 400), InboundBytes::Allowed);
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(
-            limiter.allow_inbound_bytes(&identity, 1_000),
-            InboundBytes::Allowed
-        );
+        assert_eq!(paired(&limiter, &identity, 1_000), InboundBytes::Allowed);
         assert_eq!(limiter.dropped_global_bytes(), 600);
         assert_eq!(limiter.dropped_share_bytes(), 0);
     }
@@ -546,17 +817,11 @@ mod tests {
         let hog = key(1);
         let other = key(2);
 
-        assert_eq!(
-            limiter.allow_inbound_bytes(&hog, 100),
-            InboundBytes::Allowed
-        );
-        assert_eq!(
-            limiter.allow_inbound_bytes(&hog, 1),
-            InboundBytes::ShareExhausted
-        );
+        assert_eq!(paired(&limiter, &hog, 100), InboundBytes::Allowed);
+        assert_eq!(paired(&limiter, &hog, 1), InboundBytes::ShareExhausted);
 
         assert_eq!(
-            limiter.allow_inbound_bytes(&other, 100),
+            paired(&limiter, &other, 100),
             InboundBytes::Allowed,
             "another identity keeps its own share"
         );
@@ -581,33 +846,64 @@ mod tests {
         let other = key(2);
         let oversized = key(3);
 
-        assert_eq!(limiter.allow_inbound_bytes(&hog, 4), InboundBytes::Allowed);
-        assert_eq!(
-            limiter.allow_inbound_bytes(&other, 4),
-            InboundBytes::GlobalExhausted
-        );
+        assert_eq!(paired(&limiter, &hog, 4), InboundBytes::Allowed);
+        assert_eq!(paired(&limiter, &other, 4), InboundBytes::GlobalExhausted);
         assert_eq!(limiter.dropped_global_bytes(), 4);
         assert_eq!(limiter.dropped_share_bytes(), 0);
 
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(
-            limiter.allow_inbound_bytes(&other, 4),
+            paired(&limiter, &other, 4),
             InboundBytes::Allowed,
             "a globally rejected frame must not spend the identity share"
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(
-            limiter.allow_inbound_bytes(&oversized, 5),
+            paired(&limiter, &oversized, 5),
             InboundBytes::ShareExhausted,
             "a frame larger than the share burst can never fit it"
         );
         assert_eq!(limiter.dropped_share_bytes(), 5);
         assert_eq!(
-            limiter.allow_inbound_bytes(&oversized, 4),
+            paired(&limiter, &oversized, 4),
             InboundBytes::Allowed,
             "the rejected oversized frame must not have spent the share"
         );
+    }
+
+    #[test]
+    fn outbound_budget_refuses_what_does_not_fit_and_takes_back_on_drop() {
+        let budget = Arc::new(OutboundBudget::new(100));
+
+        let first = budget.try_charge(60);
+        assert!(first.is_some());
+        assert!(
+            budget.try_charge(41).is_none(),
+            "a charge must fit beside what is held"
+        );
+        let second = budget.try_charge(40);
+        assert!(second.is_some(), "a charge may fill the budget exactly");
+        assert_eq!(budget.held(), 100);
+
+        drop(first);
+        assert_eq!(budget.held(), 40, "a dropped charge gives its bytes back");
+        assert!(budget.try_charge(60).is_some());
+        assert_eq!(budget.held(), 40, "an unbound charge is given back at once");
+    }
+
+    #[test]
+    fn outbound_budget_refuses_a_charge_larger_than_itself() {
+        let budget = Arc::new(OutboundBudget::new(100));
+        assert!(budget.try_charge(101).is_none());
+        assert!(budget.try_charge(usize::MAX).is_none());
+
+        let _held = budget.try_charge(1);
+        assert!(
+            budget.try_charge(usize::MAX).is_none(),
+            "an overflowing total must be refused, not wrapped"
+        );
+        assert_eq!(budget.held(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -624,14 +920,146 @@ mod tests {
             ..RelayLimitsConfig::default()
         });
 
+        assert_eq!(paired(&limiter, &key(1), 1_000), InboundBytes::Allowed);
         assert_eq!(
-            limiter.allow_inbound_bytes(&key(1), 1_000),
-            InboundBytes::Allowed
-        );
-        assert_eq!(
-            limiter.allow_inbound_bytes(&key(2), 1_000),
+            paired(&limiter, &key(2), 1_000),
             InboundBytes::GlobalExhausted
         );
         assert_eq!(limiter.dropped_global_bytes(), 1_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_share_caps_the_identities_behind_one_address() {
+        let roomy = RateLimit {
+            burst: 1_000_000,
+            interval: Duration::from_secs(60),
+        };
+        let limiter = Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: roomy,
+            source_inbound_byte_rate: RateLimit {
+                burst: 1_000,
+                interval: Duration::from_secs(60),
+            },
+            global_inbound_byte_rate: roomy,
+            ..RelayLimitsConfig::default()
+        });
+
+        // Fresh identities from one address spend one share between them.
+        for seed in 1..=4 {
+            assert_eq!(
+                limiter.allow_inbound_bytes(&key(seed), &source(1), 250, Traffic::Paired),
+                InboundBytes::Allowed
+            );
+        }
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(5), &source(1), 1, Traffic::Paired),
+            InboundBytes::SourceExhausted,
+            "a fifth identity from the same address finds the share spent"
+        );
+        assert_eq!(limiter.dropped_source_bytes(), 1);
+        assert_eq!(limiter.dropped_share_bytes(), 0);
+        assert_eq!(limiter.dropped_global_bytes(), 0);
+
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(1), &source(2), 1_000, Traffic::Paired),
+            InboundBytes::Allowed,
+            "another address keeps its own share, whichever identity uses it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_refusal_spends_no_identity_share() {
+        let limiter = Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: RateLimit {
+                burst: 200,
+                interval: Duration::from_secs(3600),
+            },
+            source_inbound_byte_rate: RateLimit {
+                burst: 100,
+                interval: Duration::from_secs(3600),
+            },
+            ..RelayLimitsConfig::default()
+        });
+
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(1), &source(1), 100, Traffic::Paired),
+            InboundBytes::Allowed
+        );
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(2), &source(1), 100, Traffic::Paired),
+            InboundBytes::SourceExhausted
+        );
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(2), &source(2), 100, Traffic::Paired),
+            InboundBytes::Allowed,
+            "the refused frame must not have spent the identity share"
+        );
+
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(3), &source(3), 150, Traffic::Paired),
+            InboundBytes::SourceExhausted,
+            "a frame larger than the source burst can never fit it"
+        );
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(3), &source(3), 100, Traffic::Paired),
+            InboundBytes::Allowed,
+            "the oversized frame must have spent neither share"
+        );
+        assert_eq!(limiter.dropped_source_bytes(), 250);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpaired_bytes_cannot_spend_the_paired_reserve() {
+        let roomy = RateLimit {
+            burst: 1_000_000,
+            interval: Duration::from_secs(60),
+        };
+        let limiter = Limiter::new(RelayLimitsConfig {
+            identity_inbound_byte_rate: roomy,
+            source_inbound_byte_rate: roomy,
+            global_inbound_byte_rate: RateLimit {
+                burst: 1_000,
+                interval: Duration::from_secs(3600),
+            },
+            global_paired_reserve_percent: 25,
+            ..RelayLimitsConfig::default()
+        });
+
+        // However many identities and addresses one-sided traffic comes
+        // from, it stops where the reserve begins.
+        for seed in 1..=3 {
+            assert_eq!(
+                limiter.allow_inbound_bytes(&key(seed), &source(seed), 250, Traffic::Unpaired),
+                InboundBytes::Allowed
+            );
+        }
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(4), &source(4), 1, Traffic::Unpaired),
+            InboundBytes::GlobalExhausted
+        );
+        assert_eq!(limiter.dropped_global_bytes(), 1);
+
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(5), &source(5), 250, Traffic::Paired),
+            InboundBytes::Allowed,
+            "paired traffic still has the reserve"
+        );
+        assert_eq!(
+            limiter.allow_inbound_bytes(&key(5), &source(5), 1, Traffic::Paired),
+            InboundBytes::GlobalExhausted
+        );
+    }
+
+    #[test]
+    fn the_paired_reserve_is_a_share_of_the_global_burst() {
+        let mut limits = RelayLimitsConfig::default();
+        assert_eq!(limits.paired_reserve_bytes(), 4 * 1024 * 1024);
+
+        limits.global_paired_reserve_percent = 0;
+        assert_eq!(limits.paired_reserve_bytes(), 0);
+
+        limits.global_inbound_byte_rate.burst = u32::MAX;
+        limits.global_paired_reserve_percent = 99;
+        assert_eq!(limits.paired_reserve_bytes(), 4_252_017_622);
     }
 }
