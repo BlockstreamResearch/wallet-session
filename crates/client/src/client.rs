@@ -345,6 +345,24 @@ where
 
         let wire: Message = serde_json::from_str(&payload)?;
 
+        if wire.from == self.did {
+            log::warn!("dropping frame from own identity {}", wire.from);
+            return Ok(None);
+        }
+        if let Some(counterpart) = &self.session.peer_did {
+            if wire.from != *counterpart {
+                log::warn!(
+                    "dropping frame from {}; established counterpart is {}",
+                    wire.from,
+                    counterpart
+                );
+                return Ok(None);
+            }
+        } else if topic != self.session.pairing_topic {
+            log::warn!("dropping session-topic frame before the counterpart is established");
+            return Ok(None);
+        }
+
         if wire.version != Message::VERSION {
             log::warn!("dropping frame with unsupported version {}", wire.version);
             return Ok(None);
@@ -383,6 +401,15 @@ where
             .expect("topic was checked")
             .cipher
             .open(&aad, &sealed)?;
+
+        // The counterpart is the sender of the first envelope that passes the
+        // version, topic, identity, timestamp and authentication checks on the
+        // pairing topic. It stays the counterpart for the session topic and
+        // across reconnects.
+        if topic == self.session.pairing_topic && self.session.peer_did.is_none() {
+            self.session.peer_did = Some(wire.from.clone());
+            log::debug!("established counterpart {}", wire.from);
+        }
 
         let observation = self
             .link_mut(&topic)

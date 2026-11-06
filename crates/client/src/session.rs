@@ -1,4 +1,4 @@
-use wallet_session_core::message::Topic;
+use wallet_session_core::{did::DidKey, message::Topic};
 
 pub use wallet_session_core::connection::Role;
 
@@ -37,7 +37,7 @@ pub struct Session {
     pub role: Role,
 
     /// `did:key` of the peer, once known.
-    pub peer_did: Option<String>,
+    pub peer_did: Option<DidKey>,
 
     /// Current lifecycle state.
     pub state: SessionState,

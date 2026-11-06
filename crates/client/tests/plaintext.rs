@@ -27,6 +27,7 @@ use wallet_session_client::crypto::{CipherError, NONCE_LEN, SENDER_PREFIX_LEN, S
 use wallet_session_core::{
     connection::ConnectionQuery,
     crypto::MessageCipher,
+    did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
     message::{Ciphertext, Message as Envelope, MessageType, Nonce, Topic},
 };
@@ -410,6 +411,53 @@ async fn read_raw_message(
     Ok(ClientMessage::from_bytes(&bytes)?)
 }
 
+fn request_frame(
+    topic: &Topic,
+    from: DidKey,
+    id: &str,
+    request_id: &str,
+    cipher: &mut PlaintextCipher,
+) -> Result<RelayFrame, Box<dyn std::error::Error>> {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let plaintext = ClientMessage::Request(RequestPayload {
+        request_id: request_id.to_owned(),
+        request: Opaque(serde_json::to_vec(&json!({ "method": "get_status" }))?),
+    })
+    .to_bytes()?;
+    let sealed = cipher.seal(&[], &plaintext)?;
+    let wire = Envelope::new(
+        MessageType::Request,
+        from,
+        ts.as_secs(),
+        sealed.nonce,
+        sealed.data,
+    );
+    Ok(RelayFrame {
+        v: 1,
+        id: id.to_owned(),
+        topic: topic.clone(),
+        body: RelayFrameBody::Message {
+            payload: serde_json::to_string(&wire)?,
+        },
+    })
+}
+
+/// Drive `recv` and the raw stream together, requiring neither a delivered
+/// message nor a relay frame (such as an ack) before the timeout.
+async fn expect_no_delivery_or_ack(
+    responder: &mut Client<PlaintextCipher>,
+    raw: &mut RawStream,
+) -> TestResult {
+    let mut receiving = Box::pin(responder.recv());
+    let mut incoming = Box::pin(read_raw_frame(raw));
+    tokio::select! {
+        result = &mut receiving => panic!("unexpected delivery: {result:?}"),
+        result = &mut incoming => panic!("unexpected relay frame: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn retransmission_is_reacknowledged() -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), run_retransmission()).await??;
@@ -454,30 +502,15 @@ async fn run_retransmission() -> TestResult {
     let ready = read_raw_frame(&mut raw).await?;
     assert!(matches!(ready.body, RelayFrameBody::SessionReady));
 
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     let request_id = "raw-request-1";
-    let plaintext = ClientMessage::Request(RequestPayload {
-        request_id: request_id.to_owned(),
-        request: Opaque(serde_json::to_vec(&json!({ "method": "get_status" }))?),
-    })
-    .to_bytes()?;
     let mut sender = PlaintextCipher::new();
-    let sealed = sender.seal(&[], &plaintext)?;
-    let wire = Envelope::new(
-        MessageType::Request,
+    let frame = request_frame(
+        &topic,
         proposer_identity.did(),
-        ts.as_secs(),
-        sealed.nonce,
-        sealed.data,
-    );
-    let frame = RelayFrame {
-        v: 1,
-        id: "raw-frame-1".to_owned(),
-        topic: topic.clone(),
-        body: RelayFrameBody::Message {
-            payload: serde_json::to_string(&wire)?,
-        },
-    };
+        "raw-frame-1",
+        request_id,
+        &mut sender,
+    )?;
     let text = serde_json::to_string(&frame)?;
 
     raw.send(WsMessage::text(text.clone())).await?;
@@ -505,6 +538,125 @@ async fn run_retransmission() -> TestResult {
         "the duplicate must not be delivered to the application again"
     );
     receiving.abort();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn own_and_foreign_identities_are_rejected() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_identities()).await??;
+    Ok(())
+}
+
+/// Frames from the receiver's own identity, and from an identity other than
+/// the established counterpart, must not be delivered or acknowledged.
+async fn run_identities() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+    let foreign_identity = IdentityKey::from_seed(&Seed::from_bytes([9u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        responder_identity.clone(),
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+
+    responder.wait_session_ready().await?;
+    let ready = read_raw_frame(&mut raw).await?;
+    assert!(matches!(ready.body, RelayFrameBody::SessionReady));
+
+    let mut sender = PlaintextCipher::new();
+
+    // The receiver's own identity is rejected before it can become the
+    // counterpart.
+    let own = request_frame(
+        &topic,
+        responder_identity.did(),
+        "own-frame",
+        "own-request",
+        &mut sender,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&own)?))
+        .await?;
+    expect_no_delivery_or_ack(&mut responder, &mut raw).await?;
+    assert!(responder.session().peer_did.is_none());
+
+    // The first authenticated frame establishes the counterpart.
+    let valid = request_frame(
+        &topic,
+        proposer_identity.did(),
+        "valid-frame",
+        "valid-request",
+        &mut sender,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&valid)?))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "valid-request"),
+        other => panic!("expected the valid request, got {other:?}"),
+    }
+    assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
+    match read_raw_message(&mut raw, &sender).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, "valid-frame"),
+        other => panic!("expected ack for the valid request, got {other:?}"),
+    }
+
+    // Once the counterpart is established, a different sender is rejected.
+    let foreign = request_frame(
+        &topic,
+        foreign_identity.did(),
+        "foreign-frame",
+        "foreign-request",
+        &mut sender,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&foreign)?))
+        .await?;
+    expect_no_delivery_or_ack(&mut responder, &mut raw).await?;
+    assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
+
+    // A later frame from the counterpart proves the foreign frame was skipped
+    // rather than merely still queued.
+    let after = request_frame(
+        &topic,
+        proposer_identity.did(),
+        "after-foreign-frame",
+        "after-foreign-request",
+        &mut sender,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&after)?))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => {
+            assert_eq!(payload.request_id, "after-foreign-request");
+        }
+        other => panic!("expected the post-foreign request, got {other:?}"),
+    }
+    match read_raw_message(&mut raw, &sender).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, "after-foreign-frame"),
+        other => panic!("expected ack for the post-foreign request, got {other:?}"),
+    }
 
     Ok(())
 }
