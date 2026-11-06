@@ -5,6 +5,7 @@ use chacha20poly1305::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wallet_session_core::{
+    connection::Role,
     crypto::MessageCipher,
     did::DidKey,
     message::{Ciphertext, Message, MessageType, Nonce, Topic},
@@ -21,7 +22,14 @@ pub const NONCE_LEN: usize = 24;
 
 /// AEAD associated data bound to the plaintext envelope header.
 ///
-/// `AAD = version || id || type || topic || from`.
+/// Each field is a UTF-8 string prefixed by its length as a four-byte
+/// big-endian integer:
+///
+/// `AAD = LP(version) || LP(id) || LP(kind) || LP(topic) || LP(from) || LP(ts) || LP(role)`
+///
+/// The sender uses its own role; the receiver rebuilds the AAD with its
+/// counterpart's role, so an envelope returned to its sender does not
+/// authenticate.
 ///
 /// TODO: verify `from` against the expected peer identity once it is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,28 +48,57 @@ pub struct Aad<'a> {
 
     /// Sender identity
     pub from: &'a DidKey,
+
+    /// Envelope timestamp
+    pub ts: u64,
+
+    /// Sender role on the topic
+    pub role: Role,
 }
 
 impl<'a> Aad<'a> {
     /// Build associated data with the current envelope version.
-    pub fn new(id: &'a str, kind: MessageType, topic: &'a Topic, from: &'a DidKey) -> Self {
+    pub fn new(
+        id: &'a str,
+        kind: MessageType,
+        topic: &'a Topic,
+        from: &'a DidKey,
+        ts: u64,
+        role: Role,
+    ) -> Self {
         Self {
             version: Message::VERSION,
             id,
             kind,
             topic,
             from,
+            ts,
+            role,
         }
     }
 
-    /// Serialize the associated data as UTF-8 bytes.
+    /// Serialize the associated data as length-prefixed UTF-8 bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let version = self.version.to_string();
+        let topic = self.topic.to_string();
+        let from = self.from.to_string();
+        let ts = self.ts.to_string();
+        let fields = [
+            version.as_str(),
+            self.id,
+            self.kind.as_str(),
+            topic.as_str(),
+            from.as_str(),
+            ts.as_str(),
+            self.role.as_str(),
+        ];
+
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(self.version.to_string().as_bytes());
-        bytes.extend_from_slice(self.id.as_bytes());
-        bytes.extend_from_slice(self.kind.as_str().as_bytes());
-        bytes.extend_from_slice(self.topic.to_string().as_bytes());
-        bytes.extend_from_slice(self.from.to_string().as_bytes());
+        for field in fields {
+            let len = u32::try_from(field.len()).expect("AAD field length fits u32");
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(field.as_bytes());
+        }
         bytes
     }
 }
@@ -192,7 +229,65 @@ mod tests {
     }
 
     fn aad(kind: MessageType, topic: &Topic) -> Vec<u8> {
-        Aad::new("frame-id", kind, topic, &did(7)).to_bytes()
+        Aad::new(
+            "frame-id",
+            kind,
+            topic,
+            &did(7),
+            1_700_000_000,
+            Role::Proposer,
+        )
+        .to_bytes()
+    }
+
+    #[test]
+    fn aad_is_length_prefixed_and_includes_ts_and_role() {
+        let topic = topic();
+        let from = did(7);
+        let aad = Aad::new(
+            "frame-id",
+            MessageType::Request,
+            &topic,
+            &from,
+            1_700_000_000,
+            Role::Proposer,
+        )
+        .to_bytes();
+
+        let fields = [
+            Message::VERSION.to_string(),
+            "frame-id".to_owned(),
+            "request".to_owned(),
+            topic.to_string(),
+            from.to_string(),
+            "1700000000".to_owned(),
+            "proposer".to_owned(),
+        ];
+        let mut expected = Vec::new();
+        for field in fields {
+            expected.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            expected.extend_from_slice(field.as_bytes());
+        }
+
+        assert_eq!(aad, expected);
+    }
+
+    #[test]
+    fn aad_binds_timestamp_and_role() {
+        let topic = topic();
+        let from = did(7);
+        let aad = |ts, role| {
+            Aad::new("frame-id", MessageType::Request, &topic, &from, ts, role).to_bytes()
+        };
+
+        assert_ne!(
+            aad(1_700_000_000, Role::Proposer),
+            aad(1_700_000_001, Role::Proposer)
+        );
+        assert_ne!(
+            aad(1_700_000_000, Role::Proposer),
+            aad(1_700_000_000, Role::Responder)
+        );
     }
 
     #[test]
@@ -226,10 +321,26 @@ mod tests {
         let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
 
         let sealed = cipher.seal(
-            &Aad::new("frame-id", MessageType::Request, &topic, &did(1)).to_bytes(),
+            &Aad::new(
+                "frame-id",
+                MessageType::Request,
+                &topic,
+                &did(1),
+                1_700_000_000,
+                Role::Proposer,
+            )
+            .to_bytes(),
             b"hello",
         )?;
-        let tampered = Aad::new("frame-id", MessageType::Request, &topic, &did(2)).to_bytes();
+        let tampered = Aad::new(
+            "frame-id",
+            MessageType::Request,
+            &topic,
+            &did(2),
+            1_700_000_000,
+            Role::Proposer,
+        )
+        .to_bytes();
 
         assert!(matches!(
             cipher.open(&tampered, &sealed),

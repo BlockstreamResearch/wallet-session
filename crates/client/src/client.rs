@@ -154,15 +154,10 @@ where
     async fn send_with_id(&mut self, id: String, message: &ClientMessage) -> Result<()> {
         let topic = self.transport.topic().clone();
         let kind = message.message_type();
-        let aad = Aad::new(&id, kind, &topic, &self.did).to_bytes();
+        let ts = unix_now();
+        let aad = Aad::new(&id, kind, &topic, &self.did, ts, self.session.role).to_bytes();
         let sealed = self.cipher.seal(&aad, &message.to_bytes()?)?;
-        let wire = Message::new(
-            kind,
-            self.did.clone(),
-            unix_now(),
-            sealed.nonce,
-            sealed.data,
-        );
+        let wire = Message::new(kind, self.did.clone(), ts, sealed.nonce, sealed.data);
 
         let frame = RelayFrame {
             v: 1,
@@ -205,7 +200,15 @@ where
                         continue;
                     }
 
-                    let aad = Aad::new(&id, wire.kind, &topic, &wire.from).to_bytes();
+                    let aad = Aad::new(
+                        &id,
+                        wire.kind,
+                        &topic,
+                        &wire.from,
+                        wire.ts,
+                        self.session.role.counterpart(),
+                    )
+                    .to_bytes();
                     let sealed = SealedPayload {
                         nonce: wire.nonce.clone(),
                         data: wire.data.clone(),
