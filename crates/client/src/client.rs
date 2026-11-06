@@ -7,7 +7,10 @@ use wallet_session_core::{
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
     message::{Message, Topic},
-    payload::{ApprovePayload, Opaque, ProposalPayload},
+    payload::{
+        AckPayload, ApprovePayload, DisconnectPayload, Opaque, ProposalPayload, RejectPayload,
+        RequestPayload, ResponsePayload,
+    },
 };
 
 use crate::{
@@ -217,8 +220,8 @@ where
                     let message = ClientMessage::from_bytes(&bytes)?;
 
                     // acks are consumed by reliability
-                    if let ClientMessage::Ack { ack_id } = &message {
-                        self.reliability.mark_delivered(ack_id);
+                    if let ClientMessage::Ack(ack) = &message {
+                        self.reliability.mark_delivered(&ack.ack_id);
                         continue;
                     }
 
@@ -241,9 +244,9 @@ where
 
     /// Acknowledge a received envelope by id.
     async fn send_ack(&mut self, ack_id: &str) -> Result<()> {
-        self.send(&ClientMessage::Ack {
+        self.send(&ClientMessage::Ack(AckPayload {
             ack_id: ack_id.to_owned(),
-        })
+        }))
         .await?;
         Ok(())
     }
@@ -315,65 +318,72 @@ where
 
     /// Send a `reject` and move to `Rejected`.
     pub async fn reject(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
-        self.send(&ClientMessage::Reject {
+        self.send(&ClientMessage::Reject(RejectPayload {
             code,
             message: message.into(),
-        })
+        }))
         .await?;
         self.session.state = SessionState::Rejected;
         Ok(())
     }
 
     /// Send a `request` and return its correlation id.
+    ///
+    /// The JSON value is encoded into the protocol's opaque `request` field.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
         let request_id = random::id()?;
-        self.send_with_id(
-            request_id.clone(),
-            &ClientMessage::Request {
-                request_id: request_id.clone(),
-                request,
-            },
-        )
-        .await?;
+        let payload = RequestPayload {
+            request_id: request_id.clone(),
+            request: opaque(request)?,
+        };
+        self.send_with_id(request_id.clone(), &ClientMessage::Request(payload))
+            .await?;
         Ok(request_id)
     }
 
     /// Send a `response` (or error) for a request.
+    ///
+    /// Each JSON value is encoded into its opaque `response` or `error` field.
     pub async fn respond(
         &mut self,
         request_id: impl Into<String>,
         response: Option<Value>,
         error: Option<Value>,
     ) -> Result<()> {
-        self.send(&ClientMessage::Response {
+        self.send(&ClientMessage::Response(ResponsePayload {
             request_id: request_id.into(),
-            response,
-            error,
-        })
+            response: response.map(opaque).transpose()?,
+            error: error.map(opaque).transpose()?,
+        }))
         .await?;
         Ok(())
     }
 
     /// Acknowledge a received message.
     pub async fn ack(&mut self, ack_id: impl Into<String>) -> Result<()> {
-        self.send(&ClientMessage::Ack {
+        self.send(&ClientMessage::Ack(AckPayload {
             ack_id: ack_id.into(),
-        })
+        }))
         .await?;
         Ok(())
     }
 
     /// Gracefully disconnect.
     pub async fn disconnect(&mut self, reason: impl Into<String>, code: u32) -> Result<()> {
-        self.send(&ClientMessage::Disconnect {
+        self.send(&ClientMessage::Disconnect(DisconnectPayload {
             reason: reason.into(),
             code,
             message: String::new(),
-        })
+        }))
         .await?;
         self.session.state = SessionState::Disconnected;
         Ok(())
     }
+}
+
+/// Encode a JSON application value as the protocol's opaque payload.
+fn opaque(value: Value) -> Result<Opaque> {
+    Ok(Opaque(serde_json::to_vec(&value)?))
 }
 
 /// Session expiry timestamp for a fresh proposal.

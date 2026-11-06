@@ -277,7 +277,7 @@ Payload shapes:
 - `disconnect`: `{ reason, code, message }`
 - `session_delete`: `{ code, message }`
 
-`proposal` and `approval` are opaque application data.
+`proposal`, `approval`, `request`, `response`, and `error` are opaque application data, encoded as base64url strings.
 
 ## 13. Reliability
 

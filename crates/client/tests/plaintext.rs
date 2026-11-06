@@ -153,11 +153,9 @@ async fn run() -> TestResult {
 
     let request_id = proposer.request(json!({ "method": "get_status" })).await?;
     match responder.recv().await? {
-        ClientMessage::Request {
-            request_id: received,
-            request,
-        } => {
-            assert_eq!(received, request_id);
+        ClientMessage::Request(payload) => {
+            assert_eq!(payload.request_id, request_id);
+            let request: serde_json::Value = serde_json::from_slice(&payload.request.0)?;
             assert_eq!(request, json!({ "method": "get_status" }));
         }
         other => panic!("expected request, got {other:?}"),
@@ -167,14 +165,12 @@ async fn run() -> TestResult {
         .respond(request_id.clone(), Some(json!({ "result": "ok" })), None)
         .await?;
     match proposer.recv().await? {
-        ClientMessage::Response {
-            request_id: received,
-            response,
-            error,
-        } => {
-            assert_eq!(received, request_id);
-            assert_eq!(response, Some(json!({ "result": "ok" })));
-            assert_eq!(error, None);
+        ClientMessage::Response(payload) => {
+            assert_eq!(payload.request_id, request_id);
+            assert_eq!(payload.error, None);
+            let response = payload.response.expect("response body");
+            let response: serde_json::Value = serde_json::from_slice(&response.0)?;
+            assert_eq!(response, json!({ "result": "ok" }));
         }
         other => panic!("expected response, got {other:?}"),
     }
@@ -256,10 +252,7 @@ async fn run_reconnect() -> TestResult {
 
     responder.wait_session_ready().await?;
     match responder.recv().await? {
-        ClientMessage::Request {
-            request_id: received,
-            ..
-        } => assert_eq!(received, request_id),
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
         other => panic!("expected buffered request after reconnect, got {other:?}"),
     }
 
@@ -267,13 +260,11 @@ async fn run_reconnect() -> TestResult {
         .respond(request_id.clone(), Some(json!({ "result": "ok" })), None)
         .await?;
     match proposer.recv().await? {
-        ClientMessage::Response {
-            request_id: received,
-            response,
-            ..
-        } => {
-            assert_eq!(received, request_id);
-            assert_eq!(response, Some(json!({ "result": "ok" })));
+        ClientMessage::Response(payload) => {
+            assert_eq!(payload.request_id, request_id);
+            let response = payload.response.expect("response body");
+            let response: serde_json::Value = serde_json::from_slice(&response.0)?;
+            assert_eq!(response, json!({ "result": "ok" }));
         }
         other => panic!("expected response, got {other:?}"),
     }

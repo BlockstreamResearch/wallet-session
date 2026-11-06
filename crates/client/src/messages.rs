@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use wallet_session_core::{
     message::MessageType,
-    payload::{ApprovePayload, ProposalPayload},
+    payload::{
+        AckPayload, ApprovePayload, DisconnectPayload, ProposalPayload, RejectPayload,
+        RequestPayload, ResponsePayload, SessionDeletePayload,
+    },
 };
 
 use crate::error::Result;
@@ -11,6 +13,9 @@ use crate::error::Result;
 pub type RequestId = String;
 
 /// Plaintext application message exchanged over the relay.
+///
+/// The variant bodies are the payload types from `wallet_session_core`, so the
+/// wire representation is the one defined by the protocol.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -21,33 +26,22 @@ pub enum ClientMessage {
     Approve(ApprovePayload),
 
     /// Reject a proposal.
-    Reject { code: u32, message: String },
+    Reject(RejectPayload),
 
     /// Application request.
-    Request {
-        request_id: RequestId,
-        request: Value,
-    },
+    Request(RequestPayload),
 
     /// Application response to a request.
-    Response {
-        request_id: RequestId,
-        response: Option<Value>,
-        error: Option<Value>,
-    },
+    Response(ResponsePayload),
 
     /// Acknowledge receipt of a message.
-    Ack { ack_id: String },
+    Ack(AckPayload),
 
     /// Graceful teardown.
-    Disconnect {
-        reason: String,
-        code: u32,
-        message: String,
-    },
+    Disconnect(DisconnectPayload),
 
     /// Notify the peer that the session was deleted.
-    SessionDelete { code: u32, message: String },
+    SessionDelete(SessionDeletePayload),
 }
 
 impl ClientMessage {
@@ -56,12 +50,12 @@ impl ClientMessage {
         match self {
             ClientMessage::Proposal(_) => MessageType::Proposal,
             ClientMessage::Approve(_) => MessageType::Approve,
-            ClientMessage::Reject { .. } => MessageType::Reject,
-            ClientMessage::Request { .. } => MessageType::Request,
-            ClientMessage::Response { .. } => MessageType::Response,
-            ClientMessage::Ack { .. } => MessageType::Ack,
-            ClientMessage::Disconnect { .. } => MessageType::Disconnect,
-            ClientMessage::SessionDelete { .. } => MessageType::SessionDelete,
+            ClientMessage::Reject(_) => MessageType::Reject,
+            ClientMessage::Request(_) => MessageType::Request,
+            ClientMessage::Response(_) => MessageType::Response,
+            ClientMessage::Ack(_) => MessageType::Ack,
+            ClientMessage::Disconnect(_) => MessageType::Disconnect,
+            ClientMessage::SessionDelete(_) => MessageType::SessionDelete,
         }
     }
 
@@ -78,13 +72,14 @@ impl ClientMessage {
 mod tests {
     use super::*;
     use serde_json::json;
+    use wallet_session_core::payload::Opaque;
 
     #[test]
     fn request_round_trips() {
-        let message = ClientMessage::Request {
+        let message = ClientMessage::Request(RequestPayload {
             request_id: "req-1".to_owned(),
-            request: json!({ "method": "get" }),
-        };
+            request: Opaque(serde_json::to_vec(&json!({ "method": "get" })).expect("json")),
+        });
         let bytes = message.to_bytes().expect("bytes");
         assert_eq!(ClientMessage::from_bytes(&bytes).expect("parsed"), message);
         assert_eq!(message.message_type(), MessageType::Request);
@@ -92,12 +87,60 @@ mod tests {
 
     #[test]
     fn response_error_variant_round_trips() {
-        let message = ClientMessage::Response {
+        let message = ClientMessage::Response(ResponsePayload {
             request_id: "req-1".to_owned(),
             response: None,
-            error: Some(json!({ "code": 4001 })),
-        };
+            error: Some(Opaque(
+                serde_json::to_vec(&json!({ "code": 4001 })).expect("json"),
+            )),
+        });
         let bytes = message.to_bytes().expect("bytes");
         assert_eq!(ClientMessage::from_bytes(&bytes).expect("parsed"), message);
+    }
+
+    #[test]
+    fn ack_uses_the_documented_field_name() {
+        let message = ClientMessage::Ack(AckPayload {
+            ack_id: "frame-1".to_owned(),
+        });
+
+        assert_eq!(
+            serde_json::to_value(&message).expect("json"),
+            json!({ "type": "ack", "ackId": "frame-1" })
+        );
+        assert_eq!(
+            ClientMessage::from_bytes(br#"{"type":"ack","ackId":"frame-1"}"#).expect("parsed"),
+            message
+        );
+    }
+
+    #[test]
+    fn request_uses_the_documented_field_names() {
+        let message = ClientMessage::Request(RequestPayload {
+            request_id: "req-1".to_owned(),
+            request: Opaque(vec![1, 2, 3]),
+        });
+        let value = serde_json::to_value(&message).expect("json");
+
+        assert_eq!(
+            value,
+            json!({ "type": "request", "requestId": "req-1", "request": "AQID" })
+        );
+        assert!(value.get("request_id").is_none());
+    }
+
+    #[test]
+    fn response_uses_the_documented_field_names() {
+        let message = ClientMessage::Response(ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: Some(Opaque(vec![1, 2, 3])),
+            error: None,
+        });
+        let value = serde_json::to_value(&message).expect("json");
+
+        assert_eq!(value["type"], "response");
+        assert_eq!(value["requestId"], "req-1");
+        assert_eq!(value["response"], "AQID");
+        assert!(value.get("request_id").is_none());
     }
 }

@@ -22,3 +22,7 @@ pub use messages::{ClientMessage, RequestId};
 pub use pairing::{PairingKey, PairingUri};
 pub use reliability::ClientEvent;
 pub use session::{Role, Session, SessionState};
+pub use wallet_session_core::payload::{
+    AckPayload, ApprovePayload, DisconnectPayload, Opaque, ProposalPayload, RejectPayload,
+    RequestPayload, ResponsePayload, SessionDeletePayload,
+};
