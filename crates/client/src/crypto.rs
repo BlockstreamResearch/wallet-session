@@ -134,6 +134,7 @@ pub enum CipherError {
 }
 
 /// XChaCha20-Poly1305 provider
+#[derive(Clone)]
 pub struct XChaCha20Poly1305Cipher {
     prefix: [u8; SENDER_PREFIX_LEN],
     counter: u64,

@@ -27,7 +27,10 @@ pub enum SessionState {
 /// A single paired session.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Topic both peers are connected to.
+    /// Topic used for the initial handshake.
+    pub pairing_topic: Topic,
+
+    /// Topic currently carrying application traffic.
     pub topic: Topic,
 
     /// Local role.
@@ -44,6 +47,7 @@ impl Session {
     /// Start a session on `topic` for the given role.
     pub fn new(topic: Topic, role: Role) -> Self {
         Self {
+            pairing_topic: topic.clone(),
             topic,
             role,
             peer_did: None,

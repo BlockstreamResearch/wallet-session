@@ -26,30 +26,28 @@ pub(crate) enum Outbound {
     Frame(RelayFrame),
 }
 
-/// Everything the connection task reports to the client.
+/// Everything a connection task reports to the client.
 pub(crate) enum Inbox {
     /// A relay frame received from the relay.
     Frame(RelayFrame),
 
-    /// The connection is established (initial or after reconnect).
-    Connected,
+    /// The connection for `topic` is established (initial or after reconnect).
+    Connected(Topic),
 
-    /// The connection was lost; a reconnect is starting.
-    Disconnected,
+    /// The connection for `topic` was lost; a reconnect is starting.
+    Disconnected(Topic),
 
-    /// Reconnect attempts were exhausted.
-    Closed,
+    /// Reconnect attempts for `topic` were exhausted.
+    Closed(Topic),
 }
 
 /// A reconnecting relay connection for one topic and role.
 ///
-/// A background task owns the WebSocket lifecycle and exposes stable inbound
-/// and outbound channels, so the client and reliability layer never observe a
-/// socket swap.
+/// A background task owns the WebSocket lifecycle and exposes a stable
+/// outbound channel, so the client and reliability layer never observe a
+/// socket swap. Inbound events go to the shared channel owned by the client.
 pub(crate) struct Transport {
-    topic: Topic,
     outbound: mpsc::UnboundedSender<Outbound>,
-    inbox: mpsc::UnboundedReceiver<Inbox>,
     _task: JoinHandle<()>,
 }
 
@@ -60,39 +58,24 @@ impl Transport {
         identity: IdentityKey,
         role: Role,
         topic: Topic,
+        inbox: mpsc::UnboundedSender<Inbox>,
     ) -> Self {
         let (outbound, outbound_rx) = mpsc::unbounded_channel();
-        let (inbox_tx, inbox) = mpsc::unbounded_channel();
         let _task = tokio::spawn(connection_task(
             config,
             identity,
             role,
             topic.clone(),
             outbound_rx,
-            inbox_tx,
+            inbox,
         ));
 
-        Self {
-            topic,
-            outbound,
-            inbox,
-            _task,
-        }
-    }
-
-    /// Topic of this connection.
-    pub(crate) fn topic(&self) -> &Topic {
-        &self.topic
+        Self { outbound, _task }
     }
 
     /// Cloneable handle to the outbound writer.
     pub(crate) fn outbound(&self) -> mpsc::UnboundedSender<Outbound> {
         self.outbound.clone()
-    }
-
-    /// Await the next inbox item, or `None` once the connection task exits.
-    pub(crate) async fn recv(&mut self) -> Option<Inbox> {
-        self.inbox.recv().await
     }
 }
 
@@ -112,23 +95,23 @@ async fn connection_task(
             Ok(stream) => {
                 attempt = 0;
                 delay = config.reconnect_initial_delay;
-                let _ = inbox.send(Inbox::Connected);
+                let _ = inbox.send(Inbox::Connected(topic.clone()));
 
                 if !run_connection(stream, &mut outbound, &inbox, &config).await {
                     return; // all senders dropped: shutting down
                 }
-                let _ = inbox.send(Inbox::Disconnected);
+                let _ = inbox.send(Inbox::Disconnected(topic.clone()));
             }
             Err(error) => {
                 log::debug!("relay connect failed: {error}");
-                let _ = inbox.send(Inbox::Disconnected);
+                let _ = inbox.send(Inbox::Disconnected(topic.clone()));
             }
         }
 
         attempt += 1;
         if attempt >= config.reconnect_max_attempts {
             log::warn!("relay reconnect attempts exhausted");
-            let _ = inbox.send(Inbox::Closed);
+            let _ = inbox.send(Inbox::Closed(topic.clone()));
             return;
         }
 

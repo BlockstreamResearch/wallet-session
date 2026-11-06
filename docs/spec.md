@@ -170,6 +170,8 @@ Session establishment flow:
 6. proposer derives the same session key;
 7. both parties continues exchanging messages by the new session key, using the same session.
 
+The Relay binds each connection to one topic. After deriving the session topic, each peer opens a new connection to it. The pairing connection remains available for handshake acknowledgements and retransmissions, because those messages belong to the pairing topic and key; application traffic uses the session topic.
+
 
 # Part II. Relay Protocol
 

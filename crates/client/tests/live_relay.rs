@@ -217,6 +217,9 @@ async fn full_session_round_trip() -> TestResult {
         responder.approve(json!({ "ok": true })).await?;
         assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
 
+        proposer.wait_session_ready().await?;
+        responder.wait_session_ready().await?;
+
         let request_id = proposer.request(json!({ "method": "get_status" })).await?;
         match responder.recv().await? {
             ClientMessage::Request(payload) => {
@@ -290,6 +293,8 @@ async fn long_session_with_100_messages() -> TestResult {
 
         responder.approve(json!({ "ok": true })).await?;
         assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+        proposer.wait_session_ready().await?;
+        responder.wait_session_ready().await?;
         eprintln!("long session: approved; starting {LONG_SESSION_MESSAGES} messages");
 
         // A non-trivial payload also exercises the relay's byte accounting.

@@ -39,7 +39,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 static PREFIX_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only passthrough cipher: no encryption, but a valid nonce sequence.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlaintextCipher {
     prefix: [u8; SENDER_PREFIX_LEN],
     counter: u64,
@@ -156,6 +156,13 @@ async fn run() -> TestResult {
 
     responder.approve(json!({ "ok": true })).await?;
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+
+    proposer.wait_session_ready().await?;
+    responder.wait_session_ready().await?;
+    assert_ne!(proposer.session().topic, topic);
+    assert_ne!(responder.session().topic, topic);
+    assert_eq!(proposer.session().pairing_topic, topic);
+    assert_eq!(responder.session().pairing_topic, topic);
 
     let request_id = proposer.request(json!({ "method": "get_status" })).await?;
     match responder.recv().await? {

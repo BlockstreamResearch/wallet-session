@@ -48,13 +48,6 @@ impl ReplayMemory {
         }
     }
 
-    /// Forget every record, for example when switching keys.
-    pub(crate) fn clear(&mut self) {
-        self.by_id.clear();
-        self.by_nonce.clear();
-        self.largest_discarded_ts = None;
-    }
-
     /// Whether `ts` is at or below a timestamp already discarded from the
     /// replay memory.
     pub(crate) fn is_stale(&self, ts: u64) -> bool {
@@ -257,21 +250,5 @@ mod tests {
         // The record is gone, but a copy replayed after a clock rollback is
         // still rejected by the remembered discarded timestamp.
         assert!(memory.is_stale(original.ts));
-    }
-
-    #[test]
-    fn clear_drops_records_and_discarded_timestamps() {
-        let mut memory = ReplayMemory::new(Duration::from_secs(300));
-        let original = message(1_000);
-
-        observe(&mut memory, "frame-1", &original, 1_000);
-        observe(&mut memory, "frame-2", &message(1_001), 1_301);
-        memory.clear();
-
-        assert!(!memory.is_stale(1_000));
-        assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_000),
-            Observation::New
-        );
     }
 }
