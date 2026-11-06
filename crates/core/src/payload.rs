@@ -30,7 +30,7 @@ pub struct ApprovePayload {
 }
 
 /// Body of a `reject` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RejectPayload {
     /// Reason code for the rejection
     pub code: u32,
@@ -40,7 +40,7 @@ pub struct RejectPayload {
 }
 
 /// Body of a `request` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestPayload {
     /// Caller-assigned identifier used to correlate the eventual `response`
@@ -52,7 +52,7 @@ pub struct RequestPayload {
 }
 
 /// Body of a `response` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponsePayload {
     /// Identifier of the `request` being answered.
@@ -69,7 +69,7 @@ pub struct ResponsePayload {
 ///
 /// Confirms receipt of an ack-required message, driving the retransmission
 /// logic.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AckPayload {
     /// The envelope `id` of the message being acknowledged.
@@ -77,7 +77,7 @@ pub struct AckPayload {
 }
 
 /// Body of a `disconnect` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisconnectPayload {
     /// Short reason label for the disconnect.
     pub reason: String,
@@ -90,7 +90,7 @@ pub struct DisconnectPayload {
 }
 
 /// Body of a `session_delete` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDeletePayload {
     /// Machine-readable close code.
     pub code: u32,
