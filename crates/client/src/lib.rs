@@ -7,6 +7,7 @@ mod pairing;
 mod random;
 mod relay;
 mod reliability;
+mod replay;
 mod session;
 mod tls;
 

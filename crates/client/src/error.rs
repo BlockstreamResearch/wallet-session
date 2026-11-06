@@ -39,6 +39,9 @@ pub enum ClientError {
     #[error("unexpected handshake message")]
     UnexpectedHandshake,
 
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(&'static str),
+
     #[error("random source failure: {0}")]
     Random(#[from] getrandom::Error),
 

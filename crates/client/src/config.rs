@@ -24,9 +24,6 @@ pub struct ClientConfig {
     /// Maximum retransmissions before a message is reported failed.
     pub ack_max_attempts: usize,
 
-    /// How long an inbound envelope id is remembered for duplicate suppression.
-    pub seen_ttl: Duration,
-
     /// Interval between client keepalive pings.
     pub ping_interval: Duration,
 
@@ -55,7 +52,6 @@ impl ClientConfig {
             idle_timeout: Duration::from_secs(60),
             ack_base_delay: Duration::from_secs(2),
             ack_max_attempts: 5,
-            seen_ttl: Duration::from_secs(300),
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             reconnect_initial_delay: Duration::from_millis(250),
@@ -97,12 +93,6 @@ impl ClientConfig {
     /// Set the maximum retransmission attempts.
     pub fn with_ack_max_attempts(mut self, ack_max_attempts: usize) -> Self {
         self.ack_max_attempts = ack_max_attempts;
-        self
-    }
-
-    /// Set the duplicate-suppression TTL.
-    pub fn with_seen_ttl(mut self, seen_ttl: Duration) -> Self {
-        self.seen_ttl = seen_ttl;
         self
     }
 

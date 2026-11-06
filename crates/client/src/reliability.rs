@@ -14,11 +14,7 @@ use tokio::{
 };
 use wallet_session_core::{frame::RelayFrame, message::MessageType};
 
-use crate::{
-    crypto::{NONCE_LEN, SENDER_PREFIX_LEN},
-    error::ClientError,
-    relay::Outbound,
-};
+use crate::{error::ClientError, relay::Outbound};
 
 /// Reliability events surfaced to the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,90 +61,11 @@ struct Pending {
     next: Instant,
 }
 
-/// Rolling set of recently seen envelope ids, for duplicate suppression.
-struct SeenIds {
-    ttl: Duration,
-    seen: HashMap<String, Instant>,
-}
-
-impl SeenIds {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            ttl,
-            seen: HashMap::new(),
-        }
-    }
-
-    /// Record `id`, returning true if it was already seen within the TTL.
-    fn observe(&mut self, id: &str) -> bool {
-        let now = Instant::now();
-        self.seen
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-
-        if self.seen.contains_key(id) {
-            true
-        } else {
-            self.seen.insert(id.to_owned(), now);
-            false
-        }
-    }
-}
-
-/// Maximum distinct sender prefixes tracked before the guard resets.
-const MAX_NONCE_PREFIXES: usize = 64;
-
-/// Rejects reused AEAD nonces for the current key.
-///
-/// Tracks the highest counter seen per 16-byte sender prefix and requires each
-/// new nonce to be strictly greater. Reset on rekey.
-pub(crate) struct NonceGuard {
-    highest: HashMap<[u8; SENDER_PREFIX_LEN], u64>,
-}
-
-impl NonceGuard {
-    pub(crate) fn new() -> Self {
-        Self {
-            highest: HashMap::new(),
-        }
-    }
-
-    /// Forget all seen nonces (called when the key changes).
-    pub(crate) fn clear(&mut self) {
-        self.highest.clear();
-    }
-
-    /// Returns true if the nonce was already used (not strictly increasing).
-    pub(crate) fn is_reused(&mut self, nonce: &[u8]) -> bool {
-        if nonce.len() != NONCE_LEN {
-            return true;
-        }
-        let Ok(prefix) = <[u8; SENDER_PREFIX_LEN]>::try_from(&nonce[..SENDER_PREFIX_LEN]) else {
-            return true;
-        };
-        let Ok(counter) = <[u8; 8]>::try_from(&nonce[SENDER_PREFIX_LEN..]) else {
-            return true;
-        };
-        let counter = u64::from_be_bytes(counter);
-
-        match self.highest.get(&prefix) {
-            Some(&highest) if counter <= highest => true,
-            _ => {
-                if self.highest.len() >= MAX_NONCE_PREFIXES {
-                    self.highest.clear();
-                }
-                self.highest.insert(prefix, counter);
-                false
-            }
-        }
-    }
-}
-
-/// Outbound reliability: ack tracking, retransmission, and inbound dedupe.
+/// Outbound reliability: ack tracking and retransmission.
 pub(crate) struct Reliability {
     outbox: mpsc::UnboundedSender<Outbound>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     connected: Arc<AtomicBool>,
-    seen: SeenIds,
     events: mpsc::UnboundedSender<ClientEvent>,
     base_delay: Duration,
     _retry: JoinHandle<()>,
@@ -159,7 +76,6 @@ impl Reliability {
         outbox: mpsc::UnboundedSender<Outbound>,
         base_delay: Duration,
         max_attempts: usize,
-        seen_ttl: Duration,
     ) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(false));
@@ -178,7 +94,6 @@ impl Reliability {
                 outbox,
                 pending,
                 connected,
-                seen: SeenIds::new(seen_ttl),
                 events,
                 base_delay,
                 _retry,
@@ -236,11 +151,6 @@ impl Reliability {
                 id: ack_id.to_owned(),
             });
         }
-    }
-
-    /// Returns true if the frame id was already seen recently.
-    pub(crate) fn is_duplicate(&mut self, id: &str) -> bool {
-        self.seen.observe(id)
     }
 }
 
@@ -331,42 +241,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedupes_seen_ids() {
-        let (outbox, _rx) = mpsc::unbounded_channel();
-        let (mut reliability, _events) =
-            Reliability::spawn(outbox, Duration::from_secs(1), 1, Duration::from_secs(60));
-
-        assert!(!reliability.is_duplicate("x"));
-        assert!(reliability.is_duplicate("x"));
-        assert!(!reliability.is_duplicate("y"));
-    }
-
-    #[test]
-    fn rejects_reused_nonces() {
-        let mut guard = NonceGuard::new();
-        let mut nonce = [0u8; NONCE_LEN];
-
-        nonce[16..].copy_from_slice(&1u64.to_be_bytes());
-        assert!(!guard.is_reused(&nonce));
-        assert!(guard.is_reused(&nonce));
-
-        nonce[16..].copy_from_slice(&0u64.to_be_bytes());
-        assert!(guard.is_reused(&nonce));
-
-        nonce[16..].copy_from_slice(&2u64.to_be_bytes());
-        assert!(!guard.is_reused(&nonce));
-
-        // A different sender prefix has its own counter.
-        nonce[0] = 9;
-        nonce[16..].copy_from_slice(&0u64.to_be_bytes());
-        assert!(!guard.is_reused(&nonce));
-    }
-
-    #[tokio::test]
     async fn delivers_when_acked() {
         let (outbox, mut outbound) = mpsc::unbounded_channel();
-        let (mut reliability, mut events) =
-            Reliability::spawn(outbox, Duration::from_secs(1), 5, Duration::from_secs(60));
+        let (mut reliability, mut events) = Reliability::spawn(outbox, Duration::from_secs(1), 5);
 
         reliability.dispatch(frame("a"), true).expect("dispatch");
         assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
@@ -381,8 +258,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retries_then_fails() {
         let (outbox, mut outbound) = mpsc::unbounded_channel();
-        let (mut reliability, mut events) =
-            Reliability::spawn(outbox, Duration::from_secs(1), 2, Duration::from_secs(60));
+        let (mut reliability, mut events) = Reliability::spawn(outbox, Duration::from_secs(1), 2);
 
         reliability.dispatch(frame("a"), true).expect("dispatch");
         reliability.set_connected(true);
@@ -415,8 +291,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pauses_while_disconnected_and_flushes_on_reconnect() {
         let (outbox, mut outbound) = mpsc::unbounded_channel();
-        let (mut reliability, _events) =
-            Reliability::spawn(outbox, Duration::from_secs(1), 3, Duration::from_secs(60));
+        let (mut reliability, _events) = Reliability::spawn(outbox, Duration::from_secs(1), 3);
 
         // Reliability starts disconnected.
         reliability.dispatch(frame("a"), true).expect("dispatch");

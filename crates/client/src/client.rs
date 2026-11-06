@@ -22,7 +22,8 @@ use crate::{
     messages::{ClientMessage, RequestId},
     random,
     relay::{Inbox, Transport},
-    reliability::{ClientEvent, NonceGuard, Reliability, requires_ack},
+    reliability::{ClientEvent, Reliability, requires_ack},
+    replay::{Observation, ReplayMemory},
     session::{Role, Session, SessionState},
 };
 
@@ -55,7 +56,7 @@ pub struct Client<C> {
     reliability: Reliability,
     events: mpsc::UnboundedReceiver<ClientEvent>,
     did: DidKey,
-    nonce_guard: NonceGuard,
+    replay: ReplayMemory,
     saw_disconnect: bool,
 }
 
@@ -76,7 +77,6 @@ where
             transport.outbound(),
             config.ack_base_delay,
             config.ack_max_attempts,
-            config.seen_ttl,
         );
 
         Ok(Self {
@@ -87,7 +87,7 @@ where
             reliability,
             events,
             did,
-            nonce_guard: NonceGuard::new(),
+            replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS)),
             saw_disconnect: false,
         })
     }
@@ -183,10 +183,6 @@ where
                         log::warn!("dropping frame for unsubscribed topic {topic}");
                         continue;
                     }
-                    if self.reliability.is_duplicate(&id) {
-                        log::debug!("dropping duplicate frame {id}");
-                        continue;
-                    }
 
                     let wire: Message = serde_json::from_str(&payload)?;
 
@@ -197,6 +193,10 @@ where
                     let now = unix_now();
                     if now.abs_diff(wire.ts) > MAX_TS_SKEW_SECS {
                         log::warn!("dropping frame with stale timestamp ts={}", wire.ts);
+                        continue;
+                    }
+                    if self.replay.is_stale(wire.ts) {
+                        log::warn!("dropping frame with discarded timestamp ts={}", wire.ts);
                         continue;
                     }
 
@@ -215,23 +215,52 @@ where
                     };
                     let bytes = self.cipher.open(&aad, &sealed)?;
 
-                    if self.nonce_guard.is_reused(wire.nonce.as_bytes()) {
-                        log::warn!("dropping frame with reused nonce {id}");
-                        continue;
+                    match self.replay.classify(&id, &wire, now) {
+                        Observation::Retransmission => {
+                            if requires_ack(wire.kind) {
+                                self.send_ack(&id).await?;
+                            }
+                            log::debug!("re-acknowledged retransmission {id}");
+                            continue;
+                        }
+                        Observation::Conflict => {
+                            return Err(ClientError::ProtocolViolation(
+                                "envelope reuses a frame id or nonce with different content",
+                            ));
+                        }
+                        Observation::New => {}
                     }
 
                     let message = ClientMessage::from_bytes(&bytes)?;
 
                     // acks are consumed by reliability
                     if let ClientMessage::Ack(ack) = &message {
+                        self.replay.record(&id, &wire);
                         self.reliability.mark_delivered(&ack.ack_id);
                         continue;
                     }
 
-                    self.observe(&message)?;
+                    // An `approve` switches keys while `observe` runs and
+                    // clears the old key's replay memory. Record it first so
+                    // that clearing covers it; every other message is
+                    // recorded only after it has been validated and
+                    // acknowledged.
+                    let rekeys = matches!(message, ClientMessage::Approve(_));
+                    if rekeys {
+                        self.replay.record(&id, &wire);
+                    }
+
+                    if let Err(error) = self.observe(&message) {
+                        self.replay.forget(&id);
+                        return Err(error);
+                    }
 
                     if requires_ack(message.message_type()) {
                         self.send_ack(&id).await?;
+                    }
+
+                    if !rekeys {
+                        self.replay.record(&id, &wire);
                     }
 
                     return Ok(message);
@@ -284,7 +313,7 @@ where
     /// Replace the cipher with one keyed by the derived session key.
     fn rekey(&mut self, key: SessionKey, _topic: SessionTopic) {
         self.cipher.rekey(key.as_bytes());
-        self.nonce_guard.clear();
+        self.replay.clear();
         self.handshake = Handshake::Established;
         self.session.state = SessionState::Active;
     }

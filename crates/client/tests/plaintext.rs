@@ -6,11 +6,15 @@ use std::{
     time::Duration,
 };
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
+};
 use wallet_session_client::{
-    Client, ClientConfig, ClientError, ClientMessage, IdentityKey, PairingKey, Role, Seed,
-    SessionState,
+    Client, ClientConfig, ClientError, ClientMessage, IdentityKey, Opaque, PairingKey,
+    RequestPayload, Role, Seed, SessionState,
 };
 use wallet_session_relay::{
     config::NativeRelayTransportConfig,
@@ -21,8 +25,10 @@ use wallet_session_relay::{
 
 use wallet_session_client::crypto::{CipherError, NONCE_LEN, SENDER_PREFIX_LEN, SealedPayload};
 use wallet_session_core::{
+    connection::ConnectionQuery,
     crypto::MessageCipher,
-    message::{Ciphertext, Nonce},
+    frame::{RelayFrame, RelayFrameBody},
+    message::{Ciphertext, Message as Envelope, MessageType, Nonce, Topic},
 };
 
 const AUDIENCE: &str = "wss://relay.example.com";
@@ -332,6 +338,166 @@ async fn run_expiry() -> TestResult {
         "expected PeerDisconnected, got {outcome:?}"
     );
     assert_eq!(proposer.session().state, SessionState::Disconnected);
+
+    Ok(())
+}
+
+type RawStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Connect to the relay as a raw peer, bypassing `Client`.
+async fn connect_raw(
+    relay_url: &str,
+    identity: &IdentityKey,
+    role: Role,
+    topic: &Topic,
+) -> Result<RawStream, Box<dyn std::error::Error>> {
+    let token = identity.connection_token("raw-test", AUDIENCE, Duration::from_secs(60))?;
+    let query = ConnectionQuery {
+        auth: token,
+        role,
+        topic: topic.clone(),
+        registration_id: None,
+    };
+    let mut url = url::Url::parse(relay_url)?;
+    url.set_query(Some(&serde_urlencoded::to_string(&query)?));
+    let (stream, _) = connect_async(url.as_str()).await?;
+    Ok(stream)
+}
+
+/// Read the next relay frame, ignoring WebSocket control frames.
+async fn read_raw_frame(stream: &mut RawStream) -> Result<RelayFrame, Box<dyn std::error::Error>> {
+    loop {
+        match stream.next().await {
+            Some(Ok(WsMessage::Text(text))) => return Ok(serde_json::from_str(&text)?),
+            Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+            Some(Ok(WsMessage::Close(frame))) => {
+                return Err(std::io::Error::other(format!(
+                    "relay closed the connection: {frame:?}"
+                ))
+                .into());
+            }
+            Some(Ok(_)) => continue,
+            Some(Err(error)) => return Err(error.into()),
+            None => return Err(std::io::Error::other("relay stream ended").into()),
+        }
+    }
+}
+
+/// Read and decrypt the next application message from the raw peer.
+async fn read_raw_message(
+    stream: &mut RawStream,
+    cipher: &PlaintextCipher,
+) -> Result<ClientMessage, Box<dyn std::error::Error>> {
+    let frame = read_raw_frame(stream).await?;
+    let RelayFrameBody::Message { payload } = frame.body else {
+        return Err(std::io::Error::other("expected a message frame").into());
+    };
+    let wire: Envelope = serde_json::from_str(&payload)?;
+    let bytes = cipher.open(
+        &[],
+        &SealedPayload {
+            nonce: wire.nonce,
+            data: wire.data,
+        },
+    )?;
+    Ok(ClientMessage::from_bytes(&bytes)?)
+}
+
+#[tokio::test]
+async fn retransmission_is_reacknowledged() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_retransmission()).await??;
+    Ok(())
+}
+
+/// An identical retransmission must not be delivered twice, but must be
+/// acknowledged again.
+async fn run_retransmission() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+
+    responder.wait_session_ready().await?;
+    let ready = read_raw_frame(&mut raw).await?;
+    assert!(matches!(ready.body, RelayFrameBody::SessionReady));
+
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let request_id = "raw-request-1";
+    let plaintext = ClientMessage::Request(RequestPayload {
+        request_id: request_id.to_owned(),
+        request: Opaque(serde_json::to_vec(&json!({ "method": "get_status" }))?),
+    })
+    .to_bytes()?;
+    let mut sender = PlaintextCipher::new();
+    let sealed = sender.seal(&[], &plaintext)?;
+    let wire = Envelope::new(
+        MessageType::Request,
+        proposer_identity.did(),
+        ts.as_secs(),
+        sealed.nonce,
+        sealed.data,
+    );
+    let frame = RelayFrame {
+        v: 1,
+        id: "raw-frame-1".to_owned(),
+        topic: topic.clone(),
+        body: RelayFrameBody::Message {
+            payload: serde_json::to_string(&wire)?,
+        },
+    };
+    let text = serde_json::to_string(&frame)?;
+
+    raw.send(WsMessage::text(text.clone())).await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
+        other => panic!("expected request, got {other:?}"),
+    }
+    match read_raw_message(&mut raw, &sender).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, frame.id),
+        other => panic!("expected ack, got {other:?}"),
+    }
+
+    // Retransmit the identical envelope. It must not reach the application
+    // again, but the responder must send a fresh ack.
+    raw.send(WsMessage::text(text)).await?;
+    let receiving = tokio::spawn(async move { responder.recv().await });
+    let ack =
+        tokio::time::timeout(Duration::from_secs(2), read_raw_message(&mut raw, &sender)).await??;
+    match ack {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, frame.id),
+        other => panic!("expected re-ack, got {other:?}"),
+    }
+    assert!(
+        !receiving.is_finished(),
+        "the duplicate must not be delivered to the application again"
+    );
+    receiving.abort();
 
     Ok(())
 }
