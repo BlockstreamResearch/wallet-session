@@ -6,7 +6,7 @@ use wallet_session_core::{
     crypto::MessageCipher,
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
-    message::{Message, Topic},
+    message::{Message, MessageId, Topic},
     payload::{
         AckPayload, ApprovePayload, DisconnectPayload, Opaque, ProposalPayload, RejectPayload,
         RequestPayload, ResponsePayload,
@@ -259,7 +259,7 @@ where
     /// the derived session topic. Handshake messages use [`Client::propose`],
     /// [`Client::approve`] and [`Client::reject`], which always stay on the
     /// pairing topic.
-    pub async fn send(&mut self, message: &ClientMessage) -> Result<String> {
+    pub async fn send(&mut self, message: &ClientMessage) -> Result<MessageId> {
         let topic = match message {
             ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_) => {
                 self.session.pairing_topic.clone()
@@ -269,7 +269,7 @@ where
         self.send_on(&topic, message).await
     }
 
-    async fn send_on(&mut self, topic: &Topic, message: &ClientMessage) -> Result<String> {
+    async fn send_on(&mut self, topic: &Topic, message: &ClientMessage) -> Result<MessageId> {
         let id = random::id()?;
         self.send_with_id_on(topic, id.clone(), message).await?;
         Ok(id)
@@ -279,7 +279,7 @@ where
     async fn send_with_id_on(
         &mut self,
         topic: &Topic,
-        id: String,
+        id: MessageId,
         message: &ClientMessage,
     ) -> Result<()> {
         let did = self.did.clone();
@@ -484,11 +484,11 @@ where
     }
 
     /// Acknowledge a received envelope by id, on the topic it arrived on.
-    async fn send_ack(&mut self, ack_id: &str, topic: &Topic) -> Result<()> {
+    async fn send_ack(&mut self, ack_id: &MessageId, topic: &Topic) -> Result<()> {
         self.send_on(
             topic,
             &ClientMessage::Ack(AckPayload {
-                ack_id: ack_id.to_owned(),
+                ack_id: ack_id.clone(),
             }),
         )
         .await?;
@@ -613,13 +613,14 @@ where
     ///
     /// The JSON value is encoded into the protocol's opaque `request` field.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
-        let request_id = random::id()?;
+        let id = random::id()?;
+        let request_id = id.to_string();
         let payload = RequestPayload {
             request_id: request_id.clone(),
             request: opaque(request)?,
         };
         let topic = self.active_topic().clone();
-        self.send_with_id_on(&topic, request_id.clone(), &ClientMessage::Request(payload))
+        self.send_with_id_on(&topic, id, &ClientMessage::Request(payload))
             .await?;
         Ok(request_id)
     }
@@ -643,11 +644,9 @@ where
     }
 
     /// Acknowledge a received message.
-    pub async fn ack(&mut self, ack_id: impl Into<String>) -> Result<()> {
-        self.send(&ClientMessage::Ack(AckPayload {
-            ack_id: ack_id.into(),
-        }))
-        .await?;
+    pub async fn ack(&mut self, ack_id: MessageId) -> Result<()> {
+        self.send(&ClientMessage::Ack(AckPayload { ack_id }))
+            .await?;
         Ok(())
     }
 

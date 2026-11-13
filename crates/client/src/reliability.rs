@@ -12,7 +12,10 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, interval},
 };
-use wallet_session_core::{frame::RelayFrame, message::MessageType};
+use wallet_session_core::{
+    frame::RelayFrame,
+    message::{MessageId, MessageType},
+};
 
 use crate::{error::ClientError, relay::Outbound};
 
@@ -22,13 +25,13 @@ pub enum ClientEvent {
     /// A sent message was acknowledged by the peer.
     Delivered {
         /// Envelope id that was acknowledged.
-        id: String,
+        id: MessageId,
     },
 
     /// A sent message exhausted its retransmissions.
     Failed {
         /// Envelope id that never got acknowledged.
-        id: String,
+        id: MessageId,
 
         /// Retransmissions attempted.
         attempts: usize,
@@ -64,7 +67,7 @@ struct Pending {
 /// Outbound reliability: ack tracking and retransmission.
 pub(crate) struct Reliability {
     outbox: mpsc::UnboundedSender<Outbound>,
-    pending: Arc<Mutex<HashMap<String, Pending>>>,
+    pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     connected: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<ClientEvent>,
     base_delay: Duration,
@@ -139,7 +142,7 @@ impl Reliability {
     }
 
     /// Record an inbound ACK, reporting delivery.
-    pub(crate) fn mark_delivered(&mut self, ack_id: &str) {
+    pub(crate) fn mark_delivered(&mut self, ack_id: &MessageId) {
         if self
             .pending
             .lock()
@@ -147,9 +150,9 @@ impl Reliability {
             .remove(ack_id)
             .is_some()
         {
-            let _ = self.events.send(ClientEvent::Delivered {
-                id: ack_id.to_owned(),
-            });
+            let _ = self
+                .events
+                .send(ClientEvent::Delivered { id: ack_id.clone() });
         }
     }
 }
@@ -163,7 +166,7 @@ impl Drop for Reliability {
 }
 
 async fn retry_loop(
-    pending: Arc<Mutex<HashMap<String, Pending>>>,
+    pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     connected: Arc<AtomicBool>,
     outbox: mpsc::UnboundedSender<Outbound>,
     events: mpsc::UnboundedSender<ClientEvent>,
@@ -221,10 +224,18 @@ mod tests {
     use super::*;
     use wallet_session_core::{frame::RelayFrameBody, message::Topic};
 
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
+    }
+
     fn frame(id: &str) -> RelayFrame {
         RelayFrame {
             v: 1,
-            id: id.to_owned(),
+            id: message_id(id),
             topic: Topic::new([0u8; 32]).expect("topic"),
             body: RelayFrameBody::Message {
                 payload: "payload".to_owned(),
@@ -248,10 +259,12 @@ mod tests {
         reliability.dispatch(frame("a"), true).expect("dispatch");
         assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
 
-        reliability.mark_delivered("a");
+        reliability.mark_delivered(&message_id("a"));
         assert_eq!(
             events.try_recv().expect("event"),
-            ClientEvent::Delivered { id: "a".to_owned() }
+            ClientEvent::Delivered {
+                id: message_id("a")
+            }
         );
     }
 
@@ -285,7 +298,7 @@ mod tests {
                 failed = Some((id, attempts));
             }
         }
-        assert_eq!(failed, Some(("a".to_owned(), 2)));
+        assert_eq!(failed, Some((message_id("a"), 2)));
     }
 
     #[tokio::test(start_paused = true)]

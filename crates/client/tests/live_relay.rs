@@ -253,7 +253,7 @@ async fn full_session_round_trip() -> TestResult {
             }
         }
         assert!(
-            delivered.contains(&request_id),
+            delivered.iter().any(|id| id.to_string() == request_id),
             "expected a Delivered event for {request_id}, got {delivered:?}"
         );
 
@@ -359,7 +359,7 @@ async fn long_session_with_100_messages() -> TestResult {
             let mut delivered = false;
             while let Some(event) = proposer.poll_event() {
                 if let ClientEvent::Delivered { id } = event
-                    && id == request_id
+                    && id.to_string() == request_id
                 {
                     delivered = true;
                 }
@@ -432,7 +432,7 @@ async fn disconnect_is_delivered_and_acknowledged() -> TestResult {
         let mut request_delivered = false;
         while let Some(event) = proposer.poll_event() {
             if let ClientEvent::Delivered { id } = event
-                && id == request_id
+                && id.to_string() == request_id
             {
                 request_delivered = true;
             }

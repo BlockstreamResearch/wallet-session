@@ -8,7 +8,7 @@ use wallet_session_core::{
     connection::Role,
     crypto::MessageCipher,
     did::DidKey,
-    message::{Ciphertext, Message, MessageType, Nonce, Topic},
+    message::{Ciphertext, Message, MessageId, MessageType, Nonce, Topic},
 };
 
 /// Symmetric key length
@@ -38,7 +38,7 @@ pub struct Aad<'a> {
     pub version: u8,
 
     /// Envelope id
-    pub id: &'a str,
+    pub id: &'a MessageId,
 
     /// Message type
     pub kind: MessageType,
@@ -59,7 +59,7 @@ pub struct Aad<'a> {
 impl<'a> Aad<'a> {
     /// Build associated data with the current envelope version.
     pub fn new(
-        id: &'a str,
+        id: &'a MessageId,
         kind: MessageType,
         topic: &'a Topic,
         from: &'a DidKey,
@@ -80,12 +80,13 @@ impl<'a> Aad<'a> {
     /// Serialize the associated data as length-prefixed UTF-8 bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let version = self.version.to_string();
+        let id = self.id.to_string();
         let topic = self.topic.to_string();
         let from = self.from.to_string();
         let ts = self.ts.to_string();
         let fields = [
             version.as_str(),
-            self.id,
+            id.as_str(),
             self.kind.as_str(),
             topic.as_str(),
             from.as_str(),
@@ -229,9 +230,13 @@ mod tests {
         DidKey::from_ed25519_bytes([seed; 32])
     }
 
+    fn message_id() -> MessageId {
+        MessageId::from_bytes([3u8; MessageId::LEN])
+    }
+
     fn aad(kind: MessageType, topic: &Topic) -> Vec<u8> {
         Aad::new(
-            "frame-id",
+            &message_id(),
             kind,
             topic,
             &did(7),
@@ -246,7 +251,7 @@ mod tests {
         let topic = topic();
         let from = did(7);
         let aad = Aad::new(
-            "frame-id",
+            &message_id(),
             MessageType::Request,
             &topic,
             &from,
@@ -257,7 +262,7 @@ mod tests {
 
         let fields = [
             Message::VERSION.to_string(),
-            "frame-id".to_owned(),
+            message_id().to_string(),
             "request".to_owned(),
             topic.to_string(),
             from.to_string(),
@@ -278,7 +283,7 @@ mod tests {
         let topic = topic();
         let from = did(7);
         let aad = |ts, role| {
-            Aad::new("frame-id", MessageType::Request, &topic, &from, ts, role).to_bytes()
+            Aad::new(&message_id(), MessageType::Request, &topic, &from, ts, role).to_bytes()
         };
 
         assert_ne!(
@@ -323,7 +328,7 @@ mod tests {
 
         let sealed = cipher.seal(
             &Aad::new(
-                "frame-id",
+                &message_id(),
                 MessageType::Request,
                 &topic,
                 &did(1),
@@ -334,7 +339,7 @@ mod tests {
             b"hello",
         )?;
         let tampered = Aad::new(
-            "frame-id",
+            &message_id(),
             MessageType::Request,
             &topic,
             &did(2),

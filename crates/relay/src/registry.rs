@@ -175,6 +175,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::limits::{Limiter, OutboundBudget, RelayLimitsConfig};
+    use wallet_session_core::message::MessageId;
 
     /// A permit for `identity`, from a limiter that is never shared: these
     /// tests do not exercise the per-identity cap.
@@ -219,7 +220,7 @@ mod tests {
     fn notification(topic: &Topic) -> RelayFrame {
         RelayFrame {
             v: 1,
-            id: "gone".to_owned(),
+            id: MessageId::from_bytes([1u8; MessageId::LEN]),
             topic: topic.clone(),
             body: wallet_session_core::frame::RelayFrameBody::PeerDisconnected,
         }
@@ -228,7 +229,7 @@ mod tests {
     fn ready(topic: &Topic) -> RelayFrame {
         RelayFrame {
             v: 1,
-            id: "ready".to_owned(),
+            id: MessageId::from_bytes([2u8; MessageId::LEN]),
             topic: topic.clone(),
             body: wallet_session_core::frame::RelayFrameBody::SessionReady,
         }

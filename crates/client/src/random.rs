@@ -1,4 +1,4 @@
-use wallet_session_core::codec;
+use wallet_session_core::message::MessageId;
 
 use crate::error::Result;
 
@@ -8,6 +8,6 @@ pub(crate) fn bytes<const N: usize>() -> Result<[u8; N]> {
     Ok(bytes)
 }
 
-pub(crate) fn id() -> Result<String> {
-    Ok(codec::encode(&bytes::<16>()?))
+pub(crate) fn id() -> Result<MessageId> {
+    Ok(MessageId::from_bytes(bytes()?))
 }

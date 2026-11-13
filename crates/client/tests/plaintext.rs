@@ -29,7 +29,7 @@ use wallet_session_core::{
     crypto::MessageCipher,
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
-    message::{Ciphertext, Message as Envelope, MessageType, Nonce, Topic},
+    message::{Ciphertext, Message as Envelope, MessageId, MessageType, Nonce, Topic},
 };
 
 const AUDIENCE: &str = "wss://relay.example.com";
@@ -411,6 +411,14 @@ async fn read_raw_message(
     Ok(ClientMessage::from_bytes(&bytes)?)
 }
 
+/// A distinct, valid message id for a test label.
+fn message_id(label: &str) -> MessageId {
+    let mut bytes = [0u8; MessageId::LEN];
+    let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+    bytes[..label.len()].copy_from_slice(label);
+    MessageId::from_bytes(bytes)
+}
+
 fn request_frame(
     topic: &Topic,
     from: DidKey,
@@ -434,7 +442,7 @@ fn request_frame(
     );
     Ok(RelayFrame {
         v: 1,
-        id: id.to_owned(),
+        id: message_id(id),
         topic: topic.clone(),
         body: RelayFrameBody::Message {
             payload: serde_json::to_string(&wire)?,
@@ -619,7 +627,7 @@ async fn run_identities() -> TestResult {
     }
     assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
     match read_raw_message(&mut raw, &sender).await? {
-        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, "valid-frame"),
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("valid-frame")),
         other => panic!("expected ack for the valid request, got {other:?}"),
     }
 
@@ -654,7 +662,9 @@ async fn run_identities() -> TestResult {
         other => panic!("expected the post-foreign request, got {other:?}"),
     }
     match read_raw_message(&mut raw, &sender).await? {
-        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, "after-foreign-frame"),
+        ClientMessage::Ack(payload) => {
+            assert_eq!(payload.ack_id, message_id("after-foreign-frame"));
+        }
         other => panic!("expected ack for the post-foreign request, got {other:?}"),
     }
 

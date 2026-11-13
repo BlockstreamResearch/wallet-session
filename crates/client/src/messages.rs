@@ -100,16 +100,18 @@ mod tests {
 
     #[test]
     fn ack_uses_the_documented_field_name() {
+        let ack_id = wallet_session_core::message::MessageId::from_bytes([1u8; 16]);
         let message = ClientMessage::Ack(AckPayload {
-            ack_id: "frame-1".to_owned(),
+            ack_id: ack_id.clone(),
         });
 
         assert_eq!(
             serde_json::to_value(&message).expect("json"),
-            json!({ "type": "ack", "ackId": "frame-1" })
+            json!({ "type": "ack", "ackId": ack_id.to_string() })
         );
         assert_eq!(
-            ClientMessage::from_bytes(br#"{"type":"ack","ackId":"frame-1"}"#).expect("parsed"),
+            ClientMessage::from_bytes(format!(r#"{{"type":"ack","ackId":"{ack_id}"}}"#).as_bytes())
+                .expect("parsed"),
             message
         );
     }

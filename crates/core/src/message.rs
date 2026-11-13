@@ -51,8 +51,8 @@ pub struct ControlFrame {
     #[serde(rename = "v")]
     version: u8,
 
-    /// 16 random bytes, base64url.
-    id: String,
+    /// Message id.
+    id: MessageId,
 
     /// Message type.
     #[serde(rename = "type")]
@@ -65,10 +65,10 @@ pub struct ControlFrame {
 impl ControlFrame {
     pub const VERSION: u8 = 1;
 
-    pub fn new(id: impl Into<String>, type_: MessageType, topic: Topic) -> Self {
+    pub fn new(id: MessageId, type_: MessageType, topic: Topic) -> Self {
         Self {
             version: Self::VERSION,
-            id: id.into(),
+            id,
             type_,
             topic,
         }
@@ -131,6 +131,58 @@ impl From<&Payload> for MessageType {
 impl From<Payload> for MessageType {
     fn from(payload: Payload) -> Self {
         MessageType::from(&payload)
+    }
+}
+
+/// 16-byte message id, base64url.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MessageId(#[serde(with = "crate::codec::base64url")] Vec<u8>);
+
+impl<'de> Deserialize<'de> for MessageId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        encoded
+            .parse::<MessageId>()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl MessageId {
+    /// Number of bytes in a message id.
+    pub const LEN: usize = 16;
+
+    /// Build a message id from raw bytes, rejecting the wrong length.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, Error> {
+        let bytes = bytes.into();
+        if bytes.len() != Self::LEN {
+            return Err(Error::InvalidLength {
+                expected: Self::LEN,
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Build a message id from a full-length byte array.
+    pub fn from_bytes(bytes: [u8; Self::LEN]) -> Self {
+        Self(bytes.to_vec())
+    }
+}
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&codec::encode(&self.0))
+    }
+}
+
+impl FromStr for MessageId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(codec::decode(s)?)
     }
 }
 
@@ -302,6 +354,55 @@ impl FromStr for Ciphertext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_id_accepts_16_bytes() {
+        assert!(MessageId::new([0u8; 16]).is_ok());
+    }
+
+    #[test]
+    fn message_id_rejects_wrong_length() {
+        assert!(matches!(
+            MessageId::new([0u8; 15]),
+            Err(Error::InvalidLength {
+                expected: 16,
+                actual: 15
+            })
+        ));
+    }
+
+    #[test]
+    fn message_id_base64url_round_trip() {
+        let id = MessageId::new([7u8; 16]).unwrap();
+        assert_eq!(id.to_string().parse::<MessageId>().unwrap(), id);
+    }
+
+    #[test]
+    fn message_id_deserialization_enforces_the_16_byte_invariant() {
+        let id = MessageId::new([7u8; 16]).unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<MessageId>(&json).unwrap(), id);
+
+        for bad in [
+            String::new(),
+            codec::encode(&[7u8; 15]),
+            codec::encode(&[7u8; 17]),
+        ] {
+            let json = format!("\"{bad}\"");
+            assert!(
+                serde_json::from_str::<MessageId>(&json).is_err(),
+                "{json} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn message_id_serializes_as_plain_string() {
+        let id = MessageId::new([7u8; 16]).unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, format!("\"{id}\""));
+        assert_eq!(serde_json::from_str::<MessageId>(&json).unwrap(), id);
+    }
 
     #[test]
     fn topic_accepts_32_bytes() {

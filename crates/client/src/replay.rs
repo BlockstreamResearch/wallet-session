@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use wallet_session_core::message::Message;
+use wallet_session_core::message::{Message, MessageId};
 
 /// How a received envelope relates to the replay memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +32,8 @@ struct Record {
 /// acceptable again.
 pub(crate) struct ReplayMemory {
     retention_secs: u64,
-    by_id: HashMap<String, Record>,
-    by_nonce: HashMap<Vec<u8>, String>,
+    by_id: HashMap<MessageId, Record>,
+    by_nonce: HashMap<Vec<u8>, MessageId>,
     largest_discarded_ts: Option<u64>,
 }
 
@@ -61,7 +61,7 @@ impl ReplayMemory {
     /// against the clock-skew window. A [`Observation::New`] envelope is only
     /// remembered once the caller has delivered or acknowledged it, with
     /// [`ReplayMemory::record`].
-    pub(crate) fn classify(&mut self, id: &str, message: &Message, now: u64) -> Observation {
+    pub(crate) fn classify(&mut self, id: &MessageId, message: &Message, now: u64) -> Observation {
         self.prune(now);
 
         if let Some(record) = self.by_id.get(id) {
@@ -91,11 +91,11 @@ impl ReplayMemory {
     }
 
     /// Remember an envelope that was classified as [`Observation::New`].
-    pub(crate) fn record(&mut self, id: &str, message: &Message) {
+    pub(crate) fn record(&mut self, id: &MessageId, message: &Message) {
         self.by_nonce
-            .insert(message.nonce.as_bytes().to_vec(), id.to_owned());
+            .insert(message.nonce.as_bytes().to_vec(), id.clone());
         self.by_id.insert(
-            id.to_owned(),
+            id.clone(),
             Record {
                 message: message.clone(),
                 expires_at: message.ts.saturating_add(self.retention_secs),
@@ -104,7 +104,7 @@ impl ReplayMemory {
     }
 
     /// Forget an envelope that was recorded but then rejected before delivery.
-    pub(crate) fn forget(&mut self, id: &str) {
+    pub(crate) fn forget(&mut self, id: &MessageId) {
         if let Some(record) = self.by_id.remove(id) {
             self.by_nonce.remove(record.message.nonce.as_bytes());
         }
@@ -112,7 +112,7 @@ impl ReplayMemory {
 
     /// Drop records whose expiry has passed and remember their timestamps.
     fn prune(&mut self, now: u64) {
-        let expired: Vec<String> = self
+        let expired: Vec<MessageId> = self
             .by_id
             .iter()
             .filter(|(_, record)| record.expires_at < now)
@@ -139,6 +139,14 @@ mod tests {
         message::{Ciphertext, MessageType, Nonce},
     };
 
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
+    }
+
     fn message_with_nonce(ts: u64, nonce: [u8; 24]) -> Message {
         Message::new(
             MessageType::Request,
@@ -160,7 +168,12 @@ mod tests {
     }
 
     /// Classify and record, as the client does after delivering a message.
-    fn observe(memory: &mut ReplayMemory, id: &str, message: &Message, now: u64) -> Observation {
+    fn observe(
+        memory: &mut ReplayMemory,
+        id: &MessageId,
+        message: &Message,
+        now: u64,
+    ) -> Observation {
         let observation = memory.classify(id, message, now);
         if observation == Observation::New {
             memory.record(id, message);
@@ -174,24 +187,24 @@ mod tests {
         let original = message(1_000);
 
         assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_000),
+            observe(&mut memory, &message_id("frame-1"), &original, 1_000),
             Observation::New
         );
         assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_000),
+            observe(&mut memory, &message_id("frame-1"), &original, 1_000),
             Observation::Retransmission
         );
 
         let mut modified = original.clone();
         modified.data = Ciphertext::new(vec![9]);
         assert_eq!(
-            observe(&mut memory, "frame-1", &modified, 1_000),
+            observe(&mut memory, &message_id("frame-1"), &modified, 1_000),
             Observation::Conflict
         );
 
         // The same nonce under a different frame id is also a conflict.
         assert_eq!(
-            observe(&mut memory, "frame-2", &original, 1_000),
+            observe(&mut memory, &message_id("frame-2"), &original, 1_000),
             Observation::Conflict
         );
     }
@@ -205,11 +218,11 @@ mod tests {
         // A later counter is accepted first. An unseen earlier counter is not
         // a replay of it; counters only have to be unique per key.
         assert_eq!(
-            observe(&mut memory, "frame-later", &later, 1_000),
+            observe(&mut memory, &message_id("frame-later"), &later, 1_000),
             Observation::New
         );
         assert_eq!(
-            observe(&mut memory, "frame-earlier", &earlier, 1_000),
+            observe(&mut memory, &message_id("frame-earlier"), &earlier, 1_000),
             Observation::New
         );
     }
@@ -220,17 +233,17 @@ mod tests {
         let original = message(1_000);
 
         assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_000),
+            observe(&mut memory, &message_id("frame-1"), &original, 1_000),
             Observation::New
         );
         assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_300),
+            observe(&mut memory, &message_id("frame-1"), &original, 1_300),
             Observation::Retransmission
         );
 
         // Pruning at 1_301 discards the record and remembers its timestamp.
         assert_eq!(
-            observe(&mut memory, "frame-1", &original, 1_301),
+            observe(&mut memory, &message_id("frame-1"), &original, 1_301),
             Observation::New
         );
         assert!(memory.is_stale(1_000));
@@ -242,10 +255,10 @@ mod tests {
         let mut memory = ReplayMemory::new(Duration::from_secs(300));
         let original = message(1_000);
 
-        observe(&mut memory, "frame-1", &original, 1_000);
+        observe(&mut memory, &message_id("frame-1"), &original, 1_000);
         let mut later = message(1_001);
         later.nonce = Nonce::new([3u8; 24]).expect("nonce");
-        observe(&mut memory, "frame-2", &later, 1_301);
+        observe(&mut memory, &message_id("frame-2"), &later, 1_301);
 
         // The record is gone, but a copy replayed after a clock rollback is
         // still rejected by the remembered discarded timestamp.

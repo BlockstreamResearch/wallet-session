@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::message::MessageId;
+
 /// Opaque application data carried inside a payload shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opaque(#[serde(with = "crate::codec::base64url")] pub Vec<u8>);
@@ -73,7 +75,7 @@ pub struct ResponsePayload {
 #[serde(rename_all = "camelCase")]
 pub struct AckPayload {
     /// The envelope `id` of the message being acknowledged.
-    pub ack_id: String,
+    pub ack_id: MessageId,
 }
 
 /// Body of a `disconnect` message.

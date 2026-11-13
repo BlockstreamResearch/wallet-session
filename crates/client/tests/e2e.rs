@@ -119,7 +119,7 @@ async fn run() -> TestResult {
         delivered.push(id);
     }
     assert!(
-        delivered.contains(&request_id),
+        delivered.iter().any(|id| id.to_string() == request_id),
         "expected a Delivered event for {request_id}, got {delivered:?}"
     );
 

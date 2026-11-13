@@ -128,7 +128,7 @@ async fn connect_once(
 ) -> Result<RelayStream> {
     crate::tls::ensure_crypto_provider();
 
-    let session_id = random::id()?;
+    let session_id = random::id()?.to_string();
     let token = identity.connection_token(&session_id, &config.audience, config.token_ttl)?;
 
     let query = ConnectionQuery {

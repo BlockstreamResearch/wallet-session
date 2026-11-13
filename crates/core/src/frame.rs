@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::message::Topic;
+use crate::message::{MessageId, Topic};
 
 /// Plaintext control frame exchanged over the relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,8 +8,8 @@ pub struct RelayFrame {
     /// Protocol version.
     pub v: u8,
 
-    /// 16 random bytes, base64url.
-    pub id: String,
+    /// Message id.
+    pub id: MessageId,
 
     /// Frame topic.
     pub topic: Topic,

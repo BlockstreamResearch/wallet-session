@@ -205,7 +205,7 @@ mod tests {
         },
     };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
-    use wallet_session_core::message::Topic;
+    use wallet_session_core::message::{MessageId, Topic};
 
     const AUDIENCE: &str = "wss://relay.example.com";
 
@@ -227,6 +227,14 @@ mod tests {
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([9u8; 32])
+    }
+
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
     }
 
     async fn connect(
@@ -296,7 +304,7 @@ mod tests {
 
         let message = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "m1".to_owned(),
+            id: message_id("m1"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "hello".to_owned(),
@@ -520,7 +528,7 @@ mod tests {
 
         let message = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "buffered".to_owned(),
+            id: message_id("buffered"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "queued".to_owned(),
@@ -618,7 +626,7 @@ mod tests {
     fn message(topic: &Topic, id: &str, payload: &str) -> RelayFrame {
         RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: id.to_owned(),
+            id: message_id(id),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: payload.to_owned(),
@@ -737,7 +745,7 @@ mod tests {
         }
         assert_eq!(
             redelivered,
-            ["m2", "m3"],
+            [message_id("m2"), message_id("m3")],
             "the oldest buffered frame makes room for the newest"
         );
         Ok(())
@@ -1276,7 +1284,7 @@ mod tests {
         // Clients must not forge the relay-only session_ready frame.
         let rogue = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "rogue".to_owned(),
+            id: message_id("rogue"),
             topic: topic.clone(),
             body: RelayFrameBody::SessionReady,
         };
@@ -1349,7 +1357,7 @@ mod tests {
 
         let forged = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "forged".to_owned(),
+            id: message_id("forged"),
             topic: topic.clone(),
             body: RelayFrameBody::PeerDisconnected,
         };
@@ -1449,7 +1457,7 @@ mod tests {
 
         let rogue = RelayFrame {
             v: 2,
-            id: "rogue".to_owned(),
+            id: message_id("rogue"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "future".to_owned(),
@@ -2011,7 +2019,10 @@ mod tests {
         {
             delivered.push(frame.id);
         }
-        assert_eq!(delivered, ["m0", "m1", "m2"]);
+        assert_eq!(
+            delivered,
+            [message_id("m0"), message_id("m1"), message_id("m2")]
+        );
         Ok(())
     }
 
@@ -2609,7 +2620,7 @@ mod tests {
             .await?;
 
         // The message is whole, so every fragment was read, in order.
-        assert_eq!(read_frame(&mut responder).await?.id, "f0");
+        assert_eq!(read_frame(&mut responder).await?.id, message_id("f0"));
         // What the burst did not cover takes about 2.7 seconds.
         let elapsed = started.elapsed();
         assert!(
@@ -2619,7 +2630,7 @@ mod tests {
 
         // The sender is still connected, and its next frame goes through.
         send(&mut proposer, &message(&topic, "f1", "still-connected")).await?;
-        assert_eq!(read_frame(&mut responder).await?.id, "f1");
+        assert_eq!(read_frame(&mut responder).await?.id, message_id("f1"));
         Ok(())
     }
 
