@@ -14,7 +14,8 @@ use tokio_tungstenite::{
 };
 use wallet_session_client::{
     AckPayload, ApprovePayload, Client, ClientConfig, ClientError, ClientEvent, ClientMessage,
-    IdentityKey, Opaque, PairingKey, ProposalPayload, RequestPayload, Role, Seed, SessionState,
+    IdentityKey, Opaque, PairingKey, ProposalPayload, RequestPayload, ResponsePayload, Role, Seed,
+    SessionState,
     handshake::{EphemeralKeyPair, decode_public_key},
 };
 use wallet_session_relay::{
@@ -1105,6 +1106,22 @@ async fn run_recoverable_bad_frames() -> TestResult {
     )?;
     raw.session
         .send(WsMessage::text(serde_json::to_string(&bad_tag)?))
+        .await?;
+
+    let invalid_response = ClientMessage::Response(ResponsePayload {
+        request_id: "invalid".to_owned(),
+        response: Some(Opaque(Vec::new())),
+        error: Some(Opaque(Vec::new())),
+    });
+    let invalid_response = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "invalid-response",
+        &invalid_response,
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&invalid_response)?))
         .await?;
 
     let valid = request_frame(

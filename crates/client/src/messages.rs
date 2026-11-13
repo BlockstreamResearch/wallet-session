@@ -144,5 +144,15 @@ mod tests {
         assert_eq!(value["requestId"], "req-1");
         assert_eq!(value["response"], "AQID");
         assert!(value.get("request_id").is_none());
+        assert!(value.get("error").is_none());
+
+        let message = ClientMessage::Response(ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: None,
+            error: Some(Opaque(vec![4, 5])),
+        });
+        let value = serde_json::to_value(&message).expect("json");
+        assert_eq!(value["error"], "BAU");
+        assert!(value.get("response").is_none());
     }
 }

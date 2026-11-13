@@ -677,6 +677,13 @@ where
             return Ok(None);
         }
 
+        if let ClientMessage::Response(response) = &message
+            && !response.is_valid()
+        {
+            log::warn!("dropping response without exactly one of response or error");
+            return Ok(None);
+        }
+
         if matches!(
             &message,
             ClientMessage::Disconnect(_) | ClientMessage::SessionDelete(_)
@@ -1006,12 +1013,17 @@ where
         response: Option<Value>,
         error: Option<Value>,
     ) -> Result<()> {
-        self.send(&ClientMessage::Response(ResponsePayload {
+        let payload = ResponsePayload {
             request_id: request_id.into(),
             response: response.map(opaque).transpose()?,
             error: error.map(opaque).transpose()?,
-        }))
-        .await?;
+        };
+        if !payload.is_valid() {
+            return Err(ClientError::ProtocolViolation(
+                "response must carry exactly one of response or error",
+            ));
+        }
+        self.send(&ClientMessage::Response(payload)).await?;
         Ok(())
     }
 

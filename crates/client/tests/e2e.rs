@@ -93,6 +93,17 @@ async fn run() -> TestResult {
     assert_eq!(proposer.session().pairing_topic, topic);
     assert_eq!(responder.session().pairing_topic, topic);
 
+    assert!(matches!(
+        responder
+            .respond("invalid", Some(json!({})), Some(json!({})))
+            .await,
+        Err(ClientError::ProtocolViolation(_))
+    ));
+    assert!(matches!(
+        responder.respond("invalid", None, None).await,
+        Err(ClientError::ProtocolViolation(_))
+    ));
+
     let request_id = proposer.request(json!({ "method": "get_status" })).await?;
     match responder.recv().await? {
         ClientMessage::Request(payload) => {

@@ -428,10 +428,16 @@ mod tests {
     async fn serve_tracked(
         config: NativeRelayTransportConfig,
     ) -> Result<(SocketAddr, Handlers), Box<dyn std::error::Error>> {
+        serve_tracked_with_limiter(config, limiter()).await
+    }
+
+    async fn serve_tracked_with_limiter(
+        config: NativeRelayTransportConfig,
+        limiter: Arc<Limiter>,
+    ) -> Result<(SocketAddr, Handlers), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let registry = Arc::new(Registry::new());
-        let limiter = limiter();
         let (handlers_tx, handlers) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -2263,12 +2269,13 @@ mod tests {
             ..ping_limits()
         }));
         let config = NativeRelayTransportConfig::new(AUDIENCE);
-        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+        let (addr, mut handlers) = serve_tracked_with_limiter(config, Arc::clone(&limiter)).await?;
 
         // Every ping after the first is dropped, and once the drops pass the
         // consecutive-drop limit the sender is disconnected. Sends may fail
         // after that.
         let mut hog = connect(addr, "proposer", &topic()?, None).await?;
+        let handler = handlers.recv().await.ok_or("relay stopped accepting")?;
         let _ = send_pings(&mut hog, MAX_CONSECUTIVE_RATE_DROPS + 8, PING_PAYLOAD).await;
         let limit = u64::from(PING_PAYLOAD) * u64::from(MAX_CONSECUTIVE_RATE_DROPS);
         let dropped = wait_for_count(|| limiter.dropped_share_bytes(), limit + 1).await;
@@ -2277,7 +2284,7 @@ mod tests {
             "the relay must process enough dropped pings to reach the disconnect threshold"
         );
         assert!(
-            expect_closed_within(&mut hog, Duration::from_secs(10)).await,
+            timeout(SYNC_TIMEOUT, handler).await??.is_err(),
             "an identity flooding control frames over its share must be disconnected"
         );
         assert_eq!(limiter.dropped_global_bytes(), 0);

@@ -69,10 +69,19 @@ pub struct ResponsePayload {
     pub request_id: String,
 
     /// Opaque application result; present on success, absent on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response: Option<Opaque>,
 
     /// Failure description; present on error, absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Opaque>,
+}
+
+impl ResponsePayload {
+    /// Whether exactly one of `response` and `error` is present.
+    pub fn is_valid(&self) -> bool {
+        self.response.is_some() != self.error.is_some()
+    }
 }
 
 /// Body of an `ack` message.
@@ -157,6 +166,44 @@ mod tests {
     use crate::message::MessageType;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn response_serializes_exactly_one_alternative() -> TestResult {
+        let success = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: Some(Opaque(vec![1, 2, 3])),
+            error: None,
+        };
+        let value = serde_json::to_value(&success)?;
+        assert_eq!(value.get("response"), Some(&serde_json::json!("AQID")));
+        assert!(value.get("error").is_none());
+        assert!(success.is_valid());
+
+        let failure = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: None,
+            error: Some(Opaque(vec![4, 5])),
+        };
+        let value = serde_json::to_value(&failure)?;
+        assert!(value.get("response").is_none());
+        assert_eq!(value.get("error"), Some(&serde_json::json!("BAU")));
+        assert!(failure.is_valid());
+
+        let neither = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: None,
+            error: None,
+        };
+        assert!(!neither.is_valid());
+
+        let both = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: Some(Opaque(Vec::new())),
+            error: Some(Opaque(Vec::new())),
+        };
+        assert!(!both.is_valid());
+        Ok(())
+    }
 
     #[test]
     fn opaque_debug_redacts_application_data() {
