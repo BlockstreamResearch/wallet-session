@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -79,17 +83,21 @@ where
         cipher: C,
         inbox: &mpsc::Sender<Inbox>,
     ) -> Self {
+        let ready = Arc::new(AtomicBool::new(false));
         let transport = Transport::connect(
             config.clone(),
             identity.clone(),
             role,
             topic.clone(),
+            Arc::clone(&ready),
             inbox.clone(),
         );
         let (reliability, events) = Reliability::spawn(
             transport.outbound(),
+            ready,
             config.ack_base_delay,
             config.ack_max_attempts,
+            config.retransmit_spacing,
         );
 
         Self {
@@ -204,6 +212,9 @@ where
                 Some(Inbox::Ready(topic)) => self.set_ready(&topic),
                 Some(Inbox::Disconnected(topic)) => self.set_connected(&topic, false),
                 Some(Inbox::Closed { topic, reason }) => {
+                    if let Some(link) = self.link_mut(&topic) {
+                        link.reliability.fail_all();
+                    }
                     self.set_connected(&topic, false);
                     if topic == *self.active_topic() {
                         return Err(ClientError::Transport(reason));
@@ -233,7 +244,6 @@ where
 
         // A socket is not ready until the relay reports `session_ready`.
         link.ready = false;
-        link.reliability.set_connected(false);
 
         if connected {
             if link.saw_disconnect {
@@ -254,10 +264,7 @@ where
         let Some(link) = self.link_mut(topic) else {
             return;
         };
-        if !link.ready {
-            link.ready = true;
-            link.reliability.set_connected(true);
-        }
+        link.ready = true;
     }
 
     /// Wait until the relay reports the active topic ready.
@@ -306,10 +313,13 @@ where
                 if matches!(self.handshake, Handshake::Established) {
                     return Err(ClientError::UnexpectedHandshake);
                 }
+                if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+                    return Err(ClientError::NotReady);
+                }
                 self.session.pairing_topic.clone()
             }
             _ => {
-                self.ensure_session_active()?;
+                self.ensure_session_ready()?;
                 self.active_topic().clone()
             }
         };
@@ -317,12 +327,14 @@ where
     }
 
     /// Whether application messages may be sent.
-    fn ensure_session_active(&self) -> Result<()> {
-        if matches!(self.handshake, Handshake::Established) {
-            Ok(())
-        } else {
-            Err(ClientError::SessionNotActive)
+    fn ensure_session_ready(&self) -> Result<()> {
+        if !matches!(self.handshake, Handshake::Established) {
+            return Err(ClientError::SessionNotActive);
         }
+        if !self.active_link().ready {
+            return Err(ClientError::NotReady);
+        }
+        Ok(())
     }
 
     async fn send_on(&mut self, topic: &Topic, message: &ClientMessage) -> Result<MessageId> {
@@ -356,7 +368,7 @@ where
                 payload: serde_json::to_string(&wire)?,
             },
         };
-        link.reliability.dispatch(frame, requires_ack(kind))
+        link.reliability.dispatch(frame, requires_ack(kind), ts)
     }
 
     pub async fn recv(&mut self) -> Result<ClientMessage> {
@@ -685,6 +697,7 @@ where
             return;
         };
         log::debug!("retiring pairing link {}", link.topic.log_tag());
+        link.reliability.fail_all();
         while let Ok(event) = link.events.try_recv() {
             self.push_pending_event(event);
         }
@@ -778,6 +791,9 @@ where
         if !matches!(self.handshake, Handshake::Idle) {
             return Err(ClientError::UnexpectedHandshake);
         }
+        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+            return Err(ClientError::NotReady);
+        }
         let keypair = EphemeralKeyPair::generate();
         let payload = ProposalPayload {
             ephemeral_public_key: keypair.public_key_encoded(),
@@ -798,6 +814,9 @@ where
         let Handshake::PeerProposed { peer_public } = self.handshake else {
             return Err(ClientError::UnexpectedHandshake);
         };
+        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+            return Err(ClientError::NotReady);
+        }
         let keypair = EphemeralKeyPair::generate();
         let payload = ApprovePayload {
             ephemeral_public_key: keypair.public_key_encoded(),
@@ -828,7 +847,7 @@ where
     ///
     /// The JSON value is encoded into the protocol's opaque `request` field.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
-        self.ensure_session_active()?;
+        self.ensure_session_ready()?;
         let id = random::id()?;
         let request_id = id.to_string();
         let payload = RequestPayload {

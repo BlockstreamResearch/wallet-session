@@ -40,6 +40,9 @@ pub struct ClientConfig {
     /// Maximum retransmissions before a message is reported failed.
     pub ack_max_attempts: usize,
 
+    /// Minimum spacing between retransmissions.
+    pub retransmit_spacing: Duration,
+
     /// Interval between client keepalive pings.
     pub ping_interval: Duration,
 
@@ -72,6 +75,7 @@ impl ClientConfig {
             close_timeout: Duration::from_secs(2),
             ack_base_delay: Duration::from_secs(2),
             ack_max_attempts: 5,
+            retransmit_spacing: Duration::from_millis(100),
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             reconnect_initial_delay: Duration::from_millis(250),
@@ -118,6 +122,7 @@ impl ClientConfig {
             (self.close_timeout, "close_timeout"),
             (self.ping_interval, "ping_interval"),
             (self.pong_timeout, "pong_timeout"),
+            (self.retransmit_spacing, "retransmit_spacing"),
         ] {
             if timeout.is_zero() {
                 return Err(ClientError::InvalidConfig(name));
@@ -172,6 +177,12 @@ impl ClientConfig {
     /// Set the maximum retransmission attempts.
     pub fn with_ack_max_attempts(mut self, ack_max_attempts: usize) -> Self {
         self.ack_max_attempts = ack_max_attempts;
+        self
+    }
+
+    /// Set the minimum spacing between retransmissions.
+    pub fn with_retransmit_spacing(mut self, retransmit_spacing: Duration) -> Self {
+        self.retransmit_spacing = retransmit_spacing;
         self
     }
 
@@ -246,6 +257,7 @@ mod tests {
             ClientConfig::new("wss://relay.example.com").with_close_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_ping_interval(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_pong_timeout(Duration::ZERO),
+            ClientConfig::new("wss://relay.example.com").with_retransmit_spacing(Duration::ZERO),
         ] {
             assert!(matches!(
                 config.validate(),

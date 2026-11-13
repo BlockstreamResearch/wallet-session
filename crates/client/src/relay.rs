@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::{
@@ -109,6 +115,7 @@ impl Transport {
         identity: IdentityKey,
         role: Role,
         topic: Topic,
+        ready: Arc<AtomicBool>,
         inbox: mpsc::Sender<Inbox>,
     ) -> Self {
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -119,6 +126,7 @@ impl Transport {
             role,
             topic.clone(),
             outbound_rx,
+            ready,
             inbox,
             shutdown_rx,
         ));
@@ -136,12 +144,14 @@ impl Transport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connection_task(
     config: ClientConfig,
     identity: IdentityKey,
     role: Role,
     topic: Topic,
     mut outbound: mpsc::Receiver<Outbound>,
+    ready: Arc<AtomicBool>,
     inbox: mpsc::Sender<Inbox>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -149,6 +159,7 @@ async fn connection_task(
     let mut delay = config.reconnect_initial_delay;
 
     loop {
+        ready.store(false, Ordering::Relaxed);
         let connected = tokio::select! {
             biased;
             result = connect_with_timeout(&config, &identity, role, &topic) => result,
@@ -158,8 +169,16 @@ async fn connection_task(
         let end = match connected {
             Ok(stream) => {
                 let _ = inbox.send(Inbox::Connected(topic.clone())).await;
-                let result =
-                    run_connection(stream, &mut outbound, &inbox, &mut shutdown, &config).await;
+                let result = run_connection(
+                    stream,
+                    &mut outbound,
+                    &ready,
+                    &inbox,
+                    &mut shutdown,
+                    &config,
+                )
+                .await;
+                ready.store(false, Ordering::Relaxed);
                 if result.saw_session_ready {
                     retries = 0;
                     delay = config.reconnect_initial_delay;
@@ -296,6 +315,7 @@ fn websocket_config() -> WebSocketConfig {
 async fn run_connection(
     stream: RelayStream,
     outbound: &mut mpsc::Receiver<Outbound>,
+    ready: &AtomicBool,
     inbox: &mpsc::Sender<Inbox>,
     shutdown: &mut watch::Receiver<bool>,
     config: &ClientConfig,
@@ -341,6 +361,7 @@ async fn run_connection(
                                 && !saw_session_ready
                             {
                                 saw_session_ready = true;
+                                ready.store(true, Ordering::Relaxed);
                                 if inbox.send(Inbox::Ready(frame.topic.clone())).await.is_err() {
                                     break ConnectionEnd::Shutdown;
                                 }

@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
@@ -242,6 +243,36 @@ async fn shutdown_sends_a_normal_close_frame() -> TestResult {
 
     let close = timeout(Duration::from_secs(1), close_rx).await??;
     assert_eq!(close.code, CloseCode::Normal);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn sends_before_readiness_are_rejected() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("websocket");
+        while socket.next().await.is_some() {}
+    });
+
+    let mut client = connect(addr, config(addr)).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        matches!(
+            client.propose(json!({ "test": true })).await,
+            Err(ClientError::NotReady)
+        ),
+        "handshake sends require pairing readiness"
+    );
+    assert!(matches!(
+        client.request(json!({ "method": "too_early" })).await,
+        Err(ClientError::SessionNotActive)
+    ));
+
+    drop(client);
     server.abort();
     Ok(())
 }

@@ -56,6 +56,9 @@ pub enum ClientError {
 
     #[error("session is not active")]
     SessionNotActive,
+
+    #[error("relay session is not ready")]
+    NotReady,
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
