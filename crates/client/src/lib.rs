@@ -1,3 +1,16 @@
+//! Client for the wallet-session relay protocol.
+//!
+//! A [`Client`] owns one pairing topic and, after the handshake, one derived
+//! session topic. Its counterpart, replay memory, and outstanding reliability
+//! state are in memory for the lifetime of that client instance. Creating a
+//! new client with the same pairing key starts with empty replay state and no
+//! counterpart, so long-lived applications should reuse the existing client.
+//!
+//! Inbound work, including acknowledgements and relay lifecycle events, is
+//! driven by [`Client::recv`], [`Client::next_event`], and
+//! [`Client::wait_session_ready`]. Applications should keep one of those
+//! futures pending while the session is active.
+
 mod client;
 mod config;
 mod error;

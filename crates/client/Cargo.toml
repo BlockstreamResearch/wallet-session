@@ -2,9 +2,12 @@
 name = "wallet-session-client"
 version = "0.1.0"
 edition = "2024"
+description = "Client implementation of the wallet-session relay protocol"
+license = "MIT"
+repository = "https://github.com/BlockstreamResearch/wallet-session"
 
 [dependencies]
-wallet-session-core = { path = "../core" }
+wallet-session-core = { path = "../core", version = "0.1.0" }
 
 tokio = { version = "1.53.1", features = [
     "rt-multi-thread",

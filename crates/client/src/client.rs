@@ -139,6 +139,13 @@ where
 /// pending; [`Client::send`] and [`Client::poll_event`] do not drive the receive
 /// path. Cancelling a receive future after it has dequeued a frame may lose
 /// that frame, but the peer retransmits anything left unacknowledged.
+///
+/// Counterpart, replay memory, and reliability state are owned by this
+/// instance and are not persisted. Constructing a new client for the same
+/// pairing key starts with an empty replay memory and no counterpart, so
+/// long-lived applications should keep one client alive rather than recreate
+/// it from the pairing key. Restart recovery requires persisting and restoring
+/// that state, which this crate does not implement.
 pub struct Client<C> {
     config: ClientConfig,
     identity: IdentityKey,
