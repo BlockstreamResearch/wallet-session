@@ -19,6 +19,12 @@ use wallet_session_core::{
 
 use crate::{error::ClientError, relay::Outbound};
 
+/// Events buffered between the reliability task and the client.
+const EVENT_CAPACITY: usize = 256;
+
+/// Maximum messages kept for retransmission per link.
+const PENDING_CAPACITY: usize = 256;
+
 /// Reliability events surfaced to the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
@@ -66,23 +72,23 @@ struct Pending {
 
 /// Outbound reliability: ack tracking and retransmission.
 pub(crate) struct Reliability {
-    outbox: mpsc::UnboundedSender<Outbound>,
+    outbox: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     connected: Arc<AtomicBool>,
-    events: mpsc::UnboundedSender<ClientEvent>,
+    events: mpsc::Sender<ClientEvent>,
     base_delay: Duration,
     _retry: JoinHandle<()>,
 }
 
 impl Reliability {
     pub(crate) fn spawn(
-        outbox: mpsc::UnboundedSender<Outbound>,
+        outbox: mpsc::Sender<Outbound>,
         base_delay: Duration,
         max_attempts: usize,
-    ) -> (Self, mpsc::UnboundedReceiver<ClientEvent>) {
+    ) -> (Self, mpsc::Receiver<ClientEvent>) {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let connected = Arc::new(AtomicBool::new(false));
-        let (events, events_rx) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
         let _retry = tokio::spawn(retry_loop(
             Arc::clone(&pending),
             Arc::clone(&connected),
@@ -119,26 +125,40 @@ impl Reliability {
 
     /// Emit an event to the application.
     pub(crate) fn emit(&self, event: ClientEvent) {
-        let _ = self.events.send(event);
+        let _ = self.events.try_send(event);
     }
 
     /// Enqueue a frame, tracking it for retransmission when `track` is set.
     pub(crate) fn dispatch(&mut self, frame: RelayFrame, track: bool) -> Result<(), ClientError> {
+        let id = frame.id.clone();
         if track {
             let pending = Pending {
                 frame: frame.clone(),
                 attempts: 0,
                 next: Instant::now() + self.base_delay,
             };
-            self.pending
-                .lock()
-                .expect("reliability lock")
-                .insert(frame.id.clone(), pending);
+            let mut pending_messages = self.pending.lock().expect("reliability lock");
+            if !pending_messages.contains_key(&id) && pending_messages.len() >= PENDING_CAPACITY {
+                return Err(ClientError::Busy);
+            }
+            pending_messages.insert(id.clone(), pending);
         }
 
-        self.outbox
-            .send(Outbound::Frame(frame))
-            .map_err(|_| ClientError::Closed)
+        match self.outbox.try_send(Outbound::Frame(frame)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if track {
+                    self.pending.lock().expect("reliability lock").remove(&id);
+                }
+                Err(ClientError::Busy)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                if track {
+                    self.pending.lock().expect("reliability lock").remove(&id);
+                }
+                Err(ClientError::Closed)
+            }
+        }
     }
 
     /// Record an inbound ACK, reporting delivery.
@@ -152,7 +172,7 @@ impl Reliability {
         {
             let _ = self
                 .events
-                .send(ClientEvent::Delivered { id: ack_id.clone() });
+                .try_send(ClientEvent::Delivered { id: ack_id.clone() });
         }
     }
 }
@@ -168,8 +188,8 @@ impl Drop for Reliability {
 async fn retry_loop(
     pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     connected: Arc<AtomicBool>,
-    outbox: mpsc::UnboundedSender<Outbound>,
-    events: mpsc::UnboundedSender<ClientEvent>,
+    outbox: mpsc::Sender<Outbound>,
+    events: mpsc::Sender<ClientEvent>,
     base_delay: Duration,
     max_attempts: usize,
 ) {
@@ -207,10 +227,12 @@ async fn retry_loop(
         }
 
         for frame in resend {
-            let _ = outbox.send(Outbound::Frame(frame));
+            if outbox.send(Outbound::Frame(frame)).await.is_err() {
+                return;
+            }
         }
         for (id, attempts) in failed {
-            let _ = events.send(ClientEvent::Failed { id, attempts });
+            let _ = events.try_send(ClientEvent::Failed { id, attempts });
         }
     }
 }
@@ -252,8 +274,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reports_a_full_outbound_queue() {
+        let (outbox, _outbound) = mpsc::channel(1);
+        let (mut reliability, _events) = Reliability::spawn(outbox, Duration::from_secs(1), 5);
+
+        reliability
+            .dispatch(frame("a"), true)
+            .expect("first dispatch");
+        assert!(matches!(
+            reliability.dispatch(frame("b"), true),
+            Err(ClientError::Busy)
+        ));
+        assert_eq!(
+            reliability.pending.lock().expect("reliability lock").len(),
+            1,
+            "a refused frame must not stay pending"
+        );
+    }
+
+    #[tokio::test]
     async fn delivers_when_acked() {
-        let (outbox, mut outbound) = mpsc::unbounded_channel();
+        let (outbox, mut outbound) = mpsc::channel(16);
         let (mut reliability, mut events) = Reliability::spawn(outbox, Duration::from_secs(1), 5);
 
         reliability.dispatch(frame("a"), true).expect("dispatch");
@@ -270,7 +311,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retries_then_fails() {
-        let (outbox, mut outbound) = mpsc::unbounded_channel();
+        let (outbox, mut outbound) = mpsc::channel(16);
         let (mut reliability, mut events) = Reliability::spawn(outbox, Duration::from_secs(1), 2);
 
         reliability.dispatch(frame("a"), true).expect("dispatch");
@@ -303,7 +344,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pauses_while_disconnected_and_flushes_on_reconnect() {
-        let (outbox, mut outbound) = mpsc::unbounded_channel();
+        let (outbox, mut outbound) = mpsc::channel(16);
         let (mut reliability, _events) = Reliability::spawn(outbox, Duration::from_secs(1), 3);
 
         // Reliability starts disconnected.

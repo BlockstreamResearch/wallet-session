@@ -19,7 +19,7 @@ use wallet_session_client::{
 };
 use wallet_session_relay::{
     config::NativeRelayTransportConfig,
-    limits::{Limiter, RelayLimitsConfig},
+    limits::{Limiter, RateLimit, RelayLimitsConfig},
     registry::Registry,
     server::serve,
 };
@@ -793,6 +793,79 @@ async fn run_pairing_topic_guard() -> TestResult {
     match read_raw_message(&mut raw.session, &raw.cipher).await? {
         ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("session-frame")),
         other => panic!("expected session ack, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_relay_frame_is_rejected() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_oversized_frame()).await??;
+    Ok(())
+}
+
+/// A relay that forwards a frame above the client's WebSocket limit must cause
+/// a transport failure, not an application delivery.
+async fn run_oversized_frame() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig {
+            inbound_byte_rate: RateLimit {
+                burst: 1024 * 1024,
+                interval: Duration::from_secs(1),
+            },
+            ..RelayLimitsConfig::default()
+        })),
+        NativeRelayTransportConfig::new(AUDIENCE).with_max_incoming_frame_bytes(512 * 1024),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Two base64 layers (the opaque payload and the envelope ciphertext) put
+    // this above 256 KiB on the wire while staying inside the relay's default
+    // byte budget.
+    let request = ClientMessage::Request(RequestPayload {
+        request_id: "oversized".to_owned(),
+        request: Opaque(vec![0u8; 200 * 1024]),
+    });
+    let frame = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "oversized-frame",
+        &request,
+        &mut raw.cipher,
+    )?;
+    let text = serde_json::to_string(&frame)?;
+    assert!(text.len() > 256 * 1024);
+    raw.session.send(WsMessage::text(text)).await?;
+
+    if let Ok(Ok(message)) =
+        tokio::time::timeout(Duration::from_millis(500), responder.recv()).await
+    {
+        panic!("oversized frame was delivered: {message:?}");
     }
 
     Ok(())

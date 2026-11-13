@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use wallet_session_core::message::{Message, MessageId};
 
+/// Maximum records kept per key.
+pub(crate) const CAPACITY: usize = 8192;
+
 /// How a received envelope relates to the replay memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observation {
@@ -17,10 +20,15 @@ pub(crate) enum Observation {
 
     /// An id or nonce was reused with different content.
     Conflict,
+
+    /// A new envelope cannot be recorded without exceeding the memory cap.
+    Full,
 }
 
 struct Record {
-    message: Message,
+    digest: [u8; 32],
+    nonce: Vec<u8>,
+    ts: u64,
     expires_at: u64,
 }
 
@@ -32,16 +40,18 @@ struct Record {
 /// acceptable again.
 pub(crate) struct ReplayMemory {
     retention_secs: u64,
+    capacity: usize,
     by_id: HashMap<MessageId, Record>,
     by_nonce: HashMap<Vec<u8>, MessageId>,
     largest_discarded_ts: Option<u64>,
 }
 
 impl ReplayMemory {
-    /// Build an empty replay memory with the given timestamp retention window.
-    pub(crate) fn new(retention: Duration) -> Self {
+    /// Build an empty replay memory with the given retention window and cap.
+    pub(crate) fn new(retention: Duration, capacity: usize) -> Self {
         Self {
             retention_secs: retention.as_secs(),
+            capacity,
             by_id: HashMap::new(),
             by_nonce: HashMap::new(),
             largest_discarded_ts: None,
@@ -65,7 +75,7 @@ impl ReplayMemory {
         self.prune(now);
 
         if let Some(record) = self.by_id.get(id) {
-            return if record.message == *message {
+            return if record.digest == message.digest() {
                 Observation::Retransmission
             } else {
                 log::debug!("replay conflict: frame {id} reused with different content");
@@ -87,17 +97,23 @@ impl ReplayMemory {
             return Observation::Conflict;
         }
 
+        if self.by_id.len() >= self.capacity {
+            return Observation::Full;
+        }
+
         Observation::New
     }
 
     /// Remember an envelope that was classified as [`Observation::New`].
     pub(crate) fn record(&mut self, id: &MessageId, message: &Message) {
-        self.by_nonce
-            .insert(message.nonce.as_bytes().to_vec(), id.clone());
+        let nonce = message.nonce.as_bytes().to_vec();
+        self.by_nonce.insert(nonce.clone(), id.clone());
         self.by_id.insert(
             id.clone(),
             Record {
-                message: message.clone(),
+                digest: message.digest(),
+                nonce,
+                ts: message.ts,
                 expires_at: message.ts.saturating_add(self.retention_secs),
             },
         );
@@ -106,7 +122,7 @@ impl ReplayMemory {
     /// Forget an envelope that was recorded but then rejected before delivery.
     pub(crate) fn forget(&mut self, id: &MessageId) {
         if let Some(record) = self.by_id.remove(id) {
-            self.by_nonce.remove(record.message.nonce.as_bytes());
+            self.by_nonce.remove(&record.nonce);
         }
     }
 
@@ -121,10 +137,10 @@ impl ReplayMemory {
 
         for id in expired {
             if let Some(record) = self.by_id.remove(&id) {
-                self.by_nonce.remove(record.message.nonce.as_bytes());
+                self.by_nonce.remove(&record.nonce);
                 self.largest_discarded_ts = Some(
                     self.largest_discarded_ts
-                        .map_or(record.message.ts, |largest| largest.max(record.message.ts)),
+                        .map_or(record.ts, |largest| largest.max(record.ts)),
                 );
             }
         }
@@ -138,6 +154,8 @@ mod tests {
         did::DidKey,
         message::{Ciphertext, MessageType, Nonce},
     };
+
+    const TEST_CAPACITY: usize = 8;
 
     /// A distinct, valid message id for a test label.
     fn message_id(label: &str) -> MessageId {
@@ -183,7 +201,7 @@ mod tests {
 
     #[test]
     fn classifies_retransmissions_and_conflicts() {
-        let mut memory = ReplayMemory::new(Duration::from_secs(300));
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), TEST_CAPACITY);
         let original = message(1_000);
 
         assert_eq!(
@@ -211,7 +229,7 @@ mod tests {
 
     #[test]
     fn accepts_unseen_nonces_regardless_of_counter_order() {
-        let mut memory = ReplayMemory::new(Duration::from_secs(300));
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), TEST_CAPACITY);
         let later = message_with_nonce(1_000, nonce_with_counter(1));
         let earlier = message_with_nonce(1_000, nonce_with_counter(0));
 
@@ -229,7 +247,7 @@ mod tests {
 
     #[test]
     fn expires_after_the_envelope_window() {
-        let mut memory = ReplayMemory::new(Duration::from_secs(300));
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), TEST_CAPACITY);
         let original = message(1_000);
 
         assert_eq!(
@@ -251,8 +269,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_new_records_when_full_until_expiry() {
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), 2);
+        for counter in 0..2 {
+            let message = message_with_nonce(1_000, nonce_with_counter(counter));
+            let id = message_id(&format!("frame-{counter}"));
+            assert_eq!(observe(&mut memory, &id, &message, 1_000), Observation::New);
+        }
+
+        let third = message_with_nonce(1_000, nonce_with_counter(2));
+        assert_eq!(
+            observe(&mut memory, &message_id("frame-2"), &third, 1_000),
+            Observation::Full
+        );
+        assert_eq!(memory.by_id.len(), 2, "a full memory does not grow");
+
+        // Expired records free capacity for newer timestamps.
+        let fourth = message_with_nonce(1_001, nonce_with_counter(3));
+        assert_eq!(
+            observe(&mut memory, &message_id("frame-3"), &fourth, 1_301),
+            Observation::New
+        );
+    }
+
+    #[test]
     fn discarded_timestamp_outlives_the_record() {
-        let mut memory = ReplayMemory::new(Duration::from_secs(300));
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), TEST_CAPACITY);
         let original = message(1_000);
 
         observe(&mut memory, &message_id("frame-1"), &original, 1_000);

@@ -6,8 +6,8 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval_at, sleep_until},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Bytes, Message},
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{Bytes, Message, protocol::WebSocketConfig},
 };
 use wallet_session_core::{
     connection::{ConnectionQuery, Role},
@@ -19,6 +19,18 @@ use crate::{config::ClientConfig, error::Result, identity::IdentityKey, random};
 
 /// Client-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Frames buffered between the transport task and the client.
+pub(crate) const INBOX_CAPACITY: usize = 64;
+
+/// Frames buffered between the client and the transport task.
+pub(crate) const OUTBOUND_CAPACITY: usize = 64;
+
+/// Maximum relay frame accepted from the relay, matching the relay default.
+const MAX_RELAY_FRAME_BYTES: usize = 256 * 1024;
+
+/// Maximum buffered WebSocket write bytes.
+const MAX_WRITE_BUFFER_BYTES: usize = 2 * MAX_RELAY_FRAME_BYTES;
 
 /// Everything the connection task can put on the wire.
 pub(crate) enum Outbound {
@@ -50,7 +62,7 @@ pub(crate) enum Inbox {
 /// outbound channel, so the client and reliability layer never observe a
 /// socket swap. Inbound events go to the shared channel owned by the client.
 pub(crate) struct Transport {
-    outbound: mpsc::UnboundedSender<Outbound>,
+    outbound: mpsc::Sender<Outbound>,
     _task: JoinHandle<()>,
 }
 
@@ -61,9 +73,9 @@ impl Transport {
         identity: IdentityKey,
         role: Role,
         topic: Topic,
-        inbox: mpsc::UnboundedSender<Inbox>,
+        inbox: mpsc::Sender<Inbox>,
     ) -> Self {
-        let (outbound, outbound_rx) = mpsc::unbounded_channel();
+        let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let _task = tokio::spawn(connection_task(
             config,
             identity,
@@ -77,7 +89,7 @@ impl Transport {
     }
 
     /// Cloneable handle to the outbound writer.
-    pub(crate) fn outbound(&self) -> mpsc::UnboundedSender<Outbound> {
+    pub(crate) fn outbound(&self) -> mpsc::Sender<Outbound> {
         self.outbound.clone()
     }
 }
@@ -87,8 +99,8 @@ async fn connection_task(
     identity: IdentityKey,
     role: Role,
     topic: Topic,
-    mut outbound: mpsc::UnboundedReceiver<Outbound>,
-    inbox: mpsc::UnboundedSender<Inbox>,
+    mut outbound: mpsc::Receiver<Outbound>,
+    inbox: mpsc::Sender<Inbox>,
 ) {
     let mut delay = config.reconnect_initial_delay;
     let mut attempt = 0usize;
@@ -98,23 +110,23 @@ async fn connection_task(
             Ok(stream) => {
                 attempt = 0;
                 delay = config.reconnect_initial_delay;
-                let _ = inbox.send(Inbox::Connected(topic.clone()));
+                let _ = inbox.send(Inbox::Connected(topic.clone())).await;
 
                 if !run_connection(stream, &mut outbound, &inbox, &config).await {
                     return; // all senders dropped: shutting down
                 }
-                let _ = inbox.send(Inbox::Disconnected(topic.clone()));
+                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
             }
             Err(error) => {
                 log::debug!("relay connect failed: {error}");
-                let _ = inbox.send(Inbox::Disconnected(topic.clone()));
+                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
             }
         }
 
         attempt += 1;
         if attempt >= config.reconnect_max_attempts {
             log::warn!("relay reconnect attempts exhausted");
-            let _ = inbox.send(Inbox::Closed(topic.clone()));
+            let _ = inbox.send(Inbox::Closed(topic.clone())).await;
             return;
         }
 
@@ -146,15 +158,24 @@ async fn connect_once(
     url.set_query(Some(&query));
 
     log::debug!("connecting to relay {url}");
-    let (stream, _response) = connect_async(url.as_str()).await?;
+    let (stream, _response) =
+        connect_async_with_config(url.as_str(), Some(websocket_config()), false).await?;
     Ok(stream)
+}
+
+/// WebSocket limits that bound what a relay can make the client buffer.
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_RELAY_FRAME_BYTES))
+        .max_frame_size(Some(MAX_RELAY_FRAME_BYTES))
+        .max_write_buffer_size(MAX_WRITE_BUFFER_BYTES)
 }
 
 /// Drive one WebSocket session. Returns `true` to reconnect, `false` to stop.
 async fn run_connection(
     stream: RelayStream,
-    outbound: &mut mpsc::UnboundedReceiver<Outbound>,
-    inbox: &mpsc::UnboundedSender<Inbox>,
+    outbound: &mut mpsc::Receiver<Outbound>,
+    inbox: &mpsc::Sender<Inbox>,
     config: &ClientConfig,
 ) -> bool {
     let (mut sink, mut source) = stream.split();
@@ -183,7 +204,9 @@ async fn run_connection(
                     match serde_json::from_str::<RelayFrame>(&text) {
                         Ok(frame) => {
                             log::trace!("client <- topic={} frame={text}", frame.topic);
-                            let _ = inbox.send(Inbox::Frame(frame));
+                            if inbox.send(Inbox::Frame(frame)).await.is_err() {
+                                return false;
+                            }
                         }
                         Err(error) => log::warn!("invalid relay frame: {error}"),
                     }
@@ -212,5 +235,18 @@ async fn run_connection(
                 return true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_limits_match_the_relay_default() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_RELAY_FRAME_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_RELAY_FRAME_BYTES));
+        assert_eq!(config.max_write_buffer_size, MAX_WRITE_BUFFER_BYTES);
     }
 }

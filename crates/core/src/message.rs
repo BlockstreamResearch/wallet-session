@@ -42,6 +42,23 @@ impl Message {
             data,
         }
     }
+
+    /// Cryptographic digest of all authenticated envelope fields.
+    pub fn digest(&self) -> [u8; 32] {
+        fn field(hasher: &mut Sha256, bytes: &[u8]) {
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update([self.version]);
+        field(&mut hasher, self.kind.as_str().as_bytes());
+        field(&mut hasher, &self.from.to_ed25519_bytes());
+        field(&mut hasher, &self.ts.to_be_bytes());
+        field(&mut hasher, self.nonce.as_bytes());
+        field(&mut hasher, self.data.as_bytes());
+        hasher.finalize().into()
+    }
 }
 
 /// Plaintext frame for the relay.

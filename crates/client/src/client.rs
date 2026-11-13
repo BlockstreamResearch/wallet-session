@@ -21,9 +21,9 @@ use crate::{
     identity::{IdentityKey, unix_now},
     messages::{ClientMessage, RequestId},
     random,
-    relay::{Inbox, Transport},
+    relay::{INBOX_CAPACITY, Inbox, Transport},
     reliability::{ClientEvent, Reliability, requires_ack},
-    replay::{Observation, ReplayMemory},
+    replay::{self, Observation, ReplayMemory},
     session::{Role, Session, SessionState},
 };
 
@@ -32,6 +32,12 @@ const SESSION_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Maximum accepted clock skew between envelope `ts` and local time.
 const MAX_TS_SKEW_SECS: u64 = 300;
+
+/// Maximum application messages buffered while waiting for `session_ready`.
+const MAX_PENDING_MESSAGES: usize = 256;
+
+/// Maximum reliability events held after their link is retired.
+const MAX_PENDING_EVENTS: usize = 256;
 
 /// Local side of the session handshake.
 enum Handshake {
@@ -54,7 +60,7 @@ struct Link<C> {
     topic: Topic,
     _transport: Transport,
     reliability: Reliability,
-    events: mpsc::UnboundedReceiver<ClientEvent>,
+    events: mpsc::Receiver<ClientEvent>,
     cipher: C,
     replay: ReplayMemory,
     ready: bool,
@@ -71,7 +77,7 @@ where
         role: Role,
         topic: Topic,
         cipher: C,
-        inbox: &mpsc::UnboundedSender<Inbox>,
+        inbox: &mpsc::Sender<Inbox>,
     ) -> Self {
         let transport = Transport::connect(
             config.clone(),
@@ -92,7 +98,7 @@ where
             reliability,
             events,
             cipher,
-            replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS)),
+            replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
             ready: false,
             saw_disconnect: false,
         }
@@ -102,8 +108,8 @@ where
 pub struct Client<C> {
     config: ClientConfig,
     identity: IdentityKey,
-    inbox: mpsc::UnboundedReceiver<Inbox>,
-    inbox_tx: mpsc::UnboundedSender<Inbox>,
+    inbox: mpsc::Receiver<Inbox>,
+    inbox_tx: mpsc::Sender<Inbox>,
     pairing: Option<Link<C>>,
     session_link: Option<Link<C>>,
     session: Session,
@@ -130,7 +136,7 @@ where
         cipher: C,
     ) -> Result<Self> {
         let did = identity.did();
-        let (inbox_tx, inbox) = mpsc::unbounded_channel();
+        let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
         let pairing = Link::new(&config, &identity, role, topic.clone(), cipher, &inbox_tx);
         let session = Session::new(topic, role);
 
@@ -262,8 +268,10 @@ where
                 RelayFrameBody::Message { .. } => {
                     // Consume acknowledgements and retransmissions that
                     // arrive while waiting. Application messages are queued
-                    // for the next `recv`.
-                    if let Some(message) = self.handle_message_frame(frame).await? {
+                    // for the next `recv` while there is room; otherwise they
+                    // are left unacknowledged so the peer retries later.
+                    let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
+                    if let Some(message) = self.handle_message_frame(frame, deliver).await? {
                         self.pending.push_back(message);
                     }
                 }
@@ -349,7 +357,7 @@ where
             let frame = self.next_frame().await?;
             match frame.body {
                 RelayFrameBody::Message { .. } => {
-                    if let Some(message) = self.handle_message_frame(frame).await? {
+                    if let Some(message) = self.handle_message_frame(frame, true).await? {
                         return Ok(message);
                     }
                 }
@@ -367,7 +375,11 @@ where
     /// Process one `message` frame. Returns the message to deliver, or `None`
     /// for acknowledgements, retransmissions and envelopes for inactive
     /// handshake state.
-    async fn handle_message_frame(&mut self, frame: RelayFrame) -> Result<Option<ClientMessage>> {
+    async fn handle_message_frame(
+        &mut self,
+        frame: RelayFrame,
+        deliver: bool,
+    ) -> Result<Option<ClientMessage>> {
         let RelayFrame {
             id, topic, body, ..
         } = frame;
@@ -457,6 +469,22 @@ where
             return Ok(None);
         }
 
+        // While `wait_session_ready` has no room to queue an application
+        // message, drop it without recording or acknowledging it, so the peer
+        // retransmits it later instead of the application silently losing it.
+        if !deliver
+            && matches!(
+                wire.kind,
+                MessageType::Request
+                    | MessageType::Response
+                    | MessageType::Disconnect
+                    | MessageType::SessionDelete
+            )
+        {
+            log::warn!("dropping application message: pending queue is full");
+            return Ok(None);
+        }
+
         // The counterpart is the sender of the first envelope that passes the
         // version, topic, identity, timestamp and authentication checks on the
         // pairing topic. It stays the counterpart for the session topic and
@@ -483,6 +511,10 @@ where
                 return Err(ClientError::ProtocolViolation(
                     "envelope reuses a frame id or nonce with different content",
                 ));
+            }
+            Observation::Full => {
+                log::warn!("dropping envelope: replay memory is full");
+                return Ok(None);
             }
             Observation::New => {}
         }
@@ -553,14 +585,24 @@ where
 
     /// Acknowledge a received envelope by id, on the topic it arrived on.
     async fn send_ack(&mut self, ack_id: &MessageId, topic: &Topic) -> Result<()> {
-        self.send_on(
-            topic,
-            &ClientMessage::Ack(AckPayload {
-                ack_id: ack_id.clone(),
-            }),
-        )
-        .await?;
-        Ok(())
+        let result = self
+            .send_on(
+                topic,
+                &ClientMessage::Ack(AckPayload {
+                    ack_id: ack_id.clone(),
+                }),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(ClientError::Busy) => {
+                // The peer retransmits unacknowledged messages; dropping this
+                // ack under local backpressure is recoverable.
+                log::warn!("dropping ack: outbound queue is full");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Non-blocking read of the next reliability event, if any.
@@ -580,11 +622,20 @@ where
             ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
         );
         if approval_failed {
-            self.pending_events.push_back(event);
+            self.push_pending_event(event);
             self.retire_pairing();
             return self.pending_events.pop_front();
         }
         Some(event)
+    }
+
+    /// Keep an event after its link is gone, within the bounded backlog.
+    fn push_pending_event(&mut self, event: ClientEvent) {
+        if self.pending_events.len() >= MAX_PENDING_EVENTS {
+            log::warn!("dropping client event: pending event queue is full");
+            return;
+        }
+        self.pending_events.push_back(event);
     }
 
     /// Drop the pairing connection once the handshake no longer needs it.
@@ -596,7 +647,7 @@ where
         };
         log::debug!("retiring pairing link {}", link.topic.log_tag());
         while let Ok(event) = link.events.try_recv() {
-            self.pending_events.push_back(event);
+            self.push_pending_event(event);
         }
     }
 
@@ -668,7 +719,7 @@ where
         let topic = self.session.pairing_topic.clone();
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
-            let _ = inbox.send(Inbox::Retire(topic));
+            let _ = inbox.send(Inbox::Retire(topic)).await;
         });
     }
 

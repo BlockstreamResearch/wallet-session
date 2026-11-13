@@ -30,6 +30,9 @@ pub enum ClientError {
     #[error("relay connection closed")]
     Closed,
 
+    #[error("client outbound queue is full")]
+    Busy,
+
     #[error("relay connection timed out")]
     Timeout,
 
