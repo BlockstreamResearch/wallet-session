@@ -12,6 +12,11 @@ pub trait MessageCipher: Send {
     /// Decrypt a received sealed representation.
     fn open(&self, aad: &[u8], sealed: &Self::Sealed) -> Result<Vec<u8>, Self::Error>;
 
-    /// Switch to a new 32-byte symmetric key.
-    fn rekey(&mut self, key: &[u8; 32]);
+    /// Create a fresh cipher for a new 32-byte key.
+    ///
+    /// Implementations must start with fresh nonce state: the sender prefix
+    /// must be regenerated and the counter must start at zero.
+    fn for_key(&self, key: &[u8; 32]) -> Result<Self, Self::Error>
+    where
+        Self: Sized;
 }

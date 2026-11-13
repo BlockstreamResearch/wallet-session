@@ -93,8 +93,8 @@ impl MessageCipher for PlaintextCipher {
         Ok(sealed.data.as_bytes().to_vec())
     }
 
-    fn rekey(&mut self, _key: &[u8; 32]) {
-        self.counter = 0;
+    fn for_key(&self, _key: &[u8; 32]) -> Result<Self, CipherError> {
+        Ok(Self::new())
     }
 }
 

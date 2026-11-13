@@ -3,13 +3,14 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use url::{Url, form_urlencoded};
 use wallet_session_core::{codec, message::Topic};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{error::ClientError, error::Result, random};
 
 const CONNECTION_SCHEME: &str = "bsconnect";
 
 /// 32-byte symmetric pairing key shared out of band
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct PairingKey([u8; 32]);
 
 impl PairingKey {

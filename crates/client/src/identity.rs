@@ -2,11 +2,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
 use wallet_session_core::{auth::RelayAuthToken, codec, did::DidKey};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{error::Result, random};
 
 /// Long-term identity seed, persisted across reconnects and restarts.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Seed([u8; 32]);
 
 impl Seed {
@@ -28,6 +29,9 @@ impl Seed {
 /// Ed25519 identity used to sign connection tokens.
 #[derive(Clone)]
 pub struct IdentityKey(SigningKey);
+
+// `SigningKey` zeroizes its secret key material when dropped.
+impl ZeroizeOnDrop for IdentityKey {}
 
 impl IdentityKey {
     /// Derive the identity key from a persisted seed.

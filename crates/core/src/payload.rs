@@ -1,10 +1,18 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::message::MessageId;
 
 /// Opaque application data carried inside a payload shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opaque(#[serde(with = "crate::codec::base64url")] pub Vec<u8>);
+
+impl fmt::Debug for Opaque {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Opaque(..)")
+    }
+}
 
 /// Body of a `proposal` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +157,12 @@ mod tests {
     use crate::message::MessageType;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn opaque_debug_redacts_application_data() {
+        let opaque = Opaque(vec![1, 2, 3, 4]);
+        assert_eq!(format!("{opaque:?}"), "Opaque(..)");
+    }
 
     #[test]
     fn bodies_with_the_same_shape_are_distinguished() -> TestResult {

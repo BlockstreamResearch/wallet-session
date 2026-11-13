@@ -158,12 +158,12 @@ pub struct Client<C> {
 
 impl<C> Client<C>
 where
-    C: MessageCipher<Sealed = SealedPayload, Error = CipherError> + Clone,
+    C: MessageCipher<Sealed = SealedPayload, Error = CipherError>,
 {
     /// Connect to the relay for the pairing topic.
     ///
-    /// The cipher must be cloneable: the pairing topic keeps its cipher while
-    /// the derived session topic gets a rekeyed copy.
+    /// The cipher must provide a fresh cipher for the derived session key so
+    /// the session starts with a new nonce prefix and counter.
     pub async fn connect(
         config: ClientConfig,
         identity: IdentityKey,
@@ -868,13 +868,12 @@ where
         }
 
         let session_topic = topic.as_topic().clone();
-        let mut cipher = self
+        let cipher = self
             .pairing
             .as_ref()
             .ok_or(ClientError::Closed)?
             .cipher
-            .clone();
-        cipher.rekey(key.as_bytes());
+            .for_key(key.as_bytes())?;
         let link = Link::new(
             &self.config,
             &self.identity,

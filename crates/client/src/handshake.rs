@@ -5,6 +5,7 @@ use sha2::Sha256;
 use thiserror::Error;
 use wallet_session_core::{codec, message::Topic};
 use x25519_dalek::{EphemeralSecret, PublicKey};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// HKDF info label for the session symmetric key.
 const SESSION_KEY_INFO: &[u8] = b"wallet-session/v1/session-key";
@@ -13,7 +14,7 @@ const SESSION_KEY_INFO: &[u8] = b"wallet-session/v1/session-key";
 const SESSION_TOPIC_INFO: &[u8] = b"wallet-session/v1/session-topic";
 
 /// Symmetric session key derived by both peers.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKey([u8; 32]);
 
 impl SessionKey {
@@ -71,23 +72,23 @@ impl EphemeralKeyPair {
         peer_public: &[u8; 32],
     ) -> Result<(SessionKey, SessionTopic), HandshakeError> {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer_public));
-        let shared = shared.to_bytes();
+        let shared = Zeroizing::new(shared.to_bytes());
         if shared.iter().all(|byte| *byte == 0) {
             return Err(HandshakeError::WeakKey);
         }
 
-        let hkdf = Hkdf::<Sha256>::new(None, &shared);
+        let hkdf = Hkdf::<Sha256>::new(None, shared.as_ref());
 
-        let mut key = [0u8; 32];
-        hkdf.expand(SESSION_KEY_INFO, &mut key)
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(SESSION_KEY_INFO, key.as_mut())
             .map_err(|_| HandshakeError::Derive)?;
 
-        let mut topic = [0u8; 32];
-        hkdf.expand(SESSION_TOPIC_INFO, &mut topic)
+        let mut topic = Zeroizing::new([0u8; 32]);
+        hkdf.expand(SESSION_TOPIC_INFO, topic.as_mut())
             .map_err(|_| HandshakeError::Derive)?;
         let topic = Topic::new(topic.to_vec())?;
 
-        Ok((SessionKey(key), SessionTopic(topic)))
+        Ok((SessionKey(*key), SessionTopic(topic)))
     }
 }
 
