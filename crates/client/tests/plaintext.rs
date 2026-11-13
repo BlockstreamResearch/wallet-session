@@ -13,8 +13,8 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 use wallet_session_client::{
-    AckPayload, ApprovePayload, Client, ClientConfig, ClientError, ClientMessage, IdentityKey,
-    Opaque, PairingKey, ProposalPayload, RequestPayload, Role, Seed, SessionState,
+    AckPayload, ApprovePayload, Client, ClientConfig, ClientError, ClientEvent, ClientMessage,
+    IdentityKey, Opaque, PairingKey, ProposalPayload, RequestPayload, Role, Seed, SessionState,
     handshake::{EphemeralKeyPair, decode_public_key},
 };
 use wallet_session_relay::{
@@ -616,7 +616,9 @@ async fn establish_raw_session(
     let (_key, session_topic) = keypair.derive(&peer_public)?;
     let session_topic = session_topic.as_topic().clone();
 
-    let ack = ClientMessage::Ack(AckPayload { ack_id: approve_id });
+    let ack = ClientMessage::Ack(AckPayload {
+        ack_id: approve_id.clone(),
+    });
     let ack_frame = client_frame(
         pairing_topic,
         proposer_identity.did(),
@@ -627,6 +629,18 @@ async fn establish_raw_session(
     pairing
         .send(WsMessage::text(serde_json::to_string(&ack_frame)?))
         .await?;
+
+    // Wait until the responder has consumed the ack, which also retires the
+    // pairing link. Returning after session_ready alone races with that ack.
+    loop {
+        match responder.next_event().await? {
+            ClientEvent::Delivered { id } if id == approve_id => break,
+            ClientEvent::Failed { id, .. } if id == approve_id => {
+                return Err("approve was not acknowledged".into());
+            }
+            _ => {}
+        }
+    }
 
     let mut session =
         connect_raw(relay_url, proposer_identity, Role::Proposer, &session_topic).await?;
@@ -781,7 +795,8 @@ async fn run_pairing_topic_guard() -> TestResult {
     let mut responder = Client::connect(
         ClientConfig::new(&relay_url)
             .with_insecure_ws()
-            .with_audience(AUDIENCE),
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_secs(60)),
         responder_identity,
         Role::Responder,
         topic.clone(),
