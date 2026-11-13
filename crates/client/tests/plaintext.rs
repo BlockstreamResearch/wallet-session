@@ -13,8 +13,9 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 use wallet_session_client::{
-    Client, ClientConfig, ClientError, ClientMessage, IdentityKey, Opaque, PairingKey,
-    RequestPayload, Role, Seed, SessionState,
+    AckPayload, Client, ClientConfig, ClientError, ClientMessage, IdentityKey, Opaque, PairingKey,
+    ProposalPayload, RequestPayload, Role, Seed, SessionState,
+    handshake::{EphemeralKeyPair, decode_public_key},
 };
 use wallet_session_relay::{
     config::NativeRelayTransportConfig,
@@ -144,6 +145,10 @@ async fn run() -> TestResult {
     proposer.wait_session_ready().await?;
     responder.wait_session_ready().await?;
 
+    // Relay readiness is not session establishment.
+    assert_eq!(proposer.session().state, SessionState::Idle);
+    assert_eq!(responder.session().state, SessionState::Idle);
+
     proposer
         .propose(json!({ "capabilities": ["read"] }))
         .await?;
@@ -198,9 +203,9 @@ async fn responder_reconnects_within_grace_and_resumes() -> TestResult {
     Ok(())
 }
 
-/// The responder drops abruptly, the proposer keeps going (its request is
-/// buffered), and the same identity reconnects within the grace window and
-/// resumes the session with the buffered frame redelivered.
+/// The responder drops abruptly, the proposer keeps going (its proposal is
+/// buffered), and the same identity reconnects within the grace window. The
+/// buffered proposal is redelivered and the handshake then completes normally.
 async fn run_reconnect() -> TestResult {
     let _ = env_logger::builder()
         .is_test(true)
@@ -252,7 +257,9 @@ async fn run_reconnect() -> TestResult {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Sent while the responder is away: the relay buffers it for redelivery.
-    let request_id = proposer.request(json!({ "method": "get_status" })).await?;
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
 
     // The same identity reconnects within the grace window.
     let mut responder = Client::connect(
@@ -266,8 +273,22 @@ async fn run_reconnect() -> TestResult {
 
     responder.wait_session_ready().await?;
     match responder.recv().await? {
+        ClientMessage::Proposal(payload) => {
+            let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
+            assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+        }
+        other => panic!("expected buffered proposal after reconnect, got {other:?}"),
+    }
+
+    responder.approve(json!({ "ok": true })).await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    proposer.wait_session_ready().await?;
+    responder.wait_session_ready().await?;
+
+    let request_id = proposer.request(json!({ "method": "get_status" })).await?;
+    match responder.recv().await? {
         ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
-        other => panic!("expected buffered request after reconnect, got {other:?}"),
+        other => panic!("expected request after reconnect, got {other:?}"),
     }
 
     responder
@@ -419,22 +440,18 @@ fn message_id(label: &str) -> MessageId {
     MessageId::from_bytes(bytes)
 }
 
-fn request_frame(
+fn client_frame(
     topic: &Topic,
     from: DidKey,
     id: &str,
-    request_id: &str,
+    message: &ClientMessage,
     cipher: &mut PlaintextCipher,
 ) -> Result<RelayFrame, Box<dyn std::error::Error>> {
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    let plaintext = ClientMessage::Request(RequestPayload {
-        request_id: request_id.to_owned(),
-        request: Opaque(serde_json::to_vec(&json!({ "method": "get_status" }))?),
-    })
-    .to_bytes()?;
+    let plaintext = message.to_bytes()?;
     let sealed = cipher.seal(&[], &plaintext)?;
     let wire = Envelope::new(
-        MessageType::Request,
+        message.message_type(),
         from,
         ts.as_secs(),
         sealed.nonce,
@@ -447,6 +464,137 @@ fn request_frame(
         body: RelayFrameBody::Message {
             payload: serde_json::to_string(&wire)?,
         },
+    })
+}
+
+fn request_frame(
+    topic: &Topic,
+    from: DidKey,
+    id: &str,
+    request_id: &str,
+    cipher: &mut PlaintextCipher,
+) -> Result<RelayFrame, Box<dyn std::error::Error>> {
+    client_frame(
+        topic,
+        from,
+        id,
+        &ClientMessage::Request(RequestPayload {
+            request_id: request_id.to_owned(),
+            request: Opaque(serde_json::to_vec(&json!({ "method": "get_status" }))?),
+        }),
+        cipher,
+    )
+}
+
+/// Read frames until the relay sends `session_ready`.
+async fn wait_raw_session_ready(stream: &mut RawStream) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let frame = read_raw_frame(stream).await?;
+        if matches!(frame.body, RelayFrameBody::SessionReady) {
+            return Ok(());
+        }
+    }
+}
+
+/// A raw proposer connected to both the pairing and session topics.
+struct RawSession {
+    pairing: RawStream,
+    pairing_topic: Topic,
+    pairing_cipher: PlaintextCipher,
+    approve: RelayFrame,
+    session: RawStream,
+    cipher: PlaintextCipher,
+    topic: Topic,
+}
+
+/// Drive a `Client` responder through a handshake with a raw proposer, then
+/// return a session-topic connection for the raw proposer.
+async fn establish_raw_session(
+    relay_url: &str,
+    pairing_topic: &Topic,
+    responder: &mut Client<PlaintextCipher>,
+    proposer_identity: &IdentityKey,
+) -> Result<RawSession, Box<dyn std::error::Error>> {
+    let mut pairing =
+        connect_raw(relay_url, proposer_identity, Role::Proposer, pairing_topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let keypair = EphemeralKeyPair::generate();
+    let mut cipher = PlaintextCipher::new();
+    let proposal = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: keypair.public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+    });
+    let frame = client_frame(
+        pairing_topic,
+        proposer_identity.did(),
+        "raw-proposal",
+        &proposal,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&frame)?))
+        .await?;
+
+    match responder.recv().await? {
+        ClientMessage::Proposal(_) => {}
+        other => return Err(format!("expected proposal, got {other:?}").into()),
+    }
+    responder.approve(json!({ "test": true })).await?;
+
+    let (approve_id, approve, approve_frame) = loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        let approve_frame = frame.clone();
+        let RelayFrameBody::Message { payload } = frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(&payload)?;
+        if wire.kind != MessageType::Approve {
+            continue;
+        }
+        let bytes = cipher.open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        break (frame.id, ClientMessage::from_bytes(&bytes)?, approve_frame);
+    };
+    let ClientMessage::Approve(approve) = approve else {
+        return Err("expected approve payload".into());
+    };
+    let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
+    let (_key, session_topic) = keypair.derive(&peer_public)?;
+    let session_topic = session_topic.as_topic().clone();
+
+    let ack = ClientMessage::Ack(AckPayload { ack_id: approve_id });
+    let ack_frame = client_frame(
+        pairing_topic,
+        proposer_identity.did(),
+        "raw-approve-ack",
+        &ack,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&ack_frame)?))
+        .await?;
+
+    let mut session =
+        connect_raw(relay_url, proposer_identity, Role::Proposer, &session_topic).await?;
+    wait_raw_session_ready(&mut session).await?;
+    responder.wait_session_ready().await?;
+
+    Ok(RawSession {
+        pairing,
+        pairing_topic: pairing_topic.clone(),
+        pairing_cipher: cipher,
+        approve: approve_frame,
+        session,
+        cipher: PlaintextCipher::new(),
+        topic: session_topic,
     })
 }
 
@@ -504,39 +652,42 @@ async fn run_retransmission() -> TestResult {
         PlaintextCipher::new(),
     )
     .await?;
-    let mut raw = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
-
-    responder.wait_session_ready().await?;
-    let ready = read_raw_frame(&mut raw).await?;
-    assert!(matches!(ready.body, RelayFrameBody::SessionReady));
+    let RawSession {
+        mut session,
+        mut cipher,
+        topic: session_topic,
+        ..
+    } = establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
 
     let request_id = "raw-request-1";
-    let mut sender = PlaintextCipher::new();
     let frame = request_frame(
-        &topic,
+        &session_topic,
         proposer_identity.did(),
         "raw-frame-1",
         request_id,
-        &mut sender,
+        &mut cipher,
     )?;
     let text = serde_json::to_string(&frame)?;
 
-    raw.send(WsMessage::text(text.clone())).await?;
+    session.send(WsMessage::text(text.clone())).await?;
     match responder.recv().await? {
         ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
         other => panic!("expected request, got {other:?}"),
     }
-    match read_raw_message(&mut raw, &sender).await? {
+    match read_raw_message(&mut session, &cipher).await? {
         ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, frame.id),
         other => panic!("expected ack, got {other:?}"),
     }
 
     // Retransmit the identical envelope. It must not reach the application
     // again, but the responder must send a fresh ack.
-    raw.send(WsMessage::text(text)).await?;
+    session.send(WsMessage::text(text)).await?;
     let receiving = tokio::spawn(async move { responder.recv().await });
-    let ack =
-        tokio::time::timeout(Duration::from_secs(2), read_raw_message(&mut raw, &sender)).await??;
+    let ack = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_raw_message(&mut session, &cipher),
+    )
+    .await??;
     match ack {
         ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, frame.id),
         other => panic!("expected re-ack, got {other:?}"),
@@ -546,6 +697,103 @@ async fn run_retransmission() -> TestResult {
         "the duplicate must not be delivered to the application again"
     );
     receiving.abort();
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pairing_topic_rejects_application_traffic() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_pairing_topic_guard()).await??;
+    Ok(())
+}
+
+/// Application traffic must not use the pairing key before or after the
+/// handshake, and the session topic must keep working.
+async fn run_pairing_topic_guard() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+
+    assert!(matches!(
+        responder.request(json!({ "method": "too_early" })).await,
+        Err(ClientError::SessionNotActive)
+    ));
+
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Once the approve has been acknowledged, the pairing link is retired:
+    // even an otherwise valid handshake retransmission is no longer re-acked.
+    let _ = raw
+        .pairing
+        .send(WsMessage::text(serde_json::to_string(&raw.approve)?))
+        .await;
+    match tokio::time::timeout(Duration::from_millis(300), read_raw_frame(&mut raw.pairing)).await {
+        Err(_) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(frame)) => {
+            panic!("the retired pairing link must not acknowledge handshake traffic, got {frame:?}")
+        }
+    }
+
+    // The pairing key still exists locally, but an application envelope on the
+    // pairing topic is rejected even though the session is established.
+    let pairing_request = request_frame(
+        &raw.pairing_topic,
+        proposer_identity.did(),
+        "pairing-app-frame",
+        "pairing-app-request",
+        &mut raw.pairing_cipher,
+    )?;
+    raw.pairing
+        .send(WsMessage::text(serde_json::to_string(&pairing_request)?))
+        .await?;
+    expect_no_delivery_or_ack(&mut responder, &mut raw.session).await?;
+
+    // The session topic remains usable.
+    let session_request = request_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "session-frame",
+        "session-request",
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&session_request)?))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "session-request"),
+        other => panic!("expected session request, got {other:?}"),
+    }
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("session-frame")),
+        other => panic!("expected session ack, got {other:?}"),
+    }
 
     Ok(())
 }
@@ -589,71 +837,55 @@ async fn run_identities() -> TestResult {
         PlaintextCipher::new(),
     )
     .await?;
-    let mut raw = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    let RawSession {
+        mut session,
+        mut cipher,
+        topic: session_topic,
+        ..
+    } = establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
 
-    responder.wait_session_ready().await?;
-    let ready = read_raw_frame(&mut raw).await?;
-    assert!(matches!(ready.body, RelayFrameBody::SessionReady));
+    assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
+    assert_eq!(responder.session().state, SessionState::Active);
 
-    let mut sender = PlaintextCipher::new();
-
-    // The receiver's own identity is rejected before it can become the
-    // counterpart.
+    // The receiver's own identity is rejected.
     let own = request_frame(
-        &topic,
+        &session_topic,
         responder_identity.did(),
         "own-frame",
         "own-request",
-        &mut sender,
+        &mut cipher,
     )?;
-    raw.send(WsMessage::text(serde_json::to_string(&own)?))
+    session
+        .send(WsMessage::text(serde_json::to_string(&own)?))
         .await?;
-    expect_no_delivery_or_ack(&mut responder, &mut raw).await?;
-    assert!(responder.session().peer_did.is_none());
+    expect_no_delivery_or_ack(&mut responder, &mut session).await?;
 
-    // The first authenticated frame establishes the counterpart.
-    let valid = request_frame(
-        &topic,
-        proposer_identity.did(),
-        "valid-frame",
-        "valid-request",
-        &mut sender,
-    )?;
-    raw.send(WsMessage::text(serde_json::to_string(&valid)?))
-        .await?;
-    match responder.recv().await? {
-        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "valid-request"),
-        other => panic!("expected the valid request, got {other:?}"),
-    }
-    assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
-    match read_raw_message(&mut raw, &sender).await? {
-        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("valid-frame")),
-        other => panic!("expected ack for the valid request, got {other:?}"),
-    }
-
-    // Once the counterpart is established, a different sender is rejected.
+    // A different sender is rejected because the counterpart is pinned to the
+    // proposer that completed the handshake.
     let foreign = request_frame(
-        &topic,
+        &session_topic,
         foreign_identity.did(),
         "foreign-frame",
         "foreign-request",
-        &mut sender,
+        &mut cipher,
     )?;
-    raw.send(WsMessage::text(serde_json::to_string(&foreign)?))
+    session
+        .send(WsMessage::text(serde_json::to_string(&foreign)?))
         .await?;
-    expect_no_delivery_or_ack(&mut responder, &mut raw).await?;
+    expect_no_delivery_or_ack(&mut responder, &mut session).await?;
     assert_eq!(responder.session().peer_did, Some(proposer_identity.did()));
 
-    // A later frame from the counterpart proves the foreign frame was skipped
-    // rather than merely still queued.
+    // A later frame from the counterpart proves the rejected frames were
+    // skipped rather than merely still queued.
     let after = request_frame(
-        &topic,
+        &session_topic,
         proposer_identity.did(),
         "after-foreign-frame",
         "after-foreign-request",
-        &mut sender,
+        &mut cipher,
     )?;
-    raw.send(WsMessage::text(serde_json::to_string(&after)?))
+    session
+        .send(WsMessage::text(serde_json::to_string(&after)?))
         .await?;
     match responder.recv().await? {
         ClientMessage::Request(payload) => {
@@ -661,7 +893,7 @@ async fn run_identities() -> TestResult {
         }
         other => panic!("expected the post-foreign request, got {other:?}"),
     }
-    match read_raw_message(&mut raw, &sender).await? {
+    match read_raw_message(&mut session, &cipher).await? {
         ClientMessage::Ack(payload) => {
             assert_eq!(payload.ack_id, message_id("after-foreign-frame"));
         }

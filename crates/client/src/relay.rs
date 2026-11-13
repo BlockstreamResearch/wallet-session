@@ -39,6 +39,9 @@ pub(crate) enum Inbox {
 
     /// Reconnect attempts for `topic` were exhausted.
     Closed(Topic),
+
+    /// The client no longer needs the pairing connection for `topic`.
+    Retire(Topic),
 }
 
 /// A reconnecting relay connection for one topic and role.

@@ -154,6 +154,25 @@ async fn connect_pair(live: &LiveRelay) -> Result<Pair, Box<dyn std::error::Erro
     })
 }
 
+/// Complete the pairing handshake and wait for both session links.
+async fn establish_session(
+    proposer: &mut LiveClient,
+    responder: &mut LiveClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Proposal(_) => {}
+        other => panic!("expected proposal, got {other:?}"),
+    }
+    responder.approve(json!({ "ok": true })).await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    proposer.wait_session_ready().await?;
+    responder.wait_session_ready().await?;
+    Ok(())
+}
+
 /// Build a handshake URL with the signed connection query.
 fn url_with_query(
     base: &str,
@@ -410,6 +429,7 @@ async fn disconnect_is_delivered_and_acknowledged() -> TestResult {
             mut responder,
             ..
         } = connect_pair(&live).await?;
+        establish_session(&mut proposer, &mut responder).await?;
 
         // Prove the session is active before tearing it down.
         let request_id = proposer
@@ -540,7 +560,10 @@ async fn reconnect_resumes_buffered_frames() -> TestResult {
         drop(responder);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let request_id = proposer.request(json!({ "method": "get_status" })).await?;
+        // The proposal is buffered for the reserved responder slot.
+        proposer
+            .propose(json!({ "capabilities": ["read"] }))
+            .await?;
 
         // The same identity reconnects within the deployment's grace window.
         let mut responder = Client::connect(
@@ -554,12 +577,26 @@ async fn reconnect_resumes_buffered_frames() -> TestResult {
         responder.wait_session_ready().await?;
 
         match responder.recv().await? {
+            ClientMessage::Proposal(payload) => {
+                let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
+                assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+            }
+            other => panic!("expected buffered proposal after reconnect, got {other:?}"),
+        }
+
+        responder.approve(json!({ "ok": true })).await?;
+        assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+        proposer.wait_session_ready().await?;
+        responder.wait_session_ready().await?;
+
+        let request_id = proposer.request(json!({ "method": "get_status" })).await?;
+        match responder.recv().await? {
             ClientMessage::Request(payload) => {
                 assert_eq!(payload.request_id, request_id);
                 let request: serde_json::Value = serde_json::from_slice(&payload.request.0)?;
                 assert_eq!(request, json!({ "method": "get_status" }));
             }
-            other => panic!("expected buffered request after reconnect, got {other:?}"),
+            other => panic!("expected request after reconnect, got {other:?}"),
         }
 
         responder

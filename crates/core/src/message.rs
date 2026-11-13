@@ -108,6 +108,26 @@ impl MessageType {
             MessageType::SessionReady => "session_ready",
         }
     }
+
+    /// Whether this kind belongs to the pairing handshake.
+    pub fn is_handshake(&self) -> bool {
+        matches!(
+            self,
+            MessageType::Proposal | MessageType::Approve | MessageType::Reject
+        )
+    }
+
+    /// Whether this kind is application traffic carried on the session topic.
+    pub fn is_application(&self) -> bool {
+        matches!(
+            self,
+            MessageType::Request
+                | MessageType::Response
+                | MessageType::Ack
+                | MessageType::Disconnect
+                | MessageType::SessionDelete
+        )
+    }
 }
 
 impl From<&Payload> for MessageType {

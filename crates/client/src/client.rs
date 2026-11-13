@@ -6,7 +6,7 @@ use wallet_session_core::{
     crypto::MessageCipher,
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
-    message::{Message, MessageId, Topic},
+    message::{Message, MessageId, MessageType, Topic},
     payload::{
         AckPayload, ApprovePayload, DisconnectPayload, Opaque, ProposalPayload, RejectPayload,
         RequestPayload, ResponsePayload,
@@ -104,12 +104,14 @@ pub struct Client<C> {
     identity: IdentityKey,
     inbox: mpsc::UnboundedReceiver<Inbox>,
     inbox_tx: mpsc::UnboundedSender<Inbox>,
-    pairing: Link<C>,
+    pairing: Option<Link<C>>,
     session_link: Option<Link<C>>,
     session: Session,
     handshake: Handshake,
     did: DidKey,
     pending: VecDeque<ClientMessage>,
+    pending_events: VecDeque<ClientEvent>,
+    pairing_approval: Option<MessageId>,
 }
 
 impl<C> Client<C>
@@ -137,12 +139,14 @@ where
             identity,
             inbox,
             inbox_tx,
-            pairing,
+            pairing: Some(pairing),
             session_link: None,
             session,
             handshake: Handshake::Idle,
             did,
             pending: VecDeque::new(),
+            pending_events: VecDeque::new(),
+            pairing_approval: None,
         })
     }
 
@@ -156,7 +160,10 @@ where
     }
 
     fn active_link(&self) -> &Link<C> {
-        self.session_link.as_ref().unwrap_or(&self.pairing)
+        self.session_link
+            .as_ref()
+            .or(self.pairing.as_ref())
+            .expect("the client always has a pairing or session link")
     }
 
     fn active_topic(&self) -> &Topic {
@@ -164,13 +171,16 @@ where
     }
 
     fn link_mut(&mut self, topic: &Topic) -> Option<&mut Link<C>> {
-        if self.pairing.topic == *topic {
-            Some(&mut self.pairing)
-        } else {
-            self.session_link
-                .as_mut()
-                .filter(|link| link.topic == *topic)
+        if self
+            .pairing
+            .as_ref()
+            .is_some_and(|link| link.topic == *topic)
+        {
+            return self.pairing.as_mut();
         }
+        self.session_link
+            .as_mut()
+            .filter(|link| link.topic == *topic)
     }
 
     /// Await the next relay frame, folding in transport lifecycle events.
@@ -193,6 +203,16 @@ where
                         return Err(ClientError::Closed);
                     }
                     log::debug!("relay link closed for inactive topic {topic}");
+                }
+                Some(Inbox::Retire(topic)) => {
+                    if self
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|link| link.topic == topic)
+                    {
+                        log::debug!("retiring pairing link {}", topic.log_tag());
+                        self.retire_pairing();
+                    }
                 }
                 None => return Err(ClientError::Closed),
             }
@@ -249,24 +269,41 @@ where
                 }
             }
         }
-        self.session.state = SessionState::Active;
+        if matches!(self.handshake, Handshake::Established) {
+            self.session.state = SessionState::Active;
+        }
         Ok(())
     }
 
-    /// Seal and send a message on the active topic, returning its envelope id.
+    /// Seal and send a message, returning its envelope id.
     ///
-    /// Before the handshake the active topic is the pairing topic; after it,
-    /// the derived session topic. Handshake messages use [`Client::propose`],
-    /// [`Client::approve`] and [`Client::reject`], which always stay on the
-    /// pairing topic.
+    /// Handshake messages use [`Client::propose`], [`Client::approve`] and
+    /// [`Client::reject`] and stay on the pairing topic. Application messages
+    /// are refused until the handshake is established, then use the derived
+    /// session topic.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<MessageId> {
         let topic = match message {
             ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_) => {
+                if matches!(self.handshake, Handshake::Established) {
+                    return Err(ClientError::UnexpectedHandshake);
+                }
                 self.session.pairing_topic.clone()
             }
-            _ => self.active_topic().clone(),
+            _ => {
+                self.ensure_session_active()?;
+                self.active_topic().clone()
+            }
         };
         self.send_on(&topic, message).await
+    }
+
+    /// Whether application messages may be sent.
+    fn ensure_session_active(&self) -> Result<()> {
+        if matches!(self.handshake, Handshake::Established) {
+            Ok(())
+        } else {
+            Err(ClientError::SessionNotActive)
+        }
     }
 
     async fn send_on(&mut self, topic: &Topic, message: &ClientMessage) -> Result<MessageId> {
@@ -402,6 +439,24 @@ where
             .cipher
             .open(&aad, &sealed)?;
 
+        // The pairing key is for the handshake only. Application kinds on the
+        // pairing topic are dropped even after the session is established, so
+        // a leaked pairing key cannot bypass the session key. Conversely, the
+        // session topic carries application traffic only.
+        let allowed = if topic == self.session.pairing_topic {
+            wire.kind.is_handshake() || wire.kind == MessageType::Ack
+        } else {
+            wire.kind.is_application()
+        };
+        if !allowed {
+            log::warn!(
+                "dropping {} on topic {}",
+                wire.kind.as_str(),
+                topic.log_tag()
+            );
+            return Ok(None);
+        }
+
         // The counterpart is the sender of the first envelope that passes the
         // version, topic, identity, timestamp and authentication checks on the
         // pairing topic. It stays the counterpart for the session topic and
@@ -433,25 +488,38 @@ where
         }
 
         let message = ClientMessage::from_bytes(&bytes)?;
+        if message.message_type() != wire.kind {
+            log::warn!(
+                "dropping envelope: plaintext type does not match kind {}",
+                wire.kind.as_str()
+            );
+            return Ok(None);
+        }
 
         // acks are consumed by reliability
         if let ClientMessage::Ack(ack) = &message {
             let ack_id = ack.ack_id.clone();
+            let retires_pairing = topic == self.session.pairing_topic
+                && self.pairing_approval.as_ref() == Some(&ack_id);
             let link = self.link_mut(&topic).expect("topic was checked");
             link.replay.record(&id, &wire);
             link.reliability.mark_delivered(&ack_id);
+            if retires_pairing {
+                self.retire_pairing();
+            }
             return Ok(None);
         }
 
-        if topic != self.session.pairing_topic
+        // Once established, the pairing key may no longer create new handshake
+        // state. Retransmissions of the handshake were re-acked above.
+        if matches!(self.handshake, Handshake::Established)
             && matches!(
                 &message,
                 ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_)
             )
         {
-            return Err(ClientError::ProtocolViolation(
-                "handshake message on the session topic",
-            ));
+            log::warn!("dropping handshake message after establishment");
+            return Ok(None);
         }
 
         // An `approve` establishes the session while `observe` runs. Record it
@@ -497,12 +565,39 @@ where
 
     /// Non-blocking read of the next reliability event, if any.
     pub fn poll_event(&mut self) -> Option<ClientEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
         if let Some(link) = self.session_link.as_mut()
             && let Ok(event) = link.events.try_recv()
         {
             return Some(event);
         }
-        self.pairing.events.try_recv().ok()
+
+        let event = self.pairing.as_mut()?.events.try_recv().ok()?;
+        let approval_failed = matches!(
+            &event,
+            ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
+        );
+        if approval_failed {
+            self.pending_events.push_back(event);
+            self.retire_pairing();
+            return self.pending_events.pop_front();
+        }
+        Some(event)
+    }
+
+    /// Drop the pairing connection once the handshake no longer needs it.
+    ///
+    /// Events already queued by the link are kept for [`Client::poll_event`].
+    fn retire_pairing(&mut self) {
+        let Some(mut link) = self.pairing.take() else {
+            return;
+        };
+        log::debug!("retiring pairing link {}", link.topic.log_tag());
+        while let Ok(event) = link.events.try_recv() {
+            self.pending_events.push_back(event);
+        }
     }
 
     /// Update handshake state from an inbound pairing message.
@@ -514,6 +609,7 @@ where
                 }
                 let peer_public = decode_public_key(&proposal.ephemeral_public_key)?;
                 self.handshake = Handshake::PeerProposed { peer_public };
+                self.session.state = SessionState::ProposalReceived;
             }
             ClientMessage::Approve(approve) => {
                 let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
@@ -525,20 +621,28 @@ where
                 let (key, topic) = keypair.derive(&peer_public)?;
                 self.establish_session(key, topic)?;
             }
+            ClientMessage::Reject(_) => {
+                self.session.state = SessionState::Rejected;
+            }
             _ => {}
         }
         Ok(())
     }
 
-    /// Start the session-topic connection and keep the pairing link alive for
-    /// its acknowledgements and retransmissions.
+    /// Start the session-topic connection and keep the pairing link alive
+    /// until its handshake acknowledgements have had their retry window.
     fn establish_session(&mut self, key: SessionKey, topic: SessionTopic) -> Result<()> {
         if self.session_link.is_some() {
             return Err(ClientError::UnexpectedHandshake);
         }
 
         let session_topic = topic.as_topic().clone();
-        let mut cipher = self.pairing.cipher.clone();
+        let mut cipher = self
+            .pairing
+            .as_ref()
+            .ok_or(ClientError::Closed)?
+            .cipher
+            .clone();
         cipher.rekey(key.as_bytes());
         let link = Link::new(
             &self.config,
@@ -553,7 +657,30 @@ where
         self.session.topic = session_topic;
         self.handshake = Handshake::Established;
         self.session.state = SessionState::Active;
+        self.schedule_pairing_retirement();
         Ok(())
+    }
+
+    /// Retire the pairing connection after the handshake ack retry window.
+    fn schedule_pairing_retirement(&self) {
+        let window = self.pairing_retirement_window();
+        let inbox = self.inbox_tx.clone();
+        let topic = self.session.pairing_topic.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            let _ = inbox.send(Inbox::Retire(topic));
+        });
+    }
+
+    /// Upper bound on how long handshake retransmissions can still arrive.
+    fn pairing_retirement_window(&self) -> Duration {
+        let attempts = self.config.ack_max_attempts.min(31) as u32;
+        let factor = 2u32.saturating_pow(attempts.saturating_add(1));
+        self.config
+            .ack_base_delay
+            .saturating_mul(factor.saturating_sub(1))
+            .saturating_add(Duration::from_secs(1))
+            .max(Duration::from_secs(1))
     }
 
     /// Send a `proposal` carrying ephemeral public key.
@@ -588,22 +715,20 @@ where
         };
         let (key, topic) = keypair.derive(&peer_public)?;
         let pairing_topic = self.session.pairing_topic.clone();
-        self.send_on(&pairing_topic, &ClientMessage::Approve(payload))
+        let approve_id = self
+            .send_on(&pairing_topic, &ClientMessage::Approve(payload))
             .await?;
+        self.pairing_approval = Some(approve_id);
         self.establish_session(key, topic)?;
         Ok(())
     }
 
     /// Send a `reject` and move to `Rejected`.
     pub async fn reject(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
-        let topic = self.session.pairing_topic.clone();
-        self.send_on(
-            &topic,
-            &ClientMessage::Reject(RejectPayload {
-                code,
-                message: message.into(),
-            }),
-        )
+        self.send(&ClientMessage::Reject(RejectPayload {
+            code,
+            message: message.into(),
+        }))
         .await?;
         self.session.state = SessionState::Rejected;
         Ok(())
@@ -613,6 +738,7 @@ where
     ///
     /// The JSON value is encoded into the protocol's opaque `request` field.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
+        self.ensure_session_active()?;
         let id = random::id()?;
         let request_id = id.to_string();
         let payload = RequestPayload {
