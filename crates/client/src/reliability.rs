@@ -20,7 +20,7 @@ use wallet_session_core::{
 use crate::{error::ClientError, identity::unix_now, relay::Outbound};
 
 /// Events buffered between the reliability task and the client.
-const EVENT_CAPACITY: usize = 256;
+pub(crate) const EVENT_CAPACITY: usize = 256;
 
 /// Maximum messages kept for retransmission per link.
 const PENDING_CAPACITY: usize = 256;
@@ -88,12 +88,12 @@ impl Reliability {
     pub(crate) fn spawn(
         outbox: mpsc::Sender<Outbound>,
         ready: Arc<AtomicBool>,
+        events: mpsc::Sender<ClientEvent>,
         base_delay: Duration,
         max_attempts: usize,
         retransmit_spacing: Duration,
-    ) -> (Self, mpsc::Receiver<ClientEvent>) {
+    ) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
         let _retry = tokio::spawn(retry_loop(
             Arc::clone(&pending),
             Arc::clone(&ready),
@@ -104,18 +104,15 @@ impl Reliability {
             retransmit_spacing,
         ));
 
-        (
-            Self {
-                outbox,
-                pending,
-                ready,
-                events,
-                base_delay,
-                next_sequence: 0,
-                _retry,
-            },
-            events_rx,
-        )
+        Self {
+            outbox,
+            pending,
+            ready,
+            events,
+            base_delay,
+            next_sequence: 0,
+            _retry,
+        }
     }
 
     /// Emit an event to the application.
@@ -314,6 +311,25 @@ mod tests {
     use super::*;
     use wallet_session_core::{frame::RelayFrameBody, message::Topic};
 
+    fn spawn_reliability(
+        outbox: mpsc::Sender<Outbound>,
+        ready: Arc<AtomicBool>,
+        base_delay: Duration,
+        max_attempts: usize,
+        retransmit_spacing: Duration,
+    ) -> (Reliability, mpsc::Receiver<ClientEvent>) {
+        let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let reliability = Reliability::spawn(
+            outbox,
+            ready,
+            events,
+            base_delay,
+            max_attempts,
+            retransmit_spacing,
+        );
+        (reliability, events_rx)
+    }
+
     /// A distinct, valid message id for a test label.
     fn message_id(label: &str) -> MessageId {
         let mut bytes = [0u8; MessageId::LEN];
@@ -348,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn reports_a_full_outbound_queue() {
         let (outbox, _outbound) = mpsc::channel(1);
-        let (mut reliability, _events) = Reliability::spawn(
+        let (mut reliability, _events) = spawn_reliability(
             outbox,
             ready(true),
             Duration::from_secs(1),
@@ -373,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn delivers_when_acked() {
         let (outbox, mut outbound) = mpsc::channel(16);
-        let (mut reliability, mut events) = Reliability::spawn(
+        let (mut reliability, mut events) = spawn_reliability(
             outbox,
             ready(true),
             Duration::from_secs(1),
@@ -398,7 +414,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retries_then_fails() {
         let (outbox, mut outbound) = mpsc::channel(16);
-        let (mut reliability, mut events) = Reliability::spawn(
+        let (mut reliability, mut events) = spawn_reliability(
             outbox,
             ready(true),
             Duration::from_secs(1),
@@ -439,7 +455,7 @@ mod tests {
     async fn pauses_while_disconnected_and_flushes_on_reconnect() {
         let (outbox, mut outbound) = mpsc::channel(16);
         let ready = ready(false);
-        let (mut reliability, _events) = Reliability::spawn(
+        let (mut reliability, _events) = spawn_reliability(
             outbox,
             Arc::clone(&ready),
             Duration::from_secs(1),
@@ -479,7 +495,7 @@ mod tests {
     async fn flushes_pending_frames_in_order_and_with_spacing() {
         let (outbox, mut outbound) = mpsc::channel(16);
         let ready = ready(false);
-        let (mut reliability, _events) = Reliability::spawn(
+        let (mut reliability, _events) = spawn_reliability(
             outbox,
             Arc::clone(&ready),
             Duration::from_secs(60),
@@ -508,7 +524,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expired_frames_fail_without_sending() {
         let (outbox, mut outbound) = mpsc::channel(16);
-        let (mut reliability, mut events) = Reliability::spawn(
+        let (mut reliability, mut events) = spawn_reliability(
             outbox,
             ready(false),
             Duration::from_secs(1),
@@ -534,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn fail_all_reports_every_pending_frame() {
         let (outbox, _outbound) = mpsc::channel(16);
-        let (mut reliability, mut events) = Reliability::spawn(
+        let (mut reliability, mut events) = spawn_reliability(
             outbox,
             ready(false),
             Duration::from_secs(1),

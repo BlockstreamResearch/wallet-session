@@ -126,5 +126,20 @@ async fn run() -> TestResult {
         "expected a Delivered event for {request_id}, got {delivered:?}"
     );
 
+    // A second request has no response. `next_event` must process the inbound
+    // ack itself, without the application calling `recv`.
+    let second = proposer
+        .request(json!({ "method": "wait_for_ack" }))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, second),
+        other => panic!("expected the second request, got {other:?}"),
+    }
+    let event = tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await??;
+    assert!(
+        matches!(event, ClientEvent::Delivered { ref id } if id.to_string() == second),
+        "expected a Delivered event for {second}, got {event:?}"
+    );
+
     Ok(())
 }

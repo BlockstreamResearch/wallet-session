@@ -26,7 +26,7 @@ use crate::{
     messages::{ClientMessage, RequestId},
     random,
     relay::{INBOX_CAPACITY, Inbox, Transport},
-    reliability::{ClientEvent, Reliability, requires_ack},
+    reliability::{ClientEvent, EVENT_CAPACITY, Reliability, requires_ack},
     replay::{self, Observation, ReplayMemory},
     session::{Role, Session, SessionState},
 };
@@ -39,9 +39,6 @@ const MAX_TS_SKEW_SECS: u64 = 300;
 
 /// Maximum application messages buffered while waiting for `session_ready`.
 const MAX_PENDING_MESSAGES: usize = 256;
-
-/// Maximum reliability events held after their link is retired.
-const MAX_PENDING_EVENTS: usize = 256;
 
 /// Local side of the session handshake.
 enum Handshake {
@@ -64,7 +61,6 @@ struct Link<C> {
     topic: Topic,
     _transport: Transport,
     reliability: Reliability,
-    events: mpsc::Receiver<ClientEvent>,
     cipher: C,
     replay: ReplayMemory,
     ready: bool,
@@ -81,6 +77,7 @@ where
         role: Role,
         topic: Topic,
         cipher: C,
+        events: mpsc::Sender<ClientEvent>,
         inbox: &mpsc::Sender<Inbox>,
     ) -> Self {
         let ready = Arc::new(AtomicBool::new(false));
@@ -92,9 +89,10 @@ where
             Arc::clone(&ready),
             inbox.clone(),
         );
-        let (reliability, events) = Reliability::spawn(
+        let reliability = Reliability::spawn(
             transport.outbound(),
             ready,
+            events,
             config.ack_base_delay,
             config.ack_max_attempts,
             config.retransmit_spacing,
@@ -104,7 +102,6 @@ where
             topic,
             _transport: transport,
             reliability,
-            events,
             cipher,
             replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
             ready: false,
@@ -113,18 +110,27 @@ where
     }
 }
 
+/// A paired client.
+///
+/// Inbound work, including acknowledgements, retransmissions and relay
+/// lifecycle events, is driven by [`Client::recv`], [`Client::next_event`] and
+/// [`Client::wait_session_ready`]. Applications must keep one of those futures
+/// pending; [`Client::send`] and [`Client::poll_event`] do not drive the receive
+/// path. Cancelling a receive future after it has dequeued a frame may lose
+/// that frame, but the peer retransmits anything left unacknowledged.
 pub struct Client<C> {
     config: ClientConfig,
     identity: IdentityKey,
     inbox: mpsc::Receiver<Inbox>,
     inbox_tx: mpsc::Sender<Inbox>,
+    events: mpsc::Receiver<ClientEvent>,
+    events_tx: mpsc::Sender<ClientEvent>,
     pairing: Option<Link<C>>,
     session_link: Option<Link<C>>,
     session: Session,
     handshake: Handshake,
     did: DidKey,
     pending: VecDeque<ClientMessage>,
-    pending_events: VecDeque<ClientEvent>,
     pairing_approval: Option<MessageId>,
 }
 
@@ -146,7 +152,16 @@ where
         config.validate()?;
         let did = identity.did();
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
-        let pairing = Link::new(&config, &identity, role, topic.clone(), cipher, &inbox_tx);
+        let (events_tx, events) = mpsc::channel(EVENT_CAPACITY);
+        let pairing = Link::new(
+            &config,
+            &identity,
+            role,
+            topic.clone(),
+            cipher,
+            events_tx.clone(),
+            &inbox_tx,
+        );
         let session = Session::new(topic, role);
 
         Ok(Self {
@@ -154,13 +169,14 @@ where
             identity,
             inbox,
             inbox_tx,
+            events,
+            events_tx,
             pairing: Some(pairing),
             session_link: None,
             session,
             handshake: Handshake::Idle,
             did,
             pending: VecDeque::new(),
-            pending_events: VecDeque::new(),
             pairing_approval: None,
         })
     }
@@ -198,41 +214,82 @@ where
             .filter(|link| link.topic == *topic)
     }
 
+    /// Apply one transport lifecycle item, returning a relay frame if present.
+    fn handle_inbox_item(&mut self, item: Inbox) -> Result<Option<RelayFrame>> {
+        match item {
+            Inbox::Frame(frame) => {
+                if matches!(&frame.body, RelayFrameBody::SessionReady) {
+                    self.set_ready(&frame.topic);
+                }
+                Ok(Some(frame))
+            }
+            Inbox::Connected(topic) => {
+                self.set_connected(&topic, true);
+                Ok(None)
+            }
+            Inbox::Ready(topic) => {
+                self.set_ready(&topic);
+                Ok(None)
+            }
+            Inbox::Disconnected(topic) => {
+                self.set_connected(&topic, false);
+                Ok(None)
+            }
+            Inbox::Closed { topic, reason } => {
+                if let Some(link) = self.link_mut(&topic) {
+                    link.reliability.fail_all();
+                }
+                self.set_connected(&topic, false);
+                if topic == *self.active_topic() {
+                    return Err(ClientError::Transport(reason));
+                }
+                log::debug!("relay link closed for inactive topic {}", topic.log_tag());
+                Ok(None)
+            }
+            Inbox::Retire(topic) => {
+                if self
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|link| link.topic == topic)
+                {
+                    log::debug!("retiring pairing link {}", topic.log_tag());
+                    self.retire_pairing();
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// Await the next relay frame, folding in transport lifecycle events.
     async fn next_frame(&mut self) -> Result<RelayFrame> {
         loop {
-            match self.inbox.recv().await {
-                Some(Inbox::Frame(frame)) => {
-                    if matches!(&frame.body, RelayFrameBody::SessionReady) {
-                        self.set_ready(&frame.topic);
-                    }
-                    return Ok(frame);
-                }
-                Some(Inbox::Connected(topic)) => self.set_connected(&topic, true),
-                Some(Inbox::Ready(topic)) => self.set_ready(&topic),
-                Some(Inbox::Disconnected(topic)) => self.set_connected(&topic, false),
-                Some(Inbox::Closed { topic, reason }) => {
-                    if let Some(link) = self.link_mut(&topic) {
-                        link.reliability.fail_all();
-                    }
-                    self.set_connected(&topic, false);
-                    if topic == *self.active_topic() {
-                        return Err(ClientError::Transport(reason));
-                    }
-                    log::debug!("relay link closed for inactive topic {}", topic.log_tag());
-                }
-                Some(Inbox::Retire(topic)) => {
-                    if self
-                        .pairing
-                        .as_ref()
-                        .is_some_and(|link| link.topic == topic)
-                    {
-                        log::debug!("retiring pairing link {}", topic.log_tag());
-                        self.retire_pairing();
-                    }
-                }
-                None => return Err(ClientError::Closed),
+            let item = self.inbox.recv().await.ok_or(ClientError::Closed)?;
+            if let Some(frame) = self.handle_inbox_item(item)? {
+                return Ok(frame);
             }
+        }
+    }
+
+    /// Process one relay frame's body.
+    async fn handle_frame(
+        &mut self,
+        frame: RelayFrame,
+        deliver: bool,
+    ) -> Result<Option<ClientMessage>> {
+        if matches!(&frame.body, RelayFrameBody::Message { .. }) {
+            return self.handle_message_frame(frame, deliver).await;
+        }
+
+        match frame.body {
+            RelayFrameBody::SessionReady => Ok(None),
+            RelayFrameBody::PeerDisconnected => {
+                if frame.topic == *self.active_topic() {
+                    self.session.state = SessionState::Disconnected;
+                    return Err(ClientError::PeerDisconnected);
+                }
+                Ok(None)
+            }
+            RelayFrameBody::Message { .. } => unreachable!("handled above"),
         }
     }
 
@@ -275,24 +332,13 @@ where
     pub async fn wait_session_ready(&mut self) -> Result<()> {
         while !self.is_ready() {
             let frame = self.next_frame().await?;
-            match frame.body {
-                RelayFrameBody::SessionReady => {}
-                RelayFrameBody::PeerDisconnected => {
-                    if frame.topic == *self.active_topic() {
-                        self.session.state = SessionState::Disconnected;
-                        return Err(ClientError::PeerDisconnected);
-                    }
-                }
-                RelayFrameBody::Message { .. } => {
-                    // Consume acknowledgements and retransmissions that
-                    // arrive while waiting. Application messages are queued
-                    // for the next `recv` while there is room; otherwise they
-                    // are left unacknowledged so the peer retries later.
-                    let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
-                    if let Some(message) = self.handle_message_frame(frame, deliver).await? {
-                        self.pending.push_back(message);
-                    }
-                }
+            // Consume acknowledgements and retransmissions that arrive while
+            // waiting. Application messages are queued for the next `recv`
+            // while there is room; otherwise they are left unacknowledged so
+            // the peer retries later.
+            let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
+            if let Some(message) = self.handle_frame(frame, deliver).await? {
+                self.pending.push_back(message);
             }
         }
         if matches!(self.handshake, Handshake::Established) {
@@ -371,6 +417,8 @@ where
         link.reliability.dispatch(frame, requires_ack(kind), ts)
     }
 
+    /// Receive the next application message, processing acknowledgements and
+    /// lifecycle traffic while waiting.
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         if let Some(message) = self.pending.pop_front() {
             return Ok(message);
@@ -378,19 +426,8 @@ where
 
         loop {
             let frame = self.next_frame().await?;
-            match frame.body {
-                RelayFrameBody::Message { .. } => {
-                    if let Some(message) = self.handle_message_frame(frame, true).await? {
-                        return Ok(message);
-                    }
-                }
-                RelayFrameBody::SessionReady => {}
-                RelayFrameBody::PeerDisconnected => {
-                    if frame.topic == *self.active_topic() {
-                        self.session.state = SessionState::Disconnected;
-                        return Err(ClientError::PeerDisconnected);
-                    }
-                }
+            if let Some(message) = self.handle_frame(frame, true).await? {
+                return Ok(message);
             }
         }
     }
@@ -657,50 +694,67 @@ where
     }
 
     /// Non-blocking read of the next reliability event, if any.
+    ///
+    /// This does not process inbound frames. Call [`Client::recv`] or
+    /// [`Client::next_event`] to drive acknowledgements and delivery.
     pub fn poll_event(&mut self) -> Option<ClientEvent> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Some(event);
-        }
-        if let Some(link) = self.session_link.as_mut()
-            && let Ok(event) = link.events.try_recv()
-        {
-            return Some(event);
-        }
-
-        let event = self.pairing.as_mut()?.events.try_recv().ok()?;
-        let approval_failed = matches!(
+        let event = self.events.try_recv().ok()?;
+        if matches!(
             &event,
             ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
-        );
-        if approval_failed {
-            self.push_pending_event(event);
+        ) {
             self.retire_pairing();
-            return self.pending_events.pop_front();
         }
         Some(event)
     }
 
-    /// Keep an event after its link is gone, within the bounded backlog.
-    fn push_pending_event(&mut self, event: ClientEvent) {
-        if self.pending_events.len() >= MAX_PENDING_EVENTS {
-            log::warn!("dropping client event: pending event queue is full");
-            return;
+    /// Await the next reliability event while processing inbound frames.
+    ///
+    /// Use this instead of polling [`Client::poll_event`] when acknowledgements
+    /// or lifecycle traffic may arrive while the application waits.
+    pub async fn next_event(&mut self) -> Result<ClientEvent> {
+        loop {
+            if let Ok(event) = self.events.try_recv() {
+                if matches!(
+                    &event,
+                    ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
+                ) {
+                    self.retire_pairing();
+                }
+                return Ok(event);
+            }
+
+            tokio::select! {
+                item = self.inbox.recv() => {
+                    let item = item.ok_or(ClientError::Closed)?;
+                    if let Some(frame) = self.handle_inbox_item(item)? {
+                        let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
+                        if let Some(message) = self.handle_frame(frame, deliver).await? {
+                            self.pending.push_back(message);
+                        }
+                    }
+                }
+                event = self.events.recv() => {
+                    let event = event.ok_or(ClientError::Closed)?;
+                    if matches!(
+                        &event,
+                        ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
+                    ) {
+                        self.retire_pairing();
+                    }
+                    return Ok(event);
+                }
+            }
         }
-        self.pending_events.push_back(event);
     }
 
     /// Drop the pairing connection once the handshake no longer needs it.
-    ///
-    /// Events already queued by the link are kept for [`Client::poll_event`].
     fn retire_pairing(&mut self) {
         let Some(mut link) = self.pairing.take() else {
             return;
         };
         log::debug!("retiring pairing link {}", link.topic.log_tag());
         link.reliability.fail_all();
-        while let Ok(event) = link.events.try_recv() {
-            self.push_pending_event(event);
-        }
     }
 
     /// Update handshake state from an inbound pairing message.
@@ -753,6 +807,7 @@ where
             self.session.role,
             session_topic.clone(),
             cipher,
+            self.events_tx.clone(),
             &self.inbox_tx,
         );
 
