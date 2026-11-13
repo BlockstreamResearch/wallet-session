@@ -96,6 +96,7 @@ impl LiveRelay {
 
     fn config(&self) -> ClientConfig {
         ClientConfig::new(self.url.clone())
+            .with_insecure_ws()
             .with_audience(self.audience.clone())
             .with_token_ttl(TOKEN_TTL)
             .with_idle_timeout(Duration::from_secs(30))

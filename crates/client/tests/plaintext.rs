@@ -124,9 +124,12 @@ async fn run() -> TestResult {
     let topic = pairing.topic()?;
 
     let proposer_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
         .with_audience(AUDIENCE)
         .with_registration_id("reg-1");
-    let responder_config = ClientConfig::new(&relay_url).with_audience(AUDIENCE);
+    let responder_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
+        .with_audience(AUDIENCE);
 
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
     let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
@@ -232,9 +235,12 @@ async fn run_reconnect() -> TestResult {
     let topic = pairing.topic()?;
 
     let proposer_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
         .with_audience(AUDIENCE)
         .with_registration_id("reg-1");
-    let responder_config = ClientConfig::new(&relay_url).with_audience(AUDIENCE);
+    let responder_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
+        .with_audience(AUDIENCE);
     let responder_seed = Seed::from_bytes([2u8; 32]);
 
     let mut proposer = Client::connect(
@@ -341,9 +347,12 @@ async fn run_expiry() -> TestResult {
     let topic = pairing.topic()?;
 
     let proposer_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
         .with_audience(AUDIENCE)
         .with_registration_id("reg-1");
-    let responder_config = ClientConfig::new(&relay_url).with_audience(AUDIENCE);
+    let responder_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
+        .with_audience(AUDIENCE);
 
     let mut proposer = Client::connect(
         proposer_config,
@@ -678,7 +687,9 @@ async fn run_retransmission() -> TestResult {
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
 
     let mut responder = Client::connect(
-        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
         responder_identity,
         Role::Responder,
         topic.clone(),
@@ -764,7 +775,9 @@ async fn run_pairing_topic_guard() -> TestResult {
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
 
     let mut responder = Client::connect(
-        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
         responder_identity,
         Role::Responder,
         topic.clone(),
@@ -867,7 +880,9 @@ async fn run_oversized_frame() -> TestResult {
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
 
     let mut responder = Client::connect(
-        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
         responder_identity,
         Role::Responder,
         topic.clone(),
@@ -934,7 +949,9 @@ async fn run_recoverable_bad_frames() -> TestResult {
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
 
     let mut responder = Client::connect(
-        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
         responder_identity,
         Role::Responder,
         topic.clone(),
@@ -1035,7 +1052,9 @@ async fn run_identities() -> TestResult {
     let foreign_identity = IdentityKey::from_seed(&Seed::from_bytes([9u8; 32]));
 
     let mut responder = Client::connect(
-        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
         responder_identity.clone(),
         Role::Responder,
         topic.clone(),

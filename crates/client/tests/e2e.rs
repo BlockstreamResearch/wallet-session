@@ -45,9 +45,12 @@ async fn run() -> TestResult {
     let key = *pairing.as_bytes();
 
     let proposer_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
         .with_audience(AUDIENCE)
         .with_registration_id("reg-1");
-    let responder_config = ClientConfig::new(&relay_url).with_audience(AUDIENCE);
+    let responder_config = ClientConfig::new(&relay_url)
+        .with_insecure_ws()
+        .with_audience(AUDIENCE);
 
     let mut proposer = Client::connect(
         proposer_config,

@@ -30,6 +30,12 @@ pub enum ClientError {
     #[error("relay connection closed")]
     Closed,
 
+    #[error("relay transport failed: {0}")]
+    Transport(&'static str),
+
+    #[error("invalid client configuration: {0}")]
+    InvalidConfig(&'static str),
+
     #[error("client outbound queue is full")]
     Busy,
 

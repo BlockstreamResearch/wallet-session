@@ -1,17 +1,22 @@
-use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
+
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::{
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior, interval_at, sleep_until},
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Bytes, Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Bytes, Error as TungsteniteError, Message,
+        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
+    },
 };
 use wallet_session_core::{
     connection::{ConnectionQuery, Role},
-    frame::RelayFrame,
+    frame::{RelayFrame, RelayFrameBody},
     message::Topic,
 };
 
@@ -43,17 +48,41 @@ pub(crate) enum Inbox {
     /// A relay frame received from the relay.
     Frame(RelayFrame),
 
-    /// The connection for `topic` is established (initial or after reconnect).
+    /// The socket for `topic` is established (initial or after reconnect).
     Connected(Topic),
+
+    /// The relay reported `session_ready` for `topic`.
+    Ready(Topic),
 
     /// The connection for `topic` was lost; a reconnect is starting.
     Disconnected(Topic),
 
-    /// Reconnect attempts for `topic` were exhausted.
-    Closed(Topic),
+    /// Reconnect attempts for `topic` were exhausted or permanently rejected.
+    Closed { topic: Topic, reason: &'static str },
 
     /// The client no longer needs the pairing connection for `topic`.
     Retire(Topic),
+}
+
+/// Why one connection attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEnd {
+    /// The client is shutting down.
+    Shutdown,
+
+    /// Retry after the configured backoff.
+    Reconnect { reason: &'static str },
+
+    /// Retry immediately, for example after a token-expiry close.
+    ReconnectNow { reason: &'static str },
+
+    /// Do not retry.
+    Fatal { reason: &'static str },
+}
+
+struct ConnectionResult {
+    end: ConnectionEnd,
+    saw_session_ready: bool,
 }
 
 /// A reconnecting relay connection for one topic and role.
@@ -63,7 +92,14 @@ pub(crate) enum Inbox {
 /// socket swap. Inbound events go to the shared channel owned by the client.
 pub(crate) struct Transport {
     outbound: mpsc::Sender<Outbound>,
+    shutdown: watch::Sender<bool>,
     _task: JoinHandle<()>,
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 impl Transport {
@@ -76,6 +112,7 @@ impl Transport {
         inbox: mpsc::Sender<Inbox>,
     ) -> Self {
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let _task = tokio::spawn(connection_task(
             config,
             identity,
@@ -83,9 +120,14 @@ impl Transport {
             topic.clone(),
             outbound_rx,
             inbox,
+            shutdown_rx,
         ));
 
-        Self { outbound, _task }
+        Self {
+            outbound,
+            shutdown,
+            _task,
+        }
     }
 
     /// Cloneable handle to the outbound writer.
@@ -101,37 +143,112 @@ async fn connection_task(
     topic: Topic,
     mut outbound: mpsc::Receiver<Outbound>,
     inbox: mpsc::Sender<Inbox>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
+    let mut retries = 0usize;
     let mut delay = config.reconnect_initial_delay;
-    let mut attempt = 0usize;
 
     loop {
-        match connect_once(&config, &identity, role, &topic).await {
-            Ok(stream) => {
-                attempt = 0;
-                delay = config.reconnect_initial_delay;
-                let _ = inbox.send(Inbox::Connected(topic.clone())).await;
+        let connected = tokio::select! {
+            biased;
+            result = connect_with_timeout(&config, &identity, role, &topic) => result,
+            _ = shutdown.changed() => return,
+        };
 
-                if !run_connection(stream, &mut outbound, &inbox, &config).await {
-                    return; // all senders dropped: shutting down
+        let end = match connected {
+            Ok(stream) => {
+                let _ = inbox.send(Inbox::Connected(topic.clone())).await;
+                let result =
+                    run_connection(stream, &mut outbound, &inbox, &mut shutdown, &config).await;
+                if result.saw_session_ready {
+                    retries = 0;
+                    delay = config.reconnect_initial_delay;
                 }
-                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
+                result.end
             }
             Err(error) => {
-                log::debug!("relay connect failed: {error}");
+                let end = classify_connect_error(&error);
+                if let ConnectionEnd::Reconnect { reason } | ConnectionEnd::Fatal { reason } = end {
+                    log::debug!("relay connect failed: {reason}");
+                }
+                end
+            }
+        };
+
+        match end {
+            ConnectionEnd::Shutdown => return,
+            ConnectionEnd::Fatal { reason } => {
+                let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                return;
+            }
+            ConnectionEnd::ReconnectNow { reason } => {
+                if retries >= config.reconnect_max_attempts {
+                    let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                    return;
+                }
+                retries += 1;
                 let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
             }
+            ConnectionEnd::Reconnect { reason } => {
+                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
+                if retries >= config.reconnect_max_attempts {
+                    let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = shutdown.changed() => return,
+                }
+                retries += 1;
+                delay = delay.saturating_mul(2).min(config.reconnect_max_delay);
+            }
         }
+    }
+}
 
-        attempt += 1;
-        if attempt >= config.reconnect_max_attempts {
-            log::warn!("relay reconnect attempts exhausted");
-            let _ = inbox.send(Inbox::Closed(topic.clone())).await;
-            return;
+async fn connect_with_timeout(
+    config: &ClientConfig,
+    identity: &IdentityKey,
+    role: Role,
+    topic: &Topic,
+) -> Result<RelayStream> {
+    tokio::time::timeout(
+        config.connect_timeout,
+        connect_once(config, identity, role, topic),
+    )
+    .await
+    .map_err(|_| crate::error::ClientError::Timeout)?
+}
+
+fn classify_connect_error(error: &crate::error::ClientError) -> ConnectionEnd {
+    use crate::error::ClientError;
+
+    match error {
+        ClientError::InvalidConfig(_) => ConnectionEnd::Fatal {
+            reason: "invalid client configuration",
+        },
+        ClientError::Url(_) => ConnectionEnd::Fatal {
+            reason: "invalid relay URL",
+        },
+        ClientError::Query(_) => ConnectionEnd::Fatal {
+            reason: "invalid connection parameters",
+        },
+        ClientError::Random(_) => ConnectionEnd::Fatal {
+            reason: "random source failure",
+        },
+        ClientError::WebSocket(TungsteniteError::Http(response))
+            if response.status().is_client_error() =>
+        {
+            ConnectionEnd::Fatal {
+                reason: "relay rejected connection",
+            }
         }
-
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(config.reconnect_max_delay);
+        ClientError::Timeout => ConnectionEnd::Reconnect {
+            reason: "relay connect timed out",
+        },
+        _ => ConnectionEnd::Reconnect {
+            reason: "relay connection failed",
+        },
     }
 }
 
@@ -175,40 +292,44 @@ fn websocket_config() -> WebSocketConfig {
         .max_write_buffer_size(MAX_WRITE_BUFFER_BYTES)
 }
 
-/// Drive one WebSocket session. Returns `true` to reconnect, `false` to stop.
+/// Drive one WebSocket session.
 async fn run_connection(
     stream: RelayStream,
     outbound: &mut mpsc::Receiver<Outbound>,
     inbox: &mpsc::Sender<Inbox>,
+    shutdown: &mut watch::Receiver<bool>,
     config: &ClientConfig,
-) -> bool {
+) -> ConnectionResult {
     let (mut sink, mut source) = stream.split();
 
     let mut ping = interval_at(Instant::now() + config.ping_interval, config.ping_interval);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut awaiting_pong = false;
     let mut pong_deadline = Instant::now();
+    let mut idle_deadline = Instant::now() + config.idle_timeout;
+    let mut saw_session_ready = false;
 
-    loop {
+    let end = loop {
         tokio::select! {
             outbound_item = outbound.recv() => match outbound_item {
                 Some(Outbound::Frame(frame)) => {
                     let Ok(text) = serde_json::to_string(&frame) else {
-                        return true;
+                        break ConnectionEnd::Reconnect { reason: "invalid outbound frame" };
                     };
                     log::trace!(
                         "client -> topic={} bytes={}",
                         frame.topic.log_tag(),
                         text.len()
                     );
-                    if sink.send(Message::text(text)).await.is_err() {
-                        return true;
+                    if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
+                        break ConnectionEnd::Reconnect { reason: "relay write timed out" };
                     }
                 }
-                None => return false,
+                None => break ConnectionEnd::Shutdown,
             },
             message = source.next() => match message {
                 Some(Ok(Message::Text(text))) => {
+                    idle_deadline = Instant::now() + config.idle_timeout;
                     match serde_json::from_str::<RelayFrame>(&text) {
                         Ok(frame) => {
                             log::trace!(
@@ -216,38 +337,118 @@ async fn run_connection(
                                 frame.topic.log_tag(),
                                 text.len()
                             );
+                            if matches!(&frame.body, RelayFrameBody::SessionReady)
+                                && !saw_session_ready
+                            {
+                                saw_session_ready = true;
+                                if inbox.send(Inbox::Ready(frame.topic.clone())).await.is_err() {
+                                    break ConnectionEnd::Shutdown;
+                                }
+                            }
                             if inbox.send(Inbox::Frame(frame)).await.is_err() {
-                                return false;
+                                break ConnectionEnd::Shutdown;
                             }
                         }
                         Err(error) => log::warn!("invalid relay frame: {error}"),
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    let _ = sink.send(Message::Pong(payload)).await;
+                    idle_deadline = Instant::now() + config.idle_timeout;
+                    if !send_with_timeout(
+                        &mut sink,
+                        Message::Pong(payload),
+                        config.write_timeout,
+                    )
+                    .await
+                    {
+                        break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                    }
                 }
-                Some(Ok(Message::Pong(_))) => awaiting_pong = false,
-                Some(Ok(Message::Close(_))) => return true,
-                Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Pong(_))) => {
+                    idle_deadline = Instant::now() + config.idle_timeout;
+                    awaiting_pong = false;
+                }
+                Some(Ok(Message::Close(frame))) => break classify_close(frame),
+                Some(Ok(Message::Binary(_) | Message::Frame(_))) => {
+                    idle_deadline = Instant::now() + config.idle_timeout;
+                }
                 Some(Err(error)) => {
                     log::debug!("relay read error: {error}");
-                    return true;
+                    break ConnectionEnd::Reconnect { reason: "relay connection lost" };
                 }
-                None => return true,
+                None => break ConnectionEnd::Reconnect { reason: "relay connection closed" },
             },
             _ = ping.tick(), if !awaiting_pong => {
                 awaiting_pong = true;
                 pong_deadline = Instant::now() + config.pong_timeout;
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                    return true;
+                if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), config.write_timeout).await {
+                    break ConnectionEnd::Reconnect { reason: "relay write timed out" };
                 }
             }
             _ = sleep_until(pong_deadline), if awaiting_pong => {
                 log::debug!("relay pong timed out");
-                return true;
+                break ConnectionEnd::Reconnect { reason: "relay pong timed out" };
             }
+            _ = sleep_until(idle_deadline) => {
+                log::debug!("relay idle timeout");
+                break ConnectionEnd::Reconnect { reason: "relay idle timeout" };
+            }
+            _ = shutdown.changed() => break ConnectionEnd::Shutdown,
         }
+    };
+
+    if matches!(end, ConnectionEnd::Shutdown) {
+        close_socket(&mut sink, config.close_timeout).await;
     }
+
+    ConnectionResult {
+        end,
+        saw_session_ready,
+    }
+}
+
+fn classify_close(frame: Option<CloseFrame>) -> ConnectionEnd {
+    match frame {
+        Some(frame) if frame.code == CloseCode::Policy => match frame.reason.as_str() {
+            "token expired" => ConnectionEnd::ReconnectNow {
+                reason: "token expired",
+            },
+            "role already taken" => ConnectionEnd::Fatal {
+                reason: "role already taken",
+            },
+            _ => ConnectionEnd::Fatal {
+                reason: "relay policy rejection",
+            },
+        },
+        _ => ConnectionEnd::Reconnect {
+            reason: "relay closed connection",
+        },
+    }
+}
+
+async fn send_with_timeout<S>(sink: &mut S, message: Message, timeout: Duration) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(timeout, sink.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn close_socket<S>(sink: &mut S, timeout: Duration)
+where
+    S: Sink<Message> + Unpin,
+{
+    let close = async {
+        let frame = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "client shutdown".into(),
+        };
+        let _ = sink.send(Message::Close(Some(frame))).await;
+        let _ = sink.close().await;
+    };
+    let _ = tokio::time::timeout(timeout, close).await;
 }
 
 #[cfg(test)]
@@ -260,5 +461,88 @@ mod tests {
         assert_eq!(config.max_message_size, Some(MAX_RELAY_FRAME_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_RELAY_FRAME_BYTES));
         assert_eq!(config.max_write_buffer_size, MAX_WRITE_BUFFER_BYTES);
+    }
+
+    struct PendingSink;
+
+    impl Sink<Message> for PendingSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_timeout_fails_a_stalled_sink() {
+        let mut sink = PendingSink;
+        assert!(
+            !send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await
+        );
+    }
+
+    #[test]
+    fn classifies_policy_closes() {
+        let close = |code: CloseCode, reason: &str| {
+            Some(CloseFrame {
+                code,
+                reason: reason.into(),
+            })
+        };
+
+        assert_eq!(
+            classify_close(close(CloseCode::Policy, "token expired")),
+            ConnectionEnd::ReconnectNow {
+                reason: "token expired"
+            }
+        );
+        assert_eq!(
+            classify_close(close(CloseCode::Policy, "role already taken")),
+            ConnectionEnd::Fatal {
+                reason: "role already taken"
+            }
+        );
+        assert_eq!(
+            classify_close(close(CloseCode::Policy, "something else")),
+            ConnectionEnd::Fatal {
+                reason: "relay policy rejection"
+            }
+        );
+        assert_eq!(
+            classify_close(close(CloseCode::Normal, "")),
+            ConnectionEnd::Reconnect {
+                reason: "relay closed connection"
+            }
+        );
+        assert_eq!(
+            classify_close(None),
+            ConnectionEnd::Reconnect {
+                reason: "relay closed connection"
+            }
+        );
     }
 }

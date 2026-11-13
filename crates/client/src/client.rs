@@ -135,6 +135,7 @@ where
         topic: Topic,
         cipher: C,
     ) -> Result<Self> {
+        config.validate()?;
         let did = identity.did();
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
         let pairing = Link::new(&config, &identity, role, topic.clone(), cipher, &inbox_tx);
@@ -194,19 +195,18 @@ where
         loop {
             match self.inbox.recv().await {
                 Some(Inbox::Frame(frame)) => {
-                    if matches!(&frame.body, RelayFrameBody::SessionReady)
-                        && let Some(link) = self.link_mut(&frame.topic)
-                    {
-                        link.ready = true;
+                    if matches!(&frame.body, RelayFrameBody::SessionReady) {
+                        self.set_ready(&frame.topic);
                     }
                     return Ok(frame);
                 }
                 Some(Inbox::Connected(topic)) => self.set_connected(&topic, true),
+                Some(Inbox::Ready(topic)) => self.set_ready(&topic),
                 Some(Inbox::Disconnected(topic)) => self.set_connected(&topic, false),
-                Some(Inbox::Closed(topic)) => {
+                Some(Inbox::Closed { topic, reason }) => {
                     self.set_connected(&topic, false);
                     if topic == *self.active_topic() {
-                        return Err(ClientError::Closed);
+                        return Err(ClientError::Transport(reason));
                     }
                     log::debug!("relay link closed for inactive topic {}", topic.log_tag());
                 }
@@ -230,7 +230,11 @@ where
         let Some(link) = self.link_mut(topic) else {
             return;
         };
-        link.reliability.set_connected(connected);
+
+        // A socket is not ready until the relay reports `session_ready`.
+        link.ready = false;
+        link.reliability.set_connected(false);
+
         if connected {
             if link.saw_disconnect {
                 link.saw_disconnect = false;
@@ -238,14 +242,21 @@ where
                     link.reliability.emit(ClientEvent::Reconnected);
                 }
             }
-        } else {
-            link.ready = false;
-            if !link.saw_disconnect {
-                link.saw_disconnect = true;
-                if active {
-                    link.reliability.emit(ClientEvent::Reconnecting);
-                }
+        } else if !link.saw_disconnect {
+            link.saw_disconnect = true;
+            if active {
+                link.reliability.emit(ClientEvent::Reconnecting);
             }
+        }
+    }
+
+    fn set_ready(&mut self, topic: &Topic) {
+        let Some(link) = self.link_mut(topic) else {
+            return;
+        };
+        if !link.ready {
+            link.ready = true;
+            link.reliability.set_connected(true);
         }
     }
 
