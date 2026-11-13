@@ -40,6 +40,9 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// Process-unique prefix so two test clients don't share a nonce space.
 static PREFIX_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Data the test cipher refuses to open, standing in for a bad AEAD tag.
+const TAMPERED: &[u8] = b"plaintext-tampered";
+
 /// Test-only passthrough cipher: no encryption, but a valid nonce sequence.
 #[derive(Debug, Clone)]
 pub struct PlaintextCipher {
@@ -84,6 +87,9 @@ impl MessageCipher for PlaintextCipher {
     }
 
     fn open(&self, _aad: &[u8], sealed: &SealedPayload) -> Result<Vec<u8>, CipherError> {
+        if sealed.data.as_bytes() == TAMPERED {
+            return Err(CipherError::Decrypt);
+        }
         Ok(sealed.data.as_bytes().to_vec())
     }
 
@@ -456,6 +462,33 @@ fn client_frame(
         ts.as_secs(),
         sealed.nonce,
         sealed.data,
+    );
+    Ok(RelayFrame {
+        v: 1,
+        id: message_id(id),
+        topic: topic.clone(),
+        body: RelayFrameBody::Message {
+            payload: serde_json::to_string(&wire)?,
+        },
+    })
+}
+
+/// Build a frame carrying arbitrary envelope data, bypassing a real cipher.
+fn envelope_frame(
+    topic: &Topic,
+    from: DidKey,
+    id: &str,
+    kind: MessageType,
+    nonce: [u8; 24],
+    data: &[u8],
+) -> Result<RelayFrame, Box<dyn std::error::Error>> {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let wire = Envelope::new(
+        kind,
+        from,
+        ts.as_secs(),
+        Nonce::new(nonce.to_vec())?,
+        Ciphertext::new(data.to_vec()),
     );
     Ok(RelayFrame {
         v: 1,
@@ -866,6 +899,105 @@ async fn run_oversized_frame() -> TestResult {
         tokio::time::timeout(Duration::from_millis(500), responder.recv()).await
     {
         panic!("oversized frame was delivered: {message:?}");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn recoverable_bad_frames_are_dropped() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_recoverable_bad_frames()).await??;
+    Ok(())
+}
+
+/// A malformed envelope, a failed AEAD open, and plaintext that is not a client
+/// message must not end the receive loop. The next valid message is delivered.
+async fn run_recoverable_bad_frames() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url).with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    let malformed = RelayFrame {
+        v: 1,
+        id: message_id("malformed-envelope"),
+        topic: raw.topic.clone(),
+        body: RelayFrameBody::Message {
+            payload: "not json".to_owned(),
+        },
+    };
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&malformed)?))
+        .await?;
+
+    let bad_plaintext = envelope_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "bad-plaintext",
+        MessageType::Request,
+        [11u8; 24],
+        b"not a client message",
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&bad_plaintext)?))
+        .await?;
+
+    let bad_tag = envelope_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "bad-tag",
+        MessageType::Request,
+        [12u8; 24],
+        TAMPERED,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&bad_tag)?))
+        .await?;
+
+    let valid = request_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "valid-after-bad",
+        "valid-request",
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&valid)?))
+        .await?;
+
+    match tokio::time::timeout(Duration::from_secs(2), responder.recv()).await?? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "valid-request"),
+        other => panic!("expected the valid request, got {other:?}"),
+    }
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("valid-after-bad")),
+        other => panic!("expected an ack for the valid request, got {other:?}"),
     }
 
     Ok(())

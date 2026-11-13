@@ -208,7 +208,7 @@ where
                     if topic == *self.active_topic() {
                         return Err(ClientError::Closed);
                     }
-                    log::debug!("relay link closed for inactive topic {topic}");
+                    log::debug!("relay link closed for inactive topic {}", topic.log_tag());
                 }
                 Some(Inbox::Retire(topic)) => {
                     if self
@@ -388,11 +388,20 @@ where
         };
 
         if self.link_mut(&topic).is_none() {
-            log::warn!("dropping frame for unknown topic {topic}");
+            log::warn!("dropping frame for unknown topic {}", topic.log_tag());
             return Ok(None);
         }
 
-        let wire: Message = serde_json::from_str(&payload)?;
+        let wire: Message = match serde_json::from_str(&payload) {
+            Ok(wire) => wire,
+            Err(error) => {
+                log::warn!(
+                    "dropping malformed envelope on topic {}: {error}",
+                    topic.log_tag()
+                );
+                return Ok(None);
+            }
+        };
 
         if wire.from == self.did {
             log::warn!("dropping frame from own identity {}", wire.from);
@@ -445,11 +454,21 @@ where
             nonce: wire.nonce.clone(),
             data: wire.data.clone(),
         };
-        let bytes = self
+        let bytes = match self
             .link_mut(&topic)
             .expect("topic was checked")
             .cipher
-            .open(&aad, &sealed)?;
+            .open(&aad, &sealed)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!(
+                    "dropping unauthenticated envelope on topic {}: {error}",
+                    topic.log_tag()
+                );
+                return Ok(None);
+            }
+        };
 
         // The pairing key is for the handshake only. Application kinds on the
         // pairing topic are dropped even after the session is established, so
@@ -519,7 +538,16 @@ where
             Observation::New => {}
         }
 
-        let message = ClientMessage::from_bytes(&bytes)?;
+        let message = match ClientMessage::from_bytes(&bytes) {
+            Ok(message) => message,
+            Err(error) => {
+                log::warn!(
+                    "dropping malformed plaintext on topic {}: {error}",
+                    topic.log_tag()
+                );
+                return Ok(None);
+            }
+        };
         if message.message_type() != wire.kind {
             log::warn!(
                 "dropping envelope: plaintext type does not match kind {}",

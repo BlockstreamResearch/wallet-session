@@ -157,7 +157,11 @@ async fn connect_once(
     let mut url = url::Url::parse(&config.relay_url)?;
     url.set_query(Some(&query));
 
-    log::debug!("connecting to relay {url}");
+    log::debug!(
+        "connecting to relay host={} topic={}",
+        url.host_str().unwrap_or("?"),
+        topic.log_tag()
+    );
     let (stream, _response) =
         connect_async_with_config(url.as_str(), Some(websocket_config()), false).await?;
     Ok(stream)
@@ -192,7 +196,11 @@ async fn run_connection(
                     let Ok(text) = serde_json::to_string(&frame) else {
                         return true;
                     };
-                    log::trace!("client -> topic={} frame={text}", frame.topic);
+                    log::trace!(
+                        "client -> topic={} bytes={}",
+                        frame.topic.log_tag(),
+                        text.len()
+                    );
                     if sink.send(Message::text(text)).await.is_err() {
                         return true;
                     }
@@ -203,7 +211,11 @@ async fn run_connection(
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<RelayFrame>(&text) {
                         Ok(frame) => {
-                            log::trace!("client <- topic={} frame={text}", frame.topic);
+                            log::trace!(
+                                "client <- topic={} bytes={}",
+                                frame.topic.log_tag(),
+                                text.len()
+                            );
                             if inbox.send(Inbox::Frame(frame)).await.is_err() {
                                 return false;
                             }

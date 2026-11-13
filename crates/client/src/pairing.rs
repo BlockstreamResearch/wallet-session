@@ -44,7 +44,7 @@ impl PairingKey {
         let bytes = codec::decode(encoded)?;
         let bytes: [u8; 32] = bytes
             .try_into()
-            .map_err(|_| ClientError::PairingUri(format!("bad pairing key length: {encoded}")))?;
+            .map_err(|_| ClientError::PairingUri("bad pairing key length".to_owned()))?;
         Ok(Self(bytes))
     }
 }
@@ -75,9 +75,9 @@ impl PairingUri {
     }
 
     pub fn parse(uri: &str) -> Result<Self> {
-        let url = Url::parse(uri).map_err(|error| ClientError::PairingUri(error.to_string()))?;
+        let url = Url::parse(uri).map_err(|_| ClientError::PairingUri("invalid URI".to_owned()))?;
         if url.scheme() != CONNECTION_SCHEME || url.host_str() != Some("pairing") {
-            return Err(ClientError::PairingUri(uri.to_owned()));
+            return Err(ClientError::PairingUri("not a pairing URI".to_owned()));
         }
 
         let mut key = None;
@@ -91,8 +91,9 @@ impl PairingUri {
         }
 
         Ok(Self {
-            key: key.ok_or_else(|| ClientError::PairingUri(uri.to_owned()))?,
-            relay: relay.ok_or_else(|| ClientError::PairingUri(uri.to_owned()))?,
+            key: key.ok_or_else(|| ClientError::PairingUri("missing pairing key".to_owned()))?,
+            relay: relay
+                .ok_or_else(|| ClientError::PairingUri("missing relay endpoint".to_owned()))?,
         })
     }
 }
@@ -131,5 +132,38 @@ mod tests {
     #[test]
     fn rejects_unknown_scheme() {
         assert!(PairingUri::parse("https://example.com").is_err());
+    }
+
+    #[test]
+    fn errors_do_not_echo_pairing_secrets_or_uris() {
+        let key = codec::encode(&[9u8; 32]);
+        let uri = format!("https://example.com/?key={key}&relay=wss://relay.example.com");
+        let error = PairingUri::parse(&uri).expect_err("wrong scheme");
+        let text = error.to_string();
+        assert!(!text.contains(&key), "{text}");
+        assert!(!text.contains("relay.example.com"), "{text}");
+
+        let short = codec::encode(&[1u8; 31]);
+        let error = PairingKey::from_base64(&short).expect_err("short key");
+        let text = error.to_string();
+        assert!(!text.contains(&short), "{text}");
+    }
+
+    #[test]
+    fn missing_fields_have_fixed_errors() {
+        let error = PairingUri::parse("bsconnect://pairing?relay=wss://relay.example.com")
+            .expect_err("missing key");
+        assert_eq!(
+            error.to_string(),
+            "invalid pairing uri: missing pairing key"
+        );
+
+        let key = codec::encode(&[0u8; 32]);
+        let error = PairingUri::parse(&format!("bsconnect://pairing?key={key}"))
+            .expect_err("missing relay");
+        assert_eq!(
+            error.to_string(),
+            "invalid pairing uri: missing relay endpoint"
+        );
     }
 }
