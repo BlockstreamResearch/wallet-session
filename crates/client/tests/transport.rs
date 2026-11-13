@@ -96,6 +96,13 @@ async fn policy_close_is_terminal_and_surfaced() -> TestResult {
         matches!(error, ClientError::Transport("role already taken")),
         "unexpected error: {error:?}"
     );
+    let again = timeout(Duration::from_millis(100), client.recv())
+        .await?
+        .expect_err("the terminal state must not hang");
+    assert!(
+        matches!(again, ClientError::Transport("role already taken")),
+        "unexpected repeated error: {again:?}"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(

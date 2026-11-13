@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,6 +43,22 @@ const MAX_TS_SKEW_SECS: u64 = 300;
 /// Maximum application messages buffered while waiting for `session_ready`.
 const MAX_PENDING_MESSAGES: usize = 256;
 
+/// A terminal client state that no later operation can leave.
+#[derive(Clone, Copy)]
+enum Terminal {
+    Closed,
+    Transport(&'static str),
+}
+
+impl Terminal {
+    fn error(self) -> ClientError {
+        match self {
+            Terminal::Closed => ClientError::Closed,
+            Terminal::Transport(reason) => ClientError::Transport(reason),
+        }
+    }
+}
+
 /// Local side of the session handshake.
 enum Handshake {
     /// No handshake activity yet.
@@ -61,6 +80,7 @@ struct Link<C> {
     topic: Topic,
     _transport: Transport,
     reliability: Reliability,
+    shared_ready: Arc<AtomicBool>,
     cipher: C,
     replay: ReplayMemory,
     ready: bool,
@@ -91,7 +111,7 @@ where
         );
         let reliability = Reliability::spawn(
             transport.outbound(),
-            ready,
+            Arc::clone(&ready),
             events,
             config.ack_base_delay,
             config.ack_max_attempts,
@@ -102,6 +122,7 @@ where
             topic,
             _transport: transport,
             reliability,
+            shared_ready: ready,
             cipher,
             replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
             ready: false,
@@ -132,6 +153,7 @@ pub struct Client<C> {
     did: DidKey,
     pending: VecDeque<ClientMessage>,
     pairing_approval: Option<MessageId>,
+    terminal: Option<Terminal>,
 }
 
 impl<C> Client<C>
@@ -178,6 +200,7 @@ where
             did,
             pending: VecDeque::new(),
             pairing_approval: None,
+            terminal: None,
         })
     }
 
@@ -187,14 +210,30 @@ where
 
     /// Whether the relay session on the active topic is ready.
     pub fn is_ready(&self) -> bool {
-        self.active_link().ready
+        self.active_link().is_some_and(|link| link.ready)
     }
 
-    fn active_link(&self) -> &Link<C> {
-        self.session_link
-            .as_ref()
-            .or(self.pairing.as_ref())
-            .expect("the client always has a pairing or session link")
+    fn active_link(&self) -> Option<&Link<C>> {
+        self.session_link.as_ref().or(self.pairing.as_ref())
+    }
+
+    fn terminal_error(&self) -> Option<ClientError> {
+        self.terminal.map(Terminal::error)
+    }
+
+    /// Stop all traffic and release both relay links.
+    fn close(&mut self, terminal: Terminal) {
+        self.terminal = Some(terminal);
+        if let Some(link) = self.pairing.as_mut() {
+            link.ready = false;
+            link.shared_ready.store(false, Ordering::Relaxed);
+        }
+        if let Some(link) = self.session_link.as_mut() {
+            link.ready = false;
+            link.shared_ready.store(false, Ordering::Relaxed);
+        }
+        self.pairing = None;
+        self.session_link = None;
     }
 
     fn active_topic(&self) -> &Topic {
@@ -236,11 +275,13 @@ where
                 Ok(None)
             }
             Inbox::Closed { topic, reason } => {
+                let active = topic == *self.active_topic();
                 if let Some(link) = self.link_mut(&topic) {
                     link.reliability.fail_all();
                 }
                 self.set_connected(&topic, false);
-                if topic == *self.active_topic() {
+                if active {
+                    self.close(Terminal::Transport(reason));
                     return Err(ClientError::Transport(reason));
                 }
                 log::debug!("relay link closed for inactive topic {}", topic.log_tag());
@@ -284,6 +325,7 @@ where
             RelayFrameBody::SessionReady => Ok(None),
             RelayFrameBody::PeerDisconnected => {
                 if frame.topic == *self.active_topic() {
+                    self.mark_not_ready(&frame.topic);
                     self.session.state = SessionState::Disconnected;
                     return Err(ClientError::PeerDisconnected);
                 }
@@ -301,6 +343,7 @@ where
 
         // A socket is not ready until the relay reports `session_ready`.
         link.ready = false;
+        link.shared_ready.store(false, Ordering::Relaxed);
 
         if connected {
             if link.saw_disconnect {
@@ -322,6 +365,15 @@ where
             return;
         };
         link.ready = true;
+        link.shared_ready.store(true, Ordering::Relaxed);
+    }
+
+    fn mark_not_ready(&mut self, topic: &Topic) {
+        let Some(link) = self.link_mut(topic) else {
+            return;
+        };
+        link.ready = false;
+        link.shared_ready.store(false, Ordering::Relaxed);
     }
 
     /// Wait until the relay reports the active topic ready.
@@ -330,6 +382,9 @@ where
     /// handshake it waits on the derived session topic. Messages received
     /// while waiting are queued for the next [`Client::recv`].
     pub async fn wait_session_ready(&mut self) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         while !self.is_ready() {
             let frame = self.next_frame().await?;
             // Consume acknowledgements and retransmissions that arrive while
@@ -354,6 +409,9 @@ where
     /// are refused until the handshake is established, then use the derived
     /// session topic.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<MessageId> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         let topic = match message {
             ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_) => {
                 if matches!(self.handshake, Handshake::Established) {
@@ -377,7 +435,7 @@ where
         if !matches!(self.handshake, Handshake::Established) {
             return Err(ClientError::SessionNotActive);
         }
-        if !self.active_link().ready {
+        if !self.active_link().is_some_and(|link| link.ready) {
             return Err(ClientError::NotReady);
         }
         Ok(())
@@ -420,6 +478,9 @@ where
     /// Receive the next application message, processing acknowledgements and
     /// lifecycle traffic while waiting.
     pub async fn recv(&mut self) -> Result<ClientMessage> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         if let Some(message) = self.pending.pop_front() {
             return Ok(message);
         }
@@ -616,6 +677,13 @@ where
             return Ok(None);
         }
 
+        if matches!(
+            &message,
+            ClientMessage::Disconnect(_) | ClientMessage::SessionDelete(_)
+        ) {
+            self.session.state = SessionState::Disconnected;
+        }
+
         // acks are consumed by reliability
         if let ClientMessage::Ack(ack) = &message {
             let ack_id = ack.ack_id.clone();
@@ -713,6 +781,9 @@ where
     /// Use this instead of polling [`Client::poll_event`] when acknowledgements
     /// or lifecycle traffic may arrive while the application waits.
     pub async fn next_event(&mut self) -> Result<ClientEvent> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         loop {
             if let Ok(event) = self.events.try_recv() {
                 if matches!(
@@ -769,11 +840,14 @@ where
                 self.session.state = SessionState::ProposalReceived;
             }
             ClientMessage::Approve(approve) => {
+                if !matches!(self.handshake, Handshake::Proposed { .. }) {
+                    return Err(ClientError::UnexpectedHandshake);
+                }
                 let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
                 let Handshake::Proposed { keypair } =
                     std::mem::replace(&mut self.handshake, Handshake::Idle)
                 else {
-                    return Err(ClientError::UnexpectedHandshake);
+                    unreachable!("state checked above");
                 };
                 let (key, topic) = keypair.derive(&peer_public)?;
                 self.establish_session(key, topic)?;
@@ -843,6 +917,9 @@ where
 
     /// Send a `proposal` carrying ephemeral public key.
     pub async fn propose(&mut self, proposal: Value) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         if !matches!(self.handshake, Handshake::Idle) {
             return Err(ClientError::UnexpectedHandshake);
         }
@@ -866,6 +943,9 @@ where
     /// Send an `approve` carrying ephemeral public key and switch to the
     /// session topic and key.
     pub async fn approve(&mut self, approval: Value) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         let Handshake::PeerProposed { peer_public } = self.handshake else {
             return Err(ClientError::UnexpectedHandshake);
         };
@@ -902,6 +982,9 @@ where
     ///
     /// The JSON value is encoded into the protocol's opaque `request` field.
     pub async fn request(&mut self, request: Value) -> Result<RequestId> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         self.ensure_session_ready()?;
         let id = random::id()?;
         let request_id = id.to_string();
@@ -949,6 +1032,7 @@ where
         }))
         .await?;
         self.session.state = SessionState::Disconnected;
+        self.close(Terminal::Closed);
         Ok(())
     }
 }

@@ -13,8 +13,8 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
 };
 use wallet_session_client::{
-    AckPayload, Client, ClientConfig, ClientError, ClientMessage, IdentityKey, Opaque, PairingKey,
-    ProposalPayload, RequestPayload, Role, Seed, SessionState,
+    AckPayload, ApprovePayload, Client, ClientConfig, ClientError, ClientMessage, IdentityKey,
+    Opaque, PairingKey, ProposalPayload, RequestPayload, Role, Seed, SessionState,
     handshake::{EphemeralKeyPair, decode_public_key},
 };
 use wallet_session_relay::{
@@ -382,6 +382,10 @@ async fn run_expiry() -> TestResult {
         "expected PeerDisconnected, got {outcome:?}"
     );
     assert_eq!(proposer.session().state, SessionState::Disconnected);
+    assert!(
+        !proposer.is_ready(),
+        "peer disconnection must clear readiness"
+    );
 
     Ok(())
 }
@@ -840,6 +844,97 @@ async fn run_pairing_topic_guard() -> TestResult {
         ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("session-frame")),
         other => panic!("expected session ack, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_approve_preserves_the_handshake() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_unexpected_approve()).await??;
+    Ok(())
+}
+
+/// A bad `approve` in the wrong handshake state must not discard the peer's
+/// proposal, so the real approval can still complete.
+async fn run_unexpected_approve() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut raw).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let keypair = EphemeralKeyPair::generate();
+    let proposal = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: keypair.public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+    });
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "unexpected-proposal",
+        &proposal,
+        &mut cipher,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+
+    let bad = ClientMessage::Approve(ApprovePayload {
+        ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+        approval: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+    });
+    let bad = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "unexpected-approve",
+        &bad,
+        &mut cipher,
+    )?;
+    raw.send(WsMessage::text(serde_json::to_string(&bad)?))
+        .await?;
+    assert!(
+        matches!(
+            responder.recv().await,
+            Err(ClientError::UnexpectedHandshake)
+        ),
+        "an approve in the wrong state must be rejected"
+    );
+
+    // The original PeerProposed state is still intact.
+    responder.approve(json!({ "ok": true })).await?;
 
     Ok(())
 }

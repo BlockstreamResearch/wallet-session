@@ -331,6 +331,7 @@ async fn run_connection(
 
     let end = loop {
         tokio::select! {
+            biased;
             outbound_item = outbound.recv() => match outbound_item {
                 Some(Outbound::Frame(frame)) => {
                     let Ok(text) = serde_json::to_string(&frame) else {

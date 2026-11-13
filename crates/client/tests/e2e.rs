@@ -3,8 +3,8 @@ use std::{sync::Arc, time::Duration};
 use serde_json::json;
 use tokio::net::TcpListener;
 use wallet_session_client::{
-    Client, ClientConfig, ClientEvent, ClientMessage, IdentityKey, PairingKey, Role, Seed,
-    XChaCha20Poly1305Cipher,
+    Client, ClientConfig, ClientError, ClientEvent, ClientMessage, IdentityKey, PairingKey, Role,
+    Seed, SessionState, XChaCha20Poly1305Cipher,
 };
 use wallet_session_relay::{
     config::NativeRelayTransportConfig,
@@ -140,6 +140,21 @@ async fn run() -> TestResult {
         matches!(event, ClientEvent::Delivered { ref id } if id.to_string() == second),
         "expected a Delivered event for {second}, got {event:?}"
     );
+
+    // A local disconnect is terminal: later operations fail instead of hanging.
+    proposer.disconnect("done", 4000).await?;
+    match tokio::time::timeout(Duration::from_secs(2), responder.recv()).await?? {
+        ClientMessage::Disconnect(payload) => assert_eq!(payload.code, 4000),
+        other => panic!("expected disconnect, got {other:?}"),
+    }
+    assert_eq!(responder.session().state, SessionState::Disconnected);
+    assert!(matches!(proposer.recv().await, Err(ClientError::Closed)));
+    assert!(matches!(
+        proposer
+            .request(json!({ "method": "after_disconnect" }))
+            .await,
+        Err(ClientError::Closed)
+    ));
 
     Ok(())
 }
