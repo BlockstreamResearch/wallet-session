@@ -73,23 +73,28 @@ impl EphemeralKeyPair {
     ) -> Result<(SessionKey, SessionTopic), HandshakeError> {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer_public));
         let shared = Zeroizing::new(shared.to_bytes());
-        if shared.iter().all(|byte| *byte == 0) {
-            return Err(HandshakeError::WeakKey);
-        }
-
-        let hkdf = Hkdf::<Sha256>::new(None, shared.as_ref());
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        hkdf.expand(SESSION_KEY_INFO, key.as_mut())
-            .map_err(|_| HandshakeError::Derive)?;
-
-        let mut topic = Zeroizing::new([0u8; 32]);
-        hkdf.expand(SESSION_TOPIC_INFO, topic.as_mut())
-            .map_err(|_| HandshakeError::Derive)?;
-        let topic = Topic::new(topic.to_vec())?;
-
-        Ok((SessionKey(*key), SessionTopic(topic)))
+        derive_from_shared(&shared)
     }
+}
+
+/// Derive the session key and topic from an X25519 shared secret.
+fn derive_from_shared(shared: &[u8; 32]) -> Result<(SessionKey, SessionTopic), HandshakeError> {
+    if shared.iter().all(|byte| *byte == 0) {
+        return Err(HandshakeError::WeakKey);
+    }
+
+    let hkdf = Hkdf::<Sha256>::new(None, shared);
+
+    let mut key = Zeroizing::new([0u8; 32]);
+    hkdf.expand(SESSION_KEY_INFO, key.as_mut())
+        .map_err(|_| HandshakeError::Derive)?;
+
+    let mut topic = Zeroizing::new([0u8; 32]);
+    hkdf.expand(SESSION_TOPIC_INFO, topic.as_mut())
+        .map_err(|_| HandshakeError::Derive)?;
+    let topic = Topic::new(topic.to_vec())?;
+
+    Ok((SessionKey(*key), SessionTopic(topic)))
 }
 
 /// Decode a base64url public key from a handshake payload.
@@ -153,5 +158,28 @@ mod tests {
         let decoded = decode_public_key(&pair.public_key_encoded()).expect("decode");
         assert_eq!(decoded, pair.public_key());
         assert!(decode_public_key("nope").is_err());
+    }
+
+    #[test]
+    fn session_derivation_known_answer() {
+        let shared: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let (key, topic) = derive_from_shared(&shared).expect("derive");
+
+        let expected_key =
+            wallet_session_core::codec::decode("9ftlKHcaDzlqxuX9UqBAt9hnPpJ9JCZ7O9HAWPAEvcg")
+                .expect("key vector");
+        assert_eq!(key.as_bytes().as_slice(), expected_key.as_slice());
+        assert_eq!(
+            topic.as_topic().to_string(),
+            "V-btxMBvFE8yC3YzeMsNae9_4Zr0Cyw5A8VvKl2C9sE"
+        );
+    }
+
+    #[test]
+    fn rejects_all_zero_shared_secret() {
+        assert!(matches!(
+            derive_from_shared(&[0u8; 32]),
+            Err(HandshakeError::WeakKey)
+        ));
     }
 }

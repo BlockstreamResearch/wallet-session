@@ -132,7 +132,9 @@ Roles are not permanent: a client can be a proposer in one session and a respond
 
 ## 7. Topic
 
-Topic is a 32-byte value. Topics are derived from initial pairing key clients as a SHA256 hash.
+A topic is a 32-byte value, encoded as unpadded base64url on the wire.
+
+The pairing topic is `SHA-256(pairing_key)`. The session topic is derived from the X25519 shared secret with HKDF-SHA256 (§9.1); it is not a hash of the pairing key. No other topic is derived by hashing a bearer key.
 
 ## 8. Pairing
 
@@ -170,7 +172,27 @@ Session establishment flow:
 6. proposer derives the same session key;
 7. both parties continues exchanging messages by the new session key, using the same session.
 
-The Relay binds each connection to one topic. After deriving the session topic, each peer opens a new connection to it. The pairing connection remains available for handshake acknowledgements and retransmissions, because those messages belong to the pairing topic and key; application traffic uses the session topic.
+### 9.1 Session key and topic derivation
+
+Both peers use the 32-byte X25519 shared secret as HKDF-SHA256 input key
+material. `salt = None` in the HKDF API is the RFC 5869 salt of 32 zero bytes.
+
+```
+PRK = HKDF-Extract(salt = 32 zero bytes, IKM = shared_secret)
+
+session_key         = HKDF-Expand(PRK, info = "wallet-session/v1/session-key",   L = 32)
+session_topic_bytes = HKDF-Expand(PRK, info = "wallet-session/v1/session-topic", L = 32)
+```
+
+The two Expand calls are independent and both start from the same PRK. The
+session topic used on the wire is `base64url(session_topic_bytes)`. A shared
+secret of all zero bytes is rejected.
+
+See Appendix A for a known-answer vector.
+
+The Relay binds each connection to one topic. After deriving the session topic, each peer opens a new connection to it.
+
+The pairing connection carries handshake kinds only. After the `approve` frame is acknowledged, or after the handshake retry window expires, the pairing connection MAY be closed. The default retry window is 127 seconds: a 2-second base delay, five retries with doubling, and a 1-second margin. A peer MUST tolerate closure of the pairing connection after that window; application traffic MUST use the session topic.
 
 
 # Part II. Relay Protocol
@@ -211,6 +233,14 @@ The envelope `id` and `topic` are those of the enclosing relay frame and are not
 
 Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key.
 
+Kind/topic confinement:
+
+- The pairing topic carries only `proposal`, `approve`, `reject` and `ack`.
+- The session topic carries only `request`, `response`, `ack`, `disconnect` and `session_delete`.
+- An `ack` travels on the topic of the envelope it acknowledges.
+
+A receiver MUST drop a frame whose kind is not allowed on its topic. After the handshake is established, a new handshake kind on the pairing topic is also dropped; only retransmissions already in the replay memory may be re-acknowledged.
+
 A receiver processes each `message` frame in the following order. An envelope rejected at any step is neither delivered to the application nor acknowledged.
 
 1. Reject an unsupported `version`, a `topic` it is not subscribed to, a `from` equal to its own identity and, once the counterpart is established, a `from` other than the counterpart's.
@@ -232,7 +262,7 @@ Each sender generates a fresh random sender prefix per key. The counter incremen
 
 Nonce scheme:
 ```
-nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
+nonce = sender_prefix (16 random bytes) || counter (8-byte unsigned big-endian, starts at 0)
 ```
 
 The AEAD AAD concatenates the following fields, each prefixed with its length:
@@ -257,6 +287,10 @@ Relay `type`s (the frame's `type` field):
 
 WebSocket ping and pong control frames are not relay frames.
 
+The plaintext in `payload` is a JSON object with a `type` discriminator. Its
+value MUST equal the authenticated envelope `kind`; a receiver MUST reject a
+plaintext whose `type` does not match `kind`.
+
 Message `kind`s carried inside `payload`:
 
 `proposal` -- Propose a session; carries the ephemeral public key.
@@ -270,14 +304,17 @@ Message `kind`s carried inside `payload`:
 
 Payload shapes:
 
-- `proposal`: `{ ephemeralPublicKey, sessionExpiry, proposal }`
-- `approve`: `{ ephemeralPublicKey, approval }`
-- `reject`: `{ code, message }`
-- `request`: `{ requestId, request }`
-- `response`: `{ requestId, response }` or `{ requestId, error }`
-- `ack`: `{ ackId }`, where `ackId` is the `id` of the frame that carried the acknowledged message
-- `disconnect`: `{ reason, code, message }`
-- `session_delete`: `{ code, message }`
+- `proposal`: `{ "type": "proposal", "ephemeralPublicKey": ..., "sessionExpiry": ..., "proposal": ... }`
+- `approve`: `{ "type": "approve", "ephemeralPublicKey": ..., "approval": ... }`
+- `reject`: `{ "type": "reject", "code": ..., "message": ... }`
+- `request`: `{ "type": "request", "requestId": ..., "request": ... }`
+- `response`: `{ "type": "response", "requestId": ..., "response": ... }` or `{ "type": "response", "requestId": ..., "error": ... }`
+- `ack`: `{ "type": "ack", "ackId": ... }`, where `ackId` is the `id` of the frame that carried the acknowledged message
+- `disconnect`: `{ "type": "disconnect", "reason": ..., "code": ..., "message": ... }`
+- `session_delete`: `{ "type": "session_delete", "code": ..., "message": ... }`
+
+A `response` carries exactly one of `response` and `error`; the absent field is
+omitted, not encoded as `null`.
 
 `proposal`, `approval`, `request`, `response`, and `error` are opaque application data, encoded as base64url strings.
 
@@ -300,5 +337,23 @@ The relay pings every 30 seconds and requires traffic from the peer within 10 se
 Token expiry is a disconnect cause: the relay closes with `1008` and reason `token expired` when `exp` passes. The client reconnects promptly with a new token, without applying the liveness backoff. Because the slot is in the reconnection grace, the reconnect follows the normal path: the counterpart may observe an additional `session_ready` and no `peer_disconnected`; only a reconnect that misses the grace produces `peer_disconnected`.
 
 A reconnect does not reset the client state of §10 and §13. The established counterpart, the replay memory and the outstanding messages belong to the pairing or session and its keys, not to the connection. A repeated `session_ready` does not start a new session. A peer that reconnects under a different identity is rejected by its counterpart (§10, step 1), even if the Relay admitted that identity to the slot after the grace window.
+
+## Appendix A. Test vectors
+
+### A.1 Session key and topic derivation
+
+```
+shared_secret  = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+PRK            = 46bd320605c5a6b6163ab70bc6345b92a5f908e79fe58979c23ebb47d1a5e307
+session_key    = f5fb6528771a0f396ac6e5fd52a040b7d8673e927d24267b3bd1c058f004bdc8
+session_topic  = 57e6edc4c06f144f320b763378cb0d69ef7fe19af40b2c3903c56f2a5d82f6c1
+```
+
+Encoded forms:
+
+```
+session_key_base64url   = 9ftlKHcaDzlqxuX9UqBAt9hnPpJ9JCZ7O9HAWPAEvcg
+session_topic_base64url = V-btxMBvFE8yC3YzeMsNae9_4Zr0Cyw5A8VvKl2C9sE
+```
 
 
