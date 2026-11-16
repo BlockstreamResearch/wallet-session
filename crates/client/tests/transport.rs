@@ -170,6 +170,54 @@ async fn token_expiry_reconnects_without_backoff() -> TestResult {
 }
 
 #[tokio::test]
+async fn stable_connections_reset_the_token_expiry_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let _ = socket
+                        .close(Some(CloseFrame {
+                            code: CloseCode::Policy,
+                            reason: "token expired".into(),
+                        }))
+                        .await;
+                });
+            }
+        })
+    };
+
+    let _client = connect(
+        addr,
+        config(addr)
+            .with_reconnect_max_attempts(1)
+            .with_connection_stability(Duration::from_millis(50)),
+    )
+    .await?;
+
+    timeout(Duration::from_secs(2), async {
+        while accepts.load(Ordering::Relaxed) < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stable token-expiry reconnects must not exhaust the retry budget");
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconnect_attempts_are_exactly_bounded() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

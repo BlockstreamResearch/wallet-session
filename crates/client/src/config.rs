@@ -57,6 +57,13 @@ pub struct ClientConfig {
 
     /// Maximum reconnect attempts before giving up.
     pub reconnect_max_attempts: usize,
+
+    /// How long a connection must stay up before it resets the reconnect budget.
+    ///
+    /// A connection waiting for its counterpart may never see `session_ready`,
+    /// but it is still healthy and should not exhaust its retries on token
+    /// expiry or ordinary network drops.
+    pub connection_stability: Duration,
 }
 
 impl ClientConfig {
@@ -81,6 +88,7 @@ impl ClientConfig {
             reconnect_initial_delay: Duration::from_millis(250),
             reconnect_max_delay: Duration::from_secs(5),
             reconnect_max_attempts: 5,
+            connection_stability: Duration::from_secs(30),
         }
     }
 
@@ -123,6 +131,7 @@ impl ClientConfig {
             (self.ping_interval, "ping_interval"),
             (self.pong_timeout, "pong_timeout"),
             (self.retransmit_spacing, "retransmit_spacing"),
+            (self.connection_stability, "connection_stability"),
         ] {
             if timeout.is_zero() {
                 return Err(ClientError::InvalidConfig(name));
@@ -215,6 +224,12 @@ impl ClientConfig {
         self.reconnect_max_attempts = attempts;
         self
     }
+
+    /// Set how long a connection must stay up to reset the reconnect budget.
+    pub fn with_connection_stability(mut self, stability: Duration) -> Self {
+        self.connection_stability = stability;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +273,7 @@ mod tests {
             ClientConfig::new("wss://relay.example.com").with_ping_interval(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_pong_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_retransmit_spacing(Duration::ZERO),
+            ClientConfig::new("wss://relay.example.com").with_connection_stability(Duration::ZERO),
         ] {
             assert!(matches!(
                 config.validate(),

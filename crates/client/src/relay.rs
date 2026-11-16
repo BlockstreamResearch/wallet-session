@@ -89,6 +89,7 @@ enum ConnectionEnd {
 struct ConnectionResult {
     end: ConnectionEnd,
     saw_session_ready: bool,
+    uptime: Duration,
 }
 
 /// A reconnecting relay connection for one topic and role.
@@ -179,7 +180,7 @@ async fn connection_task(
                 )
                 .await;
                 ready.store(false, Ordering::Relaxed);
-                if result.saw_session_ready {
+                if result.saw_session_ready || result.uptime >= config.connection_stability {
                     retries = 0;
                     delay = config.reconnect_initial_delay;
                 }
@@ -321,6 +322,7 @@ async fn run_connection(
     config: &ClientConfig,
 ) -> ConnectionResult {
     let (mut sink, mut source) = stream.split();
+    let started_at = Instant::now();
 
     let mut ping = interval_at(Instant::now() + config.ping_interval, config.ping_interval);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -426,6 +428,7 @@ async fn run_connection(
     ConnectionResult {
         end,
         saw_session_ready,
+        uptime: started_at.elapsed(),
     }
 }
 
