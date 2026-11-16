@@ -29,7 +29,7 @@ use crate::{
     messages::{ClientMessage, RequestId},
     random,
     relay::{INBOX_CAPACITY, Inbox, Transport},
-    reliability::{ClientEvent, EVENT_CAPACITY, Reliability, requires_ack},
+    reliability::{ClientEvent, DeliveryEvent, EVENT_CAPACITY, Reliability, requires_ack},
     replay::{self, Observation, ReplayMemory},
     session::{Role, Session, SessionState},
 };
@@ -91,13 +91,15 @@ impl<C> Link<C>
 where
     C: MessageCipher<Sealed = SealedPayload, Error = CipherError>,
 {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: &ClientConfig,
         identity: &IdentityKey,
         role: Role,
         topic: Topic,
         cipher: C,
-        events: mpsc::Sender<ClientEvent>,
+        lifecycle: mpsc::Sender<ClientEvent>,
+        outcomes: mpsc::UnboundedSender<DeliveryEvent>,
         inbox: &mpsc::Sender<Inbox>,
     ) -> Self {
         let ready = Arc::new(AtomicBool::new(false));
@@ -112,10 +114,12 @@ where
         let reliability = Reliability::spawn(
             transport.outbound(),
             Arc::clone(&ready),
-            events,
+            lifecycle,
+            outcomes,
             config.ack_base_delay,
             config.ack_max_attempts,
             config.retransmit_spacing,
+            config.retransmit_bytes_per_second,
         );
 
         Self {
@@ -146,13 +150,19 @@ where
 /// long-lived applications should keep one client alive rather than recreate
 /// it from the pairing key. Restart recovery requires persisting and restoring
 /// that state, which this crate does not implement.
+///
+/// Delivery outcomes reserve pending capacity until the application consumes
+/// them. With 256 pending messages or unconsumed outcomes per link, further
+/// sends return [`ClientError::Busy`] instead of dropping an outcome.
 pub struct Client<C> {
     config: ClientConfig,
     identity: IdentityKey,
     inbox: mpsc::Receiver<Inbox>,
     inbox_tx: mpsc::Sender<Inbox>,
-    events: mpsc::Receiver<ClientEvent>,
-    events_tx: mpsc::Sender<ClientEvent>,
+    lifecycle: mpsc::Receiver<ClientEvent>,
+    lifecycle_tx: mpsc::Sender<ClientEvent>,
+    outcomes: mpsc::UnboundedReceiver<DeliveryEvent>,
+    outcomes_tx: mpsc::UnboundedSender<DeliveryEvent>,
     pairing: Option<Link<C>>,
     session_link: Option<Link<C>>,
     session: Session,
@@ -181,14 +191,16 @@ where
         config.validate()?;
         let did = identity.did();
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
-        let (events_tx, events) = mpsc::channel(EVENT_CAPACITY);
+        let (lifecycle_tx, lifecycle) = mpsc::channel(EVENT_CAPACITY);
+        let (outcomes_tx, outcomes) = mpsc::unbounded_channel();
         let pairing = Link::new(
             &config,
             &identity,
             role,
             topic.clone(),
             cipher,
-            events_tx.clone(),
+            lifecycle_tx.clone(),
+            outcomes_tx.clone(),
             &inbox_tx,
         );
         let session = Session::new(topic, role);
@@ -198,8 +210,10 @@ where
             identity,
             inbox,
             inbox_tx,
-            events,
-            events_tx,
+            lifecycle,
+            lifecycle_tx,
+            outcomes,
+            outcomes_tx,
             pairing: Some(pairing),
             session_link: None,
             session,
@@ -350,7 +364,6 @@ where
 
         // A socket is not ready until the relay reports `session_ready`.
         link.ready = false;
-        link.shared_ready.store(false, Ordering::Relaxed);
 
         if connected {
             if link.saw_disconnect {
@@ -372,7 +385,6 @@ where
             return;
         };
         link.ready = true;
-        link.shared_ready.store(true, Ordering::Relaxed);
     }
 
     fn mark_not_ready(&mut self, topic: &Topic) {
@@ -780,7 +792,12 @@ where
     /// This does not process inbound frames. Call [`Client::recv`] or
     /// [`Client::next_event`] to drive acknowledgements and delivery.
     pub fn poll_event(&mut self) -> Option<ClientEvent> {
-        let event = self.events.try_recv().ok()?;
+        let event = self
+            .outcomes
+            .try_recv()
+            .ok()
+            .map(|(event, _permit)| event)
+            .or_else(|| self.lifecycle.try_recv().ok())?;
         if matches!(
             &event,
             ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
@@ -788,6 +805,16 @@ where
             self.retire_pairing();
         }
         Some(event)
+    }
+
+    fn received_event(&mut self, event: ClientEvent) -> ClientEvent {
+        if matches!(
+            &event,
+            ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
+        ) {
+            self.retire_pairing();
+        }
+        event
     }
 
     /// Await the next reliability event while processing inbound frames.
@@ -799,14 +826,11 @@ where
             return Err(error);
         }
         loop {
-            if let Ok(event) = self.events.try_recv() {
-                if matches!(
-                    &event,
-                    ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
-                ) {
-                    self.retire_pairing();
-                }
-                return Ok(event);
+            if let Ok((event, _permit)) = self.outcomes.try_recv() {
+                return Ok(self.received_event(event));
+            }
+            if let Ok(event) = self.lifecycle.try_recv() {
+                return Ok(self.received_event(event));
             }
 
             tokio::select! {
@@ -819,15 +843,13 @@ where
                         }
                     }
                 }
-                event = self.events.recv() => {
+                event = self.outcomes.recv() => {
+                    let (event, _permit) = event.ok_or(ClientError::Closed)?;
+                    return Ok(self.received_event(event));
+                }
+                event = self.lifecycle.recv() => {
                     let event = event.ok_or(ClientError::Closed)?;
-                    if matches!(
-                        &event,
-                        ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
-                    ) {
-                        self.retire_pairing();
-                    }
-                    return Ok(event);
+                    return Ok(self.received_event(event));
                 }
             }
         }
@@ -894,7 +916,8 @@ where
             self.session.role,
             session_topic.clone(),
             cipher,
-            self.events_tx.clone(),
+            self.lifecycle_tx.clone(),
+            self.outcomes_tx.clone(),
             &self.inbox_tx,
         );
 
@@ -913,7 +936,8 @@ where
         let topic = self.session.pairing_topic.clone();
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
-            let _ = inbox.send(Inbox::Retire(topic)).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), inbox.send(Inbox::Retire(topic)))
+                .await;
         });
     }
 

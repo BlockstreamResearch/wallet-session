@@ -92,6 +92,31 @@ struct ConnectionResult {
     uptime: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxSend {
+    Sent,
+    Shutdown,
+    Stalled,
+}
+
+async fn send_inbox(
+    inbox: &mpsc::Sender<Inbox>,
+    item: Inbox,
+    shutdown: &mut watch::Receiver<bool>,
+    timeout: Duration,
+) -> InboxSend {
+    tokio::select! {
+        result = inbox.send(item) => {
+            if result.is_ok() { InboxSend::Sent } else { InboxSend::Shutdown }
+        }
+        _ = shutdown.changed() => InboxSend::Shutdown,
+        _ = tokio::time::sleep(timeout) => {
+            log::warn!("client inbox stalled; reconnecting");
+            InboxSend::Stalled
+        }
+    }
+}
+
 /// A reconnecting relay connection for one topic and role.
 ///
 /// A background task owns the WebSocket lifecycle and exposes a stable
@@ -169,7 +194,17 @@ async fn connection_task(
 
         let end = match connected {
             Ok(stream) => {
-                let _ = inbox.send(Inbox::Connected(topic.clone())).await;
+                if send_inbox(
+                    &inbox,
+                    Inbox::Connected(topic.clone()),
+                    &mut shutdown,
+                    config.idle_timeout,
+                )
+                .await
+                    != InboxSend::Sent
+                {
+                    return;
+                }
                 let result = run_connection(
                     stream,
                     &mut outbound,
@@ -180,6 +215,12 @@ async fn connection_task(
                 )
                 .await;
                 ready.store(false, Ordering::Relaxed);
+                if !matches!(result.end, ConnectionEnd::Shutdown) {
+                    // Reliability re-flushes unacked tracked frames on the next
+                    // ready edge. Do not let copies queued on the old socket
+                    // bypass that gating and pacing.
+                    while outbound.try_recv().is_ok() {}
+                }
                 if result.saw_session_ready || result.uptime >= config.connection_stability {
                     retries = 0;
                     delay = config.reconnect_initial_delay;
@@ -198,21 +239,59 @@ async fn connection_task(
         match end {
             ConnectionEnd::Shutdown => return,
             ConnectionEnd::Fatal { reason } => {
-                let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                let _ = send_inbox(
+                    &inbox,
+                    Inbox::Closed { topic, reason },
+                    &mut shutdown,
+                    config.idle_timeout,
+                )
+                .await;
                 return;
             }
             ConnectionEnd::ReconnectNow { reason } => {
                 if retries >= config.reconnect_max_attempts {
-                    let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                    let _ = send_inbox(
+                        &inbox,
+                        Inbox::Closed { topic, reason },
+                        &mut shutdown,
+                        config.idle_timeout,
+                    )
+                    .await;
                     return;
                 }
                 retries += 1;
-                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
+                if send_inbox(
+                    &inbox,
+                    Inbox::Disconnected(topic.clone()),
+                    &mut shutdown,
+                    config.idle_timeout,
+                )
+                .await
+                    != InboxSend::Sent
+                {
+                    return;
+                }
             }
             ConnectionEnd::Reconnect { reason } => {
-                let _ = inbox.send(Inbox::Disconnected(topic.clone())).await;
+                if send_inbox(
+                    &inbox,
+                    Inbox::Disconnected(topic.clone()),
+                    &mut shutdown,
+                    config.idle_timeout,
+                )
+                .await
+                    != InboxSend::Sent
+                {
+                    return;
+                }
                 if retries >= config.reconnect_max_attempts {
-                    let _ = inbox.send(Inbox::Closed { topic, reason }).await;
+                    let _ = send_inbox(
+                        &inbox,
+                        Inbox::Closed { topic, reason },
+                        &mut shutdown,
+                        config.idle_timeout,
+                    )
+                    .await;
                     return;
                 }
                 tokio::select! {
@@ -365,12 +444,34 @@ async fn run_connection(
                             {
                                 saw_session_ready = true;
                                 ready.store(true, Ordering::Relaxed);
-                                if inbox.send(Inbox::Ready(frame.topic.clone())).await.is_err() {
-                                    break ConnectionEnd::Shutdown;
+                                match send_inbox(
+                                    inbox,
+                                    Inbox::Ready(frame.topic.clone()),
+                                    shutdown,
+                                    config.idle_timeout,
+                                )
+                                .await
+                                {
+                                    InboxSend::Sent => {}
+                                    InboxSend::Shutdown => break ConnectionEnd::Shutdown,
+                                    InboxSend::Stalled => break ConnectionEnd::Reconnect {
+                                        reason: "client inbox stalled",
+                                    },
                                 }
                             }
-                            if inbox.send(Inbox::Frame(frame)).await.is_err() {
-                                break ConnectionEnd::Shutdown;
+                            match send_inbox(
+                                inbox,
+                                Inbox::Frame(frame),
+                                shutdown,
+                                config.idle_timeout,
+                            )
+                            .await
+                            {
+                                InboxSend::Sent => {}
+                                InboxSend::Shutdown => break ConnectionEnd::Shutdown,
+                                InboxSend::Stalled => break ConnectionEnd::Reconnect {
+                                    reason: "client inbox stalled",
+                                },
                             }
                         }
                         Err(error) => log::warn!("invalid relay frame: {error}"),
@@ -527,6 +628,28 @@ mod tests {
         let mut sink = PendingSink;
         assert!(
             !send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbox_send_times_out_when_the_client_is_not_draining() {
+        let topic = Topic::new([9u8; 32]).expect("topic");
+        let (inbox, _receiver) = mpsc::channel(1);
+        inbox
+            .send(Inbox::Connected(topic.clone()))
+            .await
+            .expect("first item");
+        let (_shutdown, mut shutdown) = watch::channel(false);
+
+        assert_eq!(
+            send_inbox(
+                &inbox,
+                Inbox::Connected(topic),
+                &mut shutdown,
+                Duration::from_secs(1),
+            )
+            .await,
+            InboxSend::Stalled
         );
     }
 

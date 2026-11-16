@@ -43,6 +43,9 @@ pub struct ClientConfig {
     /// Minimum spacing between retransmissions.
     pub retransmit_spacing: Duration,
 
+    /// Maximum retransmission bytes per second used to pace reconnects.
+    pub retransmit_bytes_per_second: usize,
+
     /// Interval between client keepalive pings.
     pub ping_interval: Duration,
 
@@ -83,6 +86,7 @@ impl ClientConfig {
             ack_base_delay: Duration::from_secs(2),
             ack_max_attempts: 5,
             retransmit_spacing: Duration::from_millis(100),
+            retransmit_bytes_per_second: 256 * 1024,
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(10),
             reconnect_initial_delay: Duration::from_millis(250),
@@ -136,6 +140,10 @@ impl ClientConfig {
             if timeout.is_zero() {
                 return Err(ClientError::InvalidConfig(name));
             }
+        }
+
+        if self.retransmit_bytes_per_second == 0 {
+            return Err(ClientError::InvalidConfig("retransmit_bytes_per_second"));
         }
 
         Ok(())
@@ -192,6 +200,12 @@ impl ClientConfig {
     /// Set the minimum spacing between retransmissions.
     pub fn with_retransmit_spacing(mut self, retransmit_spacing: Duration) -> Self {
         self.retransmit_spacing = retransmit_spacing;
+        self
+    }
+
+    /// Set the maximum retransmission byte rate.
+    pub fn with_retransmit_bytes_per_second(mut self, bytes_per_second: usize) -> Self {
+        self.retransmit_bytes_per_second = bytes_per_second;
         self
     }
 
@@ -274,6 +288,7 @@ mod tests {
             ClientConfig::new("wss://relay.example.com").with_pong_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_retransmit_spacing(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_connection_stability(Duration::ZERO),
+            ClientConfig::new("wss://relay.example.com").with_retransmit_bytes_per_second(0),
         ] {
             assert!(matches!(
                 config.validate(),

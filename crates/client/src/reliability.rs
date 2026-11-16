@@ -8,7 +8,7 @@ use std::{
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
     time::{Instant, interval},
 };
@@ -22,8 +22,11 @@ use crate::{error::ClientError, identity::unix_now, relay::Outbound};
 /// Events buffered between the reliability task and the client.
 pub(crate) const EVENT_CAPACITY: usize = 256;
 
-/// Maximum messages kept for retransmission per link.
-const PENDING_CAPACITY: usize = 256;
+/// Maximum pending messages plus unconsumed delivery outcomes per link.
+pub(crate) const PENDING_CAPACITY: usize = 256;
+
+/// A delivery event and the reservation it releases when consumed.
+pub(crate) type DeliveryEvent = (ClientEvent, OwnedSemaphorePermit);
 
 /// Reliability events surfaced to the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +74,7 @@ struct Pending {
     sequence: u64,
     expires_at: u64,
     sent: bool,
+    permit: OwnedSemaphorePermit,
 }
 
 /// Outbound reliability: ack tracking and retransmission.
@@ -78,46 +82,55 @@ pub(crate) struct Reliability {
     outbox: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     ready: Arc<AtomicBool>,
-    events: mpsc::Sender<ClientEvent>,
+    lifecycle: mpsc::Sender<ClientEvent>,
+    outcomes: mpsc::UnboundedSender<DeliveryEvent>,
+    permits: Arc<Semaphore>,
     base_delay: Duration,
     next_sequence: u64,
     _retry: JoinHandle<()>,
 }
 
 impl Reliability {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         outbox: mpsc::Sender<Outbound>,
         ready: Arc<AtomicBool>,
-        events: mpsc::Sender<ClientEvent>,
+        lifecycle: mpsc::Sender<ClientEvent>,
+        outcomes: mpsc::UnboundedSender<DeliveryEvent>,
         base_delay: Duration,
         max_attempts: usize,
         retransmit_spacing: Duration,
+        retransmit_bytes_per_second: usize,
     ) -> Self {
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let permits = Arc::new(Semaphore::new(PENDING_CAPACITY));
         let _retry = tokio::spawn(retry_loop(
             Arc::clone(&pending),
             Arc::clone(&ready),
             outbox.clone(),
-            events.clone(),
+            outcomes.clone(),
             base_delay,
             max_attempts,
             retransmit_spacing,
+            retransmit_bytes_per_second,
         ));
 
         Self {
             outbox,
             pending,
             ready,
-            events,
+            lifecycle,
+            outcomes,
+            permits,
             base_delay,
             next_sequence: 0,
             _retry,
         }
     }
 
-    /// Emit an event to the application.
+    /// Emit a droppable lifecycle event to the application.
     pub(crate) fn emit(&self, event: ClientEvent) {
-        let _ = self.events.try_send(event);
+        let _ = self.lifecycle.try_send(event);
     }
 
     /// Enqueue a frame, tracking it for retransmission when `track` is set.
@@ -130,6 +143,11 @@ impl Reliability {
         let id = frame.id.clone();
         let is_ready = self.ready.load(Ordering::Relaxed);
         if track {
+            let permit = self
+                .permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| ClientError::Busy)?;
             let sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.wrapping_add(1);
             let pending = Pending {
@@ -139,6 +157,7 @@ impl Reliability {
                 sequence,
                 expires_at: ts.saturating_add(300),
                 sent: is_ready,
+                permit,
             };
             let mut pending_messages = self.pending.lock().expect("reliability lock");
             if !pending_messages.contains_key(&id) && pending_messages.len() >= PENDING_CAPACITY {
@@ -180,25 +199,27 @@ impl Reliability {
             .drain()
             .collect();
         for (id, entry) in pending {
-            let _ = self.events.try_send(ClientEvent::Failed {
-                id,
-                attempts: entry.attempts,
-            });
+            let _ = self.outcomes.send((
+                ClientEvent::Failed {
+                    id,
+                    attempts: entry.attempts,
+                },
+                entry.permit,
+            ));
         }
     }
 
     /// Record an inbound ACK, reporting delivery.
     pub(crate) fn mark_delivered(&mut self, ack_id: &MessageId) {
-        if self
+        if let Some(entry) = self
             .pending
             .lock()
             .expect("reliability lock")
             .remove(ack_id)
-            .is_some()
         {
             let _ = self
-                .events
-                .try_send(ClientEvent::Delivered { id: ack_id.clone() });
+                .outcomes
+                .send((ClientEvent::Delivered { id: ack_id.clone() }, entry.permit));
         }
     }
 }
@@ -211,14 +232,16 @@ impl Drop for Reliability {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retry_loop(
     pending: Arc<Mutex<HashMap<MessageId, Pending>>>,
     ready: Arc<AtomicBool>,
     outbox: mpsc::Sender<Outbound>,
-    events: mpsc::Sender<ClientEvent>,
+    outcomes: mpsc::UnboundedSender<DeliveryEvent>,
     base_delay: Duration,
     max_attempts: usize,
     retransmit_spacing: Duration,
+    retransmit_bytes_per_second: usize,
 ) {
     let mut ticker = interval(Duration::from_millis(50));
     let mut was_ready = ready.load(Ordering::Relaxed);
@@ -244,14 +267,19 @@ async fn retry_loop(
                 .collect();
             for id in expired {
                 if let Some(entry) = pending.remove(&id) {
-                    failed.push((id, entry.attempts));
+                    failed.push((id, entry));
                 }
             }
 
             if is_ready {
                 if !was_ready {
-                    // A reconnect flush starts now, but is paced below.
-                    for entry in pending.values_mut() {
+                    // A reconnect flush starts now, but is paced below. Keep
+                    // entries already in their final ack wait on their
+                    // original deadline instead of failing them immediately.
+                    for entry in pending
+                        .values_mut()
+                        .filter(|entry| entry.attempts < max_attempts)
+                    {
                         entry.next = now;
                     }
                     next_send = now;
@@ -275,7 +303,7 @@ async fn retry_loop(
                     let entry = pending.get_mut(&id).expect("candidate exists");
                     if entry.attempts >= max_attempts {
                         if let Some(entry) = pending.remove(&id) {
-                            failed.push((id, entry.attempts));
+                            failed.push((id, entry));
                         }
                     } else {
                         entry.attempts += 1;
@@ -290,14 +318,25 @@ async fn retry_loop(
         was_ready = is_ready;
 
         if let Some(frame) = resend {
+            let frame_len = serde_json::to_string(&frame)
+                .map(|text| text.len())
+                .unwrap_or(0);
             if outbox.send(Outbound::Frame(frame)).await.is_err() {
                 return;
             }
-            next_send = now + retransmit_spacing;
+            let byte_delay =
+                Duration::from_secs_f64(frame_len as f64 / retransmit_bytes_per_second as f64);
+            next_send = now + retransmit_spacing.max(byte_delay);
         }
 
-        for (id, attempts) in failed {
-            let _ = events.try_send(ClientEvent::Failed { id, attempts });
+        for (id, entry) in failed {
+            let _ = outcomes.send((
+                ClientEvent::Failed {
+                    id,
+                    attempts: entry.attempts,
+                },
+                entry.permit,
+            ));
         }
     }
 }
@@ -311,23 +350,65 @@ mod tests {
     use super::*;
     use wallet_session_core::{frame::RelayFrameBody, message::Topic};
 
+    struct TestEvents {
+        lifecycle: mpsc::Receiver<ClientEvent>,
+        outcomes: mpsc::UnboundedReceiver<DeliveryEvent>,
+    }
+
+    impl TestEvents {
+        fn try_recv(&mut self) -> Option<ClientEvent> {
+            self.outcomes
+                .try_recv()
+                .ok()
+                .map(|(event, _permit)| event)
+                .or_else(|| self.lifecycle.try_recv().ok())
+        }
+    }
+
     fn spawn_reliability(
         outbox: mpsc::Sender<Outbound>,
         ready: Arc<AtomicBool>,
         base_delay: Duration,
         max_attempts: usize,
         retransmit_spacing: Duration,
-    ) -> (Reliability, mpsc::Receiver<ClientEvent>) {
-        let (events, events_rx) = mpsc::channel(EVENT_CAPACITY);
-        let reliability = Reliability::spawn(
+    ) -> (Reliability, TestEvents) {
+        spawn_reliability_with_bytes(
             outbox,
             ready,
-            events,
             base_delay,
             max_attempts,
             retransmit_spacing,
+            256 * 1024,
+        )
+    }
+
+    fn spawn_reliability_with_bytes(
+        outbox: mpsc::Sender<Outbound>,
+        ready: Arc<AtomicBool>,
+        base_delay: Duration,
+        max_attempts: usize,
+        retransmit_spacing: Duration,
+        retransmit_bytes_per_second: usize,
+    ) -> (Reliability, TestEvents) {
+        let (lifecycle, lifecycle_rx) = mpsc::channel(EVENT_CAPACITY);
+        let (outcomes, outcomes_rx) = mpsc::unbounded_channel();
+        let reliability = Reliability::spawn(
+            outbox,
+            ready,
+            lifecycle,
+            outcomes,
+            base_delay,
+            max_attempts,
+            retransmit_spacing,
+            retransmit_bytes_per_second,
         );
-        (reliability, events_rx)
+        (
+            reliability,
+            TestEvents {
+                lifecycle: lifecycle_rx,
+                outcomes: outcomes_rx,
+            },
+        )
     }
 
     /// A distinct, valid message id for a test label.
@@ -347,6 +428,41 @@ mod tests {
                 payload: "payload".to_owned(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_outcomes_survive_a_full_lifecycle_queue() {
+        let (outbox, _outbound) = mpsc::channel(16);
+        let (lifecycle, mut lifecycle_rx) = mpsc::channel(1);
+        let (outcomes, mut outcomes_rx) = mpsc::unbounded_channel();
+        let mut reliability = Reliability::spawn(
+            outbox,
+            ready(true),
+            lifecycle,
+            outcomes,
+            Duration::from_secs(1),
+            5,
+            Duration::from_millis(100),
+            256 * 1024,
+        );
+
+        // Fill and overflow the droppable lifecycle channel.
+        reliability.emit(ClientEvent::Reconnecting);
+        reliability.emit(ClientEvent::Reconnected);
+
+        reliability
+            .dispatch(frame("a"), true, unix_now())
+            .expect("dispatch");
+        reliability.mark_delivered(&message_id("a"));
+
+        let (event, _permit) = outcomes_rx.try_recv().expect("delivery outcome");
+        assert_eq!(
+            event,
+            ClientEvent::Delivered {
+                id: message_id("a")
+            }
+        );
+        assert!(lifecycle_rx.try_recv().is_ok());
     }
 
     #[test]
@@ -443,7 +559,7 @@ mod tests {
         );
 
         let mut failed = None;
-        while let Ok(event) = events.try_recv() {
+        while let Some(event) = events.try_recv() {
             if let ClientEvent::Failed { id, attempts } = event {
                 failed = Some((id, attempts));
             }
@@ -522,6 +638,90 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn reconnect_flush_does_not_fail_a_final_ack_wait_early() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(true);
+        let (mut reliability, mut events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(10),
+        );
+
+        reliability
+            .dispatch(frame("a"), true, unix_now())
+            .expect("dispatch");
+        while outbound.try_recv().is_ok() {}
+
+        // Consume the single retry; the entry now waits for its final ack.
+        tokio::time::advance(Duration::from_millis(1_100)).await;
+        tokio::task::yield_now().await;
+        while outbound.try_recv().is_ok() {}
+
+        // A reconnect must not fail the entry before its final wait expires.
+        ready.store(false, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        ready.store(true, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            events.try_recv().is_none(),
+            "the final ack wait must be allowed to finish"
+        );
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            events.try_recv(),
+            Some(ClientEvent::Failed { id, .. }) if id == message_id("a")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_flush_paces_by_bytes() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, _events) = spawn_reliability_with_bytes(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(1),
+            100,
+        );
+
+        for id in ["a", "b"] {
+            let mut frame = frame(id);
+            if let RelayFrameBody::Message { payload } = &mut frame.body {
+                *payload = "x".repeat(500);
+            }
+            reliability
+                .dispatch(frame, true, unix_now())
+                .expect("dispatch");
+        }
+        ready.store(true, Ordering::Relaxed);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(outbound.try_recv(), Ok(Outbound::Frame(_))),
+            "the first frame should be sent"
+        );
+        assert!(
+            outbound.try_recv().is_err(),
+            "the second frame must wait for the byte budget"
+        );
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(outbound.try_recv(), Ok(Outbound::Frame(_))),
+            "the second frame should follow after the byte delay"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn expired_frames_fail_without_sending() {
         let (outbox, mut outbound) = mpsc::channel(16);
         let (mut reliability, mut events) = spawn_reliability(
@@ -543,7 +743,7 @@ mod tests {
         assert!(outbound.try_recv().is_err());
         assert!(matches!(
             events.try_recv(),
-            Ok(ClientEvent::Failed { id, .. }) if id == message_id("old")
+            Some(ClientEvent::Failed { id, .. }) if id == message_id("old")
         ));
     }
 
@@ -566,7 +766,7 @@ mod tests {
         reliability.fail_all();
 
         let mut failed = Vec::new();
-        while let Ok(event) = events.try_recv() {
+        while let Some(event) = events.try_recv() {
             if let ClientEvent::Failed { id, .. } = event {
                 failed.push(id);
             }
