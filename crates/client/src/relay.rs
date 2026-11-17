@@ -57,9 +57,6 @@ pub(crate) enum Inbox {
     /// The socket for `topic` is established (initial or after reconnect).
     Connected(Topic),
 
-    /// The relay reported `session_ready` for `topic`.
-    Ready(Topic),
-
     /// The connection for `topic` was lost; a reconnect is starting.
     Disconnected(Topic),
 
@@ -97,27 +94,20 @@ struct ConnectionResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboxSend {
+enum InboxTry {
     Sent,
-    Shutdown,
-    Stalled,
+    Full,
+    Closed,
 }
 
-async fn send_inbox(
-    inbox: &mpsc::Sender<Inbox>,
-    item: Inbox,
-    shutdown: &mut watch::Receiver<bool>,
-    timeout: Duration,
-) -> InboxSend {
-    tokio::select! {
-        result = inbox.send(item) => {
-            if result.is_ok() { InboxSend::Sent } else { InboxSend::Shutdown }
-        }
-        _ = shutdown.changed() => InboxSend::Shutdown,
-        _ = tokio::time::sleep(timeout) => {
-            log::warn!("client inbox stalled; reconnecting");
-            InboxSend::Stalled
-        }
+/// Try to hand a frame or control event to the client without blocking the
+/// connection loop. A full inbox is backpressure: the peer retransmits any
+/// frame whose ack was not sent.
+fn try_send_inbox(inbox: &mpsc::Sender<Inbox>, item: Inbox) -> InboxTry {
+    match inbox.try_send(item) {
+        Ok(()) => InboxTry::Sent,
+        Err(mpsc::error::TrySendError::Full(_)) => InboxTry::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => InboxTry::Closed,
     }
 }
 
@@ -394,6 +384,7 @@ async fn run_connection(
     let mut pong_deadline = Instant::now();
     let mut idle_deadline = Instant::now() + config.idle_timeout;
     let mut saw_session_ready = false;
+    let mut session_writable = false;
     let mut timed_out = false;
 
     let end = loop {
@@ -401,6 +392,18 @@ async fn run_connection(
             biased;
             outbound_item = outbound.recv() => match outbound_item {
                 Some(Outbound::Frame(frame)) => {
+                    // A frame queued before the relay made this session
+                    // writable must not cross the new connection. Tracked
+                    // frames are re-dispatched by reliability on the ready
+                    // edge; stale untracked acks are dropped and the peer
+                    // retransmits the envelopes.
+                    if !session_writable {
+                        log::debug!(
+                            "dropping outbound frame before session_ready on topic {}",
+                            frame.topic.log_tag()
+                        );
+                        continue;
+                    }
                     let Ok(text) = serde_json::to_string(&frame) else {
                         break ConnectionEnd::Reconnect { reason: "invalid outbound frame" };
                     };
@@ -430,41 +433,20 @@ async fn run_connection(
                                 // the relay sends another `session_ready` on
                                 // the same socket. The shared flag must follow
                                 // every one of them, not just the first.
+                                saw_session_ready = true;
+                                session_writable = true;
                                 ready.store(true, Ordering::Relaxed);
-                                if !saw_session_ready {
-                                    saw_session_ready = true;
-                                    match send_inbox(
-                                        inbox,
-                                        Inbox::Ready(frame.topic.clone()),
-                                        shutdown,
-                                        config.idle_timeout,
-                                    )
-                                    .await
-                                    {
-                                        InboxSend::Sent => {}
-                                        InboxSend::Shutdown => break ConnectionEnd::Shutdown,
-                                        InboxSend::Stalled => break ConnectionEnd::Reconnect {
-                                            reason: "client inbox stalled",
-                                        },
-                                    }
-                                }
                             }
                             if matches!(&frame.body, RelayFrameBody::PeerDisconnected) {
+                                session_writable = false;
                                 ready.store(false, Ordering::Relaxed);
                             }
-                            match send_inbox(
-                                inbox,
-                                Inbox::Frame(frame),
-                                shutdown,
-                                config.idle_timeout,
-                            )
-                            .await
-                            {
-                                InboxSend::Sent => {}
-                                InboxSend::Shutdown => break ConnectionEnd::Shutdown,
-                                InboxSend::Stalled => break ConnectionEnd::Reconnect {
-                                    reason: "client inbox stalled",
-                                },
+                            match try_send_inbox(inbox, Inbox::Frame(frame)) {
+                                InboxTry::Sent => {}
+                                InboxTry::Full => {
+                                    log::debug!("dropping inbound frame: client inbox full");
+                                }
+                                InboxTry::Closed => break ConnectionEnd::Shutdown,
                             }
                         }
                         Err(error) => log::warn!("invalid relay frame: {error}"),
@@ -627,25 +609,22 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn inbox_send_times_out_when_the_client_is_not_draining() {
+    #[test]
+    fn inbox_try_send_is_non_blocking() {
         let topic = Topic::new([9u8; 32]).expect("topic");
-        let (inbox, _receiver) = mpsc::channel(1);
+        let (inbox, receiver) = mpsc::channel(1);
         inbox
-            .send(Inbox::Connected(topic.clone()))
-            .await
+            .try_send(Inbox::Connected(topic.clone()))
             .expect("first item");
-        let (_shutdown, mut shutdown) = watch::channel(false);
 
         assert_eq!(
-            send_inbox(
-                &inbox,
-                Inbox::Connected(topic),
-                &mut shutdown,
-                Duration::from_secs(1),
-            )
-            .await,
-            InboxSend::Stalled
+            try_send_inbox(&inbox, Inbox::Disconnected(topic.clone())),
+            InboxTry::Full
+        );
+        drop(receiver);
+        assert_eq!(
+            try_send_inbox(&inbox, Inbox::Disconnected(topic)),
+            InboxTry::Closed
         );
     }
 

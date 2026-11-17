@@ -371,7 +371,9 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
                                 return;
                             }
                         }
-                        let _ = socket.next().await;
+                        // End the connection while the client inbox is full,
+                        // so the lifecycle send has to wait.
+                        let _ = socket.close(None).await;
                     } else {
                         let frame = RelayFrame {
                             v: 1,
@@ -438,6 +440,62 @@ async fn disconnect_closes_locally_when_not_ready() -> TestResult {
         "unexpected disconnect result: {result:?}"
     );
     assert!(matches!(client.recv().await, Err(ClientError::Closed)));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pings_are_answered_while_the_client_inbox_is_full() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let topic = Topic::new([9u8; 32])?;
+    let (pong_tx, pong_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("websocket");
+
+        // Fill the client inbox faster than it is drained.
+        for index in 0..100u8 {
+            let frame = RelayFrame {
+                v: 1,
+                id: MessageId::from_bytes([index; MessageId::LEN]),
+                topic: topic.clone(),
+                body: RelayFrameBody::Message {
+                    payload: "not an envelope".to_owned(),
+                },
+            };
+            let text = serde_json::to_string(&frame).expect("json");
+            socket
+                .send(Message::Text(text.into()))
+                .await
+                .expect("frame");
+        }
+
+        socket
+            .send(Message::Ping(Bytes::new()))
+            .await
+            .expect("ping");
+        let pong = timeout(Duration::from_secs(1), async {
+            while let Some(message) = socket.next().await {
+                if matches!(message, Ok(Message::Pong(_))) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let _ = pong_tx.send(pong);
+        std::future::pending::<()>().await;
+    });
+
+    let _client = connect(addr, config(addr)).await?;
+    let ponged = timeout(Duration::from_secs(2), pong_rx).await??;
+    assert!(
+        ponged,
+        "the transport must answer pings while the client inbox is full"
+    );
 
     server.abort();
     Ok(())

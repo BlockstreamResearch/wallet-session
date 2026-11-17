@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -96,8 +99,14 @@ struct Link<C> {
     reliability: Reliability,
     cipher: C,
     replay: ReplayMemory,
-    ready: bool,
+    shared_ready: Arc<AtomicBool>,
     saw_disconnect: bool,
+}
+
+impl<C> Link<C> {
+    fn is_ready(&self) -> bool {
+        self.shared_ready.load(Ordering::Relaxed)
+    }
 }
 
 impl<C> Link<C>
@@ -141,7 +150,7 @@ where
             reliability,
             cipher,
             replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
-            ready: false,
+            shared_ready: ready,
             saw_disconnect: false,
         }
     }
@@ -245,7 +254,7 @@ where
 
     /// Whether the relay session on the active topic is ready.
     pub fn is_ready(&self) -> bool {
-        self.active_link().is_some_and(|link| link.ready)
+        self.active_link().is_some_and(Link::is_ready)
     }
 
     fn active_link(&self) -> Option<&Link<C>> {
@@ -300,18 +309,9 @@ where
     /// Apply one transport lifecycle item, returning a relay frame if present.
     fn handle_inbox_item(&mut self, item: Inbox) -> Result<Option<RelayFrame>> {
         match item {
-            Inbox::Frame(frame) => {
-                if matches!(&frame.body, RelayFrameBody::SessionReady) {
-                    self.set_ready(&frame.topic);
-                }
-                Ok(Some(frame))
-            }
+            Inbox::Frame(frame) => Ok(Some(frame)),
             Inbox::Connected(topic) => {
                 self.set_connected(&topic, true);
-                Ok(None)
-            }
-            Inbox::Ready(topic) => {
-                self.set_ready(&topic);
                 Ok(None)
             }
             Inbox::Disconnected(topic) => {
@@ -346,7 +346,7 @@ where
                 let expired = self
                     .session_link
                     .as_ref()
-                    .is_some_and(|link| link.topic == topic && !link.ready);
+                    .is_some_and(|link| link.topic == topic && !link.is_ready());
                 if expired {
                     log::warn!(
                         "session link {} did not become ready; dropping it",
@@ -386,7 +386,8 @@ where
             RelayFrameBody::SessionReady => Ok(None),
             RelayFrameBody::PeerDisconnected => {
                 if frame.topic == *self.active_topic() {
-                    self.mark_not_ready(&frame.topic);
+                    // The transport clears the shared readiness flag before
+                    // forwarding this frame.
                     self.session.state = SessionState::Disconnected;
                     return Err(ClientError::PeerDisconnected);
                 }
@@ -402,9 +403,6 @@ where
             return;
         };
 
-        // A socket is not ready until the relay reports `session_ready`.
-        link.ready = false;
-
         if connected {
             if link.saw_disconnect {
                 link.saw_disconnect = false;
@@ -418,20 +416,6 @@ where
                 link.reliability.emit(ClientEvent::Reconnecting);
             }
         }
-    }
-
-    fn set_ready(&mut self, topic: &Topic) {
-        let Some(link) = self.link_mut(topic) else {
-            return;
-        };
-        link.ready = true;
-    }
-
-    fn mark_not_ready(&mut self, topic: &Topic) {
-        let Some(link) = self.link_mut(topic) else {
-            return;
-        };
-        link.ready = false;
     }
 
     /// Wait until the relay reports the active topic ready.
@@ -500,7 +484,7 @@ where
         if !matches!(self.handshake, Handshake::Established) {
             return Err(ClientError::SessionNotActive);
         }
-        if !self.active_link().is_some_and(|link| link.ready) {
+        if !self.active_link().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
         Ok(())
@@ -1098,7 +1082,7 @@ where
         if !matches!(self.handshake, Handshake::Idle) {
             return Err(ClientError::UnexpectedHandshake);
         }
-        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+        if !self.pairing.as_ref().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
         let keypair = EphemeralKeyPair::generate();
@@ -1136,7 +1120,7 @@ where
             } => (public_key.clone(), key.clone(), topic.clone()),
             _ => return Err(ClientError::UnexpectedHandshake),
         };
-        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+        if !self.pairing.as_ref().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
         let payload = ApprovePayload {
@@ -1160,7 +1144,7 @@ where
         if matches!(self.handshake, Handshake::Established) {
             return Err(ClientError::UnexpectedHandshake);
         }
-        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+        if !self.pairing.as_ref().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
         let topic = self.session.pairing_topic.clone();
