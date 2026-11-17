@@ -1,9 +1,6 @@
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -90,7 +87,6 @@ struct Link<C> {
     topic: Topic,
     _transport: Transport,
     reliability: Reliability,
-    shared_ready: Arc<AtomicBool>,
     cipher: C,
     replay: ReplayMemory,
     ready: bool,
@@ -136,7 +132,6 @@ where
             topic,
             _transport: transport,
             reliability,
-            shared_ready: ready,
             cipher,
             replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
             ready: false,
@@ -255,14 +250,6 @@ where
     /// Stop all traffic and release both relay links.
     fn close(&mut self, terminal: Terminal) {
         self.terminal = Some(terminal);
-        if let Some(link) = self.pairing.as_mut() {
-            link.ready = false;
-            link.shared_ready.store(false, Ordering::Relaxed);
-        }
-        if let Some(link) = self.session_link.as_mut() {
-            link.ready = false;
-            link.shared_ready.store(false, Ordering::Relaxed);
-        }
         self.pairing = None;
         self.session_link = None;
     }
@@ -415,7 +402,6 @@ where
             return;
         };
         link.ready = false;
-        link.shared_ready.store(false, Ordering::Relaxed);
     }
 
     /// Wait until the relay reports the active topic ready.
@@ -450,6 +436,12 @@ where
     /// [`Client::reject`] and stay on the pairing topic. Application messages
     /// are refused until the handshake is established, then use the derived
     /// session topic.
+    ///
+    /// A tracked send reserves pending/outcome capacity until its delivery
+    /// event is consumed. Applications that only call `send`/`recv` must
+    /// still drain [`Client::poll_event`] or [`Client::next_event`]; once 256
+    /// sends are pending or their outcomes are unconsumed, sends return
+    /// [`ClientError::Busy`].
     pub async fn send(&mut self, message: &ClientMessage) -> Result<MessageId> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
@@ -989,8 +981,9 @@ where
         let topic = self.session.pairing_topic.clone();
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
-            let _ = tokio::time::timeout(Duration::from_secs(1), inbox.send(Inbox::Retire(topic)))
-                .await;
+            // Wait for inbox capacity instead of dropping the only retirement
+            // signal. The send fails once the client and its receiver are gone.
+            let _ = inbox.send(Inbox::Retire(topic)).await;
         });
     }
 

@@ -36,7 +36,10 @@ pub enum ClientError {
     #[error("invalid client configuration: {0}")]
     InvalidConfig(&'static str),
 
-    #[error("client outbound queue is full")]
+    /// The outbound queue is full, or the link has too many pending messages
+    /// and unconsumed delivery outcomes. Drain `poll_event()`/`next_event()`
+    /// and retry later.
+    #[error("client is under backpressure")]
     Busy,
 
     #[error("relay connection timed out")]

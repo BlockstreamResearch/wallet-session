@@ -23,7 +23,10 @@ use tokio_tungstenite::{
 use wallet_session_client::{
     Client, ClientConfig, ClientError, IdentityKey, Role, Seed, XChaCha20Poly1305Cipher,
 };
-use wallet_session_core::message::Topic;
+use wallet_session_core::{
+    frame::{RelayFrame, RelayFrameBody},
+    message::{MessageId, Topic},
+};
 
 const AUDIENCE: &str = "ws://test";
 
@@ -328,6 +331,87 @@ async fn sends_before_readiness_are_rejected() -> TestResult {
     ));
 
     drop(client);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let topic = Topic::new([9u8; 32])?;
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        let topic = topic.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                let accepted = accepts.fetch_add(1, Ordering::Relaxed) + 1;
+                let topic = topic.clone();
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    if accepted == 1 {
+                        // Fill the client inbox faster than it is drained.
+                        for index in 0..100u8 {
+                            let frame = RelayFrame {
+                                v: 1,
+                                id: MessageId::from_bytes([index; MessageId::LEN]),
+                                topic: topic.clone(),
+                                body: RelayFrameBody::Message {
+                                    payload: "not an envelope".to_owned(),
+                                },
+                            };
+                            let text = serde_json::to_string(&frame).expect("json");
+                            if socket.send(Message::Text(text.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        let _ = socket.next().await;
+                    } else {
+                        let frame = RelayFrame {
+                            v: 1,
+                            id: MessageId::from_bytes([u8::MAX; MessageId::LEN]),
+                            topic,
+                            body: RelayFrameBody::SessionReady,
+                        };
+                        let text = serde_json::to_string(&frame).expect("json");
+                        let _ = socket.send(Message::Text(text.into())).await;
+                        let _ = socket.next().await;
+                    }
+                });
+            }
+        })
+    };
+
+    let mut client = connect(
+        addr,
+        config(addr)
+            .with_idle_timeout(Duration::from_millis(50))
+            .with_reconnect_initial_delay(Duration::from_millis(10)),
+    )
+    .await?;
+
+    // Let the inbox fill and the transport stall past twice the send timeout.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        1,
+        "the task should be stalled on a lifecycle send"
+    );
+
+    // Draining the backlog must let the task finish its lifecycle sends and
+    // reconnect instead of exiting silently.
+    timeout(Duration::from_secs(2), client.wait_session_ready()).await??;
+    assert!(
+        accepts.load(Ordering::Relaxed) >= 2,
+        "the transport must reconnect after the inbox drains"
+    );
+
     server.abort();
     Ok(())
 }

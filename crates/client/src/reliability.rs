@@ -273,22 +273,30 @@ async fn retry_loop(
 
             if is_ready {
                 if !was_ready {
-                    // A reconnect flush starts now, but is paced below. Keep
-                    // entries already in their final ack wait on their
-                    // original deadline instead of failing them immediately.
-                    for entry in pending
-                        .values_mut()
-                        .filter(|entry| entry.attempts < max_attempts)
-                    {
-                        entry.next = now;
-                    }
+                    // A reconnect flush starts now, but is paced below.
                     next_send = now;
-                } else {
-                    // Frames dispatched while offline still need their first
-                    // write, even if the ready edge happened before this tick.
-                    for entry in pending.values_mut().filter(|entry| !entry.sent) {
-                        entry.next = now;
-                    }
+                }
+                // Only frames that were never written on this connection
+                // need their first write. A frame dispatched after the relay
+                // became ready was already sent by `dispatch`; resetting its
+                // deadline here would duplicate it. Keep entries already in
+                // their final ack wait on their original deadline instead of
+                // failing them immediately.
+                for entry in pending
+                    .values_mut()
+                    .filter(|entry| !entry.sent && entry.attempts < max_attempts)
+                {
+                    entry.next = now;
+                }
+            } else {
+                // A frame written on a connection that ended is not known to
+                // have reached the peer. Retry it after the next ready edge,
+                // but leave final-ack waits on their original deadline.
+                for entry in pending
+                    .values_mut()
+                    .filter(|entry| entry.attempts < max_attempts)
+                {
+                    entry.sent = false;
                 }
             }
 
@@ -604,6 +612,79 @@ mod tests {
         assert!(
             matches!(outbound.try_recv(), Ok(Outbound::Frame(_))),
             "expected a flush after readiness"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_edge_does_not_duplicate_a_frame_sent_after_readiness() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, _events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(100),
+        );
+
+        // Let the retry task observe the disconnected state.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        // The link becomes ready and dispatch writes the frame before the
+        // retry task's next tick observes the ready edge.
+        ready.store(true, Ordering::Relaxed);
+        reliability
+            .dispatch(frame("a"), true, unix_now())
+            .expect("dispatch");
+        assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
+        while outbound.try_recv().is_ok() {}
+
+        // Treating that edge as a reconnect flush would duplicate the frame.
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            outbound.try_recv().is_err(),
+            "the ready edge must not duplicate a frame sent after readiness"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_flushes_a_frame_sent_before_disconnect() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(true);
+        let (mut reliability, _events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(100),
+        );
+
+        reliability
+            .dispatch(frame("a"), true, unix_now())
+            .expect("dispatch");
+        assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
+
+        // Observe the disconnect, then the reconnect.
+        ready.store(false, Ordering::Relaxed);
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+        ready.store(true, Ordering::Relaxed);
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            matches!(outbound.try_recv(), Ok(Outbound::Frame(_))),
+            "reconnect must flush a frame sent before the disconnect"
         );
     }
 

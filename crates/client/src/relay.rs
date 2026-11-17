@@ -117,6 +117,22 @@ async fn send_inbox(
     }
 }
 
+/// Send a lifecycle item, waiting for the client to make room.
+///
+/// Returns `false` only when the transport shuts down or the client drops the
+/// inbox. A full inbox is not terminal: the application may drain it later,
+/// so the task must stay alive to deliver the lifecycle item.
+async fn send_inbox_wait(
+    inbox: &mpsc::Sender<Inbox>,
+    item: Inbox,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        result = inbox.send(item) => result.is_ok(),
+        _ = shutdown.changed() => false,
+    }
+}
+
 /// A reconnecting relay connection for one topic and role.
 ///
 /// A background task owns the WebSocket lifecycle and exposes a stable
@@ -194,15 +210,7 @@ async fn connection_task(
 
         let end = match connected {
             Ok(stream) => {
-                if send_inbox(
-                    &inbox,
-                    Inbox::Connected(topic.clone()),
-                    &mut shutdown,
-                    config.idle_timeout,
-                )
-                .await
-                    != InboxSend::Sent
-                {
+                if !send_inbox_wait(&inbox, Inbox::Connected(topic.clone()), &mut shutdown).await {
                     return;
                 }
                 let result = run_connection(
@@ -239,59 +247,30 @@ async fn connection_task(
         match end {
             ConnectionEnd::Shutdown => return,
             ConnectionEnd::Fatal { reason } => {
-                let _ = send_inbox(
-                    &inbox,
-                    Inbox::Closed { topic, reason },
-                    &mut shutdown,
-                    config.idle_timeout,
-                )
-                .await;
+                let _ =
+                    send_inbox_wait(&inbox, Inbox::Closed { topic, reason }, &mut shutdown).await;
                 return;
             }
             ConnectionEnd::ReconnectNow { reason } => {
                 if retries >= config.reconnect_max_attempts {
-                    let _ = send_inbox(
-                        &inbox,
-                        Inbox::Closed { topic, reason },
-                        &mut shutdown,
-                        config.idle_timeout,
-                    )
-                    .await;
+                    let _ = send_inbox_wait(&inbox, Inbox::Closed { topic, reason }, &mut shutdown)
+                        .await;
                     return;
                 }
                 retries += 1;
-                if send_inbox(
-                    &inbox,
-                    Inbox::Disconnected(topic.clone()),
-                    &mut shutdown,
-                    config.idle_timeout,
-                )
-                .await
-                    != InboxSend::Sent
+                if !send_inbox_wait(&inbox, Inbox::Disconnected(topic.clone()), &mut shutdown).await
                 {
                     return;
                 }
             }
             ConnectionEnd::Reconnect { reason } => {
-                if send_inbox(
-                    &inbox,
-                    Inbox::Disconnected(topic.clone()),
-                    &mut shutdown,
-                    config.idle_timeout,
-                )
-                .await
-                    != InboxSend::Sent
+                if !send_inbox_wait(&inbox, Inbox::Disconnected(topic.clone()), &mut shutdown).await
                 {
                     return;
                 }
                 if retries >= config.reconnect_max_attempts {
-                    let _ = send_inbox(
-                        &inbox,
-                        Inbox::Closed { topic, reason },
-                        &mut shutdown,
-                        config.idle_timeout,
-                    )
-                    .await;
+                    let _ = send_inbox_wait(&inbox, Inbox::Closed { topic, reason }, &mut shutdown)
+                        .await;
                     return;
                 }
                 tokio::select! {
@@ -439,25 +418,32 @@ async fn run_connection(
                                 frame.topic.log_tag(),
                                 text.len()
                             );
-                            if matches!(&frame.body, RelayFrameBody::SessionReady)
-                                && !saw_session_ready
-                            {
-                                saw_session_ready = true;
+                            if matches!(&frame.body, RelayFrameBody::SessionReady) {
+                                // A peer can return after its grace window and
+                                // the relay sends another `session_ready` on
+                                // the same socket. The shared flag must follow
+                                // every one of them, not just the first.
                                 ready.store(true, Ordering::Relaxed);
-                                match send_inbox(
-                                    inbox,
-                                    Inbox::Ready(frame.topic.clone()),
-                                    shutdown,
-                                    config.idle_timeout,
-                                )
-                                .await
-                                {
-                                    InboxSend::Sent => {}
-                                    InboxSend::Shutdown => break ConnectionEnd::Shutdown,
-                                    InboxSend::Stalled => break ConnectionEnd::Reconnect {
-                                        reason: "client inbox stalled",
-                                    },
+                                if !saw_session_ready {
+                                    saw_session_ready = true;
+                                    match send_inbox(
+                                        inbox,
+                                        Inbox::Ready(frame.topic.clone()),
+                                        shutdown,
+                                        config.idle_timeout,
+                                    )
+                                    .await
+                                    {
+                                        InboxSend::Sent => {}
+                                        InboxSend::Shutdown => break ConnectionEnd::Shutdown,
+                                        InboxSend::Stalled => break ConnectionEnd::Reconnect {
+                                            reason: "client inbox stalled",
+                                        },
+                                    }
                                 }
+                            }
+                            if matches!(&frame.body, RelayFrameBody::PeerDisconnected) {
+                                ready.store(false, Ordering::Relaxed);
                             }
                             match send_inbox(
                                 inbox,

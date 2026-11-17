@@ -10,6 +10,12 @@
 //! driven by [`Client::recv`], [`Client::next_event`], and
 //! [`Client::wait_session_ready`]. Applications should keep one of those
 //! futures pending while the session is active.
+//!
+//! Delivery outcomes are also part of the inbound work. Each tracked send
+//! keeps a reservation until its `Delivered` or `Failed` event is consumed by
+//! [`Client::poll_event`] or [`Client::next_event`]. Applications that only
+//! call `request`/`recv` must still drain events; otherwise sends eventually
+//! return [`ClientError::Busy`].
 
 mod client;
 mod config;

@@ -391,6 +391,101 @@ async fn run_expiry() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn peer_return_restores_tracked_sends() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(15), run_peer_return()).await??;
+    Ok(())
+}
+
+/// A peer that returns after the grace window gets another `session_ready`
+/// on the survivor's existing socket. Tracked sends must resume even though
+/// the survivor never reconnected.
+async fn run_peer_return() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(200)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    // The client under test is the survivor; a raw peer plays the wallet.
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let raw = establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+    let session_topic = raw.topic.clone();
+    let mut session_cipher = raw.cipher.clone();
+
+    // The wallet goes away without a local client reconnect.
+    drop(raw.session);
+
+    let outcome = responder.recv().await;
+    assert!(
+        matches!(outcome, Err(ClientError::PeerDisconnected)),
+        "expected PeerDisconnected, got {outcome:?}"
+    );
+    assert!(!responder.is_ready(), "peer loss must clear readiness");
+
+    // It returns on the same session topic; the relay sends a second
+    // `session_ready` on the survivor's existing socket.
+    let mut session = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+    responder.wait_session_ready().await?;
+
+    // A tracked send must now reach the wire without a local reconnect.
+    let request_id = responder
+        .request(json!({ "method": "after_peer_return" }))
+        .await?;
+    match read_raw_message(&mut session, &session_cipher).await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
+        other => panic!("expected request after peer return, got {other:?}"),
+    }
+
+    let ack_id = request_id.parse::<MessageId>()?;
+    let ack = client_frame(
+        &session_topic,
+        proposer_identity.did(),
+        "peer-return-ack",
+        &ClientMessage::Ack(AckPayload { ack_id }),
+        &mut session_cipher,
+    )?;
+    session
+        .send(WsMessage::text(serde_json::to_string(&ack)?))
+        .await?;
+    match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
+        ClientEvent::Delivered { id } => assert_eq!(id.to_string(), request_id),
+        other => panic!("expected delivery after peer return, got {other:?}"),
+    }
+
+    Ok(())
+}
+
 type RawStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Connect to the relay as a raw peer, bypassing `Client`.
@@ -1099,12 +1194,27 @@ async fn run_pairing_topic_guard() -> TestResult {
         .pairing
         .send(WsMessage::text(serde_json::to_string(&raw.approve)?))
         .await;
-    match tokio::time::timeout(Duration::from_millis(300), read_raw_frame(&mut raw.pairing)).await {
-        Err(_) => {}
-        Ok(Err(_)) => {}
-        Ok(Ok(frame)) => {
-            panic!("the retired pairing link must not acknowledge handshake traffic, got {frame:?}")
+    let outcome = tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            let frame = match read_raw_frame(&mut raw.pairing).await {
+                Ok(frame) => frame,
+                Err(_) => return Ok::<(), Box<dyn std::error::Error>>(()),
+            };
+            let RelayFrameBody::Message { payload } = &frame.body else {
+                continue;
+            };
+            let wire: Envelope = serde_json::from_str(payload)?;
+            if wire.kind == MessageType::Ack {
+                return Err(format!(
+                    "the retired pairing link must not acknowledge handshake traffic, got {frame:?}"
+                )
+                .into());
+            }
         }
+    })
+    .await;
+    if let Ok(Err(error)) = outcome {
+        panic!("{error}");
     }
 
     // The pairing key still exists locally, but an application envelope on the
