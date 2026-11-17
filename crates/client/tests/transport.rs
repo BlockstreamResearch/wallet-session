@@ -417,6 +417,33 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
 }
 
 #[tokio::test]
+async fn disconnect_closes_locally_when_not_ready() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("websocket");
+        while socket.next().await.is_some() {}
+    });
+
+    let mut client = connect(addr, config(addr)).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let result = client.disconnect("bye", 1000).await;
+    assert!(
+        matches!(
+            result,
+            Err(ClientError::SessionNotActive | ClientError::NotReady)
+        ),
+        "unexpected disconnect result: {result:?}"
+    );
+    assert!(matches!(client.recv().await, Err(ClientError::Closed)));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn connect_timeout_is_surfaced_and_stops() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

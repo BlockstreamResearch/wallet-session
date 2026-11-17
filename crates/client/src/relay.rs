@@ -68,6 +68,9 @@ pub(crate) enum Inbox {
 
     /// The client no longer needs the pairing connection for `topic`.
     Retire(Topic),
+
+    /// The session link for `topic` did not become ready in time.
+    SessionTimeout(Topic),
 }
 
 /// Why one connection attempt ended.

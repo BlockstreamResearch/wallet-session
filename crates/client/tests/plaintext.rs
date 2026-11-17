@@ -204,6 +204,40 @@ async fn run() -> TestResult {
         other => panic!("expected response, got {other:?}"),
     }
 
+    // Handshake kinds and manual acks are not accepted by generic `send`.
+    assert!(matches!(
+        proposer
+            .send(&ClientMessage::Ack(AckPayload {
+                ack_id: message_id("manual-ack")
+            }))
+            .await,
+        Err(ClientError::ProtocolViolation(
+            "acknowledgements are sent automatically"
+        ))
+    ));
+    assert!(matches!(
+        proposer
+            .send(&ClientMessage::Proposal(ProposalPayload {
+                ephemeral_public_key: "not-sent".to_owned(),
+                session_expiry: 0,
+                proposal: Opaque(Vec::new()),
+            }))
+            .await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert!(matches!(
+        responder.propose(json!({ "not": "allowed" })).await,
+        Err(ClientError::ProtocolViolation(
+            "only the proposer may propose"
+        ))
+    ));
+    assert!(matches!(
+        proposer.approve(json!({ "not": "allowed" })).await,
+        Err(ClientError::ProtocolViolation(
+            "only the responder may approve"
+        ))
+    ));
+
     Ok(())
 }
 
@@ -482,6 +516,98 @@ async fn run_peer_return() -> TestResult {
         ClientEvent::Delivered { id } => assert_eq!(id.to_string(), request_id),
         other => panic!("expected delivery after peer return, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn inbound_disconnect_is_terminal_and_acked() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_inbound_disconnect_terminal()).await??;
+    Ok(())
+}
+
+/// A peer's `disconnect` is acknowledged and delivered once, then every
+/// later operation observes a terminal client.
+async fn run_inbound_disconnect_terminal() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Leave a tracked send outstanding when the peer disconnects.
+    let request_id = responder
+        .request(json!({ "method": "pending_at_disconnect" }))
+        .await?;
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
+        other => panic!("expected pending request, got {other:?}"),
+    }
+
+    let disconnect = ClientMessage::Disconnect(DisconnectPayload {
+        reason: "peer-bye".to_owned(),
+        code: 1000,
+        message: String::new(),
+    });
+    let disconnect = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "peer-disconnect",
+        &disconnect,
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&disconnect)?))
+        .await?;
+
+    match responder.recv().await? {
+        ClientMessage::Disconnect(payload) => assert_eq!(payload.reason, "peer-bye"),
+        other => panic!("expected disconnect, got {other:?}"),
+    }
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, message_id("peer-disconnect")),
+        other => panic!("expected disconnect ack, got {other:?}"),
+    }
+
+    // Closing reports the outstanding request before the terminal error.
+    match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
+        ClientEvent::Failed { id, .. } => assert_eq!(id.to_string(), request_id),
+        other => panic!("expected the pending request to fail, got {other:?}"),
+    }
+    assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+    assert!(matches!(
+        responder
+            .request(json!({ "method": "after_disconnect" }))
+            .await,
+        Err(ClientError::Closed)
+    ));
 
     Ok(())
 }
@@ -882,12 +1008,12 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_secs(60)),
         responder_identity,
-        Role::Responder,
+        Role::Proposer,
         topic.clone(),
         PlaintextCipher::new(),
     )
     .await?;
-    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Responder, &topic).await?;
     responder.wait_session_ready().await?;
     wait_raw_session_ready(&mut pairing).await?;
 
@@ -1657,6 +1783,280 @@ async fn run_weak_approve() -> TestResult {
         ClientEvent::Delivered { id } => assert_eq!(id.to_string(), request_id),
         other => panic!("expected delivery after weak approve, got {other:?}"),
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn approve_is_an_implicit_proposal_ack() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_implicit_proposal_ack()).await??;
+    Ok(())
+}
+
+/// A valid approve proves the peer received the proposal even when the
+/// explicit proposal ack was lost.
+async fn run_implicit_proposal_ack() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(100))
+            .with_ack_max_attempts(1),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let (proposal_id, proposer_public) = loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        let proposal_id = frame.id.clone();
+        let RelayFrameBody::Message { payload } = frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(&payload)?;
+        if wire.kind != MessageType::Proposal {
+            continue;
+        }
+        let bytes = cipher.open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        let ClientMessage::Proposal(proposal) = ClientMessage::from_bytes(&bytes)? else {
+            return Err("expected proposal payload".into());
+        };
+        break (
+            proposal_id,
+            decode_public_key(&proposal.ephemeral_public_key)?,
+        );
+    };
+
+    // Deliberately do not send the explicit proposal ack.
+    let responder_keypair = EphemeralKeyPair::generate();
+    let approve = ClientMessage::Approve(ApprovePayload {
+        ephemeral_public_key: responder_keypair.public_key_encoded(),
+        approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+    });
+    let approve = client_frame(
+        &topic,
+        responder_identity.did(),
+        "implicit-approve",
+        &approve,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&approve)?))
+        .await?;
+
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Delivered { id } => assert_eq!(id, proposal_id),
+        other => panic!("expected the proposal delivery, got {other:?}"),
+    }
+
+    // No failure arrives after the retry window.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        proposer.poll_event().is_none(),
+        "an approved proposal must not be reported failed"
+    );
+
+    let (_key, session_topic) = responder_keypair.derive(&proposer_public)?;
+    let session_topic = session_topic.as_topic().clone();
+    let mut session = connect_raw(
+        &relay_url,
+        &responder_identity,
+        Role::Responder,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+    proposer.wait_session_ready().await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_proposal_returns_to_idle() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_failed_proposal()).await??;
+    Ok(())
+}
+
+/// An unacknowledged proposal returns the proposer to `Idle` so the
+/// application can try again.
+async fn run_failed_proposal() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(10))
+            .with_ack_max_attempts(0),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let _pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Failed { .. } => {}
+        other => panic!("expected the proposal failure, got {other:?}"),
+    }
+    assert_eq!(proposer.session().state, SessionState::Idle);
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_approve_drops_the_unready_session() -> TestResult {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_failed_approve_session_timeout(),
+    )
+    .await??;
+    Ok(())
+}
+
+/// When the approve is lost, the responder must not wait forever on a
+/// session link the proposer never joins.
+async fn run_failed_approve_session_timeout() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(100)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(10))
+            .with_ack_max_attempts(0)
+            .with_connection_stability(Duration::from_millis(100)),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let keypair = EphemeralKeyPair::generate();
+    let proposal = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: keypair.public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+    });
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "timeout-proposal",
+        &proposal,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+
+    // The approve is sent but never acknowledged. The proposer also never
+    // joins the session topic.
+    responder.approve(json!({ "ok": true })).await?;
+    match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
+        ClientEvent::Failed { .. } => {}
+        other => panic!("expected the approve failure, got {other:?}"),
+    }
+
+    // Let the session timeout fire, then drive the client so it processes the
+    // timeout item.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let _ = tokio::time::timeout(Duration::from_millis(200), responder.next_event()).await;
+
+    assert_eq!(responder.session().state, SessionState::Disconnected);
+    assert!(matches!(
+        responder.request(json!({ "method": "no_session" })).await,
+        Err(ClientError::NotReady)
+    ));
 
     Ok(())
 }

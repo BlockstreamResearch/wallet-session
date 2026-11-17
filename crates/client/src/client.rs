@@ -181,6 +181,7 @@ pub struct Client<C> {
     handshake: Handshake,
     did: DidKey,
     pending: VecDeque<ClientMessage>,
+    pairing_proposal: Option<MessageId>,
     pairing_approval: Option<MessageId>,
     terminal: Option<Terminal>,
 }
@@ -232,6 +233,7 @@ where
             handshake: Handshake::Idle,
             did,
             pending: VecDeque::new(),
+            pairing_proposal: None,
             pairing_approval: None,
             terminal: None,
         })
@@ -254,11 +256,15 @@ where
         self.terminal.map(Terminal::error)
     }
 
-    /// Stop all traffic and release both relay links.
+    /// Stop all traffic, report outstanding sends, and release both links.
     fn close(&mut self, terminal: Terminal) {
         self.terminal = Some(terminal);
-        self.pairing = None;
-        self.session_link = None;
+        if let Some(mut link) = self.pairing.take() {
+            link.reliability.fail_all();
+        }
+        if let Some(mut link) = self.session_link.take() {
+            link.reliability.fail_all();
+        }
     }
 
     fn active_topic(&self) -> &Topic {
@@ -333,6 +339,23 @@ where
                 {
                     log::debug!("retiring pairing link {}", topic.log_tag());
                     self.retire_pairing();
+                }
+                Ok(None)
+            }
+            Inbox::SessionTimeout(topic) => {
+                let expired = self
+                    .session_link
+                    .as_ref()
+                    .is_some_and(|link| link.topic == topic && !link.ready);
+                if expired {
+                    log::warn!(
+                        "session link {} did not become ready; dropping it",
+                        topic.log_tag()
+                    );
+                    self.session_link = None;
+                    if self.session.state == SessionState::Active {
+                        self.session.state = SessionState::Disconnected;
+                    }
                 }
                 Ok(None)
             }
@@ -437,12 +460,15 @@ where
         Ok(())
     }
 
-    /// Seal and send a message, returning its envelope id.
+    /// Seal and send an application message, returning its envelope id.
     ///
-    /// Handshake messages use [`Client::propose`], [`Client::approve`] and
-    /// [`Client::reject`] and stay on the pairing topic. Application messages
-    /// are refused until the handshake is established, then use the derived
-    /// session topic.
+    /// Handshake messages must use [`Client::propose`], [`Client::approve`]
+    /// and [`Client::reject`], which also update the handshake state.
+    /// Acknowledgements are sent automatically after a message passes the
+    /// receive checks; [`ClientMessage::Ack`] is therefore rejected here.
+    ///
+    /// Application messages are refused until the handshake is established,
+    /// then use the derived session topic.
     ///
     /// A tracked send reserves pending/outcome capacity until its delivery
     /// event is consumed. Applications that only call `send`/`recv` must
@@ -453,21 +479,19 @@ where
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
-        let topic = match message {
+        match message {
             ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_) => {
-                if matches!(self.handshake, Handshake::Established) {
-                    return Err(ClientError::UnexpectedHandshake);
-                }
-                if !self.pairing.as_ref().is_some_and(|link| link.ready) {
-                    return Err(ClientError::NotReady);
-                }
-                self.session.pairing_topic.clone()
+                return Err(ClientError::UnexpectedHandshake);
             }
-            _ => {
-                self.ensure_session_ready()?;
-                self.active_topic().clone()
+            ClientMessage::Ack(_) => {
+                return Err(ClientError::ProtocolViolation(
+                    "acknowledgements are sent automatically",
+                ));
             }
-        };
+            _ => {}
+        }
+        self.ensure_session_ready()?;
+        let topic = self.active_topic().clone();
         self.send_on(&topic, message).await
     }
 
@@ -519,11 +543,13 @@ where
     /// Receive the next application message, processing acknowledgements and
     /// lifecycle traffic while waiting.
     pub async fn recv(&mut self) -> Result<ClientMessage> {
-        if let Some(error) = self.terminal_error() {
-            return Err(error);
-        }
+        // Messages queued and already acknowledged before the link became
+        // terminal are still owed to the application.
         if let Some(message) = self.pending.pop_front() {
             return Ok(message);
+        }
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
         }
 
         loop {
@@ -755,10 +781,11 @@ where
             return Ok(None);
         }
 
-        if matches!(
+        let terminates = matches!(
             &message,
             ClientMessage::Disconnect(_) | ClientMessage::SessionDelete(_)
-        ) {
+        );
+        if terminates {
             self.session.state = SessionState::Disconnected;
         }
 
@@ -799,6 +826,12 @@ where
         if !rekeys {
             let link = self.link_mut(&topic).expect("topic was checked");
             link.replay.record(&id, &wire);
+        }
+
+        if terminates {
+            // The peer ended the session. Deliver this final message, then
+            // make every later operation observe a terminal client.
+            self.close(Terminal::Closed);
         }
 
         Ok(Some(message))
@@ -850,21 +883,32 @@ where
             .ok()
             .map(|(event, _permit)| event)
             .or_else(|| self.lifecycle.try_recv().ok())?;
-        if matches!(
-            &event,
-            ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
-        ) {
-            self.retire_pairing();
-        }
-        Some(event)
+        Some(self.received_event(event))
     }
 
     fn received_event(&mut self, event: ClientEvent) -> ClientEvent {
-        if matches!(
-            &event,
-            ClientEvent::Failed { id, .. } if self.pairing_approval.as_ref() == Some(id)
-        ) {
-            self.retire_pairing();
+        match &event {
+            ClientEvent::Delivered { id } => {
+                if self.pairing_proposal.as_ref() == Some(id) {
+                    self.pairing_proposal = None;
+                }
+            }
+            ClientEvent::Failed { id, .. } => {
+                if self.pairing_approval.as_ref() == Some(id) {
+                    self.retire_pairing();
+                    self.schedule_session_timeout();
+                }
+                if self.pairing_proposal.as_ref() == Some(id) {
+                    self.pairing_proposal = None;
+                    if matches!(self.handshake, Handshake::Proposed { .. }) {
+                        self.handshake = Handshake::Idle;
+                        if self.session.state == SessionState::ProposalSent {
+                            self.session.state = SessionState::Idle;
+                        }
+                    }
+                }
+            }
+            ClientEvent::Reconnecting | ClientEvent::Reconnected => {}
         }
         event
     }
@@ -874,15 +918,17 @@ where
     /// Use this instead of polling [`Client::poll_event`] when acknowledgements
     /// or lifecycle traffic may arrive while the application waits.
     pub async fn next_event(&mut self) -> Result<ClientEvent> {
-        if let Some(error) = self.terminal_error() {
-            return Err(error);
-        }
         loop {
+            // Outcomes are still owed after a terminal transition; drain them
+            // before surfacing the terminal error.
             if let Ok((event, _permit)) = self.outcomes.try_recv() {
                 return Ok(self.received_event(event));
             }
             if let Ok(event) = self.lifecycle.try_recv() {
                 return Ok(self.received_event(event));
+            }
+            if let Some(error) = self.terminal_error() {
+                return Err(error);
             }
 
             tokio::select! {
@@ -953,6 +999,13 @@ where
                 };
                 let (key, topic) = keypair.derive(&peer_public)?;
                 self.establish_session(key, topic)?;
+                // A valid approve proves the peer received the proposal, even
+                // when its explicit proposal ack was lost.
+                if let Some(proposal_id) = self.pairing_proposal.take()
+                    && let Some(link) = self.pairing.as_mut()
+                {
+                    link.reliability.mark_delivered(&proposal_id);
+                }
             }
             ClientMessage::Reject(_) => {
                 self.session.state = SessionState::Rejected;
@@ -995,6 +1048,19 @@ where
         Ok(())
     }
 
+    /// Drop a session link that never became ready after a failed approve.
+    fn schedule_session_timeout(&self) {
+        let Some(topic) = self.session_link.as_ref().map(|link| link.topic.clone()) else {
+            return;
+        };
+        let window = self.config.connection_stability;
+        let inbox = self.inbox_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            let _ = inbox.send(Inbox::SessionTimeout(topic)).await;
+        });
+    }
+
     /// Retire the pairing connection after the handshake ack retry window.
     fn schedule_pairing_retirement(&self) {
         let window = self.pairing_retirement_window();
@@ -1024,6 +1090,11 @@ where
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
+        if self.session.role != Role::Proposer {
+            return Err(ClientError::ProtocolViolation(
+                "only the proposer may propose",
+            ));
+        }
         if !matches!(self.handshake, Handshake::Idle) {
             return Err(ClientError::UnexpectedHandshake);
         }
@@ -1037,8 +1108,10 @@ where
             proposal: Opaque(serde_json::to_vec(&proposal)?),
         };
         let topic = self.session.pairing_topic.clone();
-        self.send_on(&topic, &ClientMessage::Proposal(payload))
+        let proposal_id = self
+            .send_on(&topic, &ClientMessage::Proposal(payload))
             .await?;
+        self.pairing_proposal = Some(proposal_id);
         self.handshake = Handshake::Proposed { keypair };
         self.session.state = SessionState::ProposalSent;
         Ok(())
@@ -1049,6 +1122,11 @@ where
     pub async fn approve(&mut self, approval: Value) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
+        }
+        if self.session.role != Role::Responder {
+            return Err(ClientError::ProtocolViolation(
+                "only the responder may approve",
+            ));
         }
         let (public_key, key, topic) = match &self.handshake {
             Handshake::PeerProposed {
@@ -1076,10 +1154,23 @@ where
 
     /// Send a `reject` and move to `Rejected`.
     pub async fn reject(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
-        self.send(&ClientMessage::Reject(RejectPayload {
-            code,
-            message: message.into(),
-        }))
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        if matches!(self.handshake, Handshake::Established) {
+            return Err(ClientError::UnexpectedHandshake);
+        }
+        if !self.pairing.as_ref().is_some_and(|link| link.ready) {
+            return Err(ClientError::NotReady);
+        }
+        let topic = self.session.pairing_topic.clone();
+        self.send_on(
+            &topic,
+            &ClientMessage::Reject(RejectPayload {
+                code,
+                message: message.into(),
+            }),
+        )
         .await?;
         self.session.state = SessionState::Rejected;
         Ok(())
@@ -1128,23 +1219,22 @@ where
         Ok(())
     }
 
-    /// Acknowledge a received message.
-    pub async fn ack(&mut self, ack_id: MessageId) -> Result<()> {
-        self.send(&ClientMessage::Ack(AckPayload { ack_id }))
-            .await?;
-        Ok(())
-    }
-
     /// Gracefully disconnect.
+    ///
+    /// The local client is closed even when the peer cannot be notified, for
+    /// example because the link is not ready. The notification error is
+    /// returned after the local teardown.
     pub async fn disconnect(&mut self, reason: impl Into<String>, code: u32) -> Result<()> {
-        self.send(&ClientMessage::Disconnect(DisconnectPayload {
-            reason: reason.into(),
-            code,
-            message: String::new(),
-        }))
-        .await?;
+        let result = self
+            .send(&ClientMessage::Disconnect(DisconnectPayload {
+                reason: reason.into(),
+                code,
+                message: String::new(),
+            }))
+            .await;
         self.session.state = SessionState::Disconnected;
         self.close(Terminal::Closed);
+        result?;
         Ok(())
     }
 }
