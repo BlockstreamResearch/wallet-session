@@ -74,6 +74,16 @@ enum Handshake {
     Established,
 }
 
+/// A message frame that passed wire validation, sender policy, topic/kind
+/// policy, capacity checks and authentication.
+struct InboundEnvelope {
+    id: MessageId,
+    topic: Topic,
+    wire: Message,
+    plaintext: Vec<u8>,
+    now: u64,
+}
+
 /// One relay connection, its outbound reliability and its inbound replay
 /// memory.
 struct Link<C> {
@@ -259,6 +269,19 @@ where
 
     fn active_topic(&self) -> &Topic {
         &self.session.topic
+    }
+
+    fn link(&self, topic: &Topic) -> Option<&Link<C>> {
+        if self
+            .pairing
+            .as_ref()
+            .is_some_and(|link| link.topic == *topic)
+        {
+            return self.pairing.as_ref();
+        }
+        self.session_link
+            .as_ref()
+            .filter(|link| link.topic == *topic)
     }
 
     fn link_mut(&mut self, topic: &Topic) -> Option<&mut Link<C>> {
@@ -520,17 +543,29 @@ where
         frame: RelayFrame,
         deliver: bool,
     ) -> Result<Option<ClientMessage>> {
+        let Some(envelope) = self.authenticate_frame(frame, deliver) else {
+            return Ok(None);
+        };
+        self.process_envelope(envelope).await
+    }
+
+    /// Apply wire, sender, topic and cryptographic checks to a frame.
+    ///
+    /// This does not mutate client state. The plaintext is returned unparsed
+    /// so the caller can preserve replay-classification ordering before
+    /// interpreting it.
+    fn authenticate_frame(&self, frame: RelayFrame, deliver: bool) -> Option<InboundEnvelope> {
         let RelayFrame {
             id, topic, body, ..
         } = frame;
         let RelayFrameBody::Message { payload } = body else {
-            return Ok(None);
+            return None;
         };
 
-        if self.link_mut(&topic).is_none() {
+        let Some(link) = self.link(&topic) else {
             log::warn!("dropping frame for unknown topic {}", topic.log_tag());
-            return Ok(None);
-        }
+            return None;
+        };
 
         let wire: Message = match serde_json::from_str(&payload) {
             Ok(wire) => wire,
@@ -539,13 +574,13 @@ where
                     "dropping malformed envelope on topic {}: {error}",
                     topic.log_tag()
                 );
-                return Ok(None);
+                return None;
             }
         };
 
         if wire.from == self.did {
             log::warn!("dropping frame from own identity {}", wire.from);
-            return Ok(None);
+            return None;
         }
         if let Some(counterpart) = &self.session.peer_did {
             if wire.from != *counterpart {
@@ -554,30 +589,25 @@ where
                     wire.from,
                     counterpart
                 );
-                return Ok(None);
+                return None;
             }
         } else if topic != self.session.pairing_topic {
             log::warn!("dropping session-topic frame before the counterpart is established");
-            return Ok(None);
+            return None;
         }
 
         if wire.version != Message::VERSION {
             log::warn!("dropping frame with unsupported version {}", wire.version);
-            return Ok(None);
+            return None;
         }
         let now = unix_now();
         if now.abs_diff(wire.ts) > MAX_TS_SKEW_SECS {
             log::warn!("dropping frame with stale timestamp ts={}", wire.ts);
-            return Ok(None);
+            return None;
         }
-        let stale = self
-            .link_mut(&topic)
-            .expect("topic was checked")
-            .replay
-            .is_stale(wire.ts);
-        if stale {
+        if link.replay.is_stale(wire.ts) {
             log::warn!("dropping frame with discarded timestamp ts={}", wire.ts);
-            return Ok(None);
+            return None;
         }
 
         let role = self.session.role;
@@ -594,19 +624,14 @@ where
             nonce: wire.nonce.clone(),
             data: wire.data.clone(),
         };
-        let bytes = match self
-            .link_mut(&topic)
-            .expect("topic was checked")
-            .cipher
-            .open(&aad, &sealed)
-        {
+        let plaintext = match link.cipher.open(&aad, &sealed) {
             Ok(bytes) => bytes,
             Err(error) => {
                 log::warn!(
                     "dropping unauthenticated envelope on topic {}: {error}",
                     topic.log_tag()
                 );
-                return Ok(None);
+                return None;
             }
         };
 
@@ -614,35 +639,63 @@ where
         // pairing topic are dropped even after the session is established, so
         // a leaked pairing key cannot bypass the session key. Conversely, the
         // session topic carries application traffic only.
-        let allowed = if topic == self.session.pairing_topic {
-            wire.kind.is_handshake() || wire.kind == MessageType::Ack
-        } else {
-            wire.kind.is_application()
-        };
-        if !allowed {
+        if !self.allowed_on_topic(&topic, wire.kind) {
             log::warn!(
                 "dropping {} on topic {}",
                 wire.kind.as_str(),
                 topic.log_tag()
             );
-            return Ok(None);
+            return None;
         }
 
-        // While `wait_session_ready` has no room to queue an application
+        // While `wait_session_ready`/`next_event` has no room to queue a
         // message, drop it without recording or acknowledging it, so the peer
         // retransmits it later instead of the application silently losing it.
-        if !deliver
-            && matches!(
-                wire.kind,
-                MessageType::Request
-                    | MessageType::Response
-                    | MessageType::Disconnect
-                    | MessageType::SessionDelete
-            )
-        {
-            log::warn!("dropping application message: pending queue is full");
-            return Ok(None);
+        // Acks are not delivered and must still be processed.
+        if !deliver && wire.kind != MessageType::Ack {
+            log::warn!("dropping message: pending queue is full");
+            return None;
         }
+
+        Some(InboundEnvelope {
+            id,
+            topic,
+            wire,
+            plaintext,
+            now,
+        })
+    }
+
+    /// Whether `kind` may travel on `topic`.
+    fn allowed_on_topic(&self, topic: &Topic, kind: MessageType) -> bool {
+        if *topic == self.session.pairing_topic {
+            kind.is_handshake() || kind == MessageType::Ack
+        } else {
+            kind.is_application()
+        }
+    }
+
+    /// Whether a handshake message arrived after the handshake completed.
+    fn is_late_handshake(&self, message: &ClientMessage) -> bool {
+        matches!(self.handshake, Handshake::Established)
+            && matches!(
+                message,
+                ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_)
+            )
+    }
+
+    /// Apply replay and handshake semantics to an authenticated frame.
+    async fn process_envelope(
+        &mut self,
+        envelope: InboundEnvelope,
+    ) -> Result<Option<ClientMessage>> {
+        let InboundEnvelope {
+            id,
+            topic,
+            wire,
+            plaintext,
+            now,
+        } = envelope;
 
         // The counterpart is the sender of the first envelope that passes the
         // version, topic, identity, timestamp and authentication checks on the
@@ -678,7 +731,7 @@ where
             Observation::New => {}
         }
 
-        let message = match ClientMessage::from_bytes(&bytes) {
+        let message = match ClientMessage::from_bytes(&plaintext) {
             Ok(message) => message,
             Err(error) => {
                 log::warn!(
@@ -712,26 +765,13 @@ where
 
         // acks are consumed by reliability
         if let ClientMessage::Ack(ack) = &message {
-            let ack_id = ack.ack_id.clone();
-            let retires_pairing = topic == self.session.pairing_topic
-                && self.pairing_approval.as_ref() == Some(&ack_id);
-            let link = self.link_mut(&topic).expect("topic was checked");
-            link.replay.record(&id, &wire);
-            link.reliability.mark_delivered(&ack_id);
-            if retires_pairing {
-                self.retire_pairing();
-            }
+            self.commit_ack(&id, &topic, &wire, ack);
             return Ok(None);
         }
 
         // Once established, the pairing key may no longer create new handshake
         // state. Retransmissions of the handshake were re-acked above.
-        if matches!(self.handshake, Handshake::Established)
-            && matches!(
-                &message,
-                ClientMessage::Proposal(_) | ClientMessage::Approve(_) | ClientMessage::Reject(_)
-            )
-        {
+        if self.is_late_handshake(&message) {
             log::warn!("dropping handshake message after establishment");
             return Ok(None);
         }
@@ -763,6 +803,19 @@ where
         }
 
         Ok(Some(message))
+    }
+
+    /// Record an inbound ack and report delivery.
+    fn commit_ack(&mut self, id: &MessageId, topic: &Topic, wire: &Message, ack: &AckPayload) {
+        let ack_id = ack.ack_id.clone();
+        let retires_pairing =
+            *topic == self.session.pairing_topic && self.pairing_approval.as_ref() == Some(&ack_id);
+        let link = self.link_mut(topic).expect("topic was checked");
+        link.replay.record(id, wire);
+        link.reliability.mark_delivered(&ack_id);
+        if retires_pairing {
+            self.retire_pairing();
+        }
     }
 
     /// Acknowledge a received envelope by id, on the topic it arrived on.
