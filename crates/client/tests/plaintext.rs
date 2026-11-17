@@ -1804,6 +1804,36 @@ async fn run_recoverable_bad_frames() -> TestResult {
         .send(WsMessage::text(serde_json::to_string(&invalid_response)?))
         .await?;
 
+    for (id, nonce, plaintext) in [
+        (
+            "null-error-response",
+            [13u8; 24],
+            r#"{"type":"response","requestId":"null-error","response":"AQID","error":null}"#,
+        ),
+        (
+            "null-response-response",
+            [14u8; 24],
+            r#"{"type":"response","requestId":"null-response","response":null,"error":"BAU"}"#,
+        ),
+        (
+            "empty-response",
+            [15u8; 24],
+            r#"{"type":"response","requestId":"empty"}"#,
+        ),
+    ] {
+        let frame = envelope_frame(
+            &raw.topic,
+            proposer_identity.did(),
+            id,
+            MessageType::Response,
+            nonce,
+            plaintext.as_bytes(),
+        )?;
+        raw.session
+            .send(WsMessage::text(serde_json::to_string(&frame)?))
+            .await?;
+    }
+
     let valid = request_frame(
         &raw.topic,
         proposer_identity.did(),

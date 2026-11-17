@@ -1,8 +1,18 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::message::MessageId;
+
+/// Distinguish an omitted optional field from an explicit `null`.
+fn deserialize_optional_alternative<'de, D>(deserializer: D) -> Result<Option<Opaque>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Opaque>::deserialize(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("field must be omitted, not null"))?;
+    Ok(Some(value))
+}
 
 /// Opaque application data carried inside a payload shape.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,11 +79,19 @@ pub struct ResponsePayload {
     pub request_id: String,
 
     /// Opaque application result; present on success, absent on error.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_alternative",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub response: Option<Opaque>,
 
     /// Failure description; present on error, absent on success.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_alternative",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub error: Option<Opaque>,
 }
 

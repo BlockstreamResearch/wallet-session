@@ -313,8 +313,10 @@ Payload shapes:
 - `disconnect`: `{ "type": "disconnect", "reason": ..., "code": ..., "message": ... }`
 - `session_delete`: `{ "type": "session_delete", "code": ..., "message": ... }`
 
-A `response` carries exactly one of `response` and `error`; the absent field is
-omitted, not encoded as `null`.
+A `response` carries exactly one of `response` and `error`. The absent field
+MUST be omitted, not encoded as `null`; an explicit `null` is invalid. A
+response with both fields, neither field, or an explicit `null` alternative is
+rejected: it is neither delivered nor acknowledged.
 
 `proposal`, `approval`, `request`, `response`, and `error` are opaque application data, encoded as base64url strings.
 
