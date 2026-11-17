@@ -18,7 +18,7 @@ use wallet_session_core::{
 };
 
 use crate::{
-    config::ClientConfig,
+    config::{ClientConfig, MAX_RETRY_DELAY},
     crypto::{Aad, CipherError, SealedPayload},
     error::{ClientError, Result},
     handshake::{
@@ -1082,7 +1082,7 @@ where
             .ack_base_delay
             .saturating_mul(factor.saturating_sub(1))
             .saturating_add(Duration::from_secs(1))
-            .max(Duration::from_secs(1))
+            .clamp(Duration::from_secs(1), MAX_RETRY_DELAY)
     }
 
     /// Send a `proposal` carrying ephemeral public key.

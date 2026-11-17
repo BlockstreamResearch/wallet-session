@@ -4,6 +4,13 @@ use url::Url;
 
 use crate::error::ClientError;
 
+/// Longest accepted retransmission delay.
+///
+/// Receivers reject envelopes once their `ts` is more than 300 seconds old, so
+/// a longer delay cannot produce a useful retry. The cap also keeps retry
+/// arithmetic away from `Duration` and `Instant` overflow.
+pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -19,7 +26,8 @@ pub struct ClientConfig {
     /// Allow `ws://` relay URLs. Without this, only `wss://` is accepted.
     pub allow_insecure_ws: bool,
 
-    /// Lifetime of the signed connection token.
+    /// Lifetime of the signed connection token. Must be non-zero and longer
+    /// than `connection_stability`.
     pub token_ttl: Duration,
 
     /// Maximum time without an inbound frame before the relay is considered dead.
@@ -35,12 +43,14 @@ pub struct ClientConfig {
     pub close_timeout: Duration,
 
     /// Base delay before the first retransmission of an un-ACKed message.
+    /// Must be non-zero and no longer than the 300-second envelope lifetime.
     pub ack_base_delay: Duration,
 
     /// Maximum retransmissions before a message is reported failed.
     pub ack_max_attempts: usize,
 
-    /// Minimum spacing between retransmissions.
+    /// Minimum spacing between retransmissions. Must be non-zero and no
+    /// longer than the 300-second envelope lifetime.
     pub retransmit_spacing: Duration,
 
     /// Maximum retransmission bytes per second used to pace reconnects.
@@ -66,6 +76,9 @@ pub struct ClientConfig {
     /// A connection waiting for its counterpart may never see `session_ready`,
     /// but it is still healthy and should not exhaust its retries on token
     /// expiry or ordinary network drops.
+    ///
+    /// Must be non-zero and shorter than `token_ttl`; otherwise a token
+    /// expiry always arrives before a connection can be considered stable.
     pub connection_stability: Duration,
 }
 
@@ -128,18 +141,35 @@ impl ClientConfig {
         }
 
         for (timeout, name) in [
+            (self.token_ttl, "token_ttl"),
             (self.idle_timeout, "idle_timeout"),
             (self.connect_timeout, "connect_timeout"),
             (self.write_timeout, "write_timeout"),
             (self.close_timeout, "close_timeout"),
+            (self.ack_base_delay, "ack_base_delay"),
+            (self.retransmit_spacing, "retransmit_spacing"),
             (self.ping_interval, "ping_interval"),
             (self.pong_timeout, "pong_timeout"),
-            (self.retransmit_spacing, "retransmit_spacing"),
             (self.connection_stability, "connection_stability"),
         ] {
             if timeout.is_zero() {
                 return Err(ClientError::InvalidConfig(name));
             }
+        }
+
+        for (delay, name) in [
+            (self.ack_base_delay, "ack_base_delay"),
+            (self.retransmit_spacing, "retransmit_spacing"),
+        ] {
+            if delay > MAX_RETRY_DELAY {
+                return Err(ClientError::InvalidConfig(name));
+            }
+        }
+
+        if self.connection_stability >= self.token_ttl {
+            return Err(ClientError::InvalidConfig(
+                "connection_stability must be shorter than token_ttl",
+            ));
         }
 
         if self.retransmit_bytes_per_second == 0 {
@@ -280,10 +310,12 @@ mod tests {
     #[test]
     fn rejects_zero_transport_timeouts() {
         for config in [
+            ClientConfig::new("wss://relay.example.com").with_token_ttl(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_idle_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_connect_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_write_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_close_timeout(Duration::ZERO),
+            ClientConfig::new("wss://relay.example.com").with_ack_base_delay(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_ping_interval(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_pong_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_retransmit_spacing(Duration::ZERO),
@@ -293,6 +325,54 @@ mod tests {
             assert!(matches!(
                 config.validate(),
                 Err(ClientError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unbounded_retry_delays() {
+        for delay in [MAX_RETRY_DELAY + Duration::from_secs(1), Duration::MAX] {
+            assert!(matches!(
+                ClientConfig::new("wss://relay.example.com")
+                    .with_ack_base_delay(delay)
+                    .validate(),
+                Err(ClientError::InvalidConfig("ack_base_delay"))
+            ));
+            assert!(matches!(
+                ClientConfig::new("wss://relay.example.com")
+                    .with_retransmit_spacing(delay)
+                    .validate(),
+                Err(ClientError::InvalidConfig("retransmit_spacing"))
+            ));
+        }
+
+        assert!(
+            ClientConfig::new("wss://relay.example.com")
+                .with_ack_base_delay(MAX_RETRY_DELAY)
+                .with_retransmit_spacing(MAX_RETRY_DELAY)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn requires_stability_shorter_than_token_ttl() {
+        assert!(
+            ClientConfig::new("wss://relay.example.com")
+                .with_token_ttl(Duration::from_secs(30))
+                .with_connection_stability(Duration::from_secs(29))
+                .validate()
+                .is_ok()
+        );
+        for stability in [Duration::from_secs(30), Duration::from_secs(31)] {
+            assert!(matches!(
+                ClientConfig::new("wss://relay.example.com")
+                    .with_token_ttl(Duration::from_secs(30))
+                    .with_connection_stability(stability)
+                    .validate(),
+                Err(ClientError::InvalidConfig(
+                    "connection_stability must be shorter than token_ttl"
+                ))
             ));
         }
     }

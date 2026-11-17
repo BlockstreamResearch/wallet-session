@@ -17,7 +17,7 @@ use wallet_session_core::{
     message::{MessageId, MessageType},
 };
 
-use crate::{error::ClientError, identity::unix_now, relay::Outbound};
+use crate::{config::MAX_RETRY_DELAY, error::ClientError, identity::unix_now, relay::Outbound};
 
 /// Events buffered between the reliability task and the client.
 pub(crate) const EVENT_CAPACITY: usize = 256;
@@ -334,7 +334,8 @@ async fn retry_loop(
             }
             let byte_delay =
                 Duration::from_secs_f64(frame_len as f64 / retransmit_bytes_per_second as f64);
-            next_send = now + retransmit_spacing.max(byte_delay);
+            let spacing = retransmit_spacing.max(byte_delay);
+            next_send = now.checked_add(spacing).unwrap_or(now + MAX_RETRY_DELAY);
         }
 
         for (id, entry) in failed {
@@ -350,7 +351,8 @@ async fn retry_loop(
 }
 
 fn backoff(base: Duration, attempts: usize) -> Duration {
-    base * 2u32.pow(attempts.min(31) as u32)
+    base.saturating_mul(2u32.pow(attempts.min(31) as u32))
+        .min(MAX_RETRY_DELAY)
 }
 
 #[cfg(test)]
@@ -479,6 +481,34 @@ mod tests {
         assert!(requires_ack(MessageType::Request));
         assert!(requires_ack(MessageType::Response));
         assert!(!requires_ack(MessageType::Ack));
+    }
+
+    #[test]
+    fn backoff_is_capped_at_the_retry_window() {
+        assert_eq!(backoff(Duration::from_secs(1), 1), Duration::from_secs(2));
+        assert_eq!(backoff(Duration::from_secs(1), 31), MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn huge_retransmit_spacing_does_not_overflow() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, _events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(1),
+            5,
+            Duration::MAX,
+        );
+
+        reliability
+            .dispatch(frame("a"), true, unix_now())
+            .expect("dispatch");
+        ready.store(true, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
     }
 
     fn ready(value: bool) -> Arc<AtomicBool> {

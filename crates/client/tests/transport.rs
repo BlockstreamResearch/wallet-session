@@ -444,6 +444,59 @@ async fn disconnect_closes_locally_when_not_ready() -> TestResult {
 }
 
 #[tokio::test]
+async fn liveness_timeouts_do_not_reset_the_reconnect_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(_socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    // Complete the upgrade, then stop reading so pings are
+                    // never answered. This is a black-holed socket.
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    };
+
+    let mut client = connect(
+        addr,
+        config(addr)
+            .with_connection_stability(Duration::from_millis(10))
+            .with_ping_interval(Duration::from_millis(100))
+            .with_pong_timeout(Duration::from_millis(100))
+            .with_reconnect_initial_delay(Duration::from_millis(10))
+            .with_reconnect_max_attempts(1),
+    )
+    .await?;
+
+    let error = timeout(Duration::from_secs(3), client.recv())
+        .await?
+        .expect_err("the client should become terminal");
+    assert!(
+        matches!(error, ClientError::Transport("relay pong timed out")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        2,
+        "a liveness timeout must not reset the retry budget"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn connect_timeout_is_surfaced_and_stops() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

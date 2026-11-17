@@ -93,6 +93,7 @@ struct ConnectionResult {
     end: ConnectionEnd,
     saw_session_ready: bool,
     uptime: Duration,
+    timed_out: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +233,9 @@ async fn connection_task(
                     // bypass that gating and pacing.
                     while outbound.try_recv().is_ok() {}
                 }
-                if result.saw_session_ready || result.uptime >= config.connection_stability {
+                if result.saw_session_ready
+                    || (!result.timed_out && result.uptime >= config.connection_stability)
+                {
                     retries = 0;
                     delay = config.reconnect_initial_delay;
                 }
@@ -391,6 +394,7 @@ async fn run_connection(
     let mut pong_deadline = Instant::now();
     let mut idle_deadline = Instant::now() + config.idle_timeout;
     let mut saw_session_ready = false;
+    let mut timed_out = false;
 
     let end = loop {
         tokio::select! {
@@ -501,10 +505,12 @@ async fn run_connection(
             }
             _ = sleep_until(pong_deadline), if awaiting_pong => {
                 log::debug!("relay pong timed out");
+                timed_out = true;
                 break ConnectionEnd::Reconnect { reason: "relay pong timed out" };
             }
             _ = sleep_until(idle_deadline) => {
                 log::debug!("relay idle timeout");
+                timed_out = true;
                 break ConnectionEnd::Reconnect { reason: "relay idle timeout" };
             }
             _ = shutdown.changed() => break ConnectionEnd::Shutdown,
@@ -519,6 +525,7 @@ async fn run_connection(
         end,
         saw_session_ready,
         uptime: started_at.elapsed(),
+        timed_out,
     }
 }
 
