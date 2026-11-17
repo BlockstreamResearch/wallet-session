@@ -189,6 +189,13 @@ async fn stable_connections_reset_the_token_expiry_budget() -> TestResult {
                     let Ok(mut socket) = accept_async(stream).await else {
                         return;
                     };
+                    // Start the stable-connection window only after the client
+                    // is demonstrably running its connection loop.
+                    while let Some(message) = socket.next().await {
+                        if matches!(message, Ok(Message::Ping(_))) {
+                            break;
+                        }
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     let _ = socket
                         .close(Some(CloseFrame {
@@ -204,6 +211,7 @@ async fn stable_connections_reset_the_token_expiry_budget() -> TestResult {
     let _client = connect(
         addr,
         config(addr)
+            .with_ping_interval(Duration::from_millis(10))
             .with_reconnect_max_attempts(1)
             .with_connection_stability(Duration::from_millis(50)),
     )

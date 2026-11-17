@@ -153,6 +153,17 @@ mod tests {
     }
 
     #[test]
+    fn session_key_debug_redacts_material() {
+        let alice = EphemeralKeyPair::generate();
+        let bob = EphemeralKeyPair::generate();
+        let (key, _topic) = alice.derive(&bob.public_key()).expect("derive");
+        let rendered = format!("{key:?}");
+
+        assert_eq!(rendered, "SessionKey(..)");
+        assert!(!rendered.contains(&codec::encode(key.as_bytes())));
+    }
+
+    #[test]
     fn distinct_pairs_derive_distinct_keys() {
         let alice = EphemeralKeyPair::generate();
         let bob = EphemeralKeyPair::generate();

@@ -475,6 +475,69 @@ mod tests {
         assert!(lifecycle_rx.try_recv().is_ok());
     }
 
+    #[tokio::test]
+    async fn delivered_outcomes_hold_capacity_until_consumed() {
+        let (outbox, _outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, mut events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(100),
+        );
+
+        for index in 0..PENDING_CAPACITY {
+            let label = format!("d{index}");
+            reliability
+                .dispatch(frame(&label), true, unix_now())
+                .expect("dispatch");
+            reliability.mark_delivered(&message_id(&label));
+        }
+
+        // Every outcome still holds its permit.
+        assert!(matches!(
+            reliability.dispatch(frame("overflow"), true, unix_now()),
+            Err(ClientError::Busy)
+        ));
+
+        // Consuming one outcome releases one reservation.
+        let _ = events.outcomes.try_recv().expect("delivery outcome");
+        reliability
+            .dispatch(frame("replacement"), true, unix_now())
+            .expect("released capacity");
+    }
+
+    #[tokio::test]
+    async fn failed_outcomes_hold_capacity_until_consumed() {
+        let (outbox, _outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, mut events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(100),
+        );
+
+        for index in 0..PENDING_CAPACITY {
+            reliability
+                .dispatch(frame(&format!("f{index}")), true, unix_now())
+                .expect("dispatch");
+        }
+        reliability.fail_all();
+
+        assert!(matches!(
+            reliability.dispatch(frame("overflow"), true, unix_now()),
+            Err(ClientError::Busy)
+        ));
+
+        let _ = events.outcomes.try_recv().expect("failed outcome");
+        reliability
+            .dispatch(frame("replacement"), true, unix_now())
+            .expect("released capacity");
+    }
+
     #[test]
     fn ack_classification() {
         assert!(requires_ack(MessageType::Proposal));
@@ -591,10 +654,7 @@ mod tests {
         while let Ok(Outbound::Frame(_)) = outbound.try_recv() {
             resends += 1;
         }
-        assert!(
-            resends >= 2,
-            "expected at least two retransmissions, got {resends}"
-        );
+        assert_eq!(resends, 2, "expected exactly two retransmissions");
 
         let mut failed = None;
         while let Some(event) = events.try_recv() {
@@ -737,15 +797,70 @@ mod tests {
         }
         ready.store(true, Ordering::Relaxed);
 
-        let mut sent = Vec::new();
+        let start = Instant::now();
+        let mut sent: Vec<(Duration, MessageId)> = Vec::new();
         for _ in 0..20 {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
+            while let Ok(Outbound::Frame(frame)) = outbound.try_recv() {
+                sent.push((Instant::now().duration_since(start), frame.id));
+            }
+        }
+
+        let ids: Vec<MessageId> = sent.iter().map(|(_, id)| id.clone()).collect();
+        assert_eq!(ids, [message_id("a"), message_id("b"), message_id("c")]);
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent[1].0 >= sent[0].0 + Duration::from_millis(100),
+            "second frame was not spaced: {:?}",
+            sent
+        );
+        assert!(
+            sent[2].0 >= sent[1].0 + Duration::from_millis(100),
+            "third frame was not spaced: {:?}",
+            sent
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_pending_queue_flushes_every_frame_in_order() {
+        let (outbox, mut outbound) = mpsc::channel(16);
+        let ready = ready(false);
+        let (mut reliability, _events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(1),
+        );
+
+        let mut expected = Vec::new();
+        for index in 0..PENDING_CAPACITY {
+            let id = format!("f{index}");
+            reliability
+                .dispatch(frame(&id), true, unix_now())
+                .expect("dispatch");
+            expected.push(message_id(&id));
+        }
+        assert!(matches!(
+            reliability.dispatch(frame("overflow"), true, unix_now()),
+            Err(ClientError::Busy)
+        ));
+
+        ready.store(true, Ordering::Relaxed);
+        let mut sent = Vec::new();
+        for _ in 0..(PENDING_CAPACITY * 2) {
             tokio::time::advance(Duration::from_millis(50)).await;
             tokio::task::yield_now().await;
             while let Ok(Outbound::Frame(frame)) = outbound.try_recv() {
                 sent.push(frame.id);
             }
+            if sent.len() == PENDING_CAPACITY {
+                break;
+            }
         }
-        assert_eq!(sent, [message_id("a"), message_id("b"), message_id("c")]);
+
+        assert_eq!(sent, expected);
     }
 
     #[tokio::test(start_paused = true)]
@@ -770,12 +885,30 @@ mod tests {
         tokio::task::yield_now().await;
         while outbound.try_recv().is_ok() {}
 
-        // A reconnect must not fail the entry before its final wait expires.
+        // A frame sent before the disconnect is only flushed again when the
+        // retry task observes a real ready edge. Use it to synchronise on the
+        // retry task having seen `ready == false`.
+        reliability
+            .dispatch(frame("probe"), true, unix_now())
+            .expect("dispatch");
+        assert!(matches!(outbound.try_recv(), Ok(Outbound::Frame(_))));
+
         ready.store(false, Ordering::Relaxed);
         tokio::time::advance(Duration::from_millis(100)).await;
-        ready.store(true, Ordering::Relaxed);
-        tokio::time::advance(Duration::from_millis(100)).await;
         tokio::task::yield_now().await;
+
+        ready.store(true, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                outbound.try_recv(),
+                Ok(Outbound::Frame(frame)) if frame.id == message_id("probe")
+            ),
+            "the retry task must have observed the disconnected state"
+        );
+
+        // The final ack wait for `a` must not be failed at the ready edge.
         assert!(
             events.try_recv().is_none(),
             "the final ack wait must be allowed to finish"
@@ -783,10 +916,16 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
-        assert!(matches!(
-            events.try_recv(),
-            Some(ClientEvent::Failed { id, .. }) if id == message_id("a")
-        ));
+        let mut failed_a = false;
+        while let Some(event) = events.try_recv() {
+            if let ClientEvent::Failed { id, attempts } = event
+                && id == message_id("a")
+            {
+                assert_eq!(attempts, 1);
+                failed_a = true;
+            }
+        }
+        assert!(failed_a, "the final ack wait must eventually fail");
     }
 
     #[tokio::test(start_paused = true)]
