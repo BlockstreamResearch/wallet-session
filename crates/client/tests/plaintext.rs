@@ -16,7 +16,7 @@ use wallet_session_client::{
     AckPayload, ApprovePayload, Client, ClientConfig, ClientError, ClientEvent, ClientMessage,
     DisconnectPayload, IdentityKey, Opaque, PairingKey, ProposalPayload, RejectPayload,
     RequestPayload, ResponsePayload, Role, Seed, SessionState,
-    handshake::{EphemeralKeyPair, decode_public_key},
+    handshake::{EphemeralKeyPair, HandshakeError, decode_public_key},
 };
 use wallet_session_relay::{
     config::NativeRelayTransportConfig,
@@ -1341,6 +1341,322 @@ async fn run_unexpected_approve() -> TestResult {
 
     // The original PeerProposed state is still intact.
     responder.approve(json!({ "ok": true })).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn weak_proposal_is_rejected_without_acking() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_weak_proposal()).await??;
+    Ok(())
+}
+
+/// A proposal with a low-order public key must not be acknowledged or change
+/// the handshake state. A later valid proposal still completes the handshake.
+async fn run_weak_proposal() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let weak = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: wallet_session_core::codec::encode(&[0u8; 32]),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "weak": true }))?),
+    });
+    let weak = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "weak-proposal",
+        &weak,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&weak)?))
+        .await?;
+
+    assert!(matches!(
+        responder.recv().await,
+        Err(ClientError::Handshake(HandshakeError::WeakKey))
+    ));
+    assert_eq!(responder.session().state, SessionState::Idle);
+
+    // The weak proposal must not be acknowledged.
+    match tokio::time::timeout(Duration::from_millis(300), read_raw_frame(&mut pairing)).await {
+        Err(_) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(frame)) => panic!("weak proposal must not be acknowledged: {frame:?}"),
+    }
+
+    // A valid proposal still completes the handshake.
+    let keypair = EphemeralKeyPair::generate();
+    let proposal = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: keypair.public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "valid": true }))?),
+    });
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "valid-proposal",
+        &proposal,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+    assert!(matches!(
+        read_raw_message(&mut pairing, &cipher).await?,
+        ClientMessage::Ack(_)
+    ));
+
+    let mut raw = approve_raw_session(
+        &relay_url,
+        pairing,
+        &topic,
+        &mut responder,
+        &proposer_identity,
+        keypair,
+        cipher,
+    )
+    .await?;
+
+    let request = request_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "weak-recovery-session",
+        "session",
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&request)?))
+        .await?;
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "session"),
+        other => panic!("expected session request, got {other:?}"),
+    }
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::Ack(payload) => {
+            assert_eq!(payload.ack_id, message_id("weak-recovery-session"))
+        }
+        other => panic!("expected session ack, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn weak_approve_preserves_the_proposal() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_weak_approve()).await??;
+    Ok(())
+}
+
+/// A low-order `approve` must not be acknowledged or consume the proposal
+/// keypair. A later valid approve still completes the handshake.
+async fn run_weak_approve() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let (proposal_id, proposer_public) = loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        let proposal_id = frame.id.clone();
+        let RelayFrameBody::Message { payload } = frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(&payload)?;
+        if wire.kind != MessageType::Proposal {
+            continue;
+        }
+        let bytes = cipher.open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        let ClientMessage::Proposal(proposal) = ClientMessage::from_bytes(&bytes)? else {
+            return Err("expected proposal payload".into());
+        };
+        break (
+            proposal_id,
+            decode_public_key(&proposal.ephemeral_public_key)?,
+        );
+    };
+
+    let proposal_ack = ClientMessage::Ack(AckPayload {
+        ack_id: proposal_id.clone(),
+    });
+    let proposal_ack = client_frame(
+        &topic,
+        responder_identity.did(),
+        "weak-approve-proposal-ack",
+        &proposal_ack,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal_ack)?))
+        .await?;
+    match proposer.next_event().await? {
+        ClientEvent::Delivered { id } => assert_eq!(id, proposal_id),
+        other => panic!("expected the proposal acknowledgment, got {other:?}"),
+    }
+
+    let weak = ClientMessage::Approve(ApprovePayload {
+        ephemeral_public_key: wallet_session_core::codec::encode(&[0u8; 32]),
+        approval: Opaque(serde_json::to_vec(&json!({ "ok": false }))?),
+    });
+    let weak = client_frame(
+        &topic,
+        responder_identity.did(),
+        "weak-approve",
+        &weak,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&weak)?))
+        .await?;
+
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::Handshake(HandshakeError::WeakKey))
+    ));
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    // The weak approve must not be acknowledged.
+    match tokio::time::timeout(Duration::from_millis(300), read_raw_frame(&mut pairing)).await {
+        Err(_) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(frame)) => panic!("weak approve must not be acknowledged: {frame:?}"),
+    }
+
+    // A valid approve still completes the handshake with the original keypair.
+    let responder_keypair = EphemeralKeyPair::generate();
+    let approve = ClientMessage::Approve(ApprovePayload {
+        ephemeral_public_key: responder_keypair.public_key_encoded(),
+        approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+    });
+    let approve = client_frame(
+        &topic,
+        responder_identity.did(),
+        "valid-approve",
+        &approve,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&approve)?))
+        .await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    assert!(matches!(
+        read_raw_message(&mut pairing, &cipher).await?,
+        ClientMessage::Ack(_)
+    ));
+
+    let (_key, session_topic) = responder_keypair.derive(&proposer_public)?;
+    let session_topic = session_topic.as_topic().clone();
+    let mut session = connect_raw(
+        &relay_url,
+        &responder_identity,
+        Role::Responder,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+    proposer.wait_session_ready().await?;
+
+    let request_id = proposer
+        .request(json!({ "method": "weak_approve_recovery" }))
+        .await?;
+    match read_raw_message(&mut session, &cipher).await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
+        other => panic!("expected session request, got {other:?}"),
+    }
+    let ack = ClientMessage::Ack(AckPayload {
+        ack_id: request_id.parse::<MessageId>()?,
+    });
+    let ack = client_frame(
+        &session_topic,
+        responder_identity.did(),
+        "weak-approve-session-ack",
+        &ack,
+        &mut cipher,
+    )?;
+    session
+        .send(WsMessage::text(serde_json::to_string(&ack)?))
+        .await?;
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Delivered { id } => assert_eq!(id.to_string(), request_id),
+        other => panic!("expected delivery after weak approve, got {other:?}"),
+    }
 
     Ok(())
 }

@@ -77,6 +77,17 @@ impl EphemeralKeyPair {
     }
 }
 
+/// Reject a peer public key that would produce an all-zero shared secret.
+pub(crate) fn validate_peer_public(peer_public: &[u8; 32]) -> Result<(), HandshakeError> {
+    let probe = EphemeralSecret::random();
+    let shared = probe.diffie_hellman(&PublicKey::from(*peer_public));
+    if shared.was_contributory() {
+        Ok(())
+    } else {
+        Err(HandshakeError::WeakKey)
+    }
+}
+
 /// Derive the session key and topic from an X25519 shared secret.
 fn derive_from_shared(shared: &[u8; 32]) -> Result<(SessionKey, SessionTopic), HandshakeError> {
     if shared.iter().all(|byte| *byte == 0) {
@@ -181,5 +192,24 @@ mod tests {
             derive_from_shared(&[0u8; 32]),
             Err(HandshakeError::WeakKey)
         ));
+    }
+
+    #[test]
+    fn derive_rejects_a_low_order_peer_key() {
+        let keypair = EphemeralKeyPair::generate();
+        assert!(matches!(
+            keypair.derive(&[0u8; 32]),
+            Err(HandshakeError::WeakKey)
+        ));
+    }
+
+    #[test]
+    fn validate_peer_public_rejects_a_low_order_key() {
+        assert!(matches!(
+            validate_peer_public(&[0u8; 32]),
+            Err(HandshakeError::WeakKey)
+        ));
+        let peer = EphemeralKeyPair::generate();
+        assert!(validate_peer_public(&peer.public_key()).is_ok());
     }
 }

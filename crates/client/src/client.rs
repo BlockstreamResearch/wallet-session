@@ -21,7 +21,9 @@ use crate::{
     config::ClientConfig,
     crypto::{Aad, CipherError, SealedPayload},
     error::{ClientError, Result},
-    handshake::{EphemeralKeyPair, SessionKey, SessionTopic, decode_public_key},
+    handshake::{
+        EphemeralKeyPair, SessionKey, SessionTopic, decode_public_key, validate_peer_public,
+    },
     identity::{IdentityKey, unix_now},
     messages::{ClientMessage, RequestId},
     random,
@@ -64,8 +66,13 @@ enum Handshake {
     /// We sent a proposal and hold its ephemeral keypair.
     Proposed { keypair: EphemeralKeyPair },
 
-    /// We received a proposal and know the peer's ephemeral public key.
-    PeerProposed { peer_public: [u8; 32] },
+    /// We received a valid proposal and already derived the session material
+    /// from our own ephemeral keypair and the peer's public key.
+    PeerProposed {
+        public_key: String,
+        key: SessionKey,
+        topic: SessionTopic,
+    },
 
     /// Session key established; traffic uses the session topic and key.
     Established,
@@ -917,7 +924,17 @@ where
                     return Err(ClientError::UnexpectedHandshake);
                 }
                 let peer_public = decode_public_key(&proposal.ephemeral_public_key)?;
-                self.handshake = Handshake::PeerProposed { peer_public };
+                // Derive now, while the proposal is being accepted, so a
+                // low-order peer key is rejected before this proposal is
+                // acknowledged or changes the handshake state.
+                let keypair = EphemeralKeyPair::generate();
+                let public_key = keypair.public_key_encoded();
+                let (key, topic) = keypair.derive(&peer_public)?;
+                self.handshake = Handshake::PeerProposed {
+                    public_key,
+                    key,
+                    topic,
+                };
                 self.session.state = SessionState::ProposalReceived;
             }
             ClientMessage::Approve(approve) => {
@@ -925,6 +942,10 @@ where
                     return Err(ClientError::UnexpectedHandshake);
                 }
                 let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
+                // Keep the proposal keypair until the peer's key is known to
+                // produce a usable shared secret, so a weak approve cannot
+                // strand the proposer in `Idle`.
+                validate_peer_public(&peer_public)?;
                 let Handshake::Proposed { keypair } =
                     std::mem::replace(&mut self.handshake, Handshake::Idle)
                 else {
@@ -1029,18 +1050,21 @@ where
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
-        let Handshake::PeerProposed { peer_public } = self.handshake else {
-            return Err(ClientError::UnexpectedHandshake);
+        let (public_key, key, topic) = match &self.handshake {
+            Handshake::PeerProposed {
+                public_key,
+                key,
+                topic,
+            } => (public_key.clone(), key.clone(), topic.clone()),
+            _ => return Err(ClientError::UnexpectedHandshake),
         };
         if !self.pairing.as_ref().is_some_and(|link| link.ready) {
             return Err(ClientError::NotReady);
         }
-        let keypair = EphemeralKeyPair::generate();
         let payload = ApprovePayload {
-            ephemeral_public_key: keypair.public_key_encoded(),
+            ephemeral_public_key: public_key,
             approval: Opaque(serde_json::to_vec(&approval)?),
         };
-        let (key, topic) = keypair.derive(&peer_public)?;
         let pairing_topic = self.session.pairing_topic.clone();
         let approve_id = self
             .send_on(&pairing_topic, &ClientMessage::Approve(payload))

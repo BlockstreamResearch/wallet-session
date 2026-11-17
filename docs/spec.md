@@ -188,6 +188,13 @@ The two Expand calls are independent and both start from the same PRK. The
 session topic used on the wire is `base64url(session_topic_bytes)`. A shared
 secret of all zero bytes is rejected.
 
+The receiver MUST abort that handshake attempt: it MUST NOT acknowledge or
+deliver a `proposal` or `approve` that yields an all-zero shared secret. A weak
+`proposal` leaves the responder idle; a weak `approve` leaves the proposer in
+its proposed state, so a later valid message can still complete the handshake.
+The client reports the weak-key error to the application, which MAY send a
+`reject`.
+
 See Appendix A for a known-answer vector.
 
 The Relay binds each connection to one topic. After deriving the session topic, each peer opens a new connection to it.
