@@ -176,6 +176,12 @@ async fn run() -> TestResult {
         other => panic!("expected disconnect, got {other:?}"),
     }
     assert_eq!(responder.session().state, SessionState::Disconnected);
+    // The disconnect is sent untracked, so closing reports no `Failed` for it.
+    let event = proposer.next_event().await;
+    assert!(
+        matches!(event, Err(ClientError::Closed)),
+        "unexpected event after disconnect: {event:?}"
+    );
     assert!(matches!(proposer.recv().await, Err(ClientError::Closed)));
     assert!(matches!(
         proposer

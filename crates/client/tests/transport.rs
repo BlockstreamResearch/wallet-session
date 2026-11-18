@@ -21,7 +21,8 @@ use tokio_tungstenite::{
     },
 };
 use wallet_session_client::{
-    Client, ClientConfig, ClientError, IdentityKey, Role, Seed, XChaCha20Poly1305Cipher,
+    Client, ClientConfig, ClientError, ClientMessage, DisconnectPayload, IdentityKey, Opaque,
+    ResponsePayload, Role, Seed, SessionDeletePayload, XChaCha20Poly1305Cipher,
 };
 use wallet_session_core::{
     frame::{RelayFrame, RelayFrameBody},
@@ -788,6 +789,55 @@ async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
     release.send(()).expect("server waiting");
     timeout(Duration::from_secs(2), client.wait_session_ready()).await??;
     assert!(client.is_ready());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn send_refuses_messages_it_cannot_deliver() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("websocket");
+        while socket.next().await.is_some() {}
+    });
+    let mut client = connect(addr, config(addr)).await?;
+
+    // A response the receiver would drop unacknowledged.
+    for (response, error) in [(None, None), (Some(vec![1]), Some(vec![2]))] {
+        let result = client
+            .send(&ClientMessage::Response(ResponsePayload {
+                request_id: "r".into(),
+                response: response.map(Opaque),
+                error: error.map(Opaque),
+            }))
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::ProtocolViolation(_))),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    // Ending the session must go through the methods that also close locally.
+    for message in [
+        ClientMessage::Disconnect(DisconnectPayload {
+            reason: "bye".into(),
+            code: 1000,
+            message: String::new(),
+        }),
+        ClientMessage::SessionDelete(SessionDeletePayload {
+            code: 1000,
+            message: String::new(),
+        }),
+    ] {
+        let result = client.send(&message).await;
+        assert!(
+            matches!(result, Err(ClientError::ProtocolViolation(_))),
+            "unexpected result: {result:?}"
+        );
+    }
 
     server.abort();
     Ok(())

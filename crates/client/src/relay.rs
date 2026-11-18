@@ -24,7 +24,7 @@ use tokio_tungstenite::{
 use wallet_session_core::{
     connection::{ConnectionQuery, Role},
     frame::{RelayFrame, RelayFrameBody},
-    message::Topic,
+    message::{MessageType, Topic},
 };
 
 use crate::{
@@ -102,23 +102,64 @@ struct ConnectionResult {
     undelivered: Vec<Inbox>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboxTry {
-    Sent,
-    Full,
-    Closed,
+/// Hand a message frame to the client without blocking the connection loop.
+///
+/// A full inbox is backpressure: the frame is dropped and the peer
+/// retransmits the envelope, since we never acked it. While control items
+/// are queued, message frames are dropped the same way, so the client never
+/// sees an envelope ahead of the lifecycle item that preceded it.
+///
+/// A `disconnect` or `session_delete` is the exception. Its sender closes
+/// straight after sending it and never retransmits it, so one that finds no
+/// room waits at the back of the control queue instead. Only the first one
+/// waits and later ones are dropped, which keeps the queue bounded: one that
+/// replaced it at the back would split repeated control frames that
+/// `queue_control` otherwise merges. The kind is read before the envelope is
+/// authenticated; the client drops a forged one like any other.
+///
+/// Returns `false` once the client has dropped the inbox.
+fn deliver_message(
+    control: &mut VecDeque<Inbox>,
+    inbox: &mpsc::Sender<Inbox>,
+    frame: RelayFrame,
+) -> bool {
+    let frame = if control.is_empty() {
+        match inbox.try_send(Inbox::Frame(frame)) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(Inbox::Frame(frame))) => frame,
+            Err(mpsc::error::TrySendError::Full(_)) => unreachable!("sent a frame"),
+        }
+    } else {
+        frame
+    };
+    let waiting = control.iter().any(|item| {
+        matches!(item, Inbox::Frame(queued) if matches!(queued.body, RelayFrameBody::Message { .. }))
+    });
+    if is_one_shot(&frame) && !waiting {
+        control.push_back(Inbox::Frame(frame));
+    } else {
+        log::debug!("dropping inbound frame: client inbox full or control items pending");
+    }
+    true
 }
 
-/// Try to hand a message frame to the client without blocking the connection
-/// loop. A full inbox is backpressure: the peer retransmits any envelope whose
-/// ack was not sent. Relay control frames are not retransmitted, so they never
-/// go through here.
-fn try_send_inbox(inbox: &mpsc::Sender<Inbox>, item: Inbox) -> InboxTry {
-    match inbox.try_send(item) {
-        Ok(()) => InboxTry::Sent,
-        Err(mpsc::error::TrySendError::Full(_)) => InboxTry::Full,
-        Err(mpsc::error::TrySendError::Closed(_)) => InboxTry::Closed,
+/// Whether a message frame carries a `disconnect` or `session_delete`.
+fn is_one_shot(frame: &RelayFrame) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Kind {
+        kind: MessageType,
     }
+
+    let RelayFrameBody::Message { payload } = &frame.body else {
+        return false;
+    };
+    serde_json::from_str::<Kind>(payload).is_ok_and(|envelope| {
+        matches!(
+            envelope.kind,
+            MessageType::Disconnect | MessageType::SessionDelete
+        )
+    })
 }
 
 /// Send a lifecycle item, waiting for the client to make room.
@@ -428,7 +469,8 @@ async fn run_connection(
     // pings or reading the socket. Queue them here and hand them over as soon
     // as there is capacity. While anything is queued, message frames are
     // dropped (the peer retransmits them) so the client never sees a frame
-    // ahead of the lifecycle item that precedes it.
+    // ahead of the lifecycle item that precedes it. A teardown, which is not
+    // retransmitted, joins the queue instead (see `deliver_message`).
     //
     // Outbound frames come first in the `select!` below, so a final message
     // the client queued just before going away is still written even when
@@ -514,16 +556,8 @@ async fn run_connection(
                             }
                             if !matches!(&frame.body, RelayFrameBody::Message { .. }) {
                                 queue_control(&mut control, frame);
-                            } else if !control.is_empty() {
-                                log::debug!("dropping inbound frame: control items pending");
-                            } else {
-                                match try_send_inbox(inbox, Inbox::Frame(frame)) {
-                                    InboxTry::Sent => {}
-                                    InboxTry::Full => {
-                                        log::debug!("dropping inbound frame: client inbox full");
-                                    }
-                                    InboxTry::Closed => break ConnectionEnd::Shutdown,
-                                }
+                            } else if !deliver_message(&mut control, inbox, frame) {
+                                break ConnectionEnd::Shutdown;
                             }
                         }
                         Err(error) => {
@@ -612,7 +646,8 @@ async fn run_connection(
 /// since: the application must still learn that the peer was gone and its
 /// grace window ran out. A repeated one collapses into the first. So besides
 /// `Connected` the queue never holds more than one `peer_disconnected`
-/// followed by one `session_ready`.
+/// followed by one `session_ready`, and at most one teardown that
+/// `deliver_message` queued among them.
 fn queue_control(control: &mut VecDeque<Inbox>, frame: RelayFrame) {
     let is = |item: Option<&Inbox>, wanted: fn(&RelayFrameBody) -> bool| matches!(item, Some(Inbox::Frame(queued)) if wanted(&queued.body));
     let ready = |body: &RelayFrameBody| matches!(body, RelayFrameBody::SessionReady);
@@ -853,23 +888,86 @@ mod tests {
         ));
     }
 
+    fn message(kind: &str) -> RelayFrame {
+        control(RelayFrameBody::Message {
+            payload: format!(r#"{{"kind":"{kind}"}}"#),
+        })
+    }
+
     #[test]
-    fn inbox_try_send_is_non_blocking() {
-        let topic = Topic::new([9u8; 32]).expect("topic");
+    fn message_delivery_is_non_blocking() {
         let (inbox, receiver) = mpsc::channel(1);
+        let mut queue = VecDeque::new();
+        assert!(deliver_message(&mut queue, &inbox, message("request")));
+        assert!(deliver_message(&mut queue, &inbox, message("request")));
+        assert!(
+            queue.is_empty(),
+            "a message the inbox has no room for is dropped"
+        );
+
+        drop(receiver);
+        assert!(!deliver_message(&mut queue, &inbox, message("request")));
+    }
+
+    #[test]
+    fn a_teardown_waits_when_the_inbox_is_full() {
+        let (inbox, _receiver) = mpsc::channel(1);
+        let mut queue = VecDeque::new();
+        assert!(deliver_message(&mut queue, &inbox, message("request")));
+
+        assert!(deliver_message(&mut queue, &inbox, message("disconnect")));
+        assert_eq!(kinds(&queue), ["message"]);
+        // Later messages, and later teardowns, are dropped behind it.
+        assert!(deliver_message(&mut queue, &inbox, message("request")));
+        assert!(deliver_message(
+            &mut queue,
+            &inbox,
+            message("session_delete")
+        ));
+        assert_eq!(kinds(&queue), ["message"]);
+        assert!(matches!(
+            queue.front(),
+            Some(Inbox::Frame(RelayFrame { body: RelayFrameBody::Message { payload }, .. }))
+                if payload.contains("disconnect")
+        ));
+    }
+
+    #[test]
+    fn teardowns_and_control_frames_keep_the_queue_bounded() {
+        // Whoever sends these, relay or peer, must not be able to grow the
+        // queue: a teardown waiting at the back must not stop repeated
+        // control frames from merging.
+        let topic = Topic::new([9u8; 32]).expect("topic");
+        let (inbox, _receiver) = mpsc::channel(1);
         inbox
             .try_send(Inbox::Connected(topic.clone()))
-            .expect("first item");
+            .expect("fill the inbox");
+        for first in [
+            RelayFrameBody::PeerDisconnected,
+            RelayFrameBody::SessionReady,
+        ] {
+            let mut queue = VecDeque::from([Inbox::Connected(topic.clone())]);
+            for _ in 0..1000 {
+                queue_control(&mut queue, control(first.clone()));
+                assert!(deliver_message(&mut queue, &inbox, message("disconnect")));
+                let second = match first {
+                    RelayFrameBody::PeerDisconnected => RelayFrameBody::SessionReady,
+                    _ => RelayFrameBody::PeerDisconnected,
+                };
+                queue_control(&mut queue, control(second));
+            }
+            assert!(queue.len() <= 5, "{:?}", kinds(&queue));
+        }
+    }
 
-        assert_eq!(
-            try_send_inbox(&inbox, Inbox::Disconnected(topic.clone())),
-            InboxTry::Full
-        );
-        drop(receiver);
-        assert_eq!(
-            try_send_inbox(&inbox, Inbox::Disconnected(topic)),
-            InboxTry::Closed
-        );
+    #[test]
+    fn a_teardown_waits_behind_queued_control_items() {
+        let topic = Topic::new([9u8; 32]).expect("topic");
+        let (inbox, _receiver) = mpsc::channel(8);
+        let mut queue = VecDeque::from([Inbox::Connected(topic)]);
+        assert!(deliver_message(&mut queue, &inbox, message("request")));
+        assert!(deliver_message(&mut queue, &inbox, message("disconnect")));
+        assert_eq!(kinds(&queue), ["connected", "message"]);
     }
 
     #[test]

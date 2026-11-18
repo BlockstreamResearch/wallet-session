@@ -16,7 +16,7 @@ use wallet_session_core::{
     message::{Message, MessageId, MessageType, Topic},
     payload::{
         AckPayload, ApprovePayload, DisconnectPayload, Opaque, ProposalPayload, RejectPayload,
-        RequestPayload, ResponsePayload,
+        RequestPayload, ResponsePayload, SessionDeletePayload,
     },
 };
 
@@ -499,6 +499,18 @@ where
                     "acknowledgements are sent automatically",
                 ));
             }
+            ClientMessage::Disconnect(_) | ClientMessage::SessionDelete(_) => {
+                return Err(ClientError::ProtocolViolation(
+                    "end the session with disconnect() or session_delete()",
+                ));
+            }
+            // The receiver drops these without an ack, so sending one would
+            // only end in `Failed` after the whole retry budget.
+            ClientMessage::Response(response) if !response.is_valid() => {
+                return Err(ClientError::ProtocolViolation(
+                    "response must carry exactly one of response or error",
+                ));
+            }
             _ => {}
         }
         self.ensure_session_ready()?;
@@ -519,16 +531,20 @@ where
 
     async fn send_on(&mut self, topic: &Topic, message: &ClientMessage) -> Result<MessageId> {
         let id = random::id()?;
-        self.send_with_id_on(topic, id.clone(), message).await?;
+        let track = requires_ack(message.message_type());
+        self.send_with_id_on(topic, id.clone(), message, track)
+            .await?;
         Ok(id)
     }
 
-    /// Seal and send a message with a caller-chosen envelope id.
+    /// Seal and send a message with a caller-chosen envelope id, tracking it
+    /// for retransmission when `track` is set.
     async fn send_with_id_on(
         &mut self,
         topic: &Topic,
         id: MessageId,
         message: &ClientMessage,
+        track: bool,
     ) -> Result<()> {
         let did = self.did.clone();
         let role = self.session.role;
@@ -548,7 +564,7 @@ where
                 payload: serde_json::to_string(&wire)?,
             },
         };
-        link.reliability.dispatch(frame, requires_ack(kind), ts)
+        link.reliability.dispatch(frame, track, ts)
     }
 
     /// Receive the next application message, processing acknowledgements and
@@ -729,6 +745,16 @@ where
             now,
         } = envelope;
 
+        // A `disconnect` or `session_delete` is sent once: its sender closes
+        // straight after sending it and never retransmits it, so dropping one
+        // for lack of room would lose it for good. It ends the session, so
+        // letting it through grows the replay memory and the pending queue by
+        // one at most.
+        let one_shot = matches!(
+            wire.kind,
+            MessageType::Disconnect | MessageType::SessionDelete
+        );
+
         let observation = self
             .link_mut(&topic)
             .expect("topic was checked")
@@ -749,7 +775,7 @@ where
             }
             // Dropping an ack would report a delivered message as `Failed`,
             // so let it through; `commit_ack` decides whether to record it.
-            Observation::Full if wire.kind != MessageType::Ack => {
+            Observation::Full if wire.kind != MessageType::Ack && !one_shot => {
                 log::warn!("dropping envelope: replay memory is full");
                 return Ok(None);
             }
@@ -762,7 +788,7 @@ where
         // retransmits it later instead of the application silently losing it.
         // This comes after replay classification so that a retransmission of
         // something we already accepted is still re-acknowledged above.
-        if !deliver && wire.kind != MessageType::Ack {
+        if !deliver && wire.kind != MessageType::Ack && !one_shot {
             log::warn!("dropping message: pending queue is full");
             return Ok(None);
         }
@@ -833,7 +859,16 @@ where
         self.pin_counterpart(&topic, &wire.from);
 
         if requires_ack(message.message_type()) {
-            self.send_ack(&id, &topic).await?;
+            let acked = self.send_ack(&id, &topic).await;
+            // Act on a disconnect even if we could not ack it, for the same
+            // reason as above; only the peer's bookkeeping misses the ack.
+            // A handshake message has already changed our state in `observe`,
+            // and its retransmission would be refused or only re-acked, so it
+            // too must reach the application now or it never will.
+            let committed = terminates || topic == self.session.pairing_topic;
+            if !committed {
+                acked?;
+            }
         }
 
         if !rekeys {
@@ -1371,7 +1406,7 @@ where
             request: opaque(request)?,
         };
         let topic = self.active_topic().clone();
-        self.send_with_id_on(&topic, id, &ClientMessage::Request(payload))
+        self.send_with_id_on(&topic, id, &ClientMessage::Request(payload), true)
             .await?;
         Ok(request_id)
     }
@@ -1390,32 +1425,53 @@ where
             response: response.map(opaque).transpose()?,
             error: error.map(opaque).transpose()?,
         };
-        if !payload.is_valid() {
-            return Err(ClientError::ProtocolViolation(
-                "response must carry exactly one of response or error",
-            ));
-        }
         self.send(&ClientMessage::Response(payload)).await?;
         Ok(())
     }
 
     /// Gracefully disconnect.
     ///
-    /// The local client is closed even when the peer cannot be notified, for
-    /// example because the link is not ready. The notification error is
-    /// returned after the local teardown.
+    /// See [`Client::session_delete`] for how the peer is notified.
     pub async fn disconnect(&mut self, reason: impl Into<String>, code: u32) -> Result<()> {
-        let result = self
-            .send(&ClientMessage::Disconnect(DisconnectPayload {
-                reason: reason.into(),
-                code,
-                message: String::new(),
-            }))
-            .await;
+        self.end_session(ClientMessage::Disconnect(DisconnectPayload {
+            reason: reason.into(),
+            code,
+            message: String::new(),
+        }))
+        .await
+    }
+
+    /// Tell the peer the session was deleted, then close.
+    ///
+    /// The local client is closed even when the peer cannot be notified, for
+    /// example because the link is not ready; the notification error is
+    /// returned after the teardown. The notification is written once and not
+    /// retransmitted, since nothing is left to retransmit it once the client
+    /// is closed, so it produces no `Delivered` or `Failed` event.
+    pub async fn session_delete(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
+        self.end_session(ClientMessage::SessionDelete(SessionDeletePayload {
+            code,
+            message: message.into(),
+        }))
+        .await
+    }
+
+    /// Send a final, untracked message and close the client.
+    async fn end_session(&mut self, message: ClientMessage) -> Result<()> {
+        let result = self.send_final(&message).await;
         self.session.state = SessionState::Disconnected;
         self.close(Terminal::Closed);
-        result?;
-        Ok(())
+        result
+    }
+
+    async fn send_final(&mut self, message: &ClientMessage) -> Result<()> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        self.ensure_session_ready()?;
+        let topic = self.active_topic().clone();
+        let id = random::id()?;
+        self.send_with_id_on(&topic, id, message, false).await
     }
 }
 

@@ -49,6 +49,8 @@ const TAMPERED: &[u8] = b"plaintext-tampered";
 pub struct PlaintextCipher {
     prefix: [u8; SENDER_PREFIX_LEN],
     counter: u64,
+    /// How many messages this cipher can seal before it fails.
+    seal_limit: u64,
     /// Whether deriving a session cipher from this one fails.
     for_key_fails: bool,
 }
@@ -62,6 +64,7 @@ impl PlaintextCipher {
         Self {
             prefix,
             counter: 0,
+            seal_limit: u64::MAX,
             for_key_fails: false,
         }
     }
@@ -71,6 +74,15 @@ impl PlaintextCipher {
     pub fn failing_for_key() -> Self {
         Self {
             for_key_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A cipher that fails every seal after the first `limit`, as the real
+    /// one does once its nonce counter is exhausted.
+    pub fn with_seal_limit(limit: u64) -> Self {
+        Self {
+            seal_limit: limit,
             ..Self::new()
         }
     }
@@ -94,6 +106,9 @@ impl MessageCipher for PlaintextCipher {
     type Error = CipherError;
 
     fn seal(&mut self, _aad: &[u8], plaintext: &[u8]) -> Result<SealedPayload, CipherError> {
+        if self.counter >= self.seal_limit {
+            return Err(CipherError::CounterExhausted);
+        }
         let nonce = self.nonce();
         self.counter = self.counter.wrapping_add(1);
         Ok(SealedPayload {
@@ -667,8 +682,256 @@ async fn run_peer_disconnect_full_inbox(peer_returns: bool) -> TestResult {
     Ok(())
 }
 
-/// Records the replay memory keeps before it refuses new envelopes.
+#[tokio::test]
+async fn disconnect_is_accepted_when_the_queue_is_full() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(20), run_disconnect_full_queue()).await??;
+    Ok(())
+}
+
+/// The sender of a `disconnect` closes straight away and never retransmits
+/// it, so the receiver must act on it even when it has no room to queue
+/// another message.
+async fn run_disconnect_full_queue() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+        inbound_message_rate: RateLimit {
+            burst: 10_000,
+            interval: Duration::from_secs(3600),
+        },
+        ..RelayLimitsConfig::default()
+    }));
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        limiter,
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Fill the pending queue while the application only drives `next_event`,
+    // one acknowledged request at a time.
+    for index in 0..256 {
+        let frame = request_frame(
+            &raw.topic,
+            proposer_identity.did(),
+            &format!("fill-{index}"),
+            &format!("fill-{index}"),
+            &mut raw.cipher,
+        )?;
+        raw.session
+            .send(WsMessage::text(serde_json::to_string(&frame)?))
+            .await?;
+        loop {
+            let mut event = Box::pin(responder.next_event());
+            let incoming = Box::pin(read_raw_message(&mut raw.session, &raw.cipher));
+            let message = tokio::select! {
+                event = &mut event => panic!("unexpected event: {event:?}"),
+                message = incoming => message?,
+            };
+            if let ClientMessage::Ack(ack) = message {
+                assert_eq!(ack.ack_id, frame.id);
+                break;
+            }
+        }
+    }
+
+    let disconnect = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "full-disconnect",
+        &ClientMessage::Disconnect(DisconnectPayload {
+            reason: "done".to_owned(),
+            code: 4000,
+            message: String::new(),
+        }),
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&disconnect)?))
+        .await?;
+    let error = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Err(error) = responder.next_event().await {
+                return error;
+            }
+        }
+    })
+    .await
+    .expect("the disconnect must be acted on although the queue is full");
+    assert!(
+        matches!(error, ClientError::Closed),
+        "unexpected error: {error:?}"
+    );
+
+    // The queued requests and then the disconnect are still handed over.
+    for _ in 0..256 {
+        assert!(matches!(responder.recv().await?, ClientMessage::Request(_)));
+    }
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Disconnect(_)
+    ));
+    assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+
+    Ok(())
+}
+
+/// Records the replay memory keeps before it refuses new envelopes. A
+/// multiple of the batch size the test below fills it with.
 const REPLAY_CAPACITY: usize = 8192;
+
+#[tokio::test]
+async fn disconnect_is_accepted_when_the_replay_memory_is_full() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(120), run_disconnect_full_replay()).await??;
+    Ok(())
+}
+
+/// Like a full pending queue, a full replay memory must not cost us a
+/// `disconnect`, which its sender never retransmits.
+async fn run_disconnect_full_replay() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // Several megabytes go through the relay, so lift its rate limits.
+    let unlimited = RateLimit {
+        burst: u32::MAX,
+        interval: Duration::from_secs(1),
+    };
+    let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+        inbound_message_rate: unlimited,
+        inbound_byte_rate: unlimited,
+        inbound_wire_byte_rate: unlimited,
+        identity_inbound_byte_rate: unlimited,
+        source_inbound_byte_rate: unlimited,
+        global_inbound_byte_rate: unlimited,
+        ..RelayLimitsConfig::default()
+    }));
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        limiter,
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Fill the session's replay memory, delivering and acknowledging every
+    // request so the pending queue stays empty. Send in batches small
+    // enough for the client's inbox and outbound queues, so none is dropped.
+    const BATCH: usize = 32;
+    for batch in 0..REPLAY_CAPACITY / BATCH {
+        let labels: Vec<String> = (0..BATCH)
+            .map(|index| format!("fill-{}", batch * BATCH + index))
+            .collect();
+        for label in &labels {
+            let frame = request_frame(
+                &raw.topic,
+                proposer_identity.did(),
+                label,
+                label,
+                &mut raw.cipher,
+            )?;
+            raw.session
+                .send(WsMessage::text(serde_json::to_string(&frame)?))
+                .await?;
+        }
+        for label in &labels {
+            match responder.recv().await? {
+                ClientMessage::Request(payload) => assert_eq!(&payload.request_id, label),
+                other => panic!("expected request, got {other:?}"),
+            }
+        }
+        for label in &labels {
+            match read_raw_message(&mut raw.session, &raw.cipher).await? {
+                ClientMessage::Ack(ack) => assert_eq!(ack.ack_id, message_id(label)),
+                other => panic!("expected ack, got {other:?}"),
+            }
+        }
+    }
+
+    // The memory is full: a further request is neither delivered nor acked.
+    let overflow = request_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "overflow",
+        "overflow",
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&overflow)?))
+        .await?;
+    expect_no_delivery_or_ack(&mut responder, &mut raw.session).await?;
+
+    let disconnect = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "full-disconnect",
+        &ClientMessage::Disconnect(DisconnectPayload {
+            reason: "done".to_owned(),
+            code: 4000,
+            message: String::new(),
+        }),
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&disconnect)?))
+        .await?;
+    let delivered = tokio::time::timeout(Duration::from_secs(2), responder.recv())
+        .await
+        .expect("the disconnect must be acted on although the replay memory is full")?;
+    assert!(
+        matches!(delivered, ClientMessage::Disconnect(_)),
+        "unexpected message: {delivered:?}"
+    );
+    assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn stray_acks_do_not_fill_the_replay_memory() -> TestResult {
@@ -2589,6 +2852,90 @@ async fn run_refused_envelope_pin() -> TestResult {
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
     assert_eq!(proposer.session().state, SessionState::Active);
     assert_eq!(proposer.session().peer_did, Some(responder_identity.did()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn handshake_answers_are_delivered_when_their_ack_fails() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_answer_ack_fails()).await??;
+    Ok(())
+}
+
+/// An approve or a reject changes the handshake state when it is accepted.
+/// The application must get it even if we then fail to acknowledge it.
+async fn run_answer_ack_fails() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+    let relay_url = format!("ws://{addr}");
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    for approve in [true, false] {
+        let topic = PairingKey::random()?.topic()?;
+        // The proposer can seal its proposal, but not the ack that follows.
+        let mut proposer = Client::connect(
+            ClientConfig::new(&relay_url)
+                .with_insecure_ws()
+                .with_audience(AUDIENCE),
+            proposer_identity.clone(),
+            Role::Proposer,
+            topic.clone(),
+            PlaintextCipher::with_seal_limit(1),
+        )
+        .await?;
+        let mut pairing =
+            connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+        proposer.wait_session_ready().await?;
+        wait_raw_session_ready(&mut pairing).await?;
+        let mut cipher = PlaintextCipher::new();
+
+        proposer.propose(json!({ "attempt": 1 })).await?;
+        let (proposal_id, _) = read_raw_proposal(&mut pairing, &cipher, None).await?;
+        let answer = if approve {
+            ClientMessage::Approve(ApprovePayload {
+                proposal_id,
+                ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+                approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+            })
+        } else {
+            ClientMessage::Reject(RejectPayload {
+                proposal_id,
+                code: 1,
+                message: "no".into(),
+            })
+        };
+        let answer = client_frame(
+            &topic,
+            responder_identity.did(),
+            "answer",
+            &answer,
+            &mut cipher,
+        )?;
+        pairing
+            .send(WsMessage::text(serde_json::to_string(&answer)?))
+            .await?;
+
+        let delivered = proposer.recv().await?;
+        if approve {
+            assert!(matches!(delivered, ClientMessage::Approve(_)));
+            assert_eq!(proposer.session().state, SessionState::Active);
+        } else {
+            assert!(matches!(delivered, ClientMessage::Reject(_)));
+            assert_eq!(proposer.session().state, SessionState::Rejected);
+        }
+    }
 
     Ok(())
 }

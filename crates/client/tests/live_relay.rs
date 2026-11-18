@@ -27,8 +27,8 @@ use tokio_tungstenite::{
 };
 use url::Url;
 use wallet_session_client::{
-    Client, ClientConfig, ClientEvent, ClientMessage, IdentityKey, PairingKey, Role, Seed,
-    SessionState, XChaCha20Poly1305Cipher,
+    Client, ClientConfig, ClientError, ClientEvent, ClientMessage, IdentityKey, PairingKey, Role,
+    Seed, SessionState, XChaCha20Poly1305Cipher,
 };
 use wallet_session_core::{connection::ConnectionQuery, message::Topic};
 
@@ -492,48 +492,24 @@ async fn disconnect_is_delivered_and_acknowledged() -> TestResult {
             other => panic!("expected disconnect from proposer, got {other:?}"),
         }
 
-        // The responder acknowledges the teardown with its own disconnect.
-        let responder_reason = "wallet closed the pairing";
-        let responder_code = 4001;
-        responder
-            .disconnect(responder_reason, responder_code)
-            .await?;
+        // Receiving the disconnect closed the responder, and the proposer
+        // closed as soon as it sent it. Neither side can send anything more,
+        // and the disconnect, which is sent untracked, produces no delivery
+        // outcome.
         assert_eq!(responder.session().state, SessionState::Disconnected);
-        eprintln!(
-            "disconnect test: responder -> disconnect reason={responder_reason:?} \
-             code={responder_code}"
-        );
-
-        // This recv processes the ack for the proposer's disconnect before
-        // returning the responder's disconnect frame.
-        match proposer.recv().await? {
-            ClientMessage::Disconnect(payload) => {
-                assert_eq!(payload.reason, responder_reason);
-                assert_eq!(payload.code, responder_code);
-                assert!(
-                    payload.message.is_empty(),
-                    "unexpected message: {:?}",
-                    payload.message
-                );
-                eprintln!(
-                    "disconnect test: proposer <- disconnect reason={:?} code={}",
-                    payload.reason, payload.code
-                );
-            }
-            other => panic!("expected disconnect from responder, got {other:?}"),
-        }
-
-        let mut delivered = false;
-        while let Some(event) = proposer.poll_event() {
-            if let ClientEvent::Delivered { .. } = event {
-                delivered = true;
-            }
-        }
+        assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+        assert!(matches!(
+            responder
+                .disconnect("wallet closed the pairing", 4001)
+                .await,
+            Err(ClientError::Closed)
+        ));
+        assert!(matches!(proposer.recv().await, Err(ClientError::Closed)));
         assert!(
-            delivered,
-            "proposer did not receive a Delivered event for its disconnect"
+            proposer.poll_event().is_none(),
+            "a disconnect must not produce a delivery outcome"
         );
-        eprintln!("disconnect test: proposer disconnect acknowledged");
+        eprintln!("disconnect test: both sides closed");
 
         Ok::<(), Box<dyn std::error::Error>>(())
     })
