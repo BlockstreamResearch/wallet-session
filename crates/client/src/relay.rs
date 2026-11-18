@@ -94,9 +94,10 @@ enum ConnectionEnd {
 
 struct ConnectionResult {
     end: ConnectionEnd,
-    saw_session_ready: bool,
-    uptime: Duration,
-    timed_out: bool,
+    /// How long the relay kept responding: the whole connection, or, if it
+    /// ended because the relay stopped responding (a pong, idle or write
+    /// deadline passed), until it last answered one of our pings.
+    healthy_for: Duration,
     /// Lifecycle and control items the client had no room for yet.
     undelivered: Vec<Inbox>,
 }
@@ -248,9 +249,14 @@ async fn connection_task(
                         }
                     }
                 }
-                if result.saw_session_ready
-                    || (!result.timed_out && result.uptime >= config.connection_stability)
-                {
+                // Only a connection on which the relay kept responding for a
+                // while shows the relay is healthy. `session_ready` alone
+                // does not: a relay that says ready and then closes, or stops
+                // responding, would otherwise keep us reconnecting forever,
+                // and on a token-expiry close without even a backoff. A
+                // connection that was healthy that long and only then
+                // stalled still counts.
+                if result.healthy_for >= config.connection_stability {
                     retries = 0;
                     delay = config.reconnect_initial_delay;
                 }
@@ -411,9 +417,11 @@ async fn run_connection(
     let mut awaiting_pong = false;
     let mut pong_deadline = Instant::now();
     let mut idle_deadline = Instant::now() + config.idle_timeout;
-    let mut saw_session_ready = false;
     let mut session_writable = false;
-    let mut timed_out = false;
+    let mut stalled = false;
+    // Only a pong shows the relay is reading what we send. Frames it sends
+    // on its own, pings included, do not.
+    let mut last_pong = started_at;
 
     // `Connected` and relay control frames must reach the client even while
     // its inbox is full, but waiting for room must not stop us answering
@@ -452,8 +460,13 @@ async fn run_connection(
                         frame.topic.log_tag(),
                         text.len()
                     );
-                    if !send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
-                        break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                    match send_with_timeout(&mut sink, Message::text(text), config.write_timeout).await {
+                        Write::Sent => {}
+                        Write::TimedOut => {
+                            stalled = true;
+                            break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                        }
+                        Write::Failed => break ConnectionEnd::Reconnect { reason: "relay connection lost" },
                     }
                 }
                 None => break ConnectionEnd::Shutdown,
@@ -491,7 +504,6 @@ async fn run_connection(
                                 // the relay sends another `session_ready` on
                                 // the same socket. The shared flag must follow
                                 // every one of them, not just the first.
-                                saw_session_ready = true;
                                 session_writable = true;
                                 ready.store(true, Ordering::Relaxed);
                                 joined.store(true, Ordering::Relaxed);
@@ -521,18 +533,24 @@ async fn run_connection(
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     idle_deadline = Instant::now() + config.idle_timeout;
-                    if !send_with_timeout(
+                    match send_with_timeout(
                         &mut sink,
                         Message::Pong(payload),
                         config.write_timeout,
                     )
                     .await
                     {
-                        break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                        Write::Sent => {}
+                        Write::TimedOut => {
+                            stalled = true;
+                            break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                        }
+                        Write::Failed => break ConnectionEnd::Reconnect { reason: "relay connection lost" },
                     }
                 }
                 Some(Ok(Message::Pong(_))) => {
                     idle_deadline = Instant::now() + config.idle_timeout;
+                    last_pong = Instant::now();
                     awaiting_pong = false;
                 }
                 Some(Ok(Message::Close(frame))) => break classify_close(frame),
@@ -548,18 +566,23 @@ async fn run_connection(
             _ = ping.tick(), if !awaiting_pong => {
                 awaiting_pong = true;
                 pong_deadline = Instant::now() + config.pong_timeout;
-                if !send_with_timeout(&mut sink, Message::Ping(Bytes::new()), config.write_timeout).await {
-                    break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                match send_with_timeout(&mut sink, Message::Ping(Bytes::new()), config.write_timeout).await {
+                    Write::Sent => {}
+                    Write::TimedOut => {
+                        stalled = true;
+                        break ConnectionEnd::Reconnect { reason: "relay write timed out" };
+                    }
+                    Write::Failed => break ConnectionEnd::Reconnect { reason: "relay connection lost" },
                 }
             }
             _ = sleep_until(pong_deadline), if awaiting_pong => {
                 log::debug!("relay pong timed out");
-                timed_out = true;
+                stalled = true;
                 break ConnectionEnd::Reconnect { reason: "relay pong timed out" };
             }
             _ = sleep_until(idle_deadline) => {
                 log::debug!("relay idle timeout");
-                timed_out = true;
+                stalled = true;
                 break ConnectionEnd::Reconnect { reason: "relay idle timeout" };
             }
             _ = shutdown.changed() => break ConnectionEnd::Shutdown,
@@ -570,11 +593,14 @@ async fn run_connection(
         close_socket(&mut sink, config.close_timeout).await;
     }
 
+    let healthy_for = if stalled {
+        last_pong.saturating_duration_since(started_at)
+    } else {
+        started_at.elapsed()
+    };
     ConnectionResult {
         end,
-        saw_session_ready,
-        uptime: started_at.elapsed(),
-        timed_out,
+        healthy_for,
         undelivered: control.into(),
     }
 }
@@ -620,14 +646,25 @@ fn classify_close(frame: Option<CloseFrame>) -> ConnectionEnd {
     }
 }
 
-async fn send_with_timeout<S>(sink: &mut S, message: Message, timeout: Duration) -> bool
+/// How a bounded write ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Write {
+    Sent,
+    /// The write deadline passed: the relay stopped reading.
+    TimedOut,
+    /// The socket failed the write, for example because it was reset.
+    Failed,
+}
+
+async fn send_with_timeout<S>(sink: &mut S, message: Message, timeout: Duration) -> Write
 where
     S: Sink<Message> + Unpin,
 {
-    matches!(
-        tokio::time::timeout(timeout, sink.send(message)).await,
-        Ok(Ok(()))
-    )
+    match tokio::time::timeout(timeout, sink.send(message)).await {
+        Ok(Ok(())) => Write::Sent,
+        Ok(Err(_)) => Write::Failed,
+        Err(_) => Write::TimedOut,
+    }
 }
 
 async fn close_socket<S>(sink: &mut S, timeout: Duration)
@@ -737,8 +774,52 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn write_timeout_fails_a_stalled_sink() {
         let mut sink = PendingSink;
-        assert!(
-            !send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await
+        assert_eq!(
+            send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await,
+            Write::TimedOut
+        );
+    }
+
+    struct BrokenSink;
+
+    impl Sink<Message> for BrokenSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Err(std::io::ErrorKind::ConnectionReset.into())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_not_a_stall() {
+        let mut sink = BrokenSink;
+        assert_eq!(
+            send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await,
+            Write::Failed
         );
     }
 

@@ -2071,7 +2071,7 @@ async fn run_failed_proposal() -> TestResult {
             .with_insecure_ws()
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_millis(10))
-            .with_ack_max_attempts(0),
+            .with_ack_max_attempts(1),
         proposer_identity,
         Role::Proposer,
         topic.clone(),
@@ -2145,7 +2145,7 @@ async fn run_failed_approve_session_timeout(consume_events: bool) -> TestResult 
             .with_insecure_ws()
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_millis(10))
-            .with_ack_max_attempts(0)
+            .with_ack_max_attempts(1)
             .with_session_join_timeout(Duration::from_millis(100)),
         responder_identity,
         Role::Responder,
@@ -2350,7 +2350,7 @@ async fn run_joined_session_timeout() -> TestResult {
             .with_insecure_ws()
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_millis(10))
-            .with_ack_max_attempts(0)
+            .with_ack_max_attempts(1)
             .with_session_join_timeout(Duration::from_millis(200)),
         responder_identity,
         Role::Responder,

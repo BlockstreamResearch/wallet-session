@@ -580,6 +580,180 @@ async fn liveness_timeouts_do_not_reset_the_reconnect_budget() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_stall_after_a_healthy_stretch_resets_the_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    // Answer pings for well over the stability period, then
+                    // stop reading, like a network that drops out.
+                    let _ = timeout(Duration::from_millis(500), async {
+                        while socket.next().await.is_some() {}
+                    })
+                    .await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    };
+
+    let mut client = connect(
+        addr,
+        config(addr)
+            .with_connection_stability(Duration::from_millis(200))
+            .with_ping_interval(Duration::from_millis(50))
+            .with_pong_timeout(Duration::from_millis(100))
+            .with_reconnect_initial_delay(Duration::from_millis(10))
+            .with_reconnect_max_attempts(1),
+    )
+    .await?;
+
+    // With one attempt, a second outage would close the client unless the
+    // healthy stretch before each one resets the budget.
+    assert!(
+        timeout(Duration::from_secs(3), client.recv())
+            .await
+            .is_err(),
+        "the client must keep reconnecting"
+    );
+    assert!(
+        accepts.load(Ordering::Relaxed) >= 3,
+        "each healthy connection is followed by a reconnect"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn relay_pings_alone_do_not_reset_the_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    // Keep sending our own pings, but never read, so the
+                    // client's pings go unanswered.
+                    loop {
+                        if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                });
+            }
+        })
+    };
+
+    let mut client = connect(
+        addr,
+        config(addr)
+            .with_connection_stability(Duration::from_millis(100))
+            .with_ping_interval(Duration::from_millis(50))
+            .with_pong_timeout(Duration::from_millis(200))
+            .with_reconnect_initial_delay(Duration::from_millis(10))
+            .with_reconnect_max_attempts(1),
+    )
+    .await?;
+
+    let error = timeout(Duration::from_secs(3), client.recv())
+        .await?
+        .expect_err("the client should become terminal");
+    assert!(
+        matches!(error, ClientError::Transport("relay pong timed out")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        2,
+        "pings from the relay must not count as it answering ours"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_then_stalled_connections_do_not_reset_the_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    // Say the session is ready, then stop answering pings.
+                    let frame = RelayFrame {
+                        v: 1,
+                        id: MessageId::from_bytes([u8::MAX; MessageId::LEN]),
+                        topic: Topic::new([9u8; 32]).expect("topic"),
+                        body: RelayFrameBody::SessionReady,
+                    };
+                    let text = serde_json::to_string(&frame).expect("json");
+                    let _ = socket.send(Message::Text(text.into())).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        })
+    };
+
+    let mut client = connect(
+        addr,
+        config(addr)
+            .with_ping_interval(Duration::from_millis(100))
+            .with_pong_timeout(Duration::from_millis(100))
+            .with_reconnect_initial_delay(Duration::from_millis(10))
+            .with_reconnect_max_attempts(1),
+    )
+    .await?;
+
+    let error = timeout(Duration::from_secs(3), client.recv())
+        .await?
+        .expect_err("the client should become terminal");
+    assert!(
+        matches!(error, ClientError::Transport("relay pong timed out")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        2,
+        "a stalled connection must not reset the retry budget, even after session_ready"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -614,6 +788,67 @@ async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
     release.send(()).expect("server waiting");
     timeout(Duration::from_secs(2), client.wait_session_ready()).await??;
     assert!(client.is_ready());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_then_expired_connections_exhaust_the_budget() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = accept(&listener).await else {
+                    return;
+                };
+                accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(mut socket) = accept_async(stream).await else {
+                        return;
+                    };
+                    // Say the session is ready, then close at once as if the
+                    // token had expired.
+                    let frame = RelayFrame {
+                        v: 1,
+                        id: MessageId::from_bytes([u8::MAX; MessageId::LEN]),
+                        topic: Topic::new([9u8; 32]).expect("topic"),
+                        body: RelayFrameBody::SessionReady,
+                    };
+                    let text = serde_json::to_string(&frame).expect("json");
+                    let _ = socket.send(Message::Text(text.into())).await;
+                    let _ = socket
+                        .close(Some(CloseFrame {
+                            code: CloseCode::Policy,
+                            reason: "token expired".into(),
+                        }))
+                        .await;
+                });
+            }
+        })
+    };
+
+    let mut client = connect(addr, config(addr).with_reconnect_max_attempts(2)).await?;
+    let error = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Err(error) = client.recv().await {
+                return error;
+            }
+        }
+    })
+    .await?;
+    assert!(
+        matches!(error, ClientError::Transport("token expired")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        3,
+        "session_ready on a connection that closes at once must not reset the budget"
+    );
 
     server.abort();
     Ok(())

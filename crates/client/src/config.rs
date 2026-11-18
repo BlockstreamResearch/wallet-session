@@ -11,6 +11,12 @@ use crate::error::ClientError;
 /// arithmetic away from `Duration` and `Instant` overflow.
 pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 
+/// Longest accepted transport timeout or interval.
+///
+/// Deadlines are computed as `Instant::now() + duration`, which panics on
+/// overflow. A day is far longer than any of these needs to be.
+const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -26,8 +32,8 @@ pub struct ClientConfig {
     /// Allow `ws://` relay URLs. Without this, only `wss://` is accepted.
     pub allow_insecure_ws: bool,
 
-    /// Lifetime of the signed connection token. Must be non-zero and longer
-    /// than `connection_stability`.
+    /// Lifetime of the signed connection token. Must be at least one second,
+    /// and leave room for `connection_stability` (see there).
     pub token_ttl: Duration,
 
     /// Maximum time without an inbound frame before the relay is considered dead.
@@ -77,8 +83,13 @@ pub struct ClientConfig {
     /// but it is still healthy and should not exhaust its retries on token
     /// expiry or ordinary network drops.
     ///
-    /// Must be non-zero and shorter than `token_ttl`; otherwise a token
-    /// expiry always arrives before a connection can be considered stable.
+    /// Must be non-zero, and together with `connect_timeout` shorter than
+    /// the lifetime a token is sure to have: the whole seconds of
+    /// `token_ttl`, less one, since tokens carry truncated whole-second `iat`
+    /// and `exp`. The token is signed before we connect, so the connect
+    /// itself uses up part of that lifetime. Otherwise a token expiry can
+    /// arrive before a connection is considered stable, and every routine
+    /// token renewal spends a reconnect attempt.
     pub connection_stability: Duration,
 
     /// How long a responder keeps a session link that the proposer has not
@@ -174,9 +185,51 @@ impl ClientConfig {
             }
         }
 
-        if self.connection_stability >= self.token_ttl {
+        for (timeout, name) in [
+            (self.token_ttl, "token_ttl"),
+            (self.idle_timeout, "idle_timeout"),
+            (self.connect_timeout, "connect_timeout"),
+            (self.write_timeout, "write_timeout"),
+            (self.close_timeout, "close_timeout"),
+            (self.ping_interval, "ping_interval"),
+            (self.pong_timeout, "pong_timeout"),
+            (self.connection_stability, "connection_stability"),
+            (self.session_join_timeout, "session_join_timeout"),
+            (self.reconnect_initial_delay, "reconnect_initial_delay"),
+            (self.reconnect_max_delay, "reconnect_max_delay"),
+        ] {
+            if timeout > MAX_TIMEOUT {
+                return Err(ClientError::InvalidConfig(name));
+            }
+        }
+
+        // With no attempts, a frame dispatched while offline would be reported
+        // failed on the next ready edge without ever being written.
+        if self.ack_max_attempts == 0 {
+            return Err(ClientError::InvalidConfig("ack_max_attempts"));
+        }
+
+        // Tokens carry whole-second `iat`/`exp`, so a shorter lifetime would
+        // produce a token that is already expired.
+        if self.token_ttl < Duration::from_secs(1) {
             return Err(ClientError::InvalidConfig(
-                "connection_stability must be shorter than token_ttl",
+                "token_ttl must be at least one second",
+            ));
+        }
+
+        if self.reconnect_initial_delay > self.reconnect_max_delay {
+            return Err(ClientError::InvalidConfig(
+                "reconnect_initial_delay must not exceed reconnect_max_delay",
+            ));
+        }
+
+        // `iat` is truncated to a whole second, so a token may already be up
+        // to a second old when the relay accepts it, and it was signed before
+        // the connect began. Both durations were bounded above.
+        let token_lifetime = Duration::from_secs(self.token_ttl.as_secs() - 1);
+        if self.connect_timeout + self.connection_stability >= token_lifetime {
+            return Err(ClientError::InvalidConfig(
+                "connect_timeout plus connection_stability must be shorter than token_ttl less one second",
             ));
         }
 
@@ -322,6 +375,64 @@ mod tests {
     }
 
     #[test]
+    fn rejects_timeouts_that_overflow_deadlines() {
+        let huge = Duration::MAX;
+        for config in [
+            ClientConfig::new("wss://relay.example.com").with_idle_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_connect_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_write_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_close_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_ping_interval(huge),
+            ClientConfig::new("wss://relay.example.com").with_pong_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_session_join_timeout(huge),
+            ClientConfig::new("wss://relay.example.com").with_reconnect_initial_delay(huge),
+            ClientConfig::new("wss://relay.example.com").with_reconnect_max_delay(huge),
+            ClientConfig::new("wss://relay.example.com")
+                .with_token_ttl(huge)
+                .with_connection_stability(MAX_TIMEOUT),
+        ] {
+            assert!(
+                matches!(config.validate(), Err(ClientError::InvalidConfig(_))),
+                "{config:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_durations() {
+        let config = ClientConfig::new("wss://relay.example.com");
+        assert!(matches!(
+            config
+                .clone()
+                .with_token_ttl(Duration::from_millis(500))
+                .with_connection_stability(Duration::from_millis(100))
+                .validate(),
+            Err(ClientError::InvalidConfig(
+                "token_ttl must be at least one second"
+            ))
+        ));
+        assert!(matches!(
+            config
+                .with_reconnect_initial_delay(Duration::from_secs(10))
+                .with_reconnect_max_delay(Duration::from_secs(5))
+                .validate(),
+            Err(ClientError::InvalidConfig(
+                "reconnect_initial_delay must not exceed reconnect_max_delay"
+            ))
+        ));
+    }
+
+    #[test]
+    fn requires_at_least_one_ack_attempt() {
+        let config = ClientConfig::new("wss://relay.example.com");
+        assert!(matches!(
+            config.clone().with_ack_max_attempts(0).validate(),
+            Err(ClientError::InvalidConfig("ack_max_attempts"))
+        ));
+        assert!(config.with_ack_max_attempts(1).validate().is_ok());
+    }
+
+    #[test]
     fn rejects_zero_transport_timeouts() {
         for config in [
             ClientConfig::new("wss://relay.example.com").with_token_ttl(Duration::ZERO),
@@ -372,21 +483,88 @@ mod tests {
 
     #[test]
     fn requires_stability_shorter_than_token_ttl() {
+        // The default connect timeout is 10 s, and a 30 s token is sure of
+        // 29 s.
         assert!(
             ClientConfig::new("wss://relay.example.com")
                 .with_token_ttl(Duration::from_secs(30))
-                .with_connection_stability(Duration::from_secs(29))
+                .with_connection_stability(Duration::from_millis(18_999))
                 .validate()
                 .is_ok()
         );
-        for stability in [Duration::from_secs(30), Duration::from_secs(31)] {
+        for stability in [
+            Duration::from_secs(19),
+            Duration::from_secs(29),
+            Duration::from_secs(30),
+        ] {
             assert!(matches!(
                 ClientConfig::new("wss://relay.example.com")
                     .with_token_ttl(Duration::from_secs(30))
                     .with_connection_stability(stability)
                     .validate(),
                 Err(ClientError::InvalidConfig(
-                    "connection_stability must be shorter than token_ttl"
+                    "connect_timeout plus connection_stability must be shorter than token_ttl less one second"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn fractional_token_ttl_only_counts_whole_seconds() {
+        // A 1.9 s token is issued for one whole second, and is not sure to
+        // outlive the truncation of its `iat`, so no stability fits.
+        assert!(matches!(
+            ClientConfig::new("wss://relay.example.com")
+                .with_token_ttl(Duration::from_millis(1_900))
+                .with_connect_timeout(Duration::from_millis(100))
+                .with_connection_stability(Duration::from_millis(100))
+                .validate(),
+            Err(ClientError::InvalidConfig(
+                "connect_timeout plus connection_stability must be shorter than token_ttl less one second"
+            ))
+        ));
+        // A 2.9 s token is sure of one second.
+        let config = ClientConfig::new("wss://relay.example.com")
+            .with_token_ttl(Duration::from_millis(2_900))
+            .with_connect_timeout(Duration::from_millis(500));
+        assert!(
+            config
+                .clone()
+                .with_connection_stability(Duration::from_millis(499))
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            config
+                .with_connection_stability(Duration::from_millis(500))
+                .validate(),
+            Err(ClientError::InvalidConfig(
+                "connect_timeout plus connection_stability must be shorter than token_ttl less one second"
+            ))
+        ));
+    }
+
+    #[test]
+    fn connect_time_counts_against_the_token_lifetime() {
+        // A 4 s token is sure of 3 s.
+        let config = ClientConfig::new("wss://relay.example.com")
+            .with_token_ttl(Duration::from_secs(4))
+            .with_connection_stability(Duration::from_secs(1));
+        assert!(
+            config
+                .clone()
+                .with_connect_timeout(Duration::from_millis(1_999))
+                .validate()
+                .is_ok()
+        );
+        for connect_timeout in [Duration::from_secs(2), Duration::from_secs(5)] {
+            assert!(matches!(
+                config
+                    .clone()
+                    .with_connect_timeout(connect_timeout)
+                    .validate(),
+                Err(ClientError::InvalidConfig(
+                    "connect_timeout plus connection_stability must be shorter than token_ttl less one second"
                 ))
             ));
         }
