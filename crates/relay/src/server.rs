@@ -1442,6 +1442,99 @@ mod tests {
         Ok(())
     }
 
+    /// Frame ids are 16 bytes, base64url. Anything else is a malformed frame,
+    /// and the relay closes the sender rather than forwarding it.
+    #[tokio::test]
+    async fn non_canonical_frame_id_closes_connection() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let frame = RelayFrame {
+            v: 1,
+            id: message_id("short-id"),
+            topic: topic.clone(),
+            body: RelayFrameBody::Message {
+                payload: "x".to_owned(),
+            },
+        };
+        let mut value = serde_json::to_value(&frame)?;
+        // Five bytes, which is valid base64url but not a frame id.
+        value["id"] = serde_json::Value::from("c2hvcnQ");
+        proposer
+            .send(Message::Text(value.to_string().into()))
+            .await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "a frame id that is not 16 bytes should close the connection"
+        );
+        Ok(())
+    }
+
+    /// A 16-byte id has exactly one encoding. Padding, or non-zero trailing
+    /// bits in the last character, must not be accepted as another spelling
+    /// of the same id.
+    #[tokio::test]
+    async fn non_canonical_frame_id_encodings_close_connection() -> TestResult {
+        let canonical = message_id("x").to_string();
+        assert_eq!(canonical.len(), 22);
+        let mut trailing_bits = canonical.clone();
+        trailing_bits.replace_range(21.., "B");
+        for (label, id) in [
+            ("padding", format!("{canonical}==")),
+            ("trailing bits", trailing_bits),
+        ] {
+            let addr = serve_with(
+                NativeRelayTransportConfig::new(AUDIENCE)
+                    .with_session_grace(Duration::from_secs(2)),
+            )
+            .await?;
+            let topic = topic()?;
+            let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+            let mut responder = connect(addr, "responder", &topic, None).await?;
+            assert!(matches!(
+                read_frame(&mut proposer).await?.body,
+                RelayFrameBody::SessionReady
+            ));
+            assert!(matches!(
+                read_frame(&mut responder).await?.body,
+                RelayFrameBody::SessionReady
+            ));
+
+            let frame = RelayFrame {
+                v: 1,
+                id: message_id("x"),
+                topic: topic.clone(),
+                body: RelayFrameBody::Message {
+                    payload: "x".to_owned(),
+                },
+            };
+            let mut value = serde_json::to_value(&frame)?;
+            value["id"] = serde_json::Value::from(id);
+            proposer
+                .send(Message::Text(value.to_string().into()))
+                .await?;
+            assert!(
+                expect_closed(&mut proposer).await,
+                "a frame id with {label} should close the connection"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unsupported_frame_version_closes_connection() -> TestResult {
         let addr = serve_with(
@@ -2283,9 +2376,14 @@ mod tests {
             dropped > limit,
             "the relay must process enough dropped pings to reach the disconnect threshold"
         );
+        let result = timeout(SYNC_TIMEOUT, handler).await?;
         assert!(
-            timeout(SYNC_TIMEOUT, handler).await??.is_err(),
-            "an identity flooding control frames over its share must be disconnected"
+            matches!(
+                result,
+                Ok(Err(ServerError::Connection(ConnectionError::RateLimited)))
+            ),
+            "an identity flooding control frames over its share must be disconnected \
+             for exceeding its rate, got {result:?}"
         );
         assert_eq!(limiter.dropped_global_bytes(), 0);
         Ok(())

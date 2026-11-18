@@ -108,7 +108,9 @@ async fn policy_close_is_terminal_and_surfaced() -> TestResult {
         "unexpected repeated error: {again:?}"
     );
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait past the 250ms default reconnect delay, so a retry scheduled
+    // alongside the terminal error would have happened.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
         accepts.load(Ordering::Relaxed),
         1,
@@ -759,6 +761,7 @@ async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (release, released) = oneshot::channel::<()>();
+    let (processed, foreign_processed) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let stream = accept(&listener).await.expect("accepted");
         let mut socket = accept_async(stream).await.expect("upgraded");
@@ -774,13 +777,25 @@ async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
         // Another topic, then an unknown version of ours.
         socket.send(ready(1, [8u8; 32])).await.expect("sent");
         socket.send(ready(2, [9u8; 32])).await.expect("sent");
+        // The client handles frames in order, so its pong to this ping means
+        // it has processed both frames above.
+        socket
+            .send(Message::Ping(Bytes::from_static(b"barrier")))
+            .await
+            .expect("sent");
+        while let Some(Ok(message)) = socket.next().await {
+            if matches!(&message, Message::Pong(payload) if payload.as_ref() == b"barrier") {
+                break;
+            }
+        }
+        let _ = processed.send(());
         let _ = released.await;
         socket.send(ready(1, [9u8; 32])).await.expect("sent");
         std::future::pending::<()>().await;
     });
 
     let mut client = connect(addr, config(addr)).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    timeout(Duration::from_secs(2), foreign_processed).await??;
     assert!(
         !client.is_ready(),
         "a foreign session_ready must not make the client ready"

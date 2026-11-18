@@ -303,7 +303,7 @@ async fn run_reconnect() -> TestResult {
         listener,
         Arc::new(Registry::new()),
         Arc::new(Limiter::new(RelayLimitsConfig::default())),
-        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(5)),
     ));
 
     let relay_url = format!("ws://{addr}");
@@ -341,7 +341,9 @@ async fn run_reconnect() -> TestResult {
 
     // The responder drops abruptly, without a disconnect message.
     drop(responder);
-    // Let the relay observe the drop and reserve the responder's slot.
+    // Let the relay observe the drop and reserve the responder's slot. The
+    // grace window is much longer than this, so a slow scheduler cannot push
+    // the reconnect below past it.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Sent while the responder is away: the relay buffers it for redelivery.
@@ -1285,6 +1287,143 @@ async fn run_stray_acks() -> TestResult {
 }
 
 #[tokio::test]
+async fn disconnect_inside_wait_session_ready_is_terminal() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_disconnect_while_waiting()).await??;
+    Ok(())
+}
+
+/// A frame processed inside `wait_session_ready` can close the client. The
+/// next wait must then report the terminal error instead of carrying on.
+async fn run_disconnect_while_waiting() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(50)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // The peer says goodbye and leaves. Nothing drives the client until the
+    // relay has also reported the peer gone, so the session is not ready and
+    // both frames wait in the inbox.
+    let disconnect = client_frame(
+        &raw.topic,
+        proposer_identity.did(),
+        "goodbye",
+        &ClientMessage::Disconnect(DisconnectPayload {
+            reason: "done".to_owned(),
+            code: 4000,
+            message: String::new(),
+        }),
+        &mut raw.cipher,
+    )?;
+    raw.session
+        .send(WsMessage::text(serde_json::to_string(&disconnect)?))
+        .await?;
+    drop(raw);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!responder.is_ready());
+
+    // The disconnect closes the client inside the wait. Without a terminal
+    // check before the next wait, the queued `peer_disconnected` would be
+    // reported instead.
+    assert!(matches!(
+        responder.wait_session_ready().await,
+        Err(ClientError::Closed)
+    ));
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Disconnect(_)
+    ));
+    assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_delete_reaches_the_peer_and_closes() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_session_delete()).await??;
+    Ok(())
+}
+
+async fn run_session_delete() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    responder.session_delete(7, "deleted").await?;
+    match read_raw_message(&mut raw.session, &raw.cipher).await? {
+        ClientMessage::SessionDelete(payload) => {
+            assert_eq!(payload.code, 7);
+            assert_eq!(payload.message, "deleted");
+        }
+        other => panic!("expected session_delete, got {other:?}"),
+    }
+    assert_eq!(responder.session().state, SessionState::Disconnected);
+    assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+    assert!(matches!(
+        responder.next_event().await,
+        Err(ClientError::Closed)
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn inbound_disconnect_is_terminal_and_acked() -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), run_inbound_disconnect_terminal()).await??;
     Ok(())
@@ -1641,10 +1780,14 @@ async fn approve_raw_session(
     keypair: EphemeralKeyPair,
     mut cipher: PlaintextCipher,
 ) -> Result<RawSession, Box<dyn std::error::Error>> {
-    responder.approve(shown, json!({ "test": true })).await?;
+    let returned_id = responder.approve(shown, json!({ "test": true })).await?;
 
     let (approve_frame, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
     let approve_id = approve_frame.id.clone();
+    assert_eq!(
+        returned_id, approve_id,
+        "approve() returns the approve's frame id"
+    );
 
     let ack = ClientMessage::Ack(AckPayload {
         ack_id: approve_id.clone(),
@@ -1993,6 +2136,12 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
             .is_err(),
         "the overflowing handshake message must not be queued"
     );
+
+    // It was not recorded either: once there is room, the same frame is new.
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&overflow)?))
+        .await?;
+    assert_eq!(proposal_index(responder.recv().await?), Some(256));
 
     Ok(())
 }
@@ -3473,8 +3622,11 @@ async fn run_newer_proposal() -> TestResult {
             &mut cipher,
         )
     };
-    let first = propose("first-proposal", &EphemeralKeyPair::generate())?;
-    let second = propose("second-proposal", &EphemeralKeyPair::generate())?;
+    // The second proposal reuses the first one's key and only changes its
+    // terms, so comparing keys alone would not tell them apart.
+    let keypair = EphemeralKeyPair::generate();
+    let first = propose("first-proposal", &keypair)?;
+    let second = propose("second-proposal", &keypair)?;
     let second_id = second.id.clone();
 
     let mut shown = Vec::new();

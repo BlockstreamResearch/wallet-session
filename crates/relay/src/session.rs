@@ -1774,10 +1774,12 @@ mod tests {
 
     #[test]
     fn encoded_len_is_the_text_the_writer_sends() -> TestResult {
+        // Frame ids are base64url and never need escaping, so put every
+        // character JSON escapes in the payload.
         let frame = RelayFrame {
-            id: message_id("quote \" backslash \\ newline \n control \u{1}"),
             body: RelayFrameBody::Message {
-                payload: "é \u{7f} \u{1f} \u{1F600}".to_owned(),
+                payload: "quote \" backslash \\ newline \n control \u{1} é \u{7f} \u{1f} \u{1F600}"
+                    .to_owned(),
             },
             ..frame(&topic()?)
         };

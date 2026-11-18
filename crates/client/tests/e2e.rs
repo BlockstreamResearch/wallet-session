@@ -319,6 +319,22 @@ fn tamper(frame: RelayFrame) -> Result<RelayFrame, Box<dyn std::error::Error>> {
     Ok(frame)
 }
 
+/// Drive `recv` and the raw stream together, requiring neither a delivered
+/// message nor a relay frame (such as an ack) before the timeout.
+async fn expect_nothing(
+    client: &mut Client<XChaCha20Poly1305Cipher>,
+    raw: &mut RawStream,
+    what: &str,
+) {
+    let mut receiving = Box::pin(client.recv());
+    let mut incoming = Box::pin(read_raw_frame(raw));
+    tokio::select! {
+        result = &mut receiving => panic!("{what} was delivered: {result:?}"),
+        result = &mut incoming => panic!("{what} was answered: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+}
+
 fn request(request_id: &str) -> ClientMessage {
     ClientMessage::Request(RequestPayload {
         request_id: request_id.to_owned(),
@@ -517,6 +533,85 @@ async fn run_session_key() -> TestResult {
         ClientMessage::Ack(payload) => assert_eq!(payload.ack_id, valid_frame.id),
         other => panic!("expected session ack, got {other:?}"),
     }
+
+    // Reflection: one of the responder's own requests, sent back to it. An
+    // accepted request would be delivered and acked, so silence shows it was
+    // refused. Besides carrying the responder's own `from`, the AAD binds its
+    // role, so the real cipher refuses it too.
+    responder.request(json!({ "method": "reflect_me" })).await?;
+    let own_request = read_raw_frame(&mut session_stream).await?;
+    match open_message(&own_request, &session_cipher, Role::Proposer)? {
+        ClientMessage::Request(_) => {}
+        other => panic!("expected the responder's request, got {other:?}"),
+    }
+    session_stream
+        .send(WsMessage::text(serde_json::to_string(&own_request)?))
+        .await?;
+    expect_nothing(&mut responder, &mut session_stream, "a reflected envelope").await;
+
+    // Role binding on its own: the peer's identity and the session key, but
+    // an AAD built for the responder's role. Only the role differs from a
+    // valid request, so only the AEAD can refuse it.
+    let wrong_role = seal_message(
+        &session_topic,
+        proposer_identity.did(),
+        message_id("wrong-role"),
+        &request("wrong-role"),
+        Role::Responder,
+        &mut session_cipher,
+    )?;
+    session_stream
+        .send(WsMessage::text(serde_json::to_string(&wrong_role)?))
+        .await?;
+    expect_nothing(&mut responder, &mut session_stream, "a wrong-role envelope").await;
+
+    // Kind mismatch: an authenticated envelope of kind `response` whose
+    // plaintext is a request.
+    let mismatched = {
+        let id = message_id("kind-mismatch");
+        let ts = unix_now();
+        let from = proposer_identity.did();
+        let aad = Aad::new(
+            &id,
+            MessageType::Response,
+            &session_topic,
+            &from,
+            ts,
+            Role::Proposer,
+        )
+        .to_bytes();
+        let sealed = session_cipher.seal(&aad, &request("kind-mismatch").to_bytes()?)?;
+        let wire = Envelope::new(MessageType::Response, from, ts, sealed.nonce, sealed.data);
+        RelayFrame {
+            v: 1,
+            id,
+            topic: session_topic.clone(),
+            body: RelayFrameBody::Message {
+                payload: serde_json::to_string(&wire)?,
+            },
+        }
+    };
+    session_stream
+        .send(WsMessage::text(serde_json::to_string(&mismatched)?))
+        .await?;
+    expect_nothing(&mut responder, &mut session_stream, "a kind mismatch").await;
+
+    // Replay conflict: the id of an accepted frame with different content.
+    let conflict = seal_message(
+        &session_topic,
+        proposer_identity.did(),
+        valid_frame.id.clone(),
+        &request("conflicting"),
+        Role::Proposer,
+        &mut session_cipher,
+    )?;
+    session_stream
+        .send(WsMessage::text(serde_json::to_string(&conflict)?))
+        .await?;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), responder.recv()).await?,
+        Err(ClientError::ProtocolViolation(_))
+    ));
 
     Ok(())
 }

@@ -205,21 +205,50 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn derive_rejects_a_low_order_peer_key() {
-        let keypair = EphemeralKeyPair::generate();
-        assert!(matches!(
-            keypair.derive(&[0u8; 32]),
-            Err(HandshakeError::WeakKey)
-        ));
+    /// libsodium's blocklist: the canonical encodings of the small-order
+    /// points (0, 1, the two points of order 8, and p - 1), plus the
+    /// non-canonical encodings p and p + 1 of 0 and 1. X25519 maps all of
+    /// them to an all-zero shared secret, whatever our scalar.
+    const LOW_ORDER: [&str; 7] = [
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    ];
+
+    fn low_order_points() -> impl Iterator<Item = [u8; 32]> {
+        LOW_ORDER.iter().map(|hex| {
+            let mut point = [0u8; 32];
+            for (byte, pair) in point.iter_mut().zip(hex.as_bytes().chunks(2)) {
+                let pair = std::str::from_utf8(pair).expect("ascii");
+                *byte = u8::from_str_radix(pair, 16).expect("hex");
+            }
+            point
+        })
     }
 
     #[test]
-    fn validate_peer_public_rejects_a_low_order_key() {
-        assert!(matches!(
-            validate_peer_public(&[0u8; 32]),
-            Err(HandshakeError::WeakKey)
-        ));
+    fn derive_rejects_low_order_peer_keys() {
+        for point in low_order_points() {
+            let keypair = EphemeralKeyPair::generate();
+            assert!(
+                matches!(keypair.derive(&point), Err(HandshakeError::WeakKey)),
+                "{point:02x?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_peer_public_rejects_low_order_keys() {
+        for point in low_order_points() {
+            assert!(
+                matches!(validate_peer_public(&point), Err(HandshakeError::WeakKey)),
+                "{point:02x?} must be rejected"
+            );
+        }
         let peer = EphemeralKeyPair::generate();
         assert!(validate_peer_public(&peer.public_key()).is_ok());
     }
