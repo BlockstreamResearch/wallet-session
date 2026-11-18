@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -96,6 +97,8 @@ struct ConnectionResult {
     saw_session_ready: bool,
     uptime: Duration,
     timed_out: bool,
+    /// Lifecycle and control items the client had no room for yet.
+    undelivered: Vec<Inbox>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +108,10 @@ enum InboxTry {
     Closed,
 }
 
-/// Try to hand a frame or control event to the client without blocking the
-/// connection loop. A full inbox is backpressure: the peer retransmits any
-/// frame whose ack was not sent.
+/// Try to hand a message frame to the client without blocking the connection
+/// loop. A full inbox is backpressure: the peer retransmits any envelope whose
+/// ack was not sent. Relay control frames are not retransmitted, so they never
+/// go through here.
 fn try_send_inbox(inbox: &mpsc::Sender<Inbox>, item: Inbox) -> InboxTry {
     match inbox.try_send(item) {
         Ok(()) => InboxTry::Sent,
@@ -215,11 +219,9 @@ async fn connection_task(
 
         let end = match connected {
             Ok(stream) => {
-                if !send_inbox_wait(&inbox, Inbox::Connected(topic.clone()), &mut shutdown).await {
-                    return;
-                }
                 let result = run_connection(
                     stream,
+                    &topic,
                     &mut outbound,
                     &ready,
                     &joined,
@@ -232,8 +234,19 @@ async fn connection_task(
                 if !matches!(result.end, ConnectionEnd::Shutdown) {
                     // Reliability re-flushes unacked tracked frames on the next
                     // ready edge. Do not let copies queued on the old socket
-                    // bypass that gating and pacing.
+                    // bypass that gating and pacing. Do this before waiting
+                    // for inbox room below: the retry task may be waiting for
+                    // outbound room, and it must not be held up until the
+                    // application drains its inbox.
                     while outbound.try_recv().is_ok() {}
+
+                    // The socket is gone, so there is nothing left to service
+                    // while we wait for room.
+                    for item in result.undelivered {
+                        if !send_inbox_wait(&inbox, item, &mut shutdown).await {
+                            return;
+                        }
+                    }
                 }
                 if result.saw_session_ready
                     || (!result.timed_out && result.uptime >= config.connection_stability)
@@ -379,8 +392,10 @@ fn websocket_config() -> WebSocketConfig {
 }
 
 /// Drive one WebSocket session.
+#[allow(clippy::too_many_arguments)]
 async fn run_connection(
     stream: RelayStream,
+    topic: &Topic,
     outbound: &mut mpsc::Receiver<Outbound>,
     ready: &AtomicBool,
     joined: &AtomicBool,
@@ -399,6 +414,18 @@ async fn run_connection(
     let mut saw_session_ready = false;
     let mut session_writable = false;
     let mut timed_out = false;
+
+    // `Connected` and relay control frames must reach the client even while
+    // its inbox is full, but waiting for room must not stop us answering
+    // pings or reading the socket. Queue them here and hand them over as soon
+    // as there is capacity. While anything is queued, message frames are
+    // dropped (the peer retransmits them) so the client never sees a frame
+    // ahead of the lifecycle item that precedes it.
+    //
+    // Outbound frames come first in the `select!` below, so a final message
+    // the client queued just before going away is still written even when
+    // the closed inbox ends the loop on the next turn.
+    let mut control = VecDeque::from([Inbox::Connected(topic.clone())]);
 
     let end = loop {
         tokio::select! {
@@ -431,10 +458,28 @@ async fn run_connection(
                 }
                 None => break ConnectionEnd::Shutdown,
             },
+            permit = inbox.reserve(), if !control.is_empty() => match permit {
+                Ok(permit) => {
+                    if let Some(item) = control.pop_front() {
+                        permit.send(item);
+                    }
+                }
+                Err(_) => break ConnectionEnd::Shutdown,
+            },
             message = source.next() => match message {
                 Some(Ok(Message::Text(text))) => {
                     idle_deadline = Instant::now() + config.idle_timeout;
                     match serde_json::from_str::<RelayFrame>(&text) {
+                        // The relay binds this socket to one topic. A frame for
+                        // another topic or version must not move our
+                        // readiness or reach the client.
+                        Ok(frame) if frame.v != RelayFrame::VERSION || frame.topic != *topic => {
+                            log::warn!(
+                                "dropping relay frame with version {} for topic {}",
+                                frame.v,
+                                frame.topic.log_tag()
+                            );
+                        }
                         Ok(frame) => {
                             log::trace!(
                                 "client <- topic={} bytes={}",
@@ -455,12 +500,18 @@ async fn run_connection(
                                 session_writable = false;
                                 ready.store(false, Ordering::Relaxed);
                             }
-                            match try_send_inbox(inbox, Inbox::Frame(frame)) {
-                                InboxTry::Sent => {}
-                                InboxTry::Full => {
-                                    log::debug!("dropping inbound frame: client inbox full");
+                            if !matches!(&frame.body, RelayFrameBody::Message { .. }) {
+                                queue_control(&mut control, frame);
+                            } else if !control.is_empty() {
+                                log::debug!("dropping inbound frame: control items pending");
+                            } else {
+                                match try_send_inbox(inbox, Inbox::Frame(frame)) {
+                                    InboxTry::Sent => {}
+                                    InboxTry::Full => {
+                                        log::debug!("dropping inbound frame: client inbox full");
+                                    }
+                                    InboxTry::Closed => break ConnectionEnd::Shutdown,
                                 }
-                                InboxTry::Closed => break ConnectionEnd::Shutdown,
                             }
                         }
                         Err(error) => {
@@ -524,7 +575,30 @@ async fn run_connection(
         saw_session_ready,
         uptime: started_at.elapsed(),
         timed_out,
+        undelivered: control.into(),
     }
+}
+
+/// Queue a relay control frame for the client.
+///
+/// An undelivered `session_ready` is stale once anything newer arrives, so it
+/// is replaced. A `peer_disconnected` is kept even if the peer has returned
+/// since: the application must still learn that the peer was gone and its
+/// grace window ran out. A repeated one collapses into the first. So besides
+/// `Connected` the queue never holds more than one `peer_disconnected`
+/// followed by one `session_ready`.
+fn queue_control(control: &mut VecDeque<Inbox>, frame: RelayFrame) {
+    let is = |item: Option<&Inbox>, wanted: fn(&RelayFrameBody) -> bool| matches!(item, Some(Inbox::Frame(queued)) if wanted(&queued.body));
+    let ready = |body: &RelayFrameBody| matches!(body, RelayFrameBody::SessionReady);
+    let gone = |body: &RelayFrameBody| matches!(body, RelayFrameBody::PeerDisconnected);
+
+    if is(control.back(), ready) {
+        control.pop_back();
+    }
+    if gone(&frame.body) && is(control.back(), gone) {
+        return;
+    }
+    control.push_back(Inbox::Frame(frame));
 }
 
 fn classify_close(frame: Option<CloseFrame>) -> ConnectionEnd {
@@ -575,6 +649,49 @@ where
 mod tests {
     use super::*;
 
+    fn control(body: RelayFrameBody) -> RelayFrame {
+        RelayFrame {
+            v: RelayFrame::VERSION,
+            id: wallet_session_core::message::MessageId::from_bytes([0u8; 16]),
+            topic: Topic::new([9u8; 32]).expect("topic"),
+            body,
+        }
+    }
+
+    fn kinds(control: &VecDeque<Inbox>) -> Vec<&'static str> {
+        control
+            .iter()
+            .map(|item| match item {
+                Inbox::Connected(_) => "connected",
+                Inbox::Frame(frame) => match frame.body {
+                    RelayFrameBody::SessionReady => "ready",
+                    RelayFrameBody::PeerDisconnected => "gone",
+                    RelayFrameBody::Message { .. } => "message",
+                },
+                _ => "other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queued_peer_disconnect_survives_the_peer_returning() {
+        let topic = Topic::new([9u8; 32]).expect("topic");
+        let mut queue = VecDeque::from([Inbox::Connected(topic)]);
+
+        queue_control(&mut queue, control(RelayFrameBody::SessionReady));
+        // A stale ready is replaced; a disconnect is kept when the peer returns.
+        queue_control(&mut queue, control(RelayFrameBody::PeerDisconnected));
+        queue_control(&mut queue, control(RelayFrameBody::SessionReady));
+        assert_eq!(kinds(&queue), ["connected", "gone", "ready"]);
+
+        // Leaving and returning again collapses into the same shape.
+        queue_control(&mut queue, control(RelayFrameBody::PeerDisconnected));
+        queue_control(&mut queue, control(RelayFrameBody::PeerDisconnected));
+        assert_eq!(kinds(&queue), ["connected", "gone"]);
+        queue_control(&mut queue, control(RelayFrameBody::SessionReady));
+        assert_eq!(kinds(&queue), ["connected", "gone", "ready"]);
+    }
+
     #[test]
     fn websocket_limits_match_the_relay_default() {
         let config = websocket_config();
@@ -623,6 +740,36 @@ mod tests {
         assert!(
             !send_with_timeout(&mut sink, Message::text("frame"), Duration::from_secs(1)).await
         );
+    }
+
+    /// A lifecycle item waits as long as it takes for room in the inbox. It
+    /// must never give up, which is what left the client with no transport
+    /// and no error before.
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_sends_wait_for_room_instead_of_giving_up() {
+        let topic = Topic::new([9u8; 32]).expect("topic");
+        let (inbox, mut receiver) = mpsc::channel(1);
+        inbox
+            .try_send(Inbox::Connected(topic.clone()))
+            .expect("first item");
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let send = tokio::spawn(async move {
+            send_inbox_wait(&inbox, Inbox::Disconnected(topic), &mut shutdown).await
+        });
+
+        // Far longer than any timeout the transport uses.
+        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        assert!(!send.is_finished(), "the send must still be waiting");
+
+        assert!(matches!(receiver.recv().await, Some(Inbox::Connected(_))));
+        assert!(
+            send.await.expect("task"),
+            "the send completes once there is room"
+        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Inbox::Disconnected(_))
+        ));
     }
 
     #[test]

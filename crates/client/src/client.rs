@@ -534,7 +534,7 @@ where
         let sealed = link.cipher.seal(&aad, &plaintext)?;
         let wire = Message::new(kind, did, ts, sealed.nonce, sealed.data);
         let frame = RelayFrame {
-            v: 1,
+            v: RelayFrame::VERSION,
             id,
             topic: topic.clone(),
             body: RelayFrameBody::Message {

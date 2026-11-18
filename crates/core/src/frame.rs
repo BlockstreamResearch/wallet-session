@@ -19,6 +19,11 @@ pub struct RelayFrame {
     pub body: RelayFrameBody,
 }
 
+impl RelayFrame {
+    /// The only relay frame version this crate speaks.
+    pub const VERSION: u8 = 1;
+}
+
 /// The relay control/forward variants carried by a [`RelayFrame`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

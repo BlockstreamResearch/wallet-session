@@ -521,6 +521,126 @@ async fn run_peer_return() -> TestResult {
 }
 
 #[tokio::test]
+async fn peer_disconnect_survives_a_full_inbox() -> TestResult {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_peer_disconnect_full_inbox(false),
+    )
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_disconnect_survives_the_peer_returning() -> TestResult {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_peer_disconnect_full_inbox(true),
+    )
+    .await??;
+    Ok(())
+}
+
+/// `peer_disconnected` is sent once. If it arrives while the application is
+/// not draining and the inbox is full, it must still be reported once the
+/// application catches up, even if the peer has come back by then.
+async fn run_peer_disconnect_full_inbox(peer_returns: bool) -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // Filling the inbox takes more than the default per-connection burst.
+    let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+        inbound_message_rate: RateLimit {
+            burst: 10_000,
+            interval: Duration::from_secs(3600),
+        },
+        ..RelayLimitsConfig::default()
+    }));
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        limiter,
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(50)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Overfill the inbox while the application is not driving the client,
+    // then leave for longer than the grace window.
+    for index in 0..80 {
+        let frame = request_frame(
+            &raw.topic,
+            proposer_identity.did(),
+            &format!("full-{index}"),
+            &format!("full-{index}"),
+            &mut raw.cipher,
+        )?;
+        raw.session
+            .send(WsMessage::text(serde_json::to_string(&frame)?))
+            .await?;
+    }
+    let session_topic = raw.topic.clone();
+    drop(raw);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _returned = if peer_returns {
+        let mut session = connect_raw(
+            &relay_url,
+            &proposer_identity,
+            Role::Proposer,
+            &session_topic,
+        )
+        .await?;
+        wait_raw_session_ready(&mut session).await?;
+        Some(session)
+    } else {
+        None
+    };
+
+    // Catch up. The requests that fit are delivered, then the disconnect.
+    let mut delivered = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), responder.recv()).await {
+            Ok(Ok(ClientMessage::Request(_))) => delivered += 1,
+            Ok(Err(ClientError::PeerDisconnected)) => break,
+            Ok(other) => panic!("unexpected result: {other:?}"),
+            Err(_) => panic!("peer_disconnected was lost"),
+        }
+    }
+    assert!(
+        delivered > 0,
+        "the requests that fit in the inbox must be delivered first"
+    );
+    assert_eq!(responder.session().state, SessionState::Disconnected);
+    if peer_returns {
+        responder.wait_session_ready().await?;
+    } else {
+        assert!(!responder.is_ready());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn inbound_disconnect_is_terminal_and_acked() -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), run_inbound_disconnect_terminal()).await??;
     Ok(())

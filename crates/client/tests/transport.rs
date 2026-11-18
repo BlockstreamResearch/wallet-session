@@ -349,9 +349,11 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
     let addr = listener.local_addr()?;
     let accepts = Arc::new(AtomicUsize::new(0));
     let topic = Topic::new([9u8; 32])?;
+    let (closed_tx, closed_rx) = oneshot::channel::<()>();
     let server = {
         let accepts = Arc::clone(&accepts);
         let topic = topic.clone();
+        let mut closed_tx = Some(closed_tx);
         tokio::spawn(async move {
             loop {
                 let Ok(stream) = accept(&listener).await else {
@@ -359,6 +361,11 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
                 };
                 let accepted = accepts.fetch_add(1, Ordering::Relaxed) + 1;
                 let topic = topic.clone();
+                let closed = if accepted == 1 {
+                    closed_tx.take()
+                } else {
+                    None
+                };
                 tokio::spawn(async move {
                     let Ok(mut socket) = accept_async(stream).await else {
                         return;
@@ -382,6 +389,9 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
                         // End the connection while the client inbox is full,
                         // so the lifecycle send has to wait.
                         let _ = socket.close(None).await;
+                        if let Some(closed) = closed {
+                            let _ = closed.send(());
+                        }
                     } else {
                         let frame = RelayFrame {
                             v: 1,
@@ -406,8 +416,11 @@ async fn inbox_stall_does_not_kill_the_transport() -> TestResult {
     )
     .await?;
 
-    // Let the inbox fill and the transport stall past twice the send timeout.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Once the server has filled the inbox and closed the socket, the
+    // transport has to wait to report `Disconnected`. Wait well past twice the
+    // idle timeout, which is when the old code gave up and exited silently.
+    timeout(Duration::from_secs(2), closed_rx).await??;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
         accepts.load(Ordering::Relaxed),
         1,
@@ -447,7 +460,11 @@ async fn disconnect_closes_locally_when_not_ready() -> TestResult {
         ),
         "unexpected disconnect result: {result:?}"
     );
-    assert!(matches!(client.recv().await, Err(ClientError::Closed)));
+    // Bounded, so a regression fails instead of hanging the suite.
+    assert!(matches!(
+        timeout(Duration::from_secs(2), client.recv()).await?,
+        Err(ClientError::Closed)
+    ));
 
     server.abort();
     Ok(())
@@ -557,6 +574,46 @@ async fn liveness_timeouts_do_not_reset_the_reconnect_budget() -> TestResult {
         2,
         "a liveness timeout must not reset the retry budget"
     );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreign_relay_frames_do_not_signal_readiness() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (release, released) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("upgraded");
+        let ready = |v: u8, topic: [u8; 32]| {
+            let frame = RelayFrame {
+                v,
+                id: MessageId::from_bytes([u8::MAX; MessageId::LEN]),
+                topic: Topic::new(topic).expect("topic"),
+                body: RelayFrameBody::SessionReady,
+            };
+            Message::Text(serde_json::to_string(&frame).expect("json").into())
+        };
+        // Another topic, then an unknown version of ours.
+        socket.send(ready(1, [8u8; 32])).await.expect("sent");
+        socket.send(ready(2, [9u8; 32])).await.expect("sent");
+        let _ = released.await;
+        socket.send(ready(1, [9u8; 32])).await.expect("sent");
+        std::future::pending::<()>().await;
+    });
+
+    let mut client = connect(addr, config(addr)).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !client.is_ready(),
+        "a foreign session_ready must not make the client ready"
+    );
+
+    release.send(()).expect("server waiting");
+    timeout(Duration::from_secs(2), client.wait_session_ready()).await??;
+    assert!(client.is_ready());
 
     server.abort();
     Ok(())
