@@ -112,7 +112,7 @@ mod tests {
     use wallet_session_core::{
         did::DidKey,
         frame::{RelayFrame, RelayFrameBody},
-        message::Topic,
+        message::{MessageId, Topic},
     };
 
     use super::*;
@@ -185,7 +185,7 @@ mod tests {
             permit,
             &RelayFrame {
                 v: 1,
-                id: "ready".to_owned(),
+                id: MessageId::from_bytes([0u8; MessageId::LEN]),
                 topic: topic.clone(),
                 body: RelayFrameBody::SessionReady,
             },

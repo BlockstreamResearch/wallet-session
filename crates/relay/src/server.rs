@@ -205,7 +205,7 @@ mod tests {
         },
     };
     use wallet_session_core::frame::{RelayFrame, RelayFrameBody};
-    use wallet_session_core::message::Topic;
+    use wallet_session_core::message::{MessageId, Topic};
 
     const AUDIENCE: &str = "wss://relay.example.com";
 
@@ -227,6 +227,14 @@ mod tests {
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([9u8; 32])
+    }
+
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
     }
 
     async fn connect(
@@ -296,7 +304,7 @@ mod tests {
 
         let message = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "m1".to_owned(),
+            id: message_id("m1"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "hello".to_owned(),
@@ -420,10 +428,16 @@ mod tests {
     async fn serve_tracked(
         config: NativeRelayTransportConfig,
     ) -> Result<(SocketAddr, Handlers), Box<dyn std::error::Error>> {
+        serve_tracked_with_limiter(config, limiter()).await
+    }
+
+    async fn serve_tracked_with_limiter(
+        config: NativeRelayTransportConfig,
+        limiter: Arc<Limiter>,
+    ) -> Result<(SocketAddr, Handlers), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let registry = Arc::new(Registry::new());
-        let limiter = limiter();
         let (handlers_tx, handlers) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -520,7 +534,7 @@ mod tests {
 
         let message = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "buffered".to_owned(),
+            id: message_id("buffered"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "queued".to_owned(),
@@ -618,7 +632,7 @@ mod tests {
     fn message(topic: &Topic, id: &str, payload: &str) -> RelayFrame {
         RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: id.to_owned(),
+            id: message_id(id),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: payload.to_owned(),
@@ -737,7 +751,7 @@ mod tests {
         }
         assert_eq!(
             redelivered,
-            ["m2", "m3"],
+            [message_id("m2"), message_id("m3")],
             "the oldest buffered frame makes room for the newest"
         );
         Ok(())
@@ -1276,7 +1290,7 @@ mod tests {
         // Clients must not forge the relay-only session_ready frame.
         let rogue = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "rogue".to_owned(),
+            id: message_id("rogue"),
             topic: topic.clone(),
             body: RelayFrameBody::SessionReady,
         };
@@ -1349,7 +1363,7 @@ mod tests {
 
         let forged = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "forged".to_owned(),
+            id: message_id("forged"),
             topic: topic.clone(),
             body: RelayFrameBody::PeerDisconnected,
         };
@@ -1428,6 +1442,99 @@ mod tests {
         Ok(())
     }
 
+    /// Frame ids are 16 bytes, base64url. Anything else is a malformed frame,
+    /// and the relay closes the sender rather than forwarding it.
+    #[tokio::test]
+    async fn non_canonical_frame_id_closes_connection() -> TestResult {
+        let addr = serve_with(
+            NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_secs(2)),
+        )
+        .await?;
+
+        let topic = topic()?;
+        let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+        let mut responder = connect(addr, "responder", &topic, None).await?;
+        assert!(matches!(
+            read_frame(&mut proposer).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+        assert!(matches!(
+            read_frame(&mut responder).await?.body,
+            RelayFrameBody::SessionReady
+        ));
+
+        let frame = RelayFrame {
+            v: 1,
+            id: message_id("short-id"),
+            topic: topic.clone(),
+            body: RelayFrameBody::Message {
+                payload: "x".to_owned(),
+            },
+        };
+        let mut value = serde_json::to_value(&frame)?;
+        // Five bytes, which is valid base64url but not a frame id.
+        value["id"] = serde_json::Value::from("c2hvcnQ");
+        proposer
+            .send(Message::Text(value.to_string().into()))
+            .await?;
+        assert!(
+            expect_closed(&mut proposer).await,
+            "a frame id that is not 16 bytes should close the connection"
+        );
+        Ok(())
+    }
+
+    /// A 16-byte id has exactly one encoding. Padding, or non-zero trailing
+    /// bits in the last character, must not be accepted as another spelling
+    /// of the same id.
+    #[tokio::test]
+    async fn non_canonical_frame_id_encodings_close_connection() -> TestResult {
+        let canonical = message_id("x").to_string();
+        assert_eq!(canonical.len(), 22);
+        let mut trailing_bits = canonical.clone();
+        trailing_bits.replace_range(21.., "B");
+        for (label, id) in [
+            ("padding", format!("{canonical}==")),
+            ("trailing bits", trailing_bits),
+        ] {
+            let addr = serve_with(
+                NativeRelayTransportConfig::new(AUDIENCE)
+                    .with_session_grace(Duration::from_secs(2)),
+            )
+            .await?;
+            let topic = topic()?;
+            let mut proposer = connect(addr, "proposer", &topic, Some("reg-1")).await?;
+            let mut responder = connect(addr, "responder", &topic, None).await?;
+            assert!(matches!(
+                read_frame(&mut proposer).await?.body,
+                RelayFrameBody::SessionReady
+            ));
+            assert!(matches!(
+                read_frame(&mut responder).await?.body,
+                RelayFrameBody::SessionReady
+            ));
+
+            let frame = RelayFrame {
+                v: 1,
+                id: message_id("x"),
+                topic: topic.clone(),
+                body: RelayFrameBody::Message {
+                    payload: "x".to_owned(),
+                },
+            };
+            let mut value = serde_json::to_value(&frame)?;
+            value["id"] = serde_json::Value::from(id);
+            proposer
+                .send(Message::Text(value.to_string().into()))
+                .await?;
+            assert!(
+                expect_closed(&mut proposer).await,
+                "a frame id with {label} should close the connection"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unsupported_frame_version_closes_connection() -> TestResult {
         let addr = serve_with(
@@ -1449,7 +1556,7 @@ mod tests {
 
         let rogue = RelayFrame {
             v: 2,
-            id: "rogue".to_owned(),
+            id: message_id("rogue"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "future".to_owned(),
@@ -2011,7 +2118,10 @@ mod tests {
         {
             delivered.push(frame.id);
         }
-        assert_eq!(delivered, ["m0", "m1", "m2"]);
+        assert_eq!(
+            delivered,
+            [message_id("m0"), message_id("m1"), message_id("m2")]
+        );
         Ok(())
     }
 
@@ -2252,12 +2362,13 @@ mod tests {
             ..ping_limits()
         }));
         let config = NativeRelayTransportConfig::new(AUDIENCE);
-        let addr = serve_with_limiter(config, Arc::clone(&limiter)).await?;
+        let (addr, mut handlers) = serve_tracked_with_limiter(config, Arc::clone(&limiter)).await?;
 
         // Every ping after the first is dropped, and once the drops pass the
         // consecutive-drop limit the sender is disconnected. Sends may fail
         // after that.
         let mut hog = connect(addr, "proposer", &topic()?, None).await?;
+        let handler = handlers.recv().await.ok_or("relay stopped accepting")?;
         let _ = send_pings(&mut hog, MAX_CONSECUTIVE_RATE_DROPS + 8, PING_PAYLOAD).await;
         let limit = u64::from(PING_PAYLOAD) * u64::from(MAX_CONSECUTIVE_RATE_DROPS);
         let dropped = wait_for_count(|| limiter.dropped_share_bytes(), limit + 1).await;
@@ -2265,9 +2376,14 @@ mod tests {
             dropped > limit,
             "the relay must process enough dropped pings to reach the disconnect threshold"
         );
+        let result = timeout(SYNC_TIMEOUT, handler).await?;
         assert!(
-            expect_closed_within(&mut hog, Duration::from_secs(10)).await,
-            "an identity flooding control frames over its share must be disconnected"
+            matches!(
+                result,
+                Ok(Err(ServerError::Connection(ConnectionError::RateLimited)))
+            ),
+            "an identity flooding control frames over its share must be disconnected \
+             for exceeding its rate, got {result:?}"
         );
         assert_eq!(limiter.dropped_global_bytes(), 0);
         Ok(())
@@ -2609,7 +2725,7 @@ mod tests {
             .await?;
 
         // The message is whole, so every fragment was read, in order.
-        assert_eq!(read_frame(&mut responder).await?.id, "f0");
+        assert_eq!(read_frame(&mut responder).await?.id, message_id("f0"));
         // What the burst did not cover takes about 2.7 seconds.
         let elapsed = started.elapsed();
         assert!(
@@ -2619,7 +2735,7 @@ mod tests {
 
         // The sender is still connected, and its next frame goes through.
         send(&mut proposer, &message(&topic, "f1", "still-connected")).await?;
-        assert_eq!(read_frame(&mut responder).await?.id, "f1");
+        assert_eq!(read_frame(&mut responder).await?.id, message_id("f1"));
         Ok(())
     }
 

@@ -17,7 +17,7 @@ use tokio_tungstenite::{
         protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
-use wallet_session_core::{codec, connection::ConnectionQuery};
+use wallet_session_core::connection::ConnectionQuery;
 
 use crate::{
     auth::{Identity, IdentityError, unix_now},
@@ -30,6 +30,7 @@ use crate::{
 use wallet_session_core::{
     did::DidKey,
     frame::{RelayFrame, RelayFrameBody},
+    message::MessageId,
 };
 
 /// Server-side relay WebSocket stream, read through the connection's wire
@@ -99,10 +100,10 @@ fn reject_response() -> ErrorResponse {
     response
 }
 
-pub(crate) fn random_id() -> Result<String, ConnectionError> {
-    let mut bytes = [0u8; 16];
+pub(crate) fn random_id() -> Result<MessageId, ConnectionError> {
+    let mut bytes = [0u8; MessageId::LEN];
     getrandom::fill(&mut bytes)?;
-    Ok(codec::encode(&bytes))
+    Ok(MessageId::from_bytes(bytes))
 }
 
 /// The client behind an accepted handshake.
@@ -982,6 +983,14 @@ mod tests {
         Topic::new([1u8; 32])
     }
 
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
+    }
+
     fn parse(query: &str) -> Result<(ConnectionQuery, Identity), ConnectionError> {
         parse_connection(
             &uri(query).map_err(|_| ConnectionError::HandshakeFailed)?,
@@ -1176,7 +1185,7 @@ mod tests {
     }
 
     /// Ids of the frames a test reader accepted.
-    type Accepted = Arc<std::sync::Mutex<Vec<String>>>;
+    type Accepted = Arc<std::sync::Mutex<Vec<MessageId>>>;
 
     /// A reader that takes `per_message` to accept each message, and the ids
     /// of the frames it accepted.
@@ -1235,7 +1244,7 @@ mod tests {
     ) -> Result<Outbound, Box<dyn std::error::Error>> {
         let frame = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: id.to_owned(),
+            id: message_id(id),
             topic: topic()?,
             body: RelayFrameBody::Message {
                 payload: "ciphertext".to_owned(),
@@ -1267,7 +1276,10 @@ mod tests {
             window.contains(&elapsed),
             "the writer must stop once a frame has waited the queue timeout, not {elapsed:?}"
         );
-        assert_eq!(*accepted.lock().expect("accepted ids"), ["m0", "m1", "m2"]);
+        assert_eq!(
+            *accepted.lock().expect("accepted ids"),
+            [message_id("m0"), message_id("m1"), message_id("m2")]
+        );
 
         drop(tx);
         assert_eq!(budget.held(), 0, "frames left behind give their bytes back");
@@ -1296,7 +1308,12 @@ mod tests {
         );
         assert_eq!(
             *accepted.lock().expect("accepted ids"),
-            ["m0", "m1", "m2", "m3"]
+            [
+                message_id("m0"),
+                message_id("m1"),
+                message_id("m2"),
+                message_id("m3")
+            ]
         );
         assert_eq!(budget.held(), 0, "written frames give their bytes back");
 
@@ -1351,7 +1368,7 @@ mod tests {
         };
         let ready = RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "ready".to_owned(),
+            id: message_id("ready"),
             topic: topic()?,
             body: RelayFrameBody::SessionReady,
         };

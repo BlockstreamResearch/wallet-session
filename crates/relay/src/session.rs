@@ -651,7 +651,7 @@ mod tests {
     use crate::connection::RELAY_FRAME_VERSION;
     use crate::limits::{Limiter, RelayLimitsConfig};
     use wallet_session_core::frame::RelayFrameBody;
-    use wallet_session_core::message::Topic;
+    use wallet_session_core::message::{MessageId, Topic};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -668,6 +668,14 @@ mod tests {
 
     fn topic() -> Result<Topic, wallet_session_core::error::Error> {
         Topic::new([1u8; 32])
+    }
+
+    /// A distinct, valid message id for a test label.
+    fn message_id(label: &str) -> MessageId {
+        let mut bytes = [0u8; MessageId::LEN];
+        let label = &label.as_bytes()[..label.len().min(MessageId::LEN)];
+        bytes[..label.len()].copy_from_slice(label);
+        MessageId::from_bytes(bytes)
     }
 
     fn peer(seed: u8) -> (PeerHandle, mpsc::Receiver<Outbound>) {
@@ -693,7 +701,7 @@ mod tests {
     }
 
     /// Ids of the frames waiting in a queue, taking them out as a writer would.
-    fn take_ids(rx: &mut mpsc::Receiver<Outbound>) -> Vec<String> {
+    fn take_ids(rx: &mut mpsc::Receiver<Outbound>) -> Vec<MessageId> {
         let mut ids = Vec::new();
         while let Ok(queued) = rx.try_recv() {
             ids.push(queued.frame.id);
@@ -717,7 +725,7 @@ mod tests {
     fn frame(topic: &Topic) -> RelayFrame {
         RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "frame-id".to_owned(),
+            id: message_id("frame-id"),
             topic: topic.clone(),
             body: RelayFrameBody::Message {
                 payload: "ciphertext".to_owned(),
@@ -728,7 +736,7 @@ mod tests {
     fn ready(topic: &Topic) -> RelayFrame {
         RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "ready".to_owned(),
+            id: message_id("ready"),
             topic: topic.clone(),
             body: RelayFrameBody::SessionReady,
         }
@@ -738,7 +746,7 @@ mod tests {
     fn notification() -> RelayFrame {
         RelayFrame {
             v: RELAY_FRAME_VERSION,
-            id: "gone".to_owned(),
+            id: message_id("gone"),
             topic: topic().expect("topic"),
             body: RelayFrameBody::PeerDisconnected,
         }
@@ -746,7 +754,7 @@ mod tests {
 
     fn frame_with_id(topic: &Topic, id: &str) -> RelayFrame {
         RelayFrame {
-            id: id.to_owned(),
+            id: message_id(id),
             ..frame(topic)
         }
     }
@@ -783,7 +791,7 @@ mod tests {
         role: Role,
         tx: &mpsc::Sender<Outbound>,
         rx: &mut mpsc::Receiver<Outbound>,
-    ) -> Result<Vec<String>, SessionError> {
+    ) -> Result<Vec<MessageId>, SessionError> {
         let mut ids = Vec::new();
         loop {
             let drain = session.drain_backlog(role, tx)?;
@@ -932,7 +940,7 @@ mod tests {
 
         // frames to the disconnected peer are buffered, not dropped
         session.route(Role::Proposer, frame(&topic()?), MAX_BUFFERED, BUFFER_TTL)?;
-        assert_eq!(responder_rx.try_recv()?.frame.id, "ready");
+        assert_eq!(responder_rx.try_recv()?.frame.id, message_id("ready"));
         assert!(responder_rx.try_recv().is_err());
 
         // same identity reconnects within grace and receives session_ready,
@@ -943,7 +951,7 @@ mod tests {
         assert!(matches!(registration, Registration::BothReady));
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "frame-id"]
+            [message_id("ready"), message_id("frame-id")]
         );
         Ok(())
     }
@@ -985,7 +993,7 @@ mod tests {
         let ids = received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?;
         assert_eq!(
             ids,
-            ["ready", "frame-id"],
+            [message_id("ready"), message_id("frame-id")],
             "only the unexpired frame is redelivered"
         );
         Ok(())
@@ -1008,7 +1016,14 @@ mod tests {
         let tx = responder.tx.clone();
         register(&session, Role::Responder, responder)?;
         let ids = received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?;
-        assert_eq!(ids, ["ready", "frame-id", "frame-id"]);
+        assert_eq!(
+            ids,
+            [
+                message_id("ready"),
+                message_id("frame-id"),
+                message_id("frame-id")
+            ]
+        );
         Ok(())
     }
 
@@ -1039,7 +1054,7 @@ mod tests {
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, responder)?;
         disconnect_current(&session, Role::Responder, Duration::from_secs(1))?;
-        assert_eq!(proposer_rx.try_recv()?.frame.id, "ready");
+        assert_eq!(proposer_rx.try_recv()?.frame.id, message_id("ready"));
 
         tokio::time::advance(Duration::from_secs(2)).await;
         let notice = notification();
@@ -1104,8 +1119,8 @@ mod tests {
             BUFFER_TTL,
         )?;
 
-        assert_eq!(responder_rx.try_recv()?.frame.id, "ready");
-        assert_eq!(responder_rx.try_recv()?.frame.id, "m1");
+        assert_eq!(responder_rx.try_recv()?.frame.id, message_id("ready"));
+        assert_eq!(responder_rx.try_recv()?.frame.id, message_id("m1"));
         Ok(())
     }
 
@@ -1144,7 +1159,13 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "old1", "old2", "new1", "new2"]
+            [
+                message_id("ready"),
+                message_id("old1"),
+                message_id("old2"),
+                message_id("new1"),
+                message_id("new2")
+            ]
         );
 
         // Once drained, frames go straight to the queue again.
@@ -1154,7 +1175,7 @@ mod tests {
             MAX_BUFFERED,
             BUFFER_TTL,
         )?;
-        assert_eq!(responder_rx.try_recv()?.frame.id, "live");
+        assert_eq!(responder_rx.try_recv()?.frame.id, message_id("live"));
         Ok(())
     }
 
@@ -1196,8 +1217,8 @@ mod tests {
         let mut ids = take_ids(&mut responder_rx);
         ids.extend(received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?);
 
-        let mut expected = vec!["ready".to_owned()];
-        expected.extend((0..total).map(|i| format!("m{i:02}")));
+        let mut expected = vec![message_id("ready")];
+        expected.extend((0..total).map(|i| message_id(&format!("m{i:02}"))));
         assert_eq!(ids, expected);
         Ok(())
     }
@@ -1225,12 +1246,12 @@ mod tests {
         // The stale connection finally gets to run.
         assert_eq!(
             received_ids(&session, Role::Responder, &first_tx, &mut first_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "a stale connection must not consume the new connection's backlog"
         );
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
-            ["ready", "frame-id"]
+            [message_id("ready"), message_id("frame-id")]
         );
         Ok(())
     }
@@ -1242,7 +1263,7 @@ mod tests {
         let (old, mut old_rx) = peer(2);
         register(&session, Role::Proposer, proposer)?;
         register(&session, Role::Responder, old)?;
-        assert_eq!(proposer_rx.try_recv()?.frame.id, "ready");
+        assert_eq!(proposer_rx.try_recv()?.frame.id, message_id("ready"));
 
         // Same identity, new connection, while the old one is still registered.
         let (new, mut new_rx) = peer(2);
@@ -1253,7 +1274,7 @@ mod tests {
         ));
 
         // The counterpart sees the peer come back.
-        assert_eq!(proposer_rx.try_recv()?.frame.id, "ready");
+        assert_eq!(proposer_rx.try_recv()?.frame.id, message_id("ready"));
 
         // Routing now reaches the new connection only.
         session.route(
@@ -1264,7 +1285,7 @@ mod tests {
         )?;
         assert_eq!(
             received_ids(&session, Role::Responder, &new_tx, &mut new_rx).await?,
-            ["ready", "m1"]
+            [message_id("ready"), message_id("m1")]
         );
 
         // The replaced connection's queue is closed once its old frames drain.
@@ -1297,8 +1318,8 @@ mod tests {
             MAX_BUFFERED,
             BUFFER_TTL,
         )?;
-        assert_eq!(owner_rx.try_recv()?.frame.id, "ready");
-        assert_eq!(owner_rx.try_recv()?.frame.id, "m1");
+        assert_eq!(owner_rx.try_recv()?.frame.id, message_id("ready"));
+        assert_eq!(owner_rx.try_recv()?.frame.id, message_id("m1"));
         Ok(())
     }
 
@@ -1327,7 +1348,7 @@ mod tests {
         )?;
         assert_eq!(
             received_ids(&session, Role::Responder, &new_tx, &mut new_rx).await?,
-            ["ready", "m1"]
+            [message_id("ready"), message_id("m1")]
         );
 
         // And an expiry the old teardown might have scheduled is a no-op.
@@ -1369,7 +1390,7 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
-            ["ready", "old", "new"],
+            [message_id("ready"), message_id("old"), message_id("new")],
             "frames not yet handed to the replaced connection must not be lost"
         );
         Ok(())
@@ -1491,7 +1512,7 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &other_tx, &mut other_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "frames buffered for the previous owner must not reach another identity"
         );
         Ok(())
@@ -1515,7 +1536,7 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut reconnect_rx).await?,
-            ["ready", "frame-id"],
+            [message_id("ready"), message_id("frame-id")],
             "the owner gets its frames back after the reservation expired"
         );
         Ok(())
@@ -1552,7 +1573,7 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "a frame reclaimed before its TTL must not be delivered after it"
         );
         Ok(())
@@ -1602,7 +1623,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3)).await;
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "late"],
+            [message_id("ready"), message_id("late")],
             "at t=9 only the frame queued at t=6 is still deliverable"
         );
         Ok(())
@@ -1632,7 +1653,7 @@ mod tests {
 
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "an inherited frame must not outlive its TTL"
         );
         Ok(())
@@ -1711,7 +1732,7 @@ mod tests {
         ));
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["gone", "ready"],
+            [message_id("gone"), message_id("ready")],
             "frames from an expired counterpart must not follow peer_disconnected"
         );
         Ok(())
@@ -1745,7 +1766,7 @@ mod tests {
         ));
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "frames the previous proposer sent must not reach the responder as the new one's"
         );
         Ok(())
@@ -1753,10 +1774,12 @@ mod tests {
 
     #[test]
     fn encoded_len_is_the_text_the_writer_sends() -> TestResult {
+        // Frame ids are base64url and never need escaping, so put every
+        // character JSON escapes in the payload.
         let frame = RelayFrame {
-            id: "quote \" backslash \\ newline \n control \u{1}".to_owned(),
             body: RelayFrameBody::Message {
-                payload: "é \u{7f} \u{1f} \u{1F600}".to_owned(),
+                payload: "quote \" backslash \\ newline \n control \u{1} é \u{7f} \u{1f} \u{1F600}"
+                    .to_owned(),
             },
             ..frame(&topic()?)
         };
@@ -1782,12 +1805,15 @@ mod tests {
             route_id(&session, id)?;
         }
         assert_eq!(budget.held(), 2 * one, "session_ready is not charged");
-        assert_eq!(take_ids(&mut responder_rx), ["ready", "m1", "m2"]);
+        assert_eq!(
+            take_ids(&mut responder_rx),
+            [message_id("ready"), message_id("m1"), message_id("m2")]
+        );
 
         // Written frames give their bytes back.
         assert_eq!(budget.held(), 0);
         route_id(&session, "m4")?;
-        assert_eq!(take_ids(&mut responder_rx), ["m4"]);
+        assert_eq!(take_ids(&mut responder_rx), [message_id("m4")]);
         Ok(())
     }
 
@@ -1812,7 +1838,12 @@ mod tests {
 
         assert_eq!(
             take_ids(&mut responder_rx),
-            ["ready", "m1", "gone", "ready"],
+            [
+                message_id("ready"),
+                message_id("m1"),
+                message_id("gone"),
+                message_id("ready")
+            ],
             "control frames bypass the byte budget"
         );
         Ok(())
@@ -1840,7 +1871,13 @@ mod tests {
         assert_eq!(budget.held(), 4 * one);
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m1", "m3", "m4", "m5"]
+            [
+                message_id("ready"),
+                message_id("m1"),
+                message_id("m3"),
+                message_id("m4"),
+                message_id("m5")
+            ]
         );
         assert_eq!(budget.held(), 0, "written frames give their bytes back");
         Ok(())
@@ -1868,7 +1905,7 @@ mod tests {
         session.route(Role::Proposer, large, MAX_BUFFERED, BUFFER_TTL)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m1", "m2"]
+            [message_id("ready"), message_id("m1"), message_id("m2")]
         );
         Ok(())
     }
@@ -1900,7 +1937,12 @@ mod tests {
         session.route(Role::Proposer, large_frame(&topic, 2 * one), 2, BUFFER_TTL)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m1", "m2", "m3"]
+            [
+                message_id("ready"),
+                message_id("m1"),
+                message_id("m2"),
+                message_id("m3")
+            ]
         );
         Ok(())
     }
@@ -1928,7 +1970,7 @@ mod tests {
         register(&session, Role::Responder, responder)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m1", "m2"]
+            [message_id("ready"), message_id("m1"), message_id("m2")]
         );
         Ok(())
     }
@@ -1945,7 +1987,7 @@ mod tests {
         assert_eq!(drain.delivered, 1);
 
         // The writer takes session_ready, which frees a queue slot but no bytes.
-        assert_eq!(responder_rx.try_recv()?.frame.id, "ready");
+        assert_eq!(responder_rx.try_recv()?.frame.id, message_id("ready"));
 
         // Room for m3 means dropping m2, the whole backlog. A frame left on an
         // empty backlog would never be drained, so m3 goes to the queue.
@@ -1958,7 +2000,10 @@ mod tests {
                 finished: true,
             }
         );
-        assert_eq!(take_ids(&mut responder_rx), ["m1", "m3"]);
+        assert_eq!(
+            take_ids(&mut responder_rx),
+            [message_id("m1"), message_id("m3")]
+        );
         Ok(())
     }
 
@@ -1991,7 +2036,7 @@ mod tests {
         assert_eq!(budget.held(), 2 * one, "moved to the new budget");
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m2", "m3"]
+            [message_id("ready"), message_id("m2"), message_id("m3")]
         );
         Ok(())
     }
@@ -2007,7 +2052,7 @@ mod tests {
         register(&session, Role::Responder, responder)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &tx, &mut responder_rx).await?,
-            ["ready", "m2", "m3"]
+            [message_id("ready"), message_id("m2"), message_id("m3")]
         );
         Ok(())
     }
@@ -2035,7 +2080,7 @@ mod tests {
         assert_eq!(second_budget.held(), 2 * one);
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
-            ["ready", "m2", "m3"]
+            [message_id("ready"), message_id("m2"), message_id("m3")]
         );
         Ok(())
     }
@@ -2091,7 +2136,7 @@ mod tests {
         register(&session, Role::Responder, second)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &second_tx, &mut second_rx).await?,
-            ["ready", "late"],
+            [message_id("ready"), message_id("late")],
             "the backlog survives the connection, with the expiry it was buffered with"
         );
         Ok(())
@@ -2120,7 +2165,7 @@ mod tests {
         register(&session, Role::Responder, other)?;
         assert_eq!(
             received_ids(&session, Role::Responder, &other_tx, &mut other_rx).await?,
-            ["ready"],
+            [message_id("ready")],
             "frames kept for the previous owner must not reach another identity"
         );
         assert_eq!(

@@ -1,8 +1,28 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::message::MessageId;
+
+/// Distinguish an omitted optional field from an explicit `null`.
+fn deserialize_optional_alternative<'de, D>(deserializer: D) -> Result<Option<Opaque>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Opaque>::deserialize(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("field must be omitted, not null"))?;
+    Ok(Some(value))
+}
 
 /// Opaque application data carried inside a payload shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opaque(#[serde(with = "crate::codec::base64url")] pub Vec<u8>);
+
+impl fmt::Debug for Opaque {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Opaque(..)")
+    }
+}
 
 /// Body of a `proposal` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +42,9 @@ pub struct ProposalPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovePayload {
+    /// The `id` of the frame that carried the proposal being approved.
+    pub proposal_id: MessageId,
+
     /// The responder's one-time X25519 public key.
     pub ephemeral_public_key: String,
 
@@ -30,8 +53,12 @@ pub struct ApprovePayload {
 }
 
 /// Body of a `reject` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RejectPayload {
+    /// The `id` of the frame that carried the proposal being rejected.
+    pub proposal_id: MessageId,
+
     /// Reason code for the rejection
     pub code: u32,
 
@@ -40,7 +67,7 @@ pub struct RejectPayload {
 }
 
 /// Body of a `request` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestPayload {
     /// Caller-assigned identifier used to correlate the eventual `response`
@@ -52,32 +79,49 @@ pub struct RequestPayload {
 }
 
 /// Body of a `response` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponsePayload {
     /// Identifier of the `request` being answered.
     pub request_id: String,
 
     /// Opaque application result; present on success, absent on error.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_alternative",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub response: Option<Opaque>,
 
     /// Failure description; present on error, absent on success.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_alternative",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub error: Option<Opaque>,
+}
+
+impl ResponsePayload {
+    /// Whether exactly one of `response` and `error` is present.
+    pub fn is_valid(&self) -> bool {
+        self.response.is_some() != self.error.is_some()
+    }
 }
 
 /// Body of an `ack` message.
 ///
 /// Confirms receipt of an ack-required message, driving the retransmission
 /// logic.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AckPayload {
     /// The envelope `id` of the message being acknowledged.
-    pub ack_id: String,
+    pub ack_id: MessageId,
 }
 
 /// Body of a `disconnect` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisconnectPayload {
     /// Short reason label for the disconnect.
     pub reason: String,
@@ -90,7 +134,7 @@ pub struct DisconnectPayload {
 }
 
 /// Body of a `session_delete` message.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDeletePayload {
     /// Machine-readable close code.
     pub code: u32,
@@ -149,9 +193,54 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
+    fn response_serializes_exactly_one_alternative() -> TestResult {
+        let success = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: Some(Opaque(vec![1, 2, 3])),
+            error: None,
+        };
+        let value = serde_json::to_value(&success)?;
+        assert_eq!(value.get("response"), Some(&serde_json::json!("AQID")));
+        assert!(value.get("error").is_none());
+        assert!(success.is_valid());
+
+        let failure = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: None,
+            error: Some(Opaque(vec![4, 5])),
+        };
+        let value = serde_json::to_value(&failure)?;
+        assert!(value.get("response").is_none());
+        assert_eq!(value.get("error"), Some(&serde_json::json!("BAU")));
+        assert!(failure.is_valid());
+
+        let neither = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: None,
+            error: None,
+        };
+        assert!(!neither.is_valid());
+
+        let both = ResponsePayload {
+            request_id: "req-1".to_owned(),
+            response: Some(Opaque(Vec::new())),
+            error: Some(Opaque(Vec::new())),
+        };
+        assert!(!both.is_valid());
+        Ok(())
+    }
+
+    #[test]
+    fn opaque_debug_redacts_application_data() {
+        let opaque = Opaque(vec![1, 2, 3, 4]);
+        assert_eq!(format!("{opaque:?}"), "Opaque(..)");
+    }
+
+    #[test]
     fn bodies_with_the_same_shape_are_distinguished() -> TestResult {
-        let rejected: Payload =
-            serde_json::from_str(r#"{"type":"reject","code":1,"message":"no"}"#)?;
+        let rejected: Payload = serde_json::from_str(
+            r#"{"type":"reject","proposalId":"AAAAAAAAAAAAAAAAAAAAAA","code":1,"message":"no"}"#,
+        )?;
         assert!(matches!(rejected, Payload::Reject(_)));
 
         let disconnected: Payload = serde_json::from_str(

@@ -130,9 +130,15 @@ Responder (wallet) -- Scans the pairing QR-code, approves or rejects proposals, 
 
 Roles are not permanent: a client can be a proposer in one session and a responder in another. Both roles run the same client implementation and differ only in which side initiates.
 
+Within a session the roles are fixed. Only the proposer sends `proposal`; only the responder sends `approve` or `reject`. A receiver drops, without acknowledging, a handshake message that its counterpart's role may not send.
+
 ## 7. Topic
 
-Topic is a 32-byte value. Topics are derived from initial pairing key clients as a SHA256 hash.
+A topic is a 32-byte value, encoded as unpadded base64url on the wire.
+
+Every binary field in this document (keys, topics, ids, nonces, ciphertext and opaque application data) uses the URL-safe base64 alphabet without padding, in its canonical form: a decoder rejects padding, and non-zero bits left over in the last character. A field of fixed length, such as a 16-byte frame id, also has exactly one valid length.
+
+The pairing topic is `SHA-256(pairing_key)`. The session topic is derived from the X25519 shared secret with HKDF-SHA256 (§9.1); it is not a hash of the pairing key. No other topic is derived by hashing a bearer key.
 
 ## 8. Pairing
 
@@ -166,9 +172,47 @@ Session establishment flow:
 2. responder scans QR-code, derives topic from pairing key, and connects to the Relay by this topic.
 3. Relay sending `session_ready` control frame to both sides
 4. proposer embeds its ephemeral public key in the proposal, encrypted with the pairing key
-5. responder derives the session key, and embeds its own ephemeral public key in the approve message, encrypted with the pairing key;
+5. responder derives the session key, and embeds its own ephemeral public key in the approve message, encrypted with the pairing key, together with the `id` of the frame that carried the proposal it approves;
 6. proposer derives the same session key;
 7. both parties continues exchanging messages by the new session key, using the same session.
+
+A valid `approve` or `reject` also acknowledges the proposal it answers, so a lost `ack` for the proposal does not make the proposer report it as failed. A `reject` names the proposal it answers in the same way as an `approve` (see below), and the proposer drops a `reject` for any proposal but its outstanding one. It ends that proposal on both sides: the responder forgets the pending proposal and the key it derived for it, and the proposer discards the proposal's keypair. The pairing connection stays open, and the proposer may propose again.
+
+A proposer whose proposal is never acknowledged may propose again with a fresh ephemeral keypair. An `approve` therefore names the proposal it answers. The proposer MUST drop, without acknowledging, an `approve` whose `proposalId` is not the `id` of its outstanding proposal: the responder's key was derived against a keypair the proposer no longer holds, and accepting it would leave the two peers on different session topics. Until it approves, a responder that receives a newer `proposal` from its counterpart replaces the pending one. Its user then has to decide on the newer proposal: a decision made on the replaced one MUST NOT be sent as the answer to the newer one, since the proposer could otherwise swap the terms after the user has seen them. A newer proposal whose `ephemeralPublicKey`, `sessionExpiry` and `proposal` are all identical to the replaced one's offers the user nothing new, and a decision made on either may answer it.
+
+### 9.1 Session key and topic derivation
+
+Both peers use the 32-byte X25519 shared secret as HKDF-SHA256 input key
+material. `salt = None` in the HKDF API is the RFC 5869 salt of 32 zero bytes.
+
+```
+PRK = HKDF-Extract(salt = 32 zero bytes, IKM = shared_secret)
+
+session_key         = HKDF-Expand(PRK, info = "wallet-session/v1/session-key",   L = 32)
+session_topic_bytes = HKDF-Expand(PRK, info = "wallet-session/v1/session-topic", L = 32)
+```
+
+The two Expand calls are independent and both start from the same PRK. The
+session topic used on the wire is `base64url(session_topic_bytes)`. A shared
+secret of all zero bytes is rejected.
+
+The receiver MUST abort that handshake attempt: it MUST NOT acknowledge or
+deliver a `proposal` or `approve` that yields an all-zero shared secret. A weak
+`proposal` leaves the responder's handshake as it was: idle, or with an earlier
+valid proposal still pending. A weak `approve` leaves the proposer in its
+proposed state. Either way a later valid message can still complete the
+handshake. The client reports the weak-key error to the application. It cannot
+answer with a `reject`: a weak `proposal` never becomes the pending proposal a
+`reject` would answer, and the proposer never sends one. The application should
+treat the pairing as compromised or broken and start over.
+
+See Appendix A for a known-answer vector.
+
+The Relay binds each connection to one topic. After deriving the session topic, each peer opens a new connection to it.
+
+The pairing connection carries handshake kinds and their acknowledgements only. After the `approve` frame is acknowledged, or after the handshake retry window expires, the pairing connection MAY be closed. The window starts when a peer establishes the session: for the responder when it sends `approve`, for the proposer when it accepts one. The default retry window is 127 seconds: a 2-second base delay, five retries with doubling, and a 1-second margin. A peer MUST tolerate closure of the pairing connection after that window; application traffic MUST use the session topic.
+
+The window is local. Retransmissions pause while the counterpart is disconnected (§13), so a delayed `approve` can still be in flight when the proposer retires its pairing connection, and the responder then sees its `approve` reported as failed even though the proposer may have received it. A responder MUST NOT treat that as a failed handshake on its own. It keeps the session connection until the relay reports `session_ready` on it, which means the proposer derived the same session topic, or until a join timeout (30 seconds by default, counted from the end of the retry window that starts when it sends the `approve`) passes without that ever happening. Only in the latter case was the session not established. An acknowledgement of the `approve` does not stop the join timeout: any holder of the pairing key can send one, and only `session_ready` shows that the proposer derived the session topic.
 
 
 # Part II. Relay Protocol
@@ -209,17 +253,27 @@ The envelope `id` and `topic` are those of the enclosing relay frame and are not
 
 Messages on the pairing topic are encrypted with the pairing key; messages on the session topic with the session key.
 
+Kind/topic confinement:
+
+- The pairing topic carries only `proposal`, `approve`, `reject` and `ack`.
+- The session topic carries only `request`, `response`, `ack`, `disconnect` and `session_delete`.
+- An `ack` travels on the topic of the envelope it acknowledges.
+
+A receiver MUST drop a frame whose kind is not allowed on its topic. After the handshake is established, a new handshake kind on the pairing topic is also dropped; only retransmissions already in the replay memory may be re-acknowledged.
+
 A receiver processes each `message` frame in the following order. An envelope rejected at any step is neither delivered to the application nor acknowledged.
 
 1. Reject an unsupported `version`, a `topic` it is not subscribed to, a `from` equal to its own identity and, once the counterpart is established, a `from` other than the counterpart's.
 2. Authenticate: decrypt `data` with the topic's key, the envelope `nonce` and the AAD of §11 built with the counterpart's role. Reject an invalid tag.
 3. Reject an envelope whose `ts` is more than 300 seconds (5 minutes) older or newer than the local system clock. Also reject one whose `ts` is not greater than the largest `ts` the receiver has discarded from the replay memory of the key.
 4. Look up the frame `id` and the `nonce` in the replay memory of the key. An envelope that matches a record by either one, and whose frame `id`, `kind`, `from`, `ts`, `nonce` and `data` are all identical to that record's, is a retransmission: it is acknowledged again if its kind requires an acknowledgement (§13), and it is not delivered again. An envelope that matches a record with any other content is a protocol violation; the receiver must reject it and may end the session.
-5. Otherwise, record the envelope in the replay memory, deliver it to the application, and acknowledge it if its kind requires an acknowledgement.
+5. Otherwise, record the envelope in the replay memory, deliver it to the application, and acknowledge it if its kind requires an acknowledgement. A receiver may bound its replay memory. One whose memory is full drops a new envelope instead (its sender retransmits it later), except an `ack` that completes one of the receiver's own outstanding sends: dropping that would report a delivered message as failed, so it is processed, and recorded beyond the bound up to a fixed headroom; past that it is processed without being recorded. An `ack` that completes nothing has no effect and may be dropped. A `disconnect` or `session_delete` is not dropped either: its sender never retransmits it (§12). It is processed and recorded, which grows the memory by one record at most, since the receiver then closes.
 
 Steps 1 to 3 may run in any order, but only an envelope that has passed all three reaches step 4: an envelope that has not been authenticated is never treated as a retransmission.
 
-The counterpart is the `from` of the first envelope that passes steps 1 to 3 on the pairing topic. It remains the counterpart for that pairing and for the session derived from it, across reconnects. Step 1 rejects the receiver's own identity, so the two peers of a session must have different identities. The AEAD authenticates `from` only as the identity that a holder of the key declares; the identity key does not sign envelopes (§4).
+The kind/topic check above runs once the envelope is authenticated, before step 4. The checks on the decrypted plaintext in §12 (its `type` equals `kind`, a `response` carries exactly one alternative) run after step 4 and before step 5, so a retransmission found at step 4 is acknowledged again without being re-checked. An envelope that fails them is dropped like one rejected at any other step.
+
+The counterpart is the `from` of the first envelope on the pairing topic that the receiver accepts: one that passes every check of this section and is delivered or, for an `ack`, completes one of the receiver's outstanding sends. An envelope that authenticates but is then refused, for example a handshake message from the wrong role, does not establish the counterpart. It remains the counterpart for that pairing and for the session derived from it, across reconnects. Step 1 rejects the receiver's own identity, so the two peers of a session must have different identities. The AEAD authenticates `from` only as the identity that a holder of the key declares; the identity key does not sign envelopes (§4).
 
 The replay memory holds, for each key, every envelope the receiver has accepted at step 5. Each record is kept at least until the local clock passes the envelope's `ts` plus 300 seconds. From then on, step 3 rejects every copy of the envelope, so no envelope is delivered twice. Step 3 admits a `ts` at most 300 seconds ahead of the local clock, so no record has to be kept longer than 10 minutes after it was made. While the local clock runs forward, the second check of step 3 rejects nothing the first does not. If the clock steps backward, it keeps discarded envelopes rejected. A receiver may discard the replay memory of a key once it stops accepting envelopes under that key.
 
@@ -230,7 +284,7 @@ Each sender generates a fresh random sender prefix per key. The counter incremen
 
 Nonce scheme:
 ```
-nonce = sender_prefix (16 random bytes) || counter (8 bytes, starts at 0)
+nonce = sender_prefix (16 random bytes) || counter (8-byte unsigned big-endian, starts at 0)
 ```
 
 The AEAD AAD concatenates the following fields, each prefixed with its length:
@@ -255,6 +309,10 @@ Relay `type`s (the frame's `type` field):
 
 WebSocket ping and pong control frames are not relay frames.
 
+The plaintext in `payload` is a JSON object with a `type` discriminator. Its
+value MUST equal the authenticated envelope `kind`; a receiver MUST reject a
+plaintext whose `type` does not match `kind`.
+
 Message `kind`s carried inside `payload`:
 
 `proposal` -- Propose a session; carries the ephemeral public key.
@@ -268,24 +326,33 @@ Message `kind`s carried inside `payload`:
 
 Payload shapes:
 
-- `proposal`: `{ ephemeralPublicKey, sessionExpiry, proposal }`
-- `approve`: `{ ephemeralPublicKey, approval }`
-- `reject`: `{ code, message }`
-- `request`: `{ requestId, request }`
-- `response`: `{ requestId, response }` or `{ requestId, error }`
-- `ack`: `{ ackId }`, where `ackId` is the `id` of the frame that carried the acknowledged message
-- `disconnect`: `{ reason, code, message }`
-- `session_delete`: `{ code, message }`
+- `proposal`: `{ "type": "proposal", "ephemeralPublicKey": ..., "sessionExpiry": ..., "proposal": ... }`
+- `approve`: `{ "type": "approve", "proposalId": ..., "ephemeralPublicKey": ..., "approval": ... }`, where `proposalId` is the `id` of the frame that carried the approved proposal
+- `reject`: `{ "type": "reject", "proposalId": ..., "code": ..., "message": ... }`, where `proposalId` is the `id` of the frame that carried the rejected proposal
+- `request`: `{ "type": "request", "requestId": ..., "request": ... }`
+- `response`: `{ "type": "response", "requestId": ..., "response": ... }` or `{ "type": "response", "requestId": ..., "error": ... }`
+- `ack`: `{ "type": "ack", "ackId": ... }`, where `ackId` is the `id` of the frame that carried the acknowledged message
+- `disconnect`: `{ "type": "disconnect", "reason": ..., "code": ..., "message": ... }`
+- `session_delete`: `{ "type": "session_delete", "code": ..., "message": ... }`
 
-`proposal` and `approval` are opaque application data.
+A `response` carries exactly one of `response` and `error`. The absent field
+MUST be omitted, not encoded as `null`; an explicit `null` is invalid. A
+response with both fields, neither field, or an explicit `null` alternative is
+rejected: it is neither delivered nor acknowledged.
+
+`proposal`, `approval`, `request`, `response`, and `error` are opaque application data, encoded as base64url strings.
+
+`sessionExpiry` is the Unix time at which the proposer suggests the session should end. It is advisory in this version of the protocol: neither peer is required to end the session when it passes, and applications that rely on it must enforce it themselves.
+
+A `disconnect` or `session_delete` ends the session. The receiver acknowledges it and delivers it to the application like any other message, then closes. A receiver that drops other messages for lack of room, counting on their retransmission, MUST NOT drop a `disconnect` or `session_delete` that way, wherever it runs out of room. The sender closes as soon as it has sent it; since nothing is left to retransmit it, the sender does not wait for its acknowledgement.
 
 ## 13. Reliability
 
-Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the `id` of the frame that carried the message. The `ack` message is not itself acknowledged. The receiver sends the `ack` on the topic the message arrived on, only after the message passes the receiver checks of §10, and never for a rejected envelope. An `ack` is sent for every accepted envelope whose type requires one, including a retransmission found in the replay memory (§10, step 4): such a retransmission is acknowledged again and is not delivered to the application a second time. Each `ack` is a new envelope with its own frame `id`, `nonce` and `ts`. Retransmissions must be identical: the same frame `id`, and the same authenticated envelope header and ciphertext (`kind`, `from`, `ts`, `nonce`, `data`).
+Ack: every message of type `proposal`, `approve`, `reject`, `request`, `response`, `disconnect`, and `session_delete` must be acknowledged with an `ack` whose `ackId` equals the `id` of the frame that carried the message. The `ack` message is not itself acknowledged. The receiver sends the `ack` on the topic the message arrived on, only after the message passes the receiver checks of §10, and never for a rejected envelope. A receiver under local backpressure may drop an `ack` it cannot send; the sender's retransmission is then acknowledged again (§10, step 4). An `ack` is sent for every accepted envelope whose type requires one, including a retransmission found in the replay memory (§10, step 4): such a retransmission is acknowledged again and is not delivered to the application a second time. Each `ack` is a new envelope with its own frame `id`, `nonce` and `ts`. Retransmissions must be identical: the same frame `id`, and the same authenticated envelope header and ciphertext (`kind`, `from`, `ts`, `nonce`, `data`).
 
-A sender accepts an `ack` only if the envelope carrying it passes the receiver checks of §10, which means it comes from the established counterpart. Its `ackId` must also name a message the sender sent on that topic and still has outstanding. Such an `ack` completes the send. The sender ignores any other `ack` without error. That includes an `ack` for an id it never sent on that topic, or for a message already completed or given up on, so a late `ack` plus a re-`ack` for the same id cannot fail a send.
+A sender accepts an `ack` only if the envelope carrying it passes the receiver checks of §10. Once the counterpart is established, that means it comes from the counterpart. Before that, an `ack` that completes a send establishes the counterpart itself (§10); a proposer whose responder acknowledges its proposal before the user decides is in this case. Its `ackId` must also name a message the sender sent on that topic and still has outstanding. Such an `ack` completes the send. The sender ignores any other `ack` without error. That includes an `ack` for an id it never sent on that topic, or for a message already completed or given up on, so a late `ack` plus a re-`ack` for the same id cannot fail a send.
 
-If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection, and each such retransmission counts as an attempt. A post-reconnect flush is paced traffic like any other: a sender with many pending messages must spread them within the relay's inbound budget instead of sending them in one burst. The sender gives up when the last attempt fails, or earlier once its own clock passes the envelope's `ts` plus 300 seconds, because receivers reject every copy after that (§10, step 3). It then reports the failure to the application. With the values here, the last attempt is about a minute after the first send. The schedule does not affect recognition: a receiver keeps an envelope in its replay memory for as long as it would accept a copy, so every retransmission it accepts is recognized as one.
+If a sender does not receive an `ack` within 2 seconds, it must retransmit the envelope. The exceptions are `disconnect` and `session_delete`: the sender closes right after sending them (§12), so it neither retransmits them nor waits for their `ack`. Retries must use exponential backoff, doubling from the base delay, up to a maximum of 5 attempts. If the WebSocket disconnects, un-ACKed messages must be held in a local in memory queue and retransmitted immediately upon successful reconnection, and each such retransmission counts as an attempt. A post-reconnect flush is paced traffic like any other: a sender with many pending messages must spread them within the relay's inbound budget instead of sending them in one burst. The sender gives up when the last attempt fails, or earlier once its own clock passes the envelope's `ts` plus 300 seconds, because receivers reject every copy after that (§10, step 3). It then reports the failure to the application. With the values here, the last attempt is about a minute after the first send. The schedule does not affect recognition: a receiver keeps an envelope in its replay memory for as long as it would accept a copy, so every retransmission it accepts is recognized as one.
 
 ## 14. Connection lifecycle
 
@@ -298,5 +365,23 @@ The relay pings every 30 seconds and requires traffic from the peer within 10 se
 Token expiry is a disconnect cause: the relay closes with `1008` and reason `token expired` when `exp` passes. The client reconnects promptly with a new token, without applying the liveness backoff. Because the slot is in the reconnection grace, the reconnect follows the normal path: the counterpart may observe an additional `session_ready` and no `peer_disconnected`; only a reconnect that misses the grace produces `peer_disconnected`.
 
 A reconnect does not reset the client state of §10 and §13. The established counterpart, the replay memory and the outstanding messages belong to the pairing or session and its keys, not to the connection. A repeated `session_ready` does not start a new session. A peer that reconnects under a different identity is rejected by its counterpart (§10, step 1), even if the Relay admitted that identity to the slot after the grace window.
+
+## Appendix A. Test vectors
+
+### A.1 Session key and topic derivation
+
+```
+shared_secret  = 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+PRK            = 46bd320605c5a6b6163ab70bc6345b92a5f908e79fe58979c23ebb47d1a5e307
+session_key    = f5fb6528771a0f396ac6e5fd52a040b7d8673e927d24267b3bd1c058f004bdc8
+session_topic  = 57e6edc4c06f144f320b763378cb0d69ef7fe19af40b2c3903c56f2a5d82f6c1
+```
+
+Encoded forms:
+
+```
+session_key_base64url   = 9ftlKHcaDzlqxuX9UqBAt9hnPpJ9JCZ7O9HAWPAEvcg
+session_topic_base64url = V-btxMBvFE8yC3YzeMsNae9_4Zr0Cyw5A8VvKl2C9sE
+```
 
 
