@@ -876,31 +876,8 @@ async fn approve_raw_session(
 ) -> Result<RawSession, Box<dyn std::error::Error>> {
     responder.approve(json!({ "test": true })).await?;
 
-    let (approve_id, approve, approve_frame) = loop {
-        let frame = read_raw_frame(&mut pairing).await?;
-        let approve_frame = frame.clone();
-        let RelayFrameBody::Message { payload } = frame.body else {
-            continue;
-        };
-        let wire: Envelope = serde_json::from_str(&payload)?;
-        if wire.kind != MessageType::Approve {
-            continue;
-        }
-        let bytes = cipher.open(
-            &[],
-            &SealedPayload {
-                nonce: wire.nonce,
-                data: wire.data,
-            },
-        )?;
-        break (frame.id, ClientMessage::from_bytes(&bytes)?, approve_frame);
-    };
-    let ClientMessage::Approve(approve) = approve else {
-        return Err("expected approve payload".into());
-    };
-    let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
-    let (_key, session_topic) = keypair.derive(&peer_public)?;
-    let session_topic = session_topic.as_topic().clone();
+    let (approve_frame, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
+    let approve_id = approve_frame.id.clone();
 
     let ack = ClientMessage::Ack(AckPayload {
         ack_id: approve_id.clone(),
@@ -942,6 +919,38 @@ async fn approve_raw_session(
         cipher: PlaintextCipher::new(),
         topic: session_topic,
     })
+}
+
+/// Read the responder's `approve` on the pairing topic and derive the session
+/// topic from it, without acknowledging it.
+async fn read_raw_approve(
+    pairing: &mut RawStream,
+    cipher: &PlaintextCipher,
+    keypair: EphemeralKeyPair,
+) -> Result<(RelayFrame, Topic), Box<dyn std::error::Error>> {
+    loop {
+        let frame = read_raw_frame(pairing).await?;
+        let RelayFrameBody::Message { payload } = &frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(payload)?;
+        if wire.kind != MessageType::Approve {
+            continue;
+        }
+        let bytes = cipher.open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        let ClientMessage::Approve(approve) = ClientMessage::from_bytes(&bytes)? else {
+            return Err("expected approve payload".into());
+        };
+        let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
+        let (_key, session_topic) = keypair.derive(&peer_public)?;
+        return Ok((frame, session_topic.as_topic().clone()));
+    }
 }
 
 /// Drive `recv` and the raw stream together, requiring neither a delivered
@@ -1968,18 +1977,29 @@ async fn run_failed_proposal() -> TestResult {
 }
 
 #[tokio::test]
-async fn failed_approve_drops_the_unready_session() -> TestResult {
+async fn failed_approve_closes_an_unjoined_session() -> TestResult {
     tokio::time::timeout(
         Duration::from_secs(10),
-        run_failed_approve_session_timeout(),
+        run_failed_approve_session_timeout(true),
+    )
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_approve_closes_without_consuming_events() -> TestResult {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_failed_approve_session_timeout(false),
     )
     .await??;
     Ok(())
 }
 
 /// When the approve is lost, the responder must not wait forever on a
-/// session link the proposer never joins.
-async fn run_failed_approve_session_timeout() -> TestResult {
+/// session link the proposer never joins, whether or not the application
+/// consumes the approve's `Failed` outcome.
+async fn run_failed_approve_session_timeout(consume_events: bool) -> TestResult {
     let _ = env_logger::builder()
         .is_test(true)
         .parse_default_env()
@@ -2006,7 +2026,7 @@ async fn run_failed_approve_session_timeout() -> TestResult {
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_millis(10))
             .with_ack_max_attempts(0)
-            .with_connection_stability(Duration::from_millis(100)),
+            .with_session_join_timeout(Duration::from_millis(100)),
         responder_identity,
         Role::Responder,
         topic.clone(),
@@ -2042,21 +2062,257 @@ async fn run_failed_approve_session_timeout() -> TestResult {
     // The approve is sent but never acknowledged. The proposer also never
     // joins the session topic.
     responder.approve(json!({ "ok": true })).await?;
+
+    // The proposer never joins the session topic, so the join window ends the
+    // client and the call driving it reports why.
+    let error = if consume_events {
+        match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
+            ClientEvent::Failed { .. } => {}
+            other => panic!("expected the approve failure, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Err(error) = responder.next_event().await {
+                    return error;
+                }
+            }
+        })
+        .await?
+    } else {
+        // Without consuming the outcome the join window still runs: it was
+        // armed when the approve went out.
+        tokio::time::timeout(Duration::from_secs(5), responder.wait_session_ready())
+            .await?
+            .expect_err("the session must not become ready")
+    };
+    assert!(
+        matches!(error, ClientError::SessionNotEstablished),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(responder.session().state, SessionState::Disconnected);
+    assert!(matches!(
+        responder.recv().await,
+        Err(ClientError::SessionNotEstablished)
+    ));
+    assert!(matches!(
+        responder.request(json!({ "method": "no_session" })).await,
+        Err(ClientError::SessionNotEstablished)
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn acked_approve_still_closes_an_unjoined_session() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(20), run_acked_approve_unjoined()).await??;
+    Ok(())
+}
+
+/// Anyone holding the pairing key can acknowledge our approve. That must not
+/// stop the join timeout: only the proposer joining the session topic does.
+async fn run_acked_approve_unjoined() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(10))
+            .with_ack_max_attempts(1)
+            .with_session_join_timeout(Duration::from_millis(100)),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let keypair = EphemeralKeyPair::generate();
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "acked-proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: keypair.public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+    responder.approve(json!({ "ok": true })).await?;
+
+    // Acknowledge the approve, but never join the session topic.
+    let (approve, _) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
+    let ack = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "acked-approve-ack",
+        &ClientMessage::Ack(AckPayload { ack_id: approve.id }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&ack)?))
+        .await?;
+
+    let error = tokio::time::timeout(Duration::from_secs(5), responder.wait_session_ready())
+        .await
+        .expect("the join timeout must close the client")
+        .expect_err("the session must not become ready");
+    assert!(
+        matches!(error, ClientError::SessionNotEstablished),
+        "unexpected error: {error:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn joined_session_survives_the_join_timeout() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_joined_session_timeout()).await??;
+    Ok(())
+}
+
+/// A failed `approve` only means its acks were lost. If the proposer did join
+/// the session topic, the join timeout must not tear the session down, even
+/// when the peer happens to be away when the timer fires.
+async fn run_joined_session_timeout() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(50)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(10))
+            .with_ack_max_attempts(0)
+            .with_session_join_timeout(Duration::from_millis(200)),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let keypair = EphemeralKeyPair::generate();
+    let proposal = ClientMessage::Proposal(ProposalPayload {
+        ephemeral_public_key: keypair.public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+    });
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "joined-proposal",
+        &proposal,
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+
+    // The proposer reads the approve and joins the session topic, but never
+    // acknowledges the approve.
+    responder.approve(json!({ "ok": true })).await?;
+    let (_approve, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
+    let mut session = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+    responder.wait_session_ready().await?;
     match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
         ClientEvent::Failed { .. } => {}
         other => panic!("expected the approve failure, got {other:?}"),
     }
 
-    // Let the session timeout fire, then drive the client so it processes the
-    // timeout item.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let _ = tokio::time::timeout(Duration::from_millis(200), responder.next_event()).await;
+    // The proposer goes away past its grace window and stays away while the
+    // join timeout fires. Only `PeerDisconnected` may be reported.
+    drop(session);
+    let driving = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match responder.next_event().await {
+                Ok(_) | Err(ClientError::PeerDisconnected) => {}
+                Err(error) => return error,
+            }
+        }
+    })
+    .await;
+    if let Ok(error) = driving {
+        panic!("the joined session was closed: {error:?}");
+    }
 
-    assert_eq!(responder.session().state, SessionState::Disconnected);
-    assert!(matches!(
-        responder.request(json!({ "method": "no_session" })).await,
-        Err(ClientError::NotReady)
-    ));
+    // The proposer returns and the session still carries traffic.
+    let mut session = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+    responder.wait_session_ready().await?;
+    let request_id = responder.request(json!({ "method": "still_here" })).await?;
+    match read_raw_message(&mut session, &PlaintextCipher::new()).await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, request_id),
+        other => panic!("expected the request, got {other:?}"),
+    }
 
     Ok(())
 }

@@ -80,6 +80,12 @@ pub struct ClientConfig {
     /// Must be non-zero and shorter than `token_ttl`; otherwise a token
     /// expiry always arrives before a connection can be considered stable.
     pub connection_stability: Duration,
+
+    /// How long a responder keeps a session link that the proposer has not
+    /// joined, counted from the end of the handshake retry window that starts
+    /// when it sends `approve`. When it expires the client closes with
+    /// [`ClientError::SessionNotEstablished`].
+    pub session_join_timeout: Duration,
 }
 
 impl ClientConfig {
@@ -106,6 +112,7 @@ impl ClientConfig {
             reconnect_max_delay: Duration::from_secs(5),
             reconnect_max_attempts: 5,
             connection_stability: Duration::from_secs(30),
+            session_join_timeout: Duration::from_secs(30),
         }
     }
 
@@ -151,6 +158,7 @@ impl ClientConfig {
             (self.ping_interval, "ping_interval"),
             (self.pong_timeout, "pong_timeout"),
             (self.connection_stability, "connection_stability"),
+            (self.session_join_timeout, "session_join_timeout"),
         ] {
             if timeout.is_zero() {
                 return Err(ClientError::InvalidConfig(name));
@@ -274,6 +282,12 @@ impl ClientConfig {
         self.connection_stability = stability;
         self
     }
+
+    /// Set how long an unjoined session link survives a failed `approve`.
+    pub fn with_session_join_timeout(mut self, timeout: Duration) -> Self {
+        self.session_join_timeout = timeout;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +334,7 @@ mod tests {
             ClientConfig::new("wss://relay.example.com").with_pong_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_retransmit_spacing(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_connection_stability(Duration::ZERO),
+            ClientConfig::new("wss://relay.example.com").with_session_join_timeout(Duration::ZERO),
             ClientConfig::new("wss://relay.example.com").with_retransmit_bytes_per_second(0),
         ] {
             assert!(matches!(

@@ -62,6 +62,11 @@ pub enum ClientError {
 
     #[error("relay session is not ready")]
     NotReady,
+
+    /// The proposer did not join the session topic within the join timeout
+    /// after the responder's `approve`. The client is closed.
+    #[error("session was not established")]
+    SessionNotEstablished,
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;

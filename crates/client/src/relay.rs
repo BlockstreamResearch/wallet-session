@@ -66,7 +66,7 @@ pub(crate) enum Inbox {
     /// The client no longer needs the pairing connection for `topic`.
     Retire(Topic),
 
-    /// The session link for `topic` did not become ready in time.
+    /// The session-join window for `topic` after a failed `approve` ended.
     SessionTimeout(Topic),
 }
 
@@ -146,12 +146,16 @@ impl Drop for Transport {
 
 impl Transport {
     /// Start (asynchronously) a connection to the relay for `topic` as `role`.
+    ///
+    /// `ready` follows the relay's current view of the counterpart. `joined`
+    /// latches the first `session_ready` and is never cleared.
     pub(crate) fn connect(
         config: ClientConfig,
         identity: IdentityKey,
         role: Role,
         topic: Topic,
         ready: Arc<AtomicBool>,
+        joined: Arc<AtomicBool>,
         inbox: mpsc::Sender<Inbox>,
     ) -> Self {
         let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -163,6 +167,7 @@ impl Transport {
             topic.clone(),
             outbound_rx,
             ready,
+            joined,
             inbox,
             shutdown_rx,
         ));
@@ -188,6 +193,7 @@ async fn connection_task(
     topic: Topic,
     mut outbound: mpsc::Receiver<Outbound>,
     ready: Arc<AtomicBool>,
+    joined: Arc<AtomicBool>,
     inbox: mpsc::Sender<Inbox>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -211,6 +217,7 @@ async fn connection_task(
                     stream,
                     &mut outbound,
                     &ready,
+                    &joined,
                     &inbox,
                     &mut shutdown,
                     &config,
@@ -371,6 +378,7 @@ async fn run_connection(
     stream: RelayStream,
     outbound: &mut mpsc::Receiver<Outbound>,
     ready: &AtomicBool,
+    joined: &AtomicBool,
     inbox: &mpsc::Sender<Inbox>,
     shutdown: &mut watch::Receiver<bool>,
     config: &ClientConfig,
@@ -436,6 +444,7 @@ async fn run_connection(
                                 saw_session_ready = true;
                                 session_writable = true;
                                 ready.store(true, Ordering::Relaxed);
+                                joined.store(true, Ordering::Relaxed);
                             }
                             if matches!(&frame.body, RelayFrameBody::PeerDisconnected) {
                                 session_writable = false;

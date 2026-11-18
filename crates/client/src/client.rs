@@ -50,6 +50,7 @@ const MAX_PENDING_MESSAGES: usize = 256;
 enum Terminal {
     Closed,
     Transport(&'static str),
+    NotEstablished,
 }
 
 impl Terminal {
@@ -57,6 +58,7 @@ impl Terminal {
         match self {
             Terminal::Closed => ClientError::Closed,
             Terminal::Transport(reason) => ClientError::Transport(reason),
+            Terminal::NotEstablished => ClientError::SessionNotEstablished,
         }
     }
 }
@@ -100,12 +102,18 @@ struct Link<C> {
     cipher: C,
     replay: ReplayMemory,
     shared_ready: Arc<AtomicBool>,
+    joined: Arc<AtomicBool>,
     saw_disconnect: bool,
 }
 
 impl<C> Link<C> {
     fn is_ready(&self) -> bool {
         self.shared_ready.load(Ordering::Relaxed)
+    }
+
+    /// Whether the relay ever reported both peers on this topic.
+    fn has_joined(&self) -> bool {
+        self.joined.load(Ordering::Relaxed)
     }
 }
 
@@ -125,12 +133,14 @@ where
         inbox: &mpsc::Sender<Inbox>,
     ) -> Self {
         let ready = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(AtomicBool::new(false));
         let transport = Transport::connect(
             config.clone(),
             identity.clone(),
             role,
             topic.clone(),
             Arc::clone(&ready),
+            Arc::clone(&joined),
             inbox.clone(),
         );
         let reliability = Reliability::spawn(
@@ -151,6 +161,7 @@ where
             cipher,
             replay: ReplayMemory::new(Duration::from_secs(MAX_TS_SKEW_SECS), replay::CAPACITY),
             shared_ready: ready,
+            joined,
             saw_disconnect: false,
         }
     }
@@ -343,19 +354,20 @@ where
                 Ok(None)
             }
             Inbox::SessionTimeout(topic) => {
-                let expired = self
+                // Only a link the proposer never joined is abandoned. A peer
+                // that joined and is briefly away is handled like any other
+                // disconnect. That includes one that joined after the timer
+                // fired but before we got to this item: the session works,
+                // and closing it would only be for the timer's sake.
+                let abandoned = self
                     .session_link
                     .as_ref()
-                    .is_some_and(|link| link.topic == topic && !link.is_ready());
-                if expired {
-                    log::warn!(
-                        "session link {} did not become ready; dropping it",
-                        topic.log_tag()
-                    );
-                    self.session_link = None;
-                    if self.session.state == SessionState::Active {
-                        self.session.state = SessionState::Disconnected;
-                    }
+                    .is_some_and(|link| link.topic == topic && !link.has_joined());
+                if abandoned {
+                    log::warn!("session link {} was never joined; closing", topic.log_tag());
+                    self.session.state = SessionState::Disconnected;
+                    self.close(Terminal::NotEstablished);
+                    return Err(ClientError::SessionNotEstablished);
                 }
                 Ok(None)
             }
@@ -880,7 +892,6 @@ where
             ClientEvent::Failed { id, .. } => {
                 if self.pairing_approval.as_ref() == Some(id) {
                     self.retire_pairing();
-                    self.schedule_session_timeout();
                 }
                 if self.pairing_proposal.as_ref() == Some(id) {
                     self.pairing_proposal = None;
@@ -1032,12 +1043,20 @@ where
         Ok(())
     }
 
-    /// Drop a session link that never became ready after a failed approve.
+    /// Close the client if the proposer has not joined the session link by
+    /// the join timeout after the handshake retry window.
+    ///
+    /// This is armed when the approve goes out, whatever happens to it. Its
+    /// ack proves nothing, since anyone holding the pairing key can send one,
+    /// and its `Failed` proves nothing either (§9.1). Only `session_ready` on
+    /// the session link shows the proposer derived the same session topic.
     fn schedule_session_timeout(&self) {
         let Some(topic) = self.session_link.as_ref().map(|link| link.topic.clone()) else {
             return;
         };
-        let window = self.config.connection_stability;
+        let window = self
+            .pairing_retirement_window()
+            .saturating_add(self.config.session_join_timeout);
         let inbox = self.inbox_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(window).await;
@@ -1133,6 +1152,7 @@ where
             .await?;
         self.pairing_approval = Some(approve_id);
         self.establish_session(key, topic)?;
+        self.schedule_session_timeout();
         Ok(())
     }
 
