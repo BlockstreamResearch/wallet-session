@@ -176,12 +176,37 @@ where
 
 /// A paired client.
 ///
+/// # Driving the client
+///
 /// Inbound work, including acknowledgements, retransmissions and relay
 /// lifecycle events, is driven by [`Client::recv`], [`Client::next_event`] and
 /// [`Client::wait_session_ready`]. Applications must keep one of those futures
 /// pending; [`Client::send`] and [`Client::poll_event`] do not drive the receive
-/// path. Cancelling a receive future after it has dequeued a frame may lose
-/// that frame, but the peer retransmits anything left unacknowledged.
+/// path. Since every method takes `&mut self`, the usual pattern is a
+/// `tokio::select!` loop over one of the driving futures and the
+/// application's own work.
+///
+/// Those three futures may be cancelled, which is what `select!` does to the
+/// branches that lose. Cancelling one after it has dequeued a frame may drop
+/// that frame. We only acknowledge a frame once we have processed it, so the
+/// peer retransmits a dropped message within its usual retry budget; the
+/// exceptions are the one-shot `disconnect` and `session_delete`, and relay
+/// control frames, which are not retransmitted.
+///
+/// # Errors
+///
+/// [`ClientError::Closed`], [`ClientError::Transport`] and
+/// [`ClientError::SessionNotEstablished`] are terminal: the client is closed
+/// and outstanding sends are reported as `Failed`. Whatever was already
+/// accepted is still handed over first: [`Client::recv`] returns messages
+/// that were queued before the client closed, and [`Client::next_event`]
+/// returns outstanding delivery outcomes. Once those are drained, every call
+/// returns the error that closed the client. Other errors report a single
+/// event and leave the client usable, for example [`ClientError::PeerDisconnected`] (the relay said the
+/// peer left; it may come back), [`ClientError::UnexpectedHandshake`] (a
+/// handshake message that does not fit our state was refused), or a
+/// [`ClientError::ProtocolViolation`] for an envelope that reuses a frame id or
+/// nonce.
 ///
 /// Counterpart, replay memory, and reliability state are owned by this
 /// instance and are not persisted. Constructing a new client for the same
@@ -293,7 +318,14 @@ where
 
     /// Stop all traffic, report outstanding sends, and release both links.
     fn close(&mut self, terminal: Terminal) {
-        self.terminal = Some(terminal);
+        // Keep the first cause. A later `disconnect()` on an already closed
+        // client must not replace why it actually stopped.
+        self.terminal.get_or_insert(terminal);
+        self.session.state = SessionState::Disconnected;
+        // Nothing can use a pending proposal's session key or our proposal
+        // keypair any more, so do not keep them in memory until the client
+        // is dropped.
+        self.handshake = Handshake::Idle;
         if let Some(mut link) = self.pairing.take() {
             link.reliability.fail_all();
         }
@@ -380,7 +412,6 @@ where
                     .is_some_and(|link| link.topic == topic && !link.has_joined());
                 if abandoned {
                     log::warn!("session link {} was never joined; closing", topic.log_tag());
-                    self.session.state = SessionState::Disconnected;
                     self.close(Terminal::NotEstablished);
                     return Err(ClientError::SessionNotEstablished);
                 }
@@ -390,8 +421,16 @@ where
     }
 
     /// Await the next relay frame, folding in transport lifecycle events.
+    ///
+    /// Processing a frame can close the client, for example an inbound
+    /// `disconnect`. After that no link is left to feed the inbox, so check
+    /// for a terminal state before every wait rather than only on entry to
+    /// the public method.
     async fn next_frame(&mut self) -> Result<RelayFrame> {
         loop {
+            if let Some(error) = self.terminal_error() {
+                return Err(error);
+            }
             let item = self.inbox.recv().await.ok_or(ClientError::Closed)?;
             if let Some(frame) = self.handle_inbox_item(item)? {
                 return Ok(frame);
@@ -410,7 +449,15 @@ where
         }
 
         match frame.body {
-            RelayFrameBody::SessionReady => Ok(None),
+            RelayFrameBody::SessionReady => {
+                // A `peer_disconnected` set `Disconnected`; the peer is back.
+                if frame.topic == *self.active_topic()
+                    && matches!(self.handshake, Handshake::Established)
+                {
+                    self.session.state = SessionState::Active;
+                }
+                Ok(None)
+            }
             RelayFrameBody::PeerDisconnected => {
                 if frame.topic == *self.active_topic() {
                     // The transport clears the shared readiness flag before
@@ -450,6 +497,8 @@ where
     /// Before the handshake this waits on the pairing topic. After the
     /// handshake it waits on the derived session topic. Messages received
     /// while waiting are queued for the next [`Client::recv`].
+    ///
+    /// See the [`Client`] docs for cancellation and which errors are terminal.
     pub async fn wait_session_ready(&mut self) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
@@ -569,6 +618,8 @@ where
 
     /// Receive the next application message, processing acknowledgements and
     /// lifecycle traffic while waiting.
+    ///
+    /// See the [`Client`] docs for cancellation and which errors are terminal.
     pub async fn recv(&mut self) -> Result<ClientMessage> {
         // Messages queued and already acknowledged before the link became
         // terminal are still owed to the application.
@@ -953,6 +1004,17 @@ where
                 log::warn!("dropping ack: outbound queue is full");
                 Ok(())
             }
+            // A link's transport closes its outbound queue only once it has
+            // stopped and put its `Closed` in the inbox, behind every frame
+            // it received before. So an ack that finds the queue closed is
+            // followed by that `Closed`, which says what happened: it closes
+            // the client if this is the active link and only drops the link
+            // if it is not. Answering `Closed` here instead would lose the
+            // message we are acking and report the wrong terminal cause.
+            Err(ClientError::Closed) => {
+                log::debug!("dropping ack: relay link {} is closed", topic.log_tag());
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }
@@ -1000,7 +1062,11 @@ where
     /// Await the next reliability event while processing inbound frames.
     ///
     /// Use this instead of polling [`Client::poll_event`] when acknowledgements
-    /// or lifecycle traffic may arrive while the application waits.
+    /// or lifecycle traffic may arrive while the application waits. Delivery
+    /// outcomes are returned before lifecycle events, so the two are not
+    /// ordered relative to each other.
+    ///
+    /// See the [`Client`] docs for cancellation and which errors are terminal.
     pub async fn next_event(&mut self) -> Result<ClientEvent> {
         loop {
             // Outcomes are still owed after a terminal transition; drain them
@@ -1018,11 +1084,12 @@ where
             tokio::select! {
                 item = self.inbox.recv() => {
                     let item = item.ok_or(ClientError::Closed)?;
-                    if let Some(frame) = self.handle_inbox_item(item)? {
-                        let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
-                        if let Some(message) = self.handle_frame(frame, deliver).await? {
-                            self.pending.push_back(message);
-                        }
+                    match self.handle_next_event_item(item).await {
+                        // Closing reports every outstanding send as `Failed`.
+                        // Go round again so those come out before the error,
+                        // which the next pass returns once they are drained.
+                        Err(_) if self.terminal.is_some() => {}
+                        result => result?,
                     }
                 }
                 event = self.outcomes.recv() => {
@@ -1035,6 +1102,18 @@ where
                 }
             }
         }
+    }
+
+    /// Process one inbox item for [`Client::next_event`], queueing any message
+    /// for a later [`Client::recv`].
+    async fn handle_next_event_item(&mut self, item: Inbox) -> Result<()> {
+        if let Some(frame) = self.handle_inbox_item(item)? {
+            let deliver = self.pending.len() < MAX_PENDING_MESSAGES;
+            if let Some(message) = self.handle_frame(frame, deliver).await? {
+                self.pending.push_back(message);
+            }
+        }
+        Ok(())
     }
 
     /// Drop the pairing connection once the handshake no longer needs it.
@@ -1445,9 +1524,13 @@ where
     ///
     /// The local client is closed even when the peer cannot be notified, for
     /// example because the link is not ready; the notification error is
-    /// returned after the teardown. The notification is written once and not
-    /// retransmitted, since nothing is left to retransmit it once the client
-    /// is closed, so it produces no `Delivered` or `Failed` event.
+    /// returned after the teardown.
+    ///
+    /// The notification is best effort. `Ok` means it was queued: it is
+    /// written ahead of the connection closing, but nothing retransmits it,
+    /// and it produces no `Delivered` or `Failed` event. If the socket fails
+    /// first, the peer instead learns of the end through `peer_disconnected`
+    /// once its grace window passes.
     pub async fn session_delete(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
         self.end_session(ClientMessage::SessionDelete(SessionDeletePayload {
             code,

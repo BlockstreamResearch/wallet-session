@@ -644,7 +644,7 @@ async fn run_peer_disconnect_full_inbox(peer_returns: bool) -> TestResult {
     let session_topic = raw.topic.clone();
     drop(raw);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let _returned = if peer_returns {
+    let returned = if peer_returns {
         let mut session = connect_raw(
             &relay_url,
             &proposer_identity,
@@ -673,8 +673,29 @@ async fn run_peer_disconnect_full_inbox(peer_returns: bool) -> TestResult {
         "the requests that fit in the inbox must be delivered first"
     );
     assert_eq!(responder.session().state, SessionState::Disconnected);
-    if peer_returns {
-        responder.wait_session_ready().await?;
+    if let Some(mut session) = returned {
+        // Carry on with `recv` alone: the returned peer's message arrives,
+        // and the session says it is active again.
+        let mut cipher = PlaintextCipher::new();
+        let frame = request_frame(
+            &session_topic,
+            proposer_identity.did(),
+            "returned",
+            "returned",
+            &mut cipher,
+        )?;
+        session
+            .send(WsMessage::text(serde_json::to_string(&frame)?))
+            .await?;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), responder.recv()).await?? {
+                ClientMessage::Request(payload) if payload.request_id == "returned" => break,
+                ClientMessage::Request(_) => {}
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert!(responder.is_ready());
+        assert!(responder.session().is_active());
     } else {
         assert!(!responder.is_ready());
     }
@@ -929,6 +950,232 @@ async fn run_disconnect_full_replay() -> TestResult {
         "unexpected message: {delivered:?}"
     );
     assert!(matches!(responder.recv().await, Err(ClientError::Closed)));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_closed_pairing_link_does_not_close_the_session() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), run_closed_pairing_link()).await??;
+    Ok(())
+}
+
+/// After establishment the pairing link is no longer the active one. If its
+/// transport stops while a frame it received is still queued, failing to
+/// acknowledge that frame must not be reported as the client closing.
+async fn run_closed_pairing_link() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // The relay tells the proposer about the responder's pairing link half a
+    // second after it closes, well after the responder's transport stopped.
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(500)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing_key = PairingKey::random()?;
+    let pairing_topic = pairing_key.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    // The relay closes a connection when its token expires, and with no
+    // reconnect attempts the transport then stops. A token lives at least
+    // five seconds and at most six here.
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_token_ttl(Duration::from_secs(6))
+            .with_connect_timeout(Duration::from_secs(1))
+            .with_connection_stability(Duration::from_secs(1))
+            .with_reconnect_max_attempts(0),
+        responder_identity,
+        Role::Responder,
+        pairing_topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &pairing_topic,
+    )
+    .await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    // Establish three seconds later, so the session link's token outlives
+    // the pairing link's by at least two seconds.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let keypair = EphemeralKeyPair::generate();
+    let mut cipher = PlaintextCipher::new();
+    let proposal = client_frame(
+        &pairing_topic,
+        proposer_identity.did(),
+        "raw-proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: keypair.public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    let proposal = serde_json::to_string(&proposal)?;
+    pairing.send(WsMessage::text(proposal.clone())).await?;
+    let shown = match responder.recv().await? {
+        ClientMessage::Proposal(payload) => payload,
+        other => return Err(format!("expected proposal, got {other:?}").into()),
+    };
+    responder.approve(&shown, json!({ "test": true })).await?;
+
+    // Leave the approve unacknowledged, so the pairing link stays up.
+    let (_, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
+    let mut session = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &session_topic,
+    )
+    .await?;
+    wait_raw_session_ready(&mut session).await?;
+
+    // Retransmit the proposal, then wait until the responder's pairing link
+    // has expired, all while the application is not driving the client.
+    pairing.send(WsMessage::text(proposal)).await?;
+    loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        if matches!(frame.body, RelayFrameBody::PeerDisconnected) {
+            break;
+        }
+    }
+
+    let mut session_cipher = PlaintextCipher::new();
+    let request = request_frame(
+        &session_topic,
+        proposer_identity.did(),
+        "after-pairing",
+        "after-pairing",
+        &mut session_cipher,
+    )?;
+    session
+        .send(WsMessage::text(serde_json::to_string(&request)?))
+        .await?;
+
+    // The queued retransmission comes first, and its ack can no longer be
+    // sent. The session is unaffected.
+    match responder.recv().await? {
+        ClientMessage::Request(payload) => assert_eq!(payload.request_id, "after-pairing"),
+        other => panic!("expected request, got {other:?}"),
+    }
+    assert!(responder.is_ready());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_message_queued_before_the_link_closes_is_delivered() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(20), run_queued_before_close()).await??;
+    Ok(())
+}
+
+/// A message the transport received before it stopped is delivered, and
+/// the client then reports why it closed.
+async fn run_queued_before_close() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // The relay tells the proposer about the responder's link half a second
+    // after it closes, well after the responder's transport stopped.
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE).with_session_grace(Duration::from_millis(500)),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing_key = PairingKey::random()?;
+    let pairing_topic = pairing_key.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    // The relay closes the connection when its token expires, within three
+    // seconds, and with no reconnect attempts the transport then stops.
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_token_ttl(Duration::from_secs(3))
+            .with_connect_timeout(Duration::from_secs(1))
+            .with_connection_stability(Duration::from_millis(500))
+            .with_reconnect_max_attempts(0),
+        responder_identity,
+        Role::Responder,
+        pairing_topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(
+        &relay_url,
+        &proposer_identity,
+        Role::Proposer,
+        &pairing_topic,
+    )
+    .await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    // Send a proposal while the application is not driving the client, and
+    // wait until the responder's link has expired.
+    let keypair = EphemeralKeyPair::generate();
+    let mut cipher = PlaintextCipher::new();
+    let proposal = client_frame(
+        &pairing_topic,
+        proposer_identity.did(),
+        "queued-proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: keypair.public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        if matches!(frame.body, RelayFrameBody::PeerDisconnected) {
+            break;
+        }
+    }
+
+    // The proposal's ack can no longer be sent, but the proposal itself is
+    // still handed over, and the error after it gives the real cause.
+    assert!(matches!(
+        responder.recv().await?,
+        ClientMessage::Proposal(_)
+    ));
+    let error = responder.recv().await.expect_err("the client has closed");
+    assert!(
+        matches!(error, ClientError::Transport("token expired")),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(responder.session().state, SessionState::Disconnected);
 
     Ok(())
 }
@@ -3398,6 +3645,15 @@ async fn run_failed_approve_session_timeout(consume_events: bool) -> TestResult 
     ));
     assert!(matches!(
         responder.request(json!({ "method": "no_session" })).await,
+        Err(ClientError::SessionNotEstablished)
+    ));
+    // Ending the session afterwards must not replace the cause.
+    assert!(matches!(
+        responder.session_delete(1, "giving up").await,
+        Err(ClientError::SessionNotEstablished)
+    ));
+    assert!(matches!(
+        responder.recv().await,
         Err(ClientError::SessionNotEstablished)
     ));
 

@@ -37,12 +37,20 @@ pub enum ClientEvent {
         id: MessageId,
     },
 
-    /// A sent message exhausted its retransmissions.
+    /// A sent message was not confirmed as delivered.
+    ///
+    /// Its retransmissions ran out, its `ts` became too old for the peer to
+    /// accept, or the client closed while it was outstanding. This means
+    /// "delivery unconfirmed", not "not delivered": a copy that was already
+    /// sent can still reach the peer until its `ts` is 300 seconds old, and an ack that arrives after this event produces no
+    /// further event. Re-sending the same operation under a new id can
+    /// therefore perform it twice, so requests that must not repeat should be
+    /// idempotent at the application level.
     Failed {
-        /// Envelope id that never got acknowledged.
+        /// Envelope id that was not acknowledged.
         id: MessageId,
 
-        /// Retransmissions attempted.
+        /// Retransmissions attempted before giving up.
         attempts: usize,
     },
 

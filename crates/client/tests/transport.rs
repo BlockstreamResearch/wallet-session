@@ -21,8 +21,8 @@ use tokio_tungstenite::{
     },
 };
 use wallet_session_client::{
-    Client, ClientConfig, ClientError, ClientMessage, DisconnectPayload, IdentityKey, Opaque,
-    ResponsePayload, Role, Seed, SessionDeletePayload, XChaCha20Poly1305Cipher,
+    Client, ClientConfig, ClientError, ClientEvent, ClientMessage, DisconnectPayload, IdentityKey,
+    Opaque, ResponsePayload, Role, Seed, SessionDeletePayload, XChaCha20Poly1305Cipher,
 };
 use wallet_session_core::{
     frame::{RelayFrame, RelayFrameBody},
@@ -928,6 +928,64 @@ async fn connect_timeout_is_surfaced_and_stops() -> TestResult {
         matches!(error, ClientError::Transport("relay connect timed out")),
         "unexpected error: {error:?}"
     );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn outcomes_come_before_the_error_that_closes_the_client() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let stream = accept(&listener).await.expect("accepted");
+        let mut socket = accept_async(stream).await.expect("websocket");
+        let frame = RelayFrame {
+            v: 1,
+            id: MessageId::from_bytes([u8::MAX; MessageId::LEN]),
+            topic: Topic::new([9u8; 32]).expect("topic"),
+            body: RelayFrameBody::SessionReady,
+        };
+        let text = serde_json::to_string(&frame).expect("json");
+        socket
+            .send(Message::Text(text.into()))
+            .await
+            .expect("ready");
+        // Take the proposal without acknowledging it, then refuse the
+        // connection for good.
+        while let Some(Ok(message)) = socket.next().await {
+            if message.is_text() {
+                break;
+            }
+        }
+        let _ = socket
+            .close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "role already taken".into(),
+            }))
+            .await;
+    });
+
+    let mut client = connect(addr, config(addr)).await?;
+    client.wait_session_ready().await?;
+    let proposal = client.propose(json!({ "test": true })).await?;
+
+    let mut failed = false;
+    let error = timeout(Duration::from_secs(3), async {
+        loop {
+            match client.next_event().await {
+                Ok(ClientEvent::Failed { id, .. }) if id == proposal => failed = true,
+                Ok(_) => {}
+                Err(error) => return error,
+            }
+        }
+    })
+    .await?;
+    assert!(
+        matches!(error, ClientError::Transport("role already taken")),
+        "unexpected error: {error:?}"
+    );
+    assert!(failed, "the proposal's outcome must come before the error");
+
     server.abort();
     Ok(())
 }
