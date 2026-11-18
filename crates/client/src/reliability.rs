@@ -328,35 +328,53 @@ async fn retry_loop(
                         entry.attempts += 1;
                         entry.next = now + backoff(base_delay, entry.attempts);
                         entry.sent = true;
-                        resend = Some(entry.frame.clone());
+                        resend = Some((id, entry.frame.clone()));
                     }
                 }
+            }
+
+            // Report failures before waiting for outbox room below. These
+            // entries are already gone from `pending`, so if the task were
+            // aborted (the link closing) or the outbox closed during that
+            // wait, nothing else could ever report them.
+            //
+            // Do it before releasing the lock, too. `fail_all` takes the
+            // same lock when the client closes, so every failure is then
+            // published either here or there before the close returns, and
+            // none can turn up after the terminal error.
+            for (id, entry) in failed {
+                let _ = outcomes.send((
+                    ClientEvent::Failed {
+                        id,
+                        attempts: entry.attempts,
+                    },
+                    entry.permit,
+                ));
             }
         }
 
         was_ready = is_ready;
 
-        if let Some(frame) = resend {
+        if let Some((id, frame)) = resend {
             let frame_len = serde_json::to_string(&frame)
                 .map(|text| text.len())
                 .unwrap_or(0);
             if outbox.send(Outbound::Frame(frame)).await.is_err() {
                 return;
             }
+            // The frame only leaves now, after waiting for outbox room. Count
+            // its ack window and the pacing from here, or a long wait would
+            // use up the window before the frame was even written.
+            let sent_at = Instant::now();
+            if let Some(entry) = pending.lock().expect("reliability lock").get_mut(&id) {
+                entry.next = sent_at + backoff(base_delay, entry.attempts);
+            }
             let byte_delay =
                 Duration::from_secs_f64(frame_len as f64 / retransmit_bytes_per_second as f64);
             let spacing = retransmit_spacing.max(byte_delay);
-            next_send = now.checked_add(spacing).unwrap_or(now + MAX_RETRY_DELAY);
-        }
-
-        for (id, entry) in failed {
-            let _ = outcomes.send((
-                ClientEvent::Failed {
-                    id,
-                    attempts: entry.attempts,
-                },
-                entry.permit,
-            ));
+            next_send = sent_at
+                .checked_add(spacing)
+                .unwrap_or(sent_at + MAX_RETRY_DELAY);
         }
     }
 }
@@ -449,6 +467,94 @@ mod tests {
                 payload: "payload".to_owned(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn failures_are_reported_while_the_outbox_is_full() {
+        // An outbox with no room, which nothing drains.
+        let (outbox, _outbound) = mpsc::channel(1);
+        outbox
+            .try_send(Outbound::Frame(frame("filler")))
+            .expect("room for one");
+        let ready = ready(false);
+        let (mut reliability, mut events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(60),
+            5,
+            Duration::from_millis(100),
+        );
+
+        // One entry has already expired; the other needs its first write once
+        // the link is ready, which will wait on the full outbox.
+        reliability
+            .dispatch(frame("expired"), true, unix_now() - 400)
+            .expect("dispatch");
+        reliability
+            .dispatch(frame("waiting"), true, unix_now())
+            .expect("dispatch");
+        ready.store(true, Ordering::Relaxed);
+
+        let (event, _permit) = tokio::time::timeout(Duration::from_secs(2), events.outcomes.recv())
+            .await
+            .expect("the failure must not wait for outbox room")
+            .expect("outcome");
+        assert_eq!(
+            event,
+            ClientEvent::Failed {
+                id: message_id("expired"),
+                attempts: 0
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ack_window_starts_when_a_retry_reaches_the_outbox() {
+        // An outbox with no room until the test drains it.
+        let (outbox, mut outbound) = mpsc::channel(1);
+        outbox
+            .try_send(Outbound::Frame(frame("filler")))
+            .expect("room for one");
+        let ready = ready(false);
+        let (mut reliability, mut events) = spawn_reliability(
+            outbox,
+            Arc::clone(&ready),
+            Duration::from_secs(1),
+            1,
+            Duration::from_millis(100),
+        );
+
+        // Its only write waits four seconds for room. The ack window after
+        // it is two seconds.
+        reliability
+            .dispatch(frame("slow"), true, unix_now())
+            .expect("dispatch");
+        ready.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            matches!(outbound.recv().await, Some(Outbound::Frame(f)) if f.id == message_id("filler"))
+        );
+        assert!(
+            matches!(outbound.recv().await, Some(Outbound::Frame(f)) if f.id == message_id("slow"))
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_500), events.outcomes.recv())
+                .await
+                .is_err(),
+            "the window must not have run while the frame waited for room"
+        );
+        let (event, _permit) = tokio::time::timeout(Duration::from_secs(1), events.outcomes.recv())
+            .await
+            .expect("the window ends")
+            .expect("outcome");
+        assert_eq!(
+            event,
+            ClientEvent::Failed {
+                id: message_id("slow"),
+                attempts: 1
+            }
+        );
     }
 
     #[tokio::test]
