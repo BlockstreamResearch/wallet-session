@@ -163,11 +163,11 @@ async fn establish_session(
     proposer
         .propose(json!({ "capabilities": ["read"] }))
         .await?;
-    match responder.recv().await? {
-        ClientMessage::Proposal(_) => {}
+    let shown = match responder.recv().await? {
+        ClientMessage::Proposal(payload) => payload,
         other => panic!("expected proposal, got {other:?}"),
-    }
-    responder.approve(json!({ "ok": true })).await?;
+    };
+    responder.approve(&shown, json!({ "ok": true })).await?;
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
     proposer.wait_session_ready().await?;
     responder.wait_session_ready().await?;
@@ -226,15 +226,16 @@ async fn full_session_round_trip() -> TestResult {
         proposer
             .propose(json!({ "capabilities": ["read"] }))
             .await?;
-        match responder.recv().await? {
+        let shown = match responder.recv().await? {
             ClientMessage::Proposal(payload) => {
                 let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
                 assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+                payload
             }
             other => panic!("expected proposal, got {other:?}"),
-        }
+        };
 
-        responder.approve(json!({ "ok": true })).await?;
+        responder.approve(&shown, json!({ "ok": true })).await?;
         assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
 
         proposer.wait_session_ready().await?;
@@ -302,16 +303,17 @@ async fn long_session_with_100_messages() -> TestResult {
         proposer
             .propose(json!({ "capabilities": ["read"] }))
             .await?;
-        match responder.recv().await? {
+        let shown = match responder.recv().await? {
             ClientMessage::Proposal(payload) => {
                 let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
                 assert_eq!(proposal, json!({ "capabilities": ["read"] }));
                 eprintln!("long session: proposal received");
+                payload
             }
             other => panic!("expected proposal, got {other:?}"),
-        }
+        };
 
-        responder.approve(json!({ "ok": true })).await?;
+        responder.approve(&shown, json!({ "ok": true })).await?;
         assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
         proposer.wait_session_ready().await?;
         responder.wait_session_ready().await?;
@@ -577,15 +579,16 @@ async fn reconnect_resumes_buffered_frames() -> TestResult {
         .await?;
         responder.wait_session_ready().await?;
 
-        match responder.recv().await? {
+        let shown = match responder.recv().await? {
             ClientMessage::Proposal(payload) => {
                 let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
                 assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+                payload
             }
             other => panic!("expected buffered proposal after reconnect, got {other:?}"),
-        }
+        };
 
-        responder.approve(json!({ "ok": true })).await?;
+        responder.approve(&shown, json!({ "ok": true })).await?;
         assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
         proposer.wait_session_ready().await?;
         responder.wait_session_ready().await?;

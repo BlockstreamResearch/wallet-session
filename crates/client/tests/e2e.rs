@@ -91,15 +91,16 @@ async fn run() -> TestResult {
     proposer
         .propose(json!({ "capabilities": ["read"] }))
         .await?;
-    match responder.recv().await? {
+    let shown = match responder.recv().await? {
         ClientMessage::Proposal(payload) => {
             let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
             assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+            payload
         }
         other => panic!("expected proposal, got {other:?}"),
-    }
+    };
 
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
 
     proposer.wait_session_ready().await?;
@@ -385,12 +386,11 @@ async fn run_session_key() -> TestResult {
     pairing_stream
         .send(WsMessage::text(serde_json::to_string(&proposal_frame)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
 
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
     let approve_frame = loop {
         let frame = read_raw_frame(&mut pairing_stream).await?;
         let RelayFrameBody::Message { payload } = &frame.body else {

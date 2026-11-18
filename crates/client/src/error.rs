@@ -51,6 +51,12 @@ pub enum ClientError {
     #[error("unexpected handshake message")]
     UnexpectedHandshake,
 
+    /// The proposal passed to `approve()` or `reject()` is no longer the
+    /// pending one: the counterpart sent a newer proposal, which `recv()`
+    /// delivered. Show that one to the user instead.
+    #[error("the proposal was superseded by a newer one")]
+    ProposalSuperseded,
+
     #[error("protocol violation: {0}")]
     ProtocolViolation(&'static str),
 

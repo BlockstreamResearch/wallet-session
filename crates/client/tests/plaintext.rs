@@ -49,6 +49,8 @@ const TAMPERED: &[u8] = b"plaintext-tampered";
 pub struct PlaintextCipher {
     prefix: [u8; SENDER_PREFIX_LEN],
     counter: u64,
+    /// Whether deriving a session cipher from this one fails.
+    for_key_fails: bool,
 }
 
 impl PlaintextCipher {
@@ -57,7 +59,20 @@ impl PlaintextCipher {
         let sequence = PREFIX_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut prefix = [0u8; SENDER_PREFIX_LEN];
         prefix[SENDER_PREFIX_LEN - 8..].copy_from_slice(&sequence.to_be_bytes());
-        Self { prefix, counter: 0 }
+        Self {
+            prefix,
+            counter: 0,
+            for_key_fails: false,
+        }
+    }
+
+    /// A cipher that cannot produce a session cipher, as the real one cannot
+    /// when it gets no randomness for the new nonce prefix.
+    pub fn failing_for_key() -> Self {
+        Self {
+            for_key_fails: true,
+            ..Self::new()
+        }
     }
 
     fn nonce(&self) -> Nonce {
@@ -95,6 +110,9 @@ impl MessageCipher for PlaintextCipher {
     }
 
     fn for_key(&self, _key: &[u8; 32]) -> Result<Self, CipherError> {
+        if self.for_key_fails {
+            return Err(CipherError::Encrypt);
+        }
         Ok(Self::new())
     }
 }
@@ -162,15 +180,16 @@ async fn run() -> TestResult {
     proposer
         .propose(json!({ "capabilities": ["read"] }))
         .await?;
-    match responder.recv().await? {
+    let shown = match responder.recv().await? {
         ClientMessage::Proposal(payload) => {
             let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
             assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+            payload
         }
         other => panic!("expected proposal, got {other:?}"),
-    }
+    };
 
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
 
     proposer.wait_session_ready().await?;
@@ -231,8 +250,15 @@ async fn run() -> TestResult {
             "only the proposer may propose"
         ))
     ));
+    let proposal = ProposalPayload {
+        ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+        session_expiry: 0,
+        proposal: Opaque(Vec::new()),
+    };
     assert!(matches!(
-        proposer.approve(json!({ "not": "allowed" })).await,
+        proposer
+            .approve(&proposal, json!({ "not": "allowed" }))
+            .await,
         Err(ClientError::ProtocolViolation(
             "only the responder may approve"
         ))
@@ -319,15 +345,16 @@ async fn run_reconnect() -> TestResult {
     .await?;
 
     responder.wait_session_ready().await?;
-    match responder.recv().await? {
+    let shown = match responder.recv().await? {
         ClientMessage::Proposal(payload) => {
             let proposal: serde_json::Value = serde_json::from_slice(&payload.proposal.0)?;
             assert_eq!(proposal, json!({ "capabilities": ["read"] }));
+            payload
         }
         other => panic!("expected buffered proposal after reconnect, got {other:?}"),
-    }
+    };
 
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
     assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
     proposer.wait_session_ready().await?;
     responder.wait_session_ready().await?;
@@ -967,16 +994,17 @@ async fn establish_raw_session(
         .send(WsMessage::text(serde_json::to_string(&frame)?))
         .await?;
 
-    match responder.recv().await? {
-        ClientMessage::Proposal(_) => {}
+    let shown = match responder.recv().await? {
+        ClientMessage::Proposal(payload) => payload,
         other => return Err(format!("expected proposal, got {other:?}").into()),
-    }
+    };
 
     approve_raw_session(
         relay_url,
         pairing,
         pairing_topic,
         responder,
+        &shown,
         proposer_identity,
         keypair,
         cipher,
@@ -985,16 +1013,18 @@ async fn establish_raw_session(
 }
 
 /// Complete the handshake for a raw proposer after its proposal was accepted.
+#[allow(clippy::too_many_arguments)]
 async fn approve_raw_session(
     relay_url: &str,
     mut pairing: RawStream,
     pairing_topic: &Topic,
     responder: &mut Client<PlaintextCipher>,
+    shown: &ProposalPayload,
     proposer_identity: &IdentityKey,
     keypair: EphemeralKeyPair,
     mut cipher: PlaintextCipher,
 ) -> Result<RawSession, Box<dyn std::error::Error>> {
-    responder.approve(json!({ "test": true })).await?;
+    responder.approve(shown, json!({ "test": true })).await?;
 
     let (approve_frame, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
     let approve_id = approve_frame.id.clone();
@@ -1137,53 +1167,70 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
             .with_audience(AUDIENCE)
             .with_ack_base_delay(Duration::from_secs(60)),
         responder_identity,
-        Role::Proposer,
+        Role::Responder,
         topic.clone(),
         PlaintextCipher::new(),
     )
     .await?;
-    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Responder, &topic).await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
     responder.wait_session_ready().await?;
     wait_raw_session_ready(&mut pairing).await?;
 
-    // Track one outbound message so a later ack has something to deliver.
-    responder
-        .propose(json!({ "capabilities": ["read"] }))
+    let mut cipher = PlaintextCipher::new();
+    let proposal = |index: u32, cipher: &mut PlaintextCipher| {
+        client_frame(
+            &topic,
+            proposer_identity.did(),
+            &format!("proposal-{index}"),
+            &ClientMessage::Proposal(ProposalPayload {
+                ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+                session_expiry: 0,
+                proposal: Opaque(serde_json::to_vec(&json!({ "index": index })).expect("json")),
+            }),
+            cipher,
+        )
+    };
+    let proposal_index = |message: ClientMessage| -> Option<u64> {
+        let ClientMessage::Proposal(payload) = message else {
+            return None;
+        };
+        let value: serde_json::Value = serde_json::from_slice(&payload.proposal.0).ok()?;
+        value["index"].as_u64()
+    };
+
+    // Reject one proposal so the responder tracks an outbound message that a
+    // later ack can deliver.
+    let first = proposal(u32::MAX, &mut cipher)?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&first)?))
         .await?;
-    let proposal_id = loop {
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
+    responder.reject(&shown, 1, "not now").await?;
+    let reject_id = loop {
         let frame = read_raw_frame(&mut pairing).await?;
-        let RelayFrameBody::Message { payload } = frame.body else {
+        let RelayFrameBody::Message { payload } = &frame.body else {
             continue;
         };
-        let wire: Envelope = serde_json::from_str(&payload)?;
-        if wire.kind == MessageType::Proposal {
+        let wire: Envelope = serde_json::from_str(payload)?;
+        if wire.kind == MessageType::Reject {
             break frame.id;
         }
     };
 
-    let mut cipher = PlaintextCipher::new();
-
-    // Fill the pending queue one round trip at a time, so every ack is
-    // observable and the outbox is not overwhelmed by a burst.
+    // Fill the pending queue with proposals one round trip at a time, so
+    // every ack is observable and the outbox is not overwhelmed by a burst.
+    // Each proposal replaces the pending one, so all of them are accepted.
     for index in 0..256u32 {
-        let reject = ClientMessage::Reject(RejectPayload {
-            code: index,
-            message: format!("reject {index}"),
-        });
-        let frame = client_frame(
-            &topic,
-            proposer_identity.did(),
-            &format!("reject-{index}"),
-            &reject,
-            &mut cipher,
-        )?;
+        let frame = proposal(index, &mut cipher)?;
         let frame_id = frame.id.clone();
         pairing
             .send(WsMessage::text(serde_json::to_string(&frame)?))
             .await?;
 
         // Drive the client while waiting for the ack it sends for this frame.
-        // A retransmitted proposal is not the ack we are waiting for.
+        // A retransmitted reject is not the ack we are waiting for.
         let ack_id = loop {
             let mut event = Box::pin(responder.next_event());
             let incoming = Box::pin(read_raw_frame(&mut pairing));
@@ -1219,16 +1266,7 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
 
     // One more authenticated handshake message overflows the cap: it must be
     // dropped before it is recorded or acknowledged.
-    let overflow = client_frame(
-        &topic,
-        proposer_identity.did(),
-        "reject-overflow",
-        &ClientMessage::Reject(RejectPayload {
-            code: 256,
-            message: "overflow".into(),
-        }),
-        &mut cipher,
-    )?;
+    let overflow = proposal(256, &mut cipher)?;
     pairing
         .send(WsMessage::text(serde_json::to_string(&overflow)?))
         .await?;
@@ -1269,12 +1307,12 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
 
     // Acks are still processed while the pending queue is full.
     let ack = ClientMessage::Ack(AckPayload {
-        ack_id: proposal_id.clone(),
+        ack_id: reject_id.clone(),
     });
     let ack = client_frame(
         &topic,
         proposer_identity.did(),
-        "proposal-ack",
+        "reject-ack",
         &ack,
         &mut cipher,
     )?;
@@ -1282,16 +1320,14 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
         .send(WsMessage::text(serde_json::to_string(&ack)?))
         .await?;
     match tokio::time::timeout(Duration::from_secs(2), responder.next_event()).await?? {
-        ClientEvent::Delivered { id } => assert_eq!(id, proposal_id),
-        other => panic!("expected delivery of the proposal, got {other:?}"),
+        ClientEvent::Delivered { id } => assert_eq!(id, reject_id),
+        other => panic!("expected delivery of the reject, got {other:?}"),
     }
 
     // The queued handshake messages remain deliverable in order.
-    for index in 0..256u32 {
-        match responder.recv().await? {
-            ClientMessage::Reject(payload) => assert_eq!(payload.code, index),
-            other => panic!("expected reject {index}, got {other:?}"),
-        }
+    for index in 0..256u64 {
+        let message = responder.recv().await?;
+        assert_eq!(proposal_index(message), Some(index));
     }
 
     // The overflowing message was dropped rather than queued.
@@ -1568,12 +1604,12 @@ async fn run_unexpected_approve() -> TestResult {
     )?;
     raw.send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
 
     let bad = ClientMessage::Approve(ApprovePayload {
+        proposal_id: message_id("unexpected-proposal"),
         ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
         approval: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
     });
@@ -1595,7 +1631,7 @@ async fn run_unexpected_approve() -> TestResult {
     );
 
     // The original PeerProposed state is still intact.
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
 
     Ok(())
 }
@@ -1690,10 +1726,9 @@ async fn run_weak_proposal() -> TestResult {
     pairing
         .send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
     assert!(matches!(
         read_raw_message(&mut pairing, &cipher).await?,
         ClientMessage::Ack(_)
@@ -1704,6 +1739,7 @@ async fn run_weak_proposal() -> TestResult {
         pairing,
         &topic,
         &mut responder,
+        &shown,
         &proposer_identity,
         keypair,
         cipher,
@@ -1827,6 +1863,7 @@ async fn run_weak_approve() -> TestResult {
     }
 
     let weak = ClientMessage::Approve(ApprovePayload {
+        proposal_id: proposal_id.clone(),
         ephemeral_public_key: wallet_session_core::codec::encode(&[0u8; 32]),
         approval: Opaque(serde_json::to_vec(&json!({ "ok": false }))?),
     });
@@ -1857,6 +1894,7 @@ async fn run_weak_approve() -> TestResult {
     // A valid approve still completes the handshake with the original keypair.
     let responder_keypair = EphemeralKeyPair::generate();
     let approve = ClientMessage::Approve(ApprovePayload {
+        proposal_id: proposal_id.clone(),
         ephemeral_public_key: responder_keypair.public_key_encoded(),
         approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
     });
@@ -1995,6 +2033,7 @@ async fn run_implicit_proposal_ack() -> TestResult {
     // Deliberately do not send the explicit proposal ack.
     let responder_keypair = EphemeralKeyPair::generate();
     let approve = ClientMessage::Approve(ApprovePayload {
+        proposal_id: proposal_id.clone(),
         ephemeral_public_key: responder_keypair.public_key_encoded(),
         approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
     });
@@ -2097,6 +2136,549 @@ async fn run_failed_proposal() -> TestResult {
 }
 
 #[tokio::test]
+async fn proposal_to_a_proposer_is_refused() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_proposal_to_proposer()).await??;
+    Ok(())
+}
+
+/// A proposal sent to a proposer must not change its handshake state, so it
+/// can still make its own proposal afterwards.
+async fn run_proposal_to_proposer() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+
+    let mut cipher = PlaintextCipher::new();
+    let proposal = client_frame(
+        &topic,
+        responder_identity.did(),
+        "backwards-proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert_eq!(proposer.session().state, SessionState::Idle);
+
+    proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reject_ends_the_proposal_on_both_sides() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_reject_ends_proposal()).await??;
+    Ok(())
+}
+
+/// A received reject ends the proposer's outstanding proposal; a local
+/// reject forgets the responder's pending one.
+async fn run_reject_ends_proposal() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+    let relay_url = format!("ws://{addr}");
+    let config = || {
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+    };
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    // Proposer side.
+    let topic = PairingKey::random()?.topic()?;
+    let mut proposer = Client::connect(
+        config(),
+        proposer_identity.clone(),
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let mut cipher = PlaintextCipher::new();
+
+    proposer.propose(json!({ "attempt": 1 })).await?;
+    let (proposal_id, _) = read_raw_proposal(&mut pairing, &cipher, None).await?;
+    let reject = client_frame(
+        &topic,
+        responder_identity.did(),
+        "reject",
+        &ClientMessage::Reject(RejectPayload {
+            proposal_id: proposal_id.clone(),
+            code: 1,
+            message: "no".into(),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&reject)?))
+        .await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Reject(_)));
+    assert_eq!(proposer.session().state, SessionState::Rejected);
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Delivered { id } => assert_eq!(id, proposal_id),
+        other => panic!("expected the reject to count as delivery, got {other:?}"),
+    }
+
+    // A late approve for the rejected proposal establishes nothing.
+    let approve = client_frame(
+        &topic,
+        responder_identity.did(),
+        "late-approve",
+        &ClientMessage::Approve(ApprovePayload {
+            proposal_id,
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&approve)?))
+        .await?;
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert_eq!(proposer.session().state, SessionState::Rejected);
+    proposer.propose(json!({ "attempt": 2 })).await?;
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    // Responder side.
+    let topic = PairingKey::random()?.topic()?;
+    let mut responder = Client::connect(
+        config(),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let proposal = client_frame(
+        &topic,
+        proposer_identity.did(),
+        "proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&proposal)?))
+        .await?;
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
+    responder.reject(&shown, 1, "no").await?;
+    assert_eq!(responder.session().state, SessionState::Rejected);
+    assert!(matches!(
+        responder.approve(&shown, json!({ "ok": true })).await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn proposer_can_propose_again_after_a_cipher_failure() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_cipher_failure()).await??;
+    Ok(())
+}
+
+/// The approve spends the proposal keypair. If the session cipher then
+/// cannot be built, the proposal is over and the proposer must say so.
+async fn run_cipher_failure() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+    let relay_url = format!("ws://{addr}");
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let topic = PairingKey::random()?.topic()?;
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::failing_for_key(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let mut cipher = PlaintextCipher::new();
+
+    let proposal_id = proposer.propose(json!({ "attempt": 1 })).await?;
+    read_raw_proposal(&mut pairing, &cipher, None).await?;
+    let approve = client_frame(
+        &topic,
+        responder_identity.did(),
+        "approve",
+        &ClientMessage::Approve(ApprovePayload {
+            proposal_id: proposal_id.clone(),
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&approve)?))
+        .await?;
+
+    let error = proposer.recv().await.expect_err("no session cipher");
+    assert!(
+        matches!(error, ClientError::Cipher(_)),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(proposer.session().state, SessionState::Idle);
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Delivered { id } => assert_eq!(id, proposal_id),
+        other => panic!("expected the proposal to be settled, got {other:?}"),
+    }
+    proposer.propose(json!({ "attempt": 2 })).await?;
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_approve_after_reproposal_is_rejected() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_stale_approve()).await??;
+    Ok(())
+}
+
+/// Read pairing frames until a proposal other than `skip` arrives, returning
+/// its frame id and the proposer's public key.
+async fn read_raw_proposal(
+    pairing: &mut RawStream,
+    cipher: &PlaintextCipher,
+    skip: Option<&MessageId>,
+) -> Result<(MessageId, String), Box<dyn std::error::Error>> {
+    loop {
+        let frame = read_raw_frame(pairing).await?;
+        if skip == Some(&frame.id) {
+            continue;
+        }
+        let RelayFrameBody::Message { payload } = &frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(payload)?;
+        if wire.kind != MessageType::Proposal {
+            continue;
+        }
+        let bytes = cipher.open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        let ClientMessage::Proposal(proposal) = ClientMessage::from_bytes(&bytes)? else {
+            return Err("expected proposal payload".into());
+        };
+        return Ok((frame.id, proposal.ephemeral_public_key));
+    }
+}
+
+/// After a failed proposal the proposer proposes again with a new keypair.
+/// An approve that answers the first proposal must not establish a session.
+async fn run_stale_approve() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE)
+            .with_ack_base_delay(Duration::from_millis(10))
+            .with_ack_max_attempts(1),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let mut cipher = PlaintextCipher::new();
+
+    // The first proposal is read but never acknowledged.
+    let sent = proposer.propose(json!({ "attempt": 1 })).await?;
+    let (first_id, _) = read_raw_proposal(&mut pairing, &cipher, None).await?;
+    assert_eq!(sent, first_id, "propose() returns the proposal's frame id");
+    match tokio::time::timeout(Duration::from_secs(2), proposer.next_event()).await?? {
+        ClientEvent::Failed { id, .. } => assert_eq!(id, first_id),
+        other => panic!("expected the proposal failure, got {other:?}"),
+    }
+    proposer.propose(json!({ "attempt": 2 })).await?;
+    let (second_id, _) = read_raw_proposal(&mut pairing, &cipher, Some(&first_id)).await?;
+
+    // A reject of the first proposal arrives late. It must not end the second
+    // one.
+    let stale_reject = client_frame(
+        &topic,
+        responder_identity.did(),
+        "stale-reject",
+        &ClientMessage::Reject(RejectPayload {
+            proposal_id: first_id.clone(),
+            code: 1,
+            message: "no".into(),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&stale_reject)?))
+        .await?;
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    // An approve for the first proposal arrives late.
+    let stale = client_frame(
+        &topic,
+        responder_identity.did(),
+        "stale-approve",
+        &ClientMessage::Approve(ApprovePayload {
+            proposal_id: first_id,
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&stale)?))
+        .await?;
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert_eq!(proposer.session().state, SessionState::ProposalSent);
+
+    // The approve for the current proposal still establishes the session.
+    let current = client_frame(
+        &topic,
+        responder_identity.did(),
+        "current-approve",
+        &ClientMessage::Approve(ApprovePayload {
+            proposal_id: second_id,
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&current)?))
+        .await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    assert_eq!(proposer.session().state, SessionState::Active);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn newer_proposal_replaces_a_pending_one() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_newer_proposal()).await??;
+    Ok(())
+}
+
+/// Until it approves, a responder answers the newest proposal from its
+/// counterpart.
+async fn run_newer_proposal() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &proposer_identity, Role::Proposer, &topic).await?;
+    responder.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let mut cipher = PlaintextCipher::new();
+
+    let mut propose = |label: &str, keypair: &EphemeralKeyPair| {
+        client_frame(
+            &topic,
+            proposer_identity.did(),
+            label,
+            &ClientMessage::Proposal(ProposalPayload {
+                ephemeral_public_key: keypair.public_key_encoded(),
+                session_expiry: 0,
+                proposal: Opaque(serde_json::to_vec(&json!({ "label": label })).expect("json")),
+            }),
+            &mut cipher,
+        )
+    };
+    let first = propose("first-proposal", &EphemeralKeyPair::generate())?;
+    let second = propose("second-proposal", &EphemeralKeyPair::generate())?;
+    let second_id = second.id.clone();
+
+    let mut shown = Vec::new();
+    for frame in [first, second] {
+        pairing
+            .send(WsMessage::text(serde_json::to_string(&frame)?))
+            .await?;
+        let ClientMessage::Proposal(proposal) = responder.recv().await? else {
+            panic!("expected a proposal");
+        };
+        shown.push(proposal);
+    }
+
+    // The first proposal was replaced. Approving it must not approve the
+    // second one in its place.
+    assert!(matches!(
+        responder.approve(&shown[0], json!({ "ok": true })).await,
+        Err(ClientError::ProposalSuperseded)
+    ));
+    assert!(matches!(
+        responder.reject(&shown[0], 1, "no").await,
+        Err(ClientError::ProposalSuperseded)
+    ));
+
+    responder.approve(&shown[1], json!({ "ok": true })).await?;
+    let (approve, _) = loop {
+        let frame = read_raw_frame(&mut pairing).await?;
+        let RelayFrameBody::Message { payload } = &frame.body else {
+            continue;
+        };
+        let wire: Envelope = serde_json::from_str(payload)?;
+        if wire.kind != MessageType::Approve {
+            continue;
+        }
+        let bytes = PlaintextCipher::new().open(
+            &[],
+            &SealedPayload {
+                nonce: wire.nonce,
+                data: wire.data,
+            },
+        )?;
+        break (ClientMessage::from_bytes(&bytes)?, frame);
+    };
+    let ClientMessage::Approve(approve) = approve else {
+        return Err("expected approve payload".into());
+    };
+    assert_eq!(approve.proposal_id, second_id);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_approve_closes_an_unjoined_session() -> TestResult {
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -2174,14 +2756,13 @@ async fn run_failed_approve_session_timeout(consume_events: bool) -> TestResult 
     pairing
         .send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
 
     // The approve is sent but never acknowledged. The proposer also never
     // joins the session topic.
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
 
     // The proposer never joins the session topic, so the join window ends the
     // client and the call driving it reports why.
@@ -2284,19 +2865,19 @@ async fn run_acked_approve_unjoined() -> TestResult {
     pairing
         .send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
-    responder.approve(json!({ "ok": true })).await?;
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
+    let approve_id = responder.approve(&shown, json!({ "ok": true })).await?;
 
     // Acknowledge the approve, but never join the session topic.
     let (approve, _) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
+    assert_eq!(approve.id, approve_id);
     let ack = client_frame(
         &topic,
         proposer_identity.did(),
         "acked-approve-ack",
-        &ClientMessage::Ack(AckPayload { ack_id: approve.id }),
+        &ClientMessage::Ack(AckPayload { ack_id: approve_id }),
         &mut cipher,
     )?;
     pairing
@@ -2379,14 +2960,13 @@ async fn run_joined_session_timeout() -> TestResult {
     pairing
         .send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
 
     // The proposer reads the approve and joins the session topic, but never
     // acknowledges the approve.
-    responder.approve(json!({ "ok": true })).await?;
+    responder.approve(&shown, json!({ "ok": true })).await?;
     let (_approve, session_topic) = read_raw_approve(&mut pairing, &cipher, keypair).await?;
     let mut session = connect_raw(
         &relay_url,
@@ -2507,10 +3087,9 @@ async fn run_pairing_kind_guard_stages() -> TestResult {
     pairing
         .send(WsMessage::text(serde_json::to_string(&proposal)?))
         .await?;
-    assert!(matches!(
-        responder.recv().await?,
-        ClientMessage::Proposal(_)
-    ));
+    let ClientMessage::Proposal(shown) = responder.recv().await? else {
+        panic!("expected a proposal");
+    };
     assert!(matches!(
         read_raw_message(&mut pairing, &cipher).await?,
         ClientMessage::Ack(_)
@@ -2535,6 +3114,7 @@ async fn run_pairing_kind_guard_stages() -> TestResult {
         pairing,
         &topic,
         &mut responder,
+        &shown,
         &proposer_identity,
         keypair,
         cipher,
@@ -2632,7 +3212,7 @@ async fn run_proposer_retirement_window_guard() -> TestResult {
 
     // Acknowledge the proposal so its retry does not race the late request.
     let proposal_ack = ClientMessage::Ack(AckPayload {
-        ack_id: proposal_id,
+        ack_id: proposal_id.clone(),
     });
     let proposal_ack = client_frame(
         &topic,
@@ -2647,6 +3227,7 @@ async fn run_proposer_retirement_window_guard() -> TestResult {
 
     let keypair = EphemeralKeyPair::generate();
     let approve = ClientMessage::Approve(ApprovePayload {
+        proposal_id: proposal_id.clone(),
         ephemeral_public_key: keypair.public_key_encoded(),
         approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
     });

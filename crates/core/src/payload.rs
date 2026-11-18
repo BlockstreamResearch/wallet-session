@@ -42,6 +42,9 @@ pub struct ProposalPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovePayload {
+    /// The `id` of the frame that carried the proposal being approved.
+    pub proposal_id: MessageId,
+
     /// The responder's one-time X25519 public key.
     pub ephemeral_public_key: String,
 
@@ -51,7 +54,11 @@ pub struct ApprovePayload {
 
 /// Body of a `reject` message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RejectPayload {
+    /// The `id` of the frame that carried the proposal being rejected.
+    pub proposal_id: MessageId,
+
     /// Reason code for the rejection
     pub code: u32,
 
@@ -231,8 +238,9 @@ mod tests {
 
     #[test]
     fn bodies_with_the_same_shape_are_distinguished() -> TestResult {
-        let rejected: Payload =
-            serde_json::from_str(r#"{"type":"reject","code":1,"message":"no"}"#)?;
+        let rejected: Payload = serde_json::from_str(
+            r#"{"type":"reject","proposalId":"AAAAAAAAAAAAAAAAAAAAAA","code":1,"message":"no"}"#,
+        )?;
         assert!(matches!(rejected, Payload::Reject(_)));
 
         let disconnected: Payload = serde_json::from_str(

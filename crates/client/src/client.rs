@@ -68,12 +68,19 @@ enum Handshake {
     /// No handshake activity yet.
     Idle,
 
-    /// We sent a proposal and hold its ephemeral keypair.
-    Proposed { keypair: EphemeralKeyPair },
+    /// We sent the proposal carried by frame `proposal_id` and hold its
+    /// ephemeral keypair.
+    Proposed {
+        proposal_id: MessageId,
+        keypair: EphemeralKeyPair,
+    },
 
-    /// We received a valid proposal and already derived the session material
-    /// from our own ephemeral keypair and the peer's public key.
+    /// We received the proposal carried by frame `proposal_id` and already
+    /// derived the session material from our own ephemeral keypair and the
+    /// peer's public key.
     PeerProposed {
+        proposal_id: MessageId,
+        proposal: ProposalPayload,
         public_key: String,
         key: SessionKey,
         topic: SessionTopic,
@@ -817,7 +824,7 @@ where
         }
 
         if topic == self.session.pairing_topic
-            && let Err(error) = self.observe(&message)
+            && let Err(error) = self.observe(&id, &message)
         {
             if let Some(link) = self.link_mut(&topic) {
                 link.replay.forget(&id);
@@ -967,11 +974,32 @@ where
         link.reliability.fail_all();
     }
 
-    /// Update handshake state from an inbound pairing message.
-    fn observe(&mut self, message: &ClientMessage) -> Result<()> {
+    /// Update handshake state from an inbound pairing message carried by
+    /// frame `id`.
+    fn observe(&mut self, id: &MessageId, message: &ClientMessage) -> Result<()> {
+        // Proposals come from the proposer; approves and rejects come from
+        // the responder. Without this a pairing-key holder could, say, push
+        // an idle proposer into `PeerProposed`, after which it could neither
+        // propose (wrong state) nor approve (wrong role).
+        let sender = match message {
+            ClientMessage::Proposal(_) => Some(Role::Proposer),
+            ClientMessage::Approve(_) | ClientMessage::Reject(_) => Some(Role::Responder),
+            _ => None,
+        };
+        if sender.is_some_and(|sender| sender != self.session.role.counterpart()) {
+            return Err(ClientError::UnexpectedHandshake);
+        }
+
         match message {
             ClientMessage::Proposal(proposal) => {
-                if !matches!(self.handshake, Handshake::Idle) {
+                // The proposer starts over with a fresh keypair when its
+                // proposal fails to be acknowledged. Until we approve, the
+                // newest proposal replaces the pending one, so our approve
+                // answers the proposal the proposer is still waiting on.
+                if !matches!(
+                    self.handshake,
+                    Handshake::Idle | Handshake::PeerProposed { .. }
+                ) {
                     return Err(ClientError::UnexpectedHandshake);
                 }
                 let peer_public = decode_public_key(&proposal.ephemeral_public_key)?;
@@ -982,6 +1010,8 @@ where
                 let public_key = keypair.public_key_encoded();
                 let (key, topic) = keypair.derive(&peer_public)?;
                 self.handshake = Handshake::PeerProposed {
+                    proposal_id: id.clone(),
+                    proposal: proposal.clone(),
                     public_key,
                     key,
                     topic,
@@ -989,7 +1019,14 @@ where
                 self.session.state = SessionState::ProposalReceived;
             }
             ClientMessage::Approve(approve) => {
-                if !matches!(self.handshake, Handshake::Proposed { .. }) {
+                let Handshake::Proposed { proposal_id, .. } = &self.handshake else {
+                    return Err(ClientError::UnexpectedHandshake);
+                };
+                // An approve for an earlier proposal carries a key derived
+                // from that proposal's keypair, which we no longer hold.
+                // Accepting it would put us on a different session topic
+                // from the responder, with neither side ever noticing.
+                if approve.proposal_id != *proposal_id {
                     return Err(ClientError::UnexpectedHandshake);
                 }
                 let peer_public = decode_public_key(&approve.ephemeral_public_key)?;
@@ -997,13 +1034,12 @@ where
                 // produce a usable shared secret, so a weak approve cannot
                 // strand the proposer in `Idle`.
                 validate_peer_public(&peer_public)?;
-                let Handshake::Proposed { keypair } =
+                let Handshake::Proposed { keypair, .. } =
                     std::mem::replace(&mut self.handshake, Handshake::Idle)
                 else {
                     unreachable!("state checked above");
                 };
                 let (key, topic) = keypair.derive(&peer_public)?;
-                self.establish_session(key, topic)?;
                 // A valid approve proves the peer received the proposal, even
                 // when its explicit proposal ack was lost.
                 if let Some(proposal_id) = self.pairing_proposal.take()
@@ -1011,8 +1047,38 @@ where
                 {
                     link.reliability.mark_delivered(&proposal_id);
                 }
+                let cipher = match self.session_cipher(&key) {
+                    Ok(cipher) => cipher,
+                    Err(error) => {
+                        // The keypair is spent, so this proposal can never
+                        // be completed. Leave the proposer where a failed
+                        // proposal leaves it, free to propose again.
+                        self.session.state = SessionState::Idle;
+                        return Err(error);
+                    }
+                };
+                self.establish_session(cipher, topic);
             }
-            ClientMessage::Reject(_) => {
+            ClientMessage::Reject(reject) => {
+                // A reject answers our outstanding proposal. Drop its keypair
+                // so a late approve for it cannot establish anything; the
+                // application may propose again.
+                let Handshake::Proposed { proposal_id, .. } = &self.handshake else {
+                    return Err(ClientError::UnexpectedHandshake);
+                };
+                // Like an approve, it names that proposal. A retransmitted
+                // reject of an earlier proposal must not end the current one
+                // or count as its delivery.
+                if reject.proposal_id != *proposal_id {
+                    return Err(ClientError::UnexpectedHandshake);
+                }
+                self.handshake = Handshake::Idle;
+                // Like an approve, a reject proves the proposal arrived.
+                if let Some(proposal_id) = self.pairing_proposal.take()
+                    && let Some(link) = self.pairing.as_mut()
+                {
+                    link.reliability.mark_delivered(&proposal_id);
+                }
                 self.session.state = SessionState::Rejected;
             }
             _ => {}
@@ -1022,18 +1088,8 @@ where
 
     /// Start the session-topic connection and keep the pairing link alive
     /// until its handshake acknowledgements have had their retry window.
-    fn establish_session(&mut self, key: SessionKey, topic: SessionTopic) -> Result<()> {
-        if self.session_link.is_some() {
-            return Err(ClientError::UnexpectedHandshake);
-        }
-
+    fn establish_session(&mut self, cipher: C, topic: SessionTopic) {
         let session_topic = topic.as_topic().clone();
-        let cipher = self
-            .pairing
-            .as_ref()
-            .ok_or(ClientError::Closed)?
-            .cipher
-            .for_key(key.as_bytes())?;
         let link = Link::new(
             &self.config,
             &self.identity,
@@ -1050,7 +1106,16 @@ where
         self.handshake = Handshake::Established;
         self.session.state = SessionState::Active;
         self.schedule_pairing_retirement();
-        Ok(())
+    }
+
+    /// A fresh cipher for the derived session key.
+    fn session_cipher(&self, key: &SessionKey) -> Result<C> {
+        Ok(self
+            .pairing
+            .as_ref()
+            .ok_or(ClientError::Closed)?
+            .cipher
+            .for_key(key.as_bytes())?)
     }
 
     /// Close the client if the proposer has not joined the session link by
@@ -1099,7 +1164,10 @@ where
     }
 
     /// Send a `proposal` carrying ephemeral public key.
-    pub async fn propose(&mut self, proposal: Value) -> Result<()> {
+    ///
+    /// Returns the proposal's envelope id, which its `Delivered` or `Failed`
+    /// event carries.
+    pub async fn propose(&mut self, proposal: Value) -> Result<MessageId> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
@@ -1124,15 +1192,32 @@ where
         let proposal_id = self
             .send_on(&topic, &ClientMessage::Proposal(payload))
             .await?;
-        self.pairing_proposal = Some(proposal_id);
-        self.handshake = Handshake::Proposed { keypair };
+        self.pairing_proposal = Some(proposal_id.clone());
+        self.handshake = Handshake::Proposed {
+            proposal_id: proposal_id.clone(),
+            keypair,
+        };
         self.session.state = SessionState::ProposalSent;
-        Ok(())
+        Ok(proposal_id)
     }
 
-    /// Send an `approve` carrying ephemeral public key and switch to the
-    /// session topic and key.
-    pub async fn approve(&mut self, approval: Value) -> Result<()> {
+    /// Approve `proposal`, sending an `approve` carrying our ephemeral public
+    /// key, and switch to the session topic and key.
+    ///
+    /// `proposal` is the one the application showed the user. A newer
+    /// proposal from the counterpart replaces the pending one, and is
+    /// delivered through [`Client::recv`] like the first; if that happened in
+    /// the meantime this returns [`ClientError::ProposalSuperseded`] rather
+    /// than approve terms the user never saw. A newer proposal identical to
+    /// `proposal` in every field has the same terms, so it is approved.
+    ///
+    /// Returns the approve's envelope id, which its `Delivered` or `Failed`
+    /// event carries.
+    pub async fn approve(
+        &mut self,
+        proposal: &ProposalPayload,
+        approval: Value,
+    ) -> Result<MessageId> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
@@ -1141,18 +1226,35 @@ where
                 "only the responder may approve",
             ));
         }
-        let (public_key, key, topic) = match &self.handshake {
+        let (proposal_id, public_key, key, topic) = match &self.handshake {
             Handshake::PeerProposed {
+                proposal_id,
+                proposal: pending,
                 public_key,
                 key,
                 topic,
-            } => (public_key.clone(), key.clone(), topic.clone()),
+            } => {
+                if pending != proposal {
+                    return Err(ClientError::ProposalSuperseded);
+                }
+                (
+                    proposal_id.clone(),
+                    public_key.clone(),
+                    key.clone(),
+                    topic.clone(),
+                )
+            }
             _ => return Err(ClientError::UnexpectedHandshake),
         };
         if !self.pairing.as_ref().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
+        // Everything that can fail happens before the approve goes out. Once
+        // it is on the wire the proposer may establish the session, and we
+        // must then be able to as well.
+        let cipher = self.session_cipher(&key)?;
         let payload = ApprovePayload {
+            proposal_id,
             ephemeral_public_key: public_key,
             approval: Opaque(serde_json::to_vec(&approval)?),
         };
@@ -1160,20 +1262,45 @@ where
         let approve_id = self
             .send_on(&pairing_topic, &ClientMessage::Approve(payload))
             .await?;
-        self.pairing_approval = Some(approve_id);
-        self.establish_session(key, topic)?;
+        self.pairing_approval = Some(approve_id.clone());
+        self.establish_session(cipher, topic);
         self.schedule_session_timeout();
-        Ok(())
+        Ok(approve_id)
     }
 
-    /// Send a `reject` and move to `Rejected`.
-    pub async fn reject(&mut self, code: u32, message: impl Into<String>) -> Result<()> {
+    /// Reject `proposal` and move to `Rejected`.
+    ///
+    /// As with [`Client::approve`], `proposal` is the one the application
+    /// showed the user, and this returns [`ClientError::ProposalSuperseded`]
+    /// if a newer one has replaced it. Rejecting also forgets the session key
+    /// derived for the proposal, so a later `approve` fails until a new
+    /// proposal arrives.
+    pub async fn reject(
+        &mut self,
+        proposal: &ProposalPayload,
+        code: u32,
+        message: impl Into<String>,
+    ) -> Result<()> {
         if let Some(error) = self.terminal_error() {
             return Err(error);
         }
-        if matches!(self.handshake, Handshake::Established) {
-            return Err(ClientError::UnexpectedHandshake);
+        if self.session.role != Role::Responder {
+            return Err(ClientError::ProtocolViolation(
+                "only the responder may reject",
+            ));
         }
+        let Handshake::PeerProposed {
+            proposal_id,
+            proposal: pending,
+            ..
+        } = &self.handshake
+        else {
+            return Err(ClientError::UnexpectedHandshake);
+        };
+        if pending != proposal {
+            return Err(ClientError::ProposalSuperseded);
+        }
+        let proposal_id = proposal_id.clone();
         if !self.pairing.as_ref().is_some_and(Link::is_ready) {
             return Err(ClientError::NotReady);
         }
@@ -1181,11 +1308,13 @@ where
         self.send_on(
             &topic,
             &ClientMessage::Reject(RejectPayload {
+                proposal_id,
                 code,
                 message: message.into(),
             }),
         )
         .await?;
+        self.handshake = Handshake::Idle;
         self.session.state = SessionState::Rejected;
         Ok(())
     }
