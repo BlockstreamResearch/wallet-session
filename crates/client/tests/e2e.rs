@@ -58,7 +58,7 @@ async fn run() -> TestResult {
     let relay_url = format!("ws://{addr}");
     let pairing = PairingKey::random()?;
     let topic = pairing.topic()?;
-    let key = *pairing.as_bytes();
+    let key = pairing.as_bytes();
 
     let proposer_config = ClientConfig::new(&relay_url)
         .with_insecure_ws()
@@ -348,7 +348,7 @@ async fn run_session_key() -> TestResult {
     let relay_url = format!("ws://{addr}");
     let pairing = PairingKey::random()?;
     let topic = pairing.topic()?;
-    let key = *pairing.as_bytes();
+    let key = pairing.as_bytes();
     let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
     let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
 
@@ -428,7 +428,7 @@ async fn run_session_key() -> TestResult {
         other => panic!("expected approve delivery, got {other:?}"),
     }
 
-    let mut session_cipher = XChaCha20Poly1305Cipher::new(*session_key.as_bytes())?;
+    let mut session_cipher = XChaCha20Poly1305Cipher::new(session_key.as_bytes())?;
     let mut session_stream = connect_raw(
         &relay_url,
         &proposer_identity,

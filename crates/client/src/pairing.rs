@@ -3,7 +3,7 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use url::{Url, form_urlencoded};
 use wallet_session_core::{codec, message::Topic};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{error::ClientError, error::Result, random};
 
@@ -42,8 +42,9 @@ impl PairingKey {
 
     /// Parse a base64url pairing key.
     pub fn from_base64(encoded: &str) -> Result<Self> {
-        let bytes = codec::decode(encoded)?;
+        let bytes = Zeroizing::new(codec::decode(encoded)?);
         let bytes: [u8; 32] = bytes
+            .as_slice()
             .try_into()
             .map_err(|_| ClientError::PairingUri("bad pairing key length".to_owned()))?;
         Ok(Self(bytes))

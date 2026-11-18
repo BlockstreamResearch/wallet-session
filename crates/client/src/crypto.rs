@@ -10,7 +10,6 @@ use wallet_session_core::{
     did::DidKey,
     message::{Ciphertext, Message, MessageId, MessageType, Nonce, Topic},
 };
-use zeroize::Zeroizing;
 
 /// Symmetric key length
 pub const KEY_LEN: usize = 32;
@@ -148,29 +147,30 @@ pub struct XChaCha20Poly1305Cipher {
 
 impl XChaCha20Poly1305Cipher {
     /// Build a cipher with a random sender prefix.
-    pub fn new(key: [u8; KEY_LEN]) -> Result<Self, CipherError> {
+    ///
+    /// The key is taken by reference so no extra copy of it is left behind;
+    /// the cipher keeps its own and wipes it on drop.
+    pub fn new(key: &[u8; KEY_LEN]) -> Result<Self, CipherError> {
         let mut prefix = [0u8; SENDER_PREFIX_LEN];
         getrandom::fill(&mut prefix)?;
         Self::from_prefix(key, prefix)
     }
 
     fn from_prefix(
-        key: [u8; KEY_LEN],
+        key: &[u8; KEY_LEN],
         prefix: [u8; SENDER_PREFIX_LEN],
     ) -> Result<Self, CipherError> {
-        let key = Zeroizing::new(key);
         Ok(Self {
             prefix,
             counter: 0,
-            inner: XChaCha20Poly1305::new_from_slice(key.as_ref())
-                .map_err(|_| CipherError::Encrypt)?,
+            inner: XChaCha20Poly1305::new(key.into()),
         })
     }
 
     /// Build a cipher with a fixed sender prefix. Test-only.
     #[cfg(test)]
     fn with_prefix(
-        key: [u8; KEY_LEN],
+        key: &[u8; KEY_LEN],
         prefix: [u8; SENDER_PREFIX_LEN],
     ) -> Result<Self, CipherError> {
         Self::from_prefix(key, prefix)
@@ -230,7 +230,7 @@ impl MessageCipher for XChaCha20Poly1305Cipher {
     }
 
     fn for_key(&self, key: &[u8; KEY_LEN]) -> Result<Self, CipherError> {
-        Self::new(*key)
+        Self::new(key)
     }
 }
 
@@ -318,7 +318,7 @@ mod tests {
     fn round_trips() -> TestResult {
         let topic = topic();
         let aad = aad(MessageType::Request, &topic);
-        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
 
         let sealed = cipher.seal(&aad, b"hello")?;
         assert_eq!(cipher.open(&aad, &sealed)?, b"hello");
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn rejects_tampered_aad() -> TestResult {
         let topic = topic();
-        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
         let sealed = cipher.seal(&aad(MessageType::Request, &topic), b"hello")?;
 
         let other = aad(MessageType::Response, &topic);
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn rejects_tampered_from() -> TestResult {
         let topic = topic();
-        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
 
         let sealed = cipher.seal(
             &Aad::new(
@@ -377,7 +377,7 @@ mod tests {
     fn nonce_advances_per_message() -> TestResult {
         let topic = topic();
         let aad = aad(MessageType::Request, &topic);
-        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
 
         let first = cipher.seal(&aad, b"a")?;
         let second = cipher.seal(&aad, b"a")?;
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn session_cipher_starts_with_fresh_nonce_state() -> TestResult {
-        let pairing = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let pairing = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
         let session = pairing.for_key(&[8u8; 32])?;
 
         assert_ne!(pairing.prefix, session.prefix);
@@ -399,7 +399,7 @@ mod tests {
     fn session_cipher_does_not_open_with_the_pairing_key() -> TestResult {
         let topic = topic();
         let aad = aad(MessageType::Request, &topic);
-        let pairing = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let pairing = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
         let mut session = pairing.for_key(&[8u8; 32])?;
 
         let sealed = session.seal(&aad, b"hello")?;
@@ -414,7 +414,7 @@ mod tests {
     fn counter_exhaustion_fails_closed() -> TestResult {
         let topic = topic();
         let aad = aad(MessageType::Request, &topic);
-        let mut cipher = XChaCha20Poly1305Cipher::with_prefix([9u8; 32], [3u8; 16])?;
+        let mut cipher = XChaCha20Poly1305Cipher::with_prefix(&[9u8; 32], [3u8; 16])?;
         cipher.counter = u64::MAX;
 
         assert!(matches!(

@@ -23,7 +23,7 @@ use wallet_session_core::{
 use crate::{
     config::{ClientConfig, MAX_RETRY_DELAY},
     crypto::{Aad, CipherError, SealedPayload},
-    error::{ClientError, Result},
+    error::{ClientError, JsonErrorSummary, Result},
     handshake::{
         EphemeralKeyPair, SessionKey, SessionTopic, decode_public_key, validate_peer_public,
     },
@@ -186,6 +186,14 @@ where
 /// Delivery outcomes reserve pending capacity until the application consumes
 /// them. With 256 pending messages or unconsumed outcomes per link, further
 /// sends return [`ClientError::Busy`] instead of dropping an outcome.
+///
+/// # Logging
+///
+/// The relay connection token and the topic travel in the WebSocket URL.
+/// This crate logs neither, but `tungstenite` logs the whole request at
+/// `trace` level. Do not enable `trace` for `tungstenite` wherever logs are
+/// kept or shared: the token is valid for `token_ttl`, and a pairing topic
+/// lets whoever reads it take the free role on it.
 pub struct Client<C> {
     config: ClientConfig,
     identity: IdentityKey,
@@ -592,8 +600,9 @@ where
             Ok(wire) => wire,
             Err(error) => {
                 log::warn!(
-                    "dropping malformed envelope on topic {}: {error}",
-                    topic.log_tag()
+                    "dropping malformed envelope on topic {}: {}",
+                    topic.log_tag(),
+                    JsonErrorSummary(&error)
                 );
                 return None;
             }
@@ -752,12 +761,13 @@ where
             Observation::New => {}
         }
 
-        let message = match ClientMessage::from_bytes(&plaintext) {
+        let message = match serde_json::from_slice::<ClientMessage>(&plaintext) {
             Ok(message) => message,
             Err(error) => {
                 log::warn!(
-                    "dropping malformed plaintext on topic {}: {error}",
-                    topic.log_tag()
+                    "dropping malformed plaintext on topic {}: {}",
+                    topic.log_tag(),
+                    JsonErrorSummary(&error)
                 );
                 return Ok(None);
             }

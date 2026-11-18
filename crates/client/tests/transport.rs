@@ -53,7 +53,7 @@ async fn connect(
         IdentityKey::from_seed(&Seed::from_bytes([1u8; 32])),
         Role::Proposer,
         Topic::new([9u8; 32])?,
-        XChaCha20Poly1305Cipher::new([7u8; 32])?,
+        XChaCha20Poly1305Cipher::new(&[7u8; 32])?,
     )
     .await?)
 }

@@ -131,7 +131,7 @@ async fn connect_pair(live: &LiveRelay) -> Result<Pair, Box<dyn std::error::Erro
         IdentityKey::random()?,
         Role::Proposer,
         topic.clone(),
-        XChaCha20Poly1305Cipher::new(key)?,
+        XChaCha20Poly1305Cipher::new(&key)?,
     )
     .await?;
     let mut responder = Client::connect(
@@ -139,7 +139,7 @@ async fn connect_pair(live: &LiveRelay) -> Result<Pair, Box<dyn std::error::Erro
         IdentityKey::from_seed(&responder_seed),
         Role::Responder,
         topic.clone(),
-        XChaCha20Poly1305Cipher::new(key)?,
+        XChaCha20Poly1305Cipher::new(&key)?,
     )
     .await?;
 
@@ -572,7 +572,7 @@ async fn reconnect_resumes_buffered_frames() -> TestResult {
             IdentityKey::from_seed(&responder_seed),
             Role::Responder,
             topic.clone(),
-            XChaCha20Poly1305Cipher::new(key)?,
+            XChaCha20Poly1305Cipher::new(&key)?,
         )
         .await?;
         responder.wait_session_ready().await?;

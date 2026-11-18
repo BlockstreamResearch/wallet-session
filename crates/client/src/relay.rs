@@ -26,7 +26,12 @@ use wallet_session_core::{
     message::Topic,
 };
 
-use crate::{config::ClientConfig, error::Result, identity::IdentityKey, random};
+use crate::{
+    config::ClientConfig,
+    error::{JsonErrorSummary, Result},
+    identity::IdentityKey,
+    random,
+};
 
 /// Client-side relay WebSocket stream.
 pub(crate) type RelayStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -458,7 +463,9 @@ async fn run_connection(
                                 InboxTry::Closed => break ConnectionEnd::Shutdown,
                             }
                         }
-                        Err(error) => log::warn!("invalid relay frame: {error}"),
+                        Err(error) => {
+                            log::warn!("invalid relay frame: {}", JsonErrorSummary(&error));
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {

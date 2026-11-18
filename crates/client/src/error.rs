@@ -70,3 +70,46 @@ pub enum ClientError {
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+/// A JSON parse error, described without the input it may quote.
+///
+/// serde's `Display` echoes unknown variants and mistyped strings verbatim,
+/// which lets whoever controls the input (the relay, or the peer once a
+/// frame is decrypted) write into our logs. Log this instead.
+pub(crate) struct JsonErrorSummary<'a>(pub(crate) &'a serde_json::Error);
+
+impl std::fmt::Display for JsonErrorSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} error at line {} column {}",
+            self.0.classify(),
+            self.0.line(),
+            self.0.column()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_error_summary_does_not_echo_input() {
+        let secret = "do-not-log-this-value";
+        let input = format!(r#"{{"kind":"{secret}"}}"#);
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        enum Kind {
+            Request,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Frame {
+            kind: Kind,
+        }
+        let error = serde_json::from_str::<Frame>(&input).expect_err("unknown variant");
+        assert!(error.to_string().contains(secret), "serde does echo it");
+        assert!(!JsonErrorSummary(&error).to_string().contains(secret));
+    }
+}
