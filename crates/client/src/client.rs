@@ -91,7 +91,7 @@ enum Handshake {
 }
 
 /// A message frame that passed wire validation, sender policy, topic/kind
-/// policy, capacity checks and authentication.
+/// policy and authentication.
 struct InboundEnvelope {
     id: MessageId,
     topic: Topic,
@@ -579,10 +579,10 @@ where
         frame: RelayFrame,
         deliver: bool,
     ) -> Result<Option<ClientMessage>> {
-        let Some(envelope) = self.authenticate_frame(frame, deliver) else {
+        let Some(envelope) = self.authenticate_frame(frame) else {
             return Ok(None);
         };
-        self.process_envelope(envelope).await
+        self.process_envelope(envelope, deliver).await
     }
 
     /// Apply wire, sender, topic and cryptographic checks to a frame.
@@ -590,7 +590,7 @@ where
     /// This does not mutate client state. The plaintext is returned unparsed
     /// so the caller can preserve replay-classification ordering before
     /// interpreting it.
-    fn authenticate_frame(&self, frame: RelayFrame, deliver: bool) -> Option<InboundEnvelope> {
+    fn authenticate_frame(&self, frame: RelayFrame) -> Option<InboundEnvelope> {
         let RelayFrame {
             id, topic, body, ..
         } = frame;
@@ -685,15 +685,6 @@ where
             return None;
         }
 
-        // While `wait_session_ready`/`next_event` has no room to queue a
-        // message, drop it without recording or acknowledging it, so the peer
-        // retransmits it later instead of the application silently losing it.
-        // Acks are not delivered and must still be processed.
-        if !deliver && wire.kind != MessageType::Ack {
-            log::warn!("dropping message: pending queue is full");
-            return None;
-        }
-
         Some(InboundEnvelope {
             id,
             topic,
@@ -722,9 +713,13 @@ where
     }
 
     /// Apply replay and handshake semantics to an authenticated frame.
+    ///
+    /// When `deliver` is false there is no room to queue a new message for
+    /// the application.
     async fn process_envelope(
         &mut self,
         envelope: InboundEnvelope,
+        deliver: bool,
     ) -> Result<Option<ClientMessage>> {
         let InboundEnvelope {
             id,
@@ -733,15 +728,6 @@ where
             plaintext,
             now,
         } = envelope;
-
-        // The counterpart is the sender of the first envelope that passes the
-        // version, topic, identity, timestamp and authentication checks on the
-        // pairing topic. It stays the counterpart for the session topic and
-        // across reconnects.
-        if topic == self.session.pairing_topic && self.session.peer_did.is_none() {
-            self.session.peer_did = Some(wire.from.clone());
-            log::debug!("established counterpart {}", wire.from);
-        }
 
         let observation = self
             .link_mut(&topic)
@@ -761,11 +747,24 @@ where
                     "envelope reuses a frame id or nonce with different content",
                 ));
             }
-            Observation::Full => {
+            // Dropping an ack would report a delivered message as `Failed`,
+            // so let it through; `commit_ack` decides whether to record it.
+            Observation::Full if wire.kind != MessageType::Ack => {
                 log::warn!("dropping envelope: replay memory is full");
                 return Ok(None);
             }
-            Observation::New => {}
+            Observation::Full | Observation::New => {}
+        }
+        let has_room = observation == Observation::New;
+
+        // While `wait_session_ready`/`next_event` has no room to queue a new
+        // message, drop it without recording or acknowledging it, so the peer
+        // retransmits it later instead of the application silently losing it.
+        // This comes after replay classification so that a retransmission of
+        // something we already accepted is still re-acknowledged above.
+        if !deliver && wire.kind != MessageType::Ack {
+            log::warn!("dropping message: pending queue is full");
+            return Ok(None);
         }
 
         let message = match serde_json::from_slice::<ClientMessage>(&plaintext) {
@@ -804,7 +803,7 @@ where
 
         // acks are consumed by reliability
         if let ClientMessage::Ack(ack) = &message {
-            self.commit_ack(&id, &topic, &wire, ack);
+            self.commit_ack(&id, &topic, &wire, ack, has_room);
             return Ok(None);
         }
 
@@ -831,6 +830,7 @@ where
             }
             return Err(error);
         }
+        self.pin_counterpart(&topic, &wire.from);
 
         if requires_ack(message.message_type()) {
             self.send_ack(&id, &topic).await?;
@@ -850,15 +850,52 @@ where
         Ok(Some(message))
     }
 
-    /// Record an inbound ack and report delivery.
-    fn commit_ack(&mut self, id: &MessageId, topic: &Topic, wire: &Message, ack: &AckPayload) {
+    /// Pin the sender of the first envelope we accept on the pairing topic as
+    /// the counterpart. It stays the counterpart for the session topic and
+    /// across reconnects.
+    ///
+    /// This happens only once the envelope is accepted, not as soon as it
+    /// authenticates. Otherwise a pairing-key holder could get itself pinned
+    /// with a single message we then refuse (a proposal to a proposer, say),
+    /// and every frame from the real peer would be dropped from then on.
+    fn pin_counterpart(&mut self, topic: &Topic, from: &DidKey) {
+        if *topic == self.session.pairing_topic && self.session.peer_did.is_none() {
+            self.session.peer_did = Some(from.clone());
+            log::debug!("established counterpart {from}");
+        }
+    }
+
+    /// Process an inbound ack and report delivery.
+    ///
+    /// `has_room` says whether the replay memory has room for a new record.
+    /// An ack that completes one of our sends is recorded even when it does
+    /// not, up to a fixed headroom, so a conflicting copy of it is still
+    /// caught. An ack that completes nothing has no effect, so it is neither
+    /// recorded nor allowed to establish the counterpart: otherwise a
+    /// pairing-key holder could fill the replay memory, or get itself
+    /// pinned, by acking made-up ids.
+    fn commit_ack(
+        &mut self,
+        id: &MessageId,
+        topic: &Topic,
+        wire: &Message,
+        ack: &AckPayload,
+        has_room: bool,
+    ) {
         let ack_id = ack.ack_id.clone();
         let retires_pairing =
             *topic == self.session.pairing_topic && self.pairing_approval.as_ref() == Some(&ack_id);
         let link = self.link_mut(topic).expect("topic was checked");
-        link.replay.record(id, wire);
-        link.reliability.mark_delivered(&ack_id);
-        if retires_pairing {
+        let completed = link.reliability.mark_delivered(&ack_id);
+        if completed && (has_room || link.replay.has_ack_headroom()) {
+            link.replay.record(id, wire);
+        }
+        if completed {
+            self.pin_counterpart(topic, &wire.from);
+        }
+        // A late ack for an approve we already gave up on completes nothing,
+        // and like any such ack it must have no effect.
+        if retires_pairing && completed {
             self.retire_pairing();
         }
     }

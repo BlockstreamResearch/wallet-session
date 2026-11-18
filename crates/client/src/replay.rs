@@ -8,6 +8,11 @@ use wallet_session_core::message::{Message, MessageId};
 /// Maximum records kept per key.
 pub(crate) const CAPACITY: usize = 8192;
 
+/// Extra records allowed beyond [`CAPACITY`] for acks that complete one of
+/// our sends, so that a full memory does not turn a delivered message into a
+/// failed one. Beyond this such an ack is processed without being recorded.
+pub(crate) const ACK_HEADROOM: usize = 256;
+
 /// How a received envelope relates to the replay memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Observation {
@@ -104,6 +109,12 @@ impl ReplayMemory {
         Observation::New
     }
 
+    /// Whether an ack that completed a send may still be recorded although the
+    /// memory is full.
+    pub(crate) fn has_ack_headroom(&self) -> bool {
+        self.by_id.len() < self.capacity.saturating_add(ACK_HEADROOM)
+    }
+
     /// Remember an envelope that was classified as [`Observation::New`].
     pub(crate) fn record(&mut self, id: &MessageId, message: &Message) {
         let nonce = message.nonce.as_bytes().to_vec();
@@ -197,6 +208,21 @@ mod tests {
             memory.record(id, message);
         }
         observation
+    }
+
+    #[test]
+    fn ack_headroom_is_bounded() {
+        let mut memory = ReplayMemory::new(Duration::from_secs(300), 2);
+        let now = 1_000;
+        for counter in 0..(2 + ACK_HEADROOM) as u64 {
+            assert!(memory.has_ack_headroom(), "record {counter}");
+            let message = message_with_nonce(now, nonce_with_counter(counter));
+            memory.record(&message_id(&format!("ack-{counter}")), &message);
+        }
+        assert!(
+            !memory.has_ack_headroom(),
+            "the headroom past the capacity is fixed"
+        );
     }
 
     #[test]

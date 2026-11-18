@@ -209,18 +209,21 @@ impl Reliability {
         }
     }
 
-    /// Record an inbound ACK, reporting delivery.
-    pub(crate) fn mark_delivered(&mut self, ack_id: &MessageId) {
-        if let Some(entry) = self
+    /// Record an inbound ACK, reporting delivery. Returns whether it
+    /// completed an outstanding send.
+    pub(crate) fn mark_delivered(&mut self, ack_id: &MessageId) -> bool {
+        let Some(entry) = self
             .pending
             .lock()
             .expect("reliability lock")
             .remove(ack_id)
-        {
-            let _ = self
-                .outcomes
-                .send((ClientEvent::Delivered { id: ack_id.clone() }, entry.permit));
-        }
+        else {
+            return false;
+        };
+        let _ = self
+            .outcomes
+            .send((ClientEvent::Delivered { id: ack_id.clone() }, entry.permit));
+        true
     }
 }
 

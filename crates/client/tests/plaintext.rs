@@ -667,6 +667,113 @@ async fn run_peer_disconnect_full_inbox(peer_returns: bool) -> TestResult {
     Ok(())
 }
 
+/// Records the replay memory keeps before it refuses new envelopes.
+const REPLAY_CAPACITY: usize = 8192;
+
+#[tokio::test]
+async fn stray_acks_do_not_fill_the_replay_memory() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(120), run_stray_acks()).await??;
+    Ok(())
+}
+
+/// Acks that complete nothing must not use up the replay memory, or anyone
+/// holding the key could get every later message dropped.
+async fn run_stray_acks() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // Several megabytes go through the relay, so lift its rate limits.
+    let unlimited = RateLimit {
+        burst: u32::MAX,
+        interval: Duration::from_secs(1),
+    };
+    let limiter = Arc::new(Limiter::new(RelayLimitsConfig {
+        inbound_message_rate: unlimited,
+        inbound_byte_rate: unlimited,
+        inbound_wire_byte_rate: unlimited,
+        identity_inbound_byte_rate: unlimited,
+        source_inbound_byte_rate: unlimited,
+        global_inbound_byte_rate: unlimited,
+        ..RelayLimitsConfig::default()
+    }));
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        limiter,
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+
+    let mut responder = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        responder_identity,
+        Role::Responder,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut raw =
+        establish_raw_session(&relay_url, &topic, &mut responder, &proposer_identity).await?;
+
+    // Send as many stray acks as the replay memory holds, in batches that
+    // each end with a request. Once the request is delivered and acked, the
+    // client has processed the whole batch. The batches fit in the client's
+    // inbox, so none is dropped.
+    const BATCH: usize = 32;
+    for batch in 0..REPLAY_CAPACITY / (BATCH - 1) + 1 {
+        for index in 0..BATCH - 1 {
+            let label = format!("stray-{}", batch * BATCH + index);
+            let ack = client_frame(
+                &raw.topic,
+                proposer_identity.did(),
+                &label,
+                &ClientMessage::Ack(AckPayload {
+                    ack_id: message_id(&format!("made-up-{}", batch * BATCH + index)),
+                }),
+                &mut raw.cipher,
+            )?;
+            raw.session
+                .send(WsMessage::text(serde_json::to_string(&ack)?))
+                .await?;
+        }
+        let label = format!("req-{batch}");
+        let request = request_frame(
+            &raw.topic,
+            proposer_identity.did(),
+            &label,
+            &label,
+            &mut raw.cipher,
+        )?;
+        raw.session
+            .send(WsMessage::text(serde_json::to_string(&request)?))
+            .await?;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), responder.recv())
+            .await
+            .expect("stray acks must not leave the request without room")?;
+        match delivered {
+            ClientMessage::Request(payload) => assert_eq!(payload.request_id, label),
+            other => panic!("expected request, got {other:?}"),
+        }
+        match read_raw_message(&mut raw.session, &raw.cipher).await? {
+            ClientMessage::Ack(ack) => assert_eq!(ack.ack_id, request.id),
+            other => panic!("expected ack, got {other:?}"),
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn inbound_disconnect_is_terminal_and_acked() -> TestResult {
     tokio::time::timeout(Duration::from_secs(10), run_inbound_disconnect_terminal()).await??;
@@ -1222,9 +1329,11 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
     // Fill the pending queue with proposals one round trip at a time, so
     // every ack is observable and the outbox is not overwhelmed by a burst.
     // Each proposal replaces the pending one, so all of them are accepted.
+    let mut first_queued = None;
     for index in 0..256u32 {
         let frame = proposal(index, &mut cipher)?;
         let frame_id = frame.id.clone();
+        first_queued.get_or_insert_with(|| frame.clone());
         pairing
             .send(WsMessage::text(serde_json::to_string(&frame)?))
             .await?;
@@ -1304,6 +1413,43 @@ async fn run_pending_cap_handshake_messages() -> TestResult {
             .is_err(),
         "overflowing handshake message must not be acknowledged"
     );
+
+    // A retransmission of a message that is already queued is still
+    // acknowledged while the queue is full, so its sender does not give up on
+    // a message we hold.
+    let first_queued = first_queued.expect("filled the queue");
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&first_queued)?))
+        .await?;
+    let reacked = async {
+        loop {
+            let mut event = Box::pin(responder.next_event());
+            let incoming = Box::pin(read_raw_frame(&mut pairing));
+            let frame = tokio::select! {
+                event = &mut event => panic!("unexpected event: {event:?}"),
+                frame = incoming => frame?,
+            };
+            let RelayFrameBody::Message { payload } = frame.body else {
+                continue;
+            };
+            let wire: Envelope = serde_json::from_str(&payload)?;
+            if wire.kind != MessageType::Ack {
+                continue;
+            }
+            let bytes = cipher.open(
+                &[],
+                &SealedPayload {
+                    nonce: wire.nonce,
+                    data: wire.data,
+                },
+            )?;
+            if let ClientMessage::Ack(ack) = ClientMessage::from_bytes(&bytes)? {
+                return Ok::<MessageId, Box<dyn std::error::Error>>(ack.ack_id);
+            }
+        }
+    };
+    let reacked = tokio::time::timeout(Duration::from_secs(2), reacked).await??;
+    assert_eq!(reacked, first_queued.id);
 
     // Acks are still processed while the pending queue is full.
     let ack = ClientMessage::Ack(AckPayload {
@@ -2335,6 +2481,114 @@ async fn run_reject_ends_proposal() -> TestResult {
         responder.approve(&shown, json!({ "ok": true })).await,
         Err(ClientError::UnexpectedHandshake)
     ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn refused_envelope_does_not_pin_the_counterpart() -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), run_refused_envelope_pin()).await??;
+    Ok(())
+}
+
+/// A pairing-key holder sends one proposal to a proposer under its own
+/// identity. It is refused, so it must not become the counterpart and lock
+/// the real responder out.
+async fn run_refused_envelope_pin() -> TestResult {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .parse_default_env()
+        .try_init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(serve(
+        listener,
+        Arc::new(Registry::new()),
+        Arc::new(Limiter::new(RelayLimitsConfig::default())),
+        NativeRelayTransportConfig::new(AUDIENCE),
+    ));
+
+    let relay_url = format!("ws://{addr}");
+    let pairing = PairingKey::random()?;
+    let topic = pairing.topic()?;
+    let responder_identity = IdentityKey::from_seed(&Seed::from_bytes([2u8; 32]));
+    let proposer_identity = IdentityKey::from_seed(&Seed::from_bytes([1u8; 32]));
+    let intruder_identity = IdentityKey::from_seed(&Seed::from_bytes([3u8; 32]));
+
+    let mut proposer = Client::connect(
+        ClientConfig::new(&relay_url)
+            .with_insecure_ws()
+            .with_audience(AUDIENCE),
+        proposer_identity,
+        Role::Proposer,
+        topic.clone(),
+        PlaintextCipher::new(),
+    )
+    .await?;
+    let mut pairing = connect_raw(&relay_url, &responder_identity, Role::Responder, &topic).await?;
+    proposer.wait_session_ready().await?;
+    wait_raw_session_ready(&mut pairing).await?;
+    let mut cipher = PlaintextCipher::new();
+
+    let proposal_id = proposer
+        .propose(json!({ "capabilities": ["read"] }))
+        .await?;
+
+    // The intruder's proposal authenticates but is refused.
+    let intrusion = client_frame(
+        &topic,
+        intruder_identity.did(),
+        "intruder-proposal",
+        &ClientMessage::Proposal(ProposalPayload {
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            session_expiry: 0,
+            proposal: Opaque(serde_json::to_vec(&json!({ "test": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&intrusion)?))
+        .await?;
+    assert!(matches!(
+        proposer.recv().await,
+        Err(ClientError::UnexpectedHandshake)
+    ));
+    assert!(proposer.session().peer_did.is_none());
+
+    // An ack for a made-up id completes nothing, so it must not pin the
+    // intruder either. The approve below is a processing barrier for it.
+    let stray_ack = client_frame(
+        &topic,
+        intruder_identity.did(),
+        "intruder-ack",
+        &ClientMessage::Ack(AckPayload {
+            ack_id: message_id("made-up"),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&stray_ack)?))
+        .await?;
+
+    // The real responder's approve still establishes the session.
+    let approve = client_frame(
+        &topic,
+        responder_identity.did(),
+        "real-approve",
+        &ClientMessage::Approve(ApprovePayload {
+            proposal_id,
+            ephemeral_public_key: EphemeralKeyPair::generate().public_key_encoded(),
+            approval: Opaque(serde_json::to_vec(&json!({ "ok": true }))?),
+        }),
+        &mut cipher,
+    )?;
+    pairing
+        .send(WsMessage::text(serde_json::to_string(&approve)?))
+        .await?;
+    assert!(matches!(proposer.recv().await?, ClientMessage::Approve(_)));
+    assert_eq!(proposer.session().state, SessionState::Active);
+    assert_eq!(proposer.session().peer_did, Some(responder_identity.did()));
 
     Ok(())
 }
